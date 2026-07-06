@@ -1,0 +1,32 @@
+/target/
+/node/node_modules/
+/node/*.node
+/.venv*/
+/.audit-playwright/
+/.benchmarks/
+/.pytest_cache/
+__pycache__/
+/**/*.pyc
+*.so
+*.dylib
+*.pyd
+/.coverage
+/docs/internal/
+/123
+/x.har
+*.har
+
+# External benchmark datasets and generated manifests. Keep downloaded
+# Mind2Web/WebVoyager data out of git; commit the import tools, not the data.
+/.benchmark-data/
+/benchmark-results/
+/benchmark-data/
+/datasets/
+/data/Mind2Web/
+/data/mind2web/
+/data/WebVoyager/
+/data/webvoyager/
+/data/WebVoyager_data.jsonl
+/data/GAIA_web.jsonl
+/data/reference_answer.json
+/benchmarks/external/

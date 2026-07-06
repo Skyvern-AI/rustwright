@@ -1,0 +1,54 @@
+{
+  "name": "rustwright",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node.js bindings for Rustwright's Rust CDP core",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Skyvern-AI/rustwright.git"
+  },
+  "homepage": "https://github.com/Skyvern-AI/rustwright",
+  "bugs": {
+    "url": "https://github.com/Skyvern-AI/rustwright/issues"
+  },
+  "main": "./index.cjs",
+  "module": "./index.mjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.cjs"
+    },
+    "./compat": {
+      "types": "./index.d.ts",
+      "import": "./compat.mjs",
+      "require": "./compat.cjs"
+    }
+  },
+  "files": [
+    "index.cjs",
+    "index.mjs",
+    "index.d.ts",
+    "native.cjs",
+    "native.d.ts",
+    "compat.cjs",
+    "compat.mjs",
+    "*.node",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "napi build --release -p rustwright-node --dts native.d.ts && node ./scripts/generate-types.mjs",
+    "smoke": "node ./smoke.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4"
+  },
+  "napi": {
+    "name": "rustwright",
+    "triples": {
+      "defaults": true
+    }
+  }
+}

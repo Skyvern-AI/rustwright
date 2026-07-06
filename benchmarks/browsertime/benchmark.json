@@ -1,0 +1,9 @@
+{
+  "id": "browsertime",
+  "category": "page-load-user-journey",
+  "primary_use": "Collect page-load and user-journey timing metrics with repeatable browser sessions.",
+  "source_url": "https://www.sitespeed.io/",
+  "default_command": "python benchmarks/browsertime/run.py --url https://example.com --iterations 5",
+  "setup_command": "python benchmarks/browsertime/run.py --setup",
+  "outputs": ".benchmark-data/browser-speed/results/browsertime/"
+}

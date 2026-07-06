@@ -1,0 +1,297 @@
+name: Rustwright Benchmarks
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+  workflow_dispatch:
+    inputs:
+      benchmark:
+        type: choice
+        description: "Benchmark workload to run"
+        required: true
+        default: strict
+        options:
+          - strict
+          - equivalent
+          - mind2web-sharded
+          - defensible-speed
+      implementations:
+        type: string
+        description: "Comma-separated implementations, or all"
+        required: true
+        default: "rustwright,playwright"
+      repetitions:
+        type: string
+        description: "Benchmark repetitions"
+        required: true
+        default: "1"
+      iterations:
+        type: string
+        description: "Iterations per benchmark run"
+        required: true
+        default: "1"
+      lifecycle:
+        type: choice
+        description: "bench-full lifecycle"
+        required: true
+        default: warm-browser
+        options:
+          - warm-browser
+          - warm-page
+          - cold-browser
+          - cold-container
+      case:
+        type: string
+        description: "Optional strict/equivalent case name"
+        required: false
+        default: ""
+      max_tasks:
+        type: string
+        description: "Optional Mind2Web task cap"
+        required: false
+        default: ""
+      shard_size:
+        type: string
+        description: "Mind2Web shard size"
+        required: false
+        default: "25"
+      defensible_lifecycles:
+        type: string
+        description: "Comma-separated lifecycles for defensible-speed"
+        required: false
+        default: "warm-browser,warm-page,cold-browser"
+      strict_repetitions:
+        type: string
+        description: "Strict-suite repetitions for defensible-speed; defaults to repetitions"
+        required: false
+        default: ""
+      strict_iterations:
+        type: string
+        description: "Strict-suite iterations for defensible-speed"
+        required: false
+        default: "1"
+      enforce_phase2:
+        type: boolean
+        description: "Fail the workflow if strict Phase 2 acceptance checks fail"
+        required: false
+        default: false
+      runner_label:
+        type: choice
+        description: "Runner label for provenance/debug runs; Blacksmith remains the default"
+        required: false
+        default: blacksmith-4vcpu-ubuntu-2404
+        options:
+          - blacksmith-4vcpu-ubuntu-2404
+          - ubuntu-latest
+
+jobs:
+  benchmark:
+    if: >-
+      ${{
+        github.repository == 'Skyvern-AI/rustwright' &&
+        (
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        ) &&
+        (
+          github.event_name == 'workflow_dispatch' ||
+          vars.RUSTWRIGHT_RUN_PR_BENCHMARKS == '1' ||
+          (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-benchmarks'))
+        )
+      }}
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_label || vars.RUSTWRIGHT_BENCHMARK_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
+    timeout-minutes: 480
+    env:
+      RUSTWRIGHT_DOCKER_IMAGE: rustwright-verify-github-benchmark
+      TEST_DOCKER_MEMORY_LIMIT: 8g
+      INSTALL_BROWSER_HARNESS: "1"
+      INSTALL_PUPPETEER: "1"
+      DOCKER_BUILDKIT: "1"
+      BENCHMARK_KIND: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark || vars.RUSTWRIGHT_PR_BENCHMARK || 'equivalent' }}
+      IMPLEMENTATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.implementations || vars.RUSTWRIGHT_PR_BENCHMARK_IMPLEMENTATIONS || 'all' }}
+      REPETITIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.repetitions || vars.RUSTWRIGHT_PR_BENCHMARK_REPETITIONS || '1' }}
+      ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || vars.RUSTWRIGHT_PR_BENCHMARK_ITERATIONS || '1' }}
+      BENCHMARK_FULL_ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || vars.RUSTWRIGHT_PR_BENCHMARK_ITERATIONS || '1' }}
+      LIFECYCLE: ${{ github.event_name == 'workflow_dispatch' && inputs.lifecycle || vars.RUSTWRIGHT_PR_BENCHMARK_LIFECYCLE || 'warm-browser' }}
+      CASE_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.case || vars.RUSTWRIGHT_PR_BENCHMARK_CASE || '' }}
+      MAX_TASKS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_tasks || vars.RUSTWRIGHT_PR_MIND2WEB_MAX_TASKS || '' }}
+      SHARD_SIZE: ${{ github.event_name == 'workflow_dispatch' && inputs.shard_size || vars.RUSTWRIGHT_PR_MIND2WEB_SHARD_SIZE || '25' }}
+      DEFENSIBLE_LIFECYCLES: ${{ github.event_name == 'workflow_dispatch' && inputs.defensible_lifecycles || vars.RUSTWRIGHT_BENCHMARK_DEFENSIBLE_LIFECYCLES || 'warm-browser,warm-page,cold-browser' }}
+      DEFENSIBLE_STRICT_REPETITIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.strict_repetitions || vars.RUSTWRIGHT_BENCHMARK_DEFENSIBLE_STRICT_REPETITIONS || '' }}
+      DEFENSIBLE_STRICT_ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.strict_iterations || vars.RUSTWRIGHT_BENCHMARK_DEFENSIBLE_STRICT_ITERATIONS || '1' }}
+      ENFORCE_PHASE2: ${{ github.event_name == 'workflow_dispatch' && inputs.enforce_phase2 || vars.RUSTWRIGHT_BENCHMARK_ENFORCE_PHASE2 || '0' }}
+      BENCHMARK_RUNNER_LABEL: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_label || vars.RUSTWRIGHT_BENCHMARK_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Verify Docker
+        run: |
+          docker version
+          docker info
+
+      - name: Print benchmark configuration
+        run: |
+          {
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "benchmark=${BENCHMARK_KIND}"
+            echo "implementations=${IMPLEMENTATIONS}"
+            echo "repetitions=${REPETITIONS}"
+            echo "iterations=${ITERATIONS}"
+            echo "lifecycle=${LIFECYCLE}"
+            echo "case=${CASE_NAME}"
+            echo "max_tasks=${MAX_TASKS}"
+            echo "shard_size=${SHARD_SIZE}"
+            echo "defensible_lifecycles=${DEFENSIBLE_LIFECYCLES}"
+            echo "defensible_strict_repetitions=${DEFENSIBLE_STRICT_REPETITIONS}"
+            echo "defensible_strict_iterations=${DEFENSIBLE_STRICT_ITERATIONS}"
+            echo "enforce_phase2=${ENFORCE_PHASE2}"
+            echo "runner_label=${BENCHMARK_RUNNER_LABEL}"
+            echo "docker_memory=${TEST_DOCKER_MEMORY_LIMIT}"
+          }
+
+      - name: Build benchmark Docker image
+        run: |
+          tools/docker_test.sh build .
+
+      - name: Prepare Mind2Web manifest
+        if: ${{ env.BENCHMARK_KIND == 'mind2web-sharded' }}
+        run: |
+          set -euo pipefail
+          python tools/download_mind2web.py --all-train --retries 5 --timeout 300 --json
+          python tools/import_mind2web.py \
+            --source .benchmark-data/raw/mind2web/data/train \
+            --output .benchmark-data/manifests/mind2web-train-100pct-action-fixtures.json \
+            --include-action-fixtures \
+            --json
+
+      - name: Run benchmark
+        run: |
+          set -euo pipefail
+          mkdir -p .benchmark-data/results
+          timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+
+          impl_args=()
+          if [ "$IMPLEMENTATIONS" != "all" ]; then
+            IFS=',' read -ra impls <<< "$IMPLEMENTATIONS"
+            for impl in "${impls[@]}"; do
+              impl="$(echo "$impl" | xargs)"
+              if [ -n "$impl" ]; then
+                impl_args+=(--impl "$impl")
+              fi
+            done
+          fi
+
+          case_args=()
+          if [ -n "$CASE_NAME" ]; then
+            case_args+=(--case "$CASE_NAME")
+          fi
+
+          if [ "$BENCHMARK_KIND" = "defensible-speed" ]; then
+            if [ -n "$CASE_NAME" ]; then
+              echo "defensible-speed uses the full predeclared case set; do not pass case filters" >&2
+              exit 2
+            fi
+
+            IFS=',' read -ra lifecycles <<< "$DEFENSIBLE_LIFECYCLES"
+            for benchmark_lifecycle in "${lifecycles[@]}"; do
+              benchmark_lifecycle="$(echo "$benchmark_lifecycle" | xargs)"
+              if [ -z "$benchmark_lifecycle" ]; then
+                continue
+              fi
+              case "$benchmark_lifecycle" in
+                warm-browser|warm-page|cold-browser|cold-container)
+                  ;;
+                *)
+                  echo "Unsupported defensible lifecycle: $benchmark_lifecycle" >&2
+                  exit 2
+                  ;;
+              esac
+
+              BENCHMARK_FULL_ITERATIONS="$ITERATIONS" tools/docker_test.sh bench-full \
+                "${impl_args[@]}" \
+                --suite equivalent \
+                --lifecycle "$benchmark_lifecycle" \
+                --repetitions "$REPETITIONS" \
+                --output ".benchmark-data/results/defensible-speed-equivalent-${benchmark_lifecycle}-${REPETITIONS}x${ITERATIONS}-${timestamp}.json" \
+                --json
+            done
+
+            strict_repetitions="$DEFENSIBLE_STRICT_REPETITIONS"
+            if [ -z "$strict_repetitions" ]; then
+              strict_repetitions="$REPETITIONS"
+            fi
+            BENCHMARK_FULL_ITERATIONS="$DEFENSIBLE_STRICT_ITERATIONS" tools/docker_test.sh bench-full \
+              --impl rustwright \
+              --impl playwright \
+              --suite strict \
+              --lifecycle warm-browser \
+              --repetitions "$strict_repetitions" \
+              --output ".benchmark-data/results/defensible-speed-strict-warm-browser-${strict_repetitions}x${DEFENSIBLE_STRICT_ITERATIONS}-${timestamp}.json" \
+              --json
+          elif [ "$BENCHMARK_KIND" = "mind2web-sharded" ]; then
+            max_task_args=()
+            if [ -n "$MAX_TASKS" ]; then
+              max_task_args+=(--max-tasks "$MAX_TASKS")
+            fi
+            python tools/run_mind2web_sharded.py \
+              "${impl_args[@]}" \
+              --shard-size "$SHARD_SIZE" \
+              --repetitions "$REPETITIONS" \
+              --iterations "$ITERATIONS" \
+              "${max_task_args[@]}" \
+              --output ".benchmark-data/results/mind2web-sharded-${timestamp}.json" \
+              --json
+          else
+            tools/docker_test.sh bench-full \
+              "${impl_args[@]}" \
+              --suite "$BENCHMARK_KIND" \
+              --lifecycle "$LIFECYCLE" \
+              --repetitions "$REPETITIONS" \
+              "${case_args[@]}" \
+              --output ".benchmark-data/results/bench-full-${BENCHMARK_KIND}-${LIFECYCLE}-${timestamp}.json" \
+              --json
+          fi
+
+      - name: Check strict Phase 2 benchmark artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p .benchmark-data/reports
+
+          enforce=0
+          case "$ENFORCE_PHASE2" in
+            true|True|TRUE|1|yes|YES)
+              enforce=1
+              ;;
+          esac
+
+          args=(
+            --source github-actions
+            --runner "$BENCHMARK_RUNNER_LABEL"
+            --artifact rustwright-benchmark-results
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            --json
+          )
+          if [ "$enforce" = "1" ]; then
+            args+=(--enforce-phase2)
+          fi
+          python tools/check_benchmark_artifacts.py "${args[@]}"
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: always()
+        with:
+          name: rustwright-benchmark-results
+          path: |
+            .benchmark-data/results/
+            .benchmark-data/reports/
+          if-no-files-found: warn

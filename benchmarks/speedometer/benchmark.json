@@ -1,0 +1,9 @@
+{
+  "id": "speedometer",
+  "category": "browser-engine-config",
+  "primary_use": "Measure web app responsiveness for the selected browser binary/config.",
+  "source_url": "https://browserbench.org/Speedometer3.1/",
+  "default_command": "python benchmarks/speedometer/run.py --repeat 20 --browser chrome-stable",
+  "setup_command": "python benchmarks/crossbench/run.py --setup",
+  "outputs": ".benchmark-data/browser-speed/results/crossbench/"
+}

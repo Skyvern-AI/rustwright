@@ -1,0 +1,9 @@
+{
+  "id": "jetstream",
+  "category": "browser-engine-config",
+  "primary_use": "Measure JavaScript and WebAssembly engine performance for the selected browser binary/config.",
+  "source_url": "https://browserbench.org/announcements/jetstream3/",
+  "default_command": "python benchmarks/jetstream/run.py --repeat 20 --browser chrome-stable",
+  "setup_command": "python benchmarks/crossbench/run.py --setup",
+  "outputs": ".benchmark-data/browser-speed/results/crossbench/"
+}

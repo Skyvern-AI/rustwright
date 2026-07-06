@@ -1,0 +1,208 @@
+'use strict';
+
+const native = require('./native.cjs');
+
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function normalizeLaunchOptions(options = {}) {
+  if (options == null) options = {};
+  const out = {};
+  if (hasOwn(options, 'headless')) out.headless = Boolean(options.headless);
+  if (hasOwn(options, 'executablePath')) out.executable_path = String(options.executablePath);
+  if (hasOwn(options, 'channel')) out.channel = String(options.channel);
+  if (hasOwn(options, 'args')) out.args = Array.from(options.args || [], String);
+  if (hasOwn(options, 'ignoreAllDefaultArgs')) {
+    out.ignore_all_default_args = Boolean(options.ignoreAllDefaultArgs);
+  }
+  if (hasOwn(options, 'ignoreDefaultArgs')) {
+    out.ignore_default_args = Array.from(options.ignoreDefaultArgs || [], String);
+  }
+  if (hasOwn(options, 'timeout')) out.timeout = Number(options.timeout);
+  if (hasOwn(options, 'userDataDir')) out.user_data_dir = String(options.userDataDir);
+  if (hasOwn(options, 'env')) {
+    out.env = Object.fromEntries(
+      Object.entries(options.env || {}).map(([key, value]) => [key, String(value)])
+    );
+  }
+  if (hasOwn(options, 'chromiumSandbox')) out.chromium_sandbox = Boolean(options.chromiumSandbox);
+  if (options.proxy) {
+    out.proxy = {
+      server: String(options.proxy.server || ''),
+      bypass: options.proxy.bypass == null ? undefined : String(options.proxy.bypass),
+      username: options.proxy.username == null ? undefined : String(options.proxy.username),
+      password: options.proxy.password == null ? undefined : String(options.proxy.password)
+    };
+  }
+  return out;
+}
+
+function normalizeScreenshotOptions(options = {}) {
+  if (options == null) return {};
+  const out = {};
+  if (hasOwn(options, 'path')) out.path = String(options.path);
+  if (hasOwn(options, 'fullPage')) out.fullPage = Boolean(options.fullPage);
+  if (hasOwn(options, 'clip')) out.clip = options.clip;
+  if (hasOwn(options, 'timeout')) out.timeout = Number(options.timeout);
+  if (hasOwn(options, 'type')) out.type = String(options.type);
+  if (hasOwn(options, 'quality')) out.quality = Number(options.quality);
+  if (hasOwn(options, 'omitBackground')) out.omitBackground = Boolean(options.omitBackground);
+  return out;
+}
+
+function encodeEvaluateArg(arg) {
+  if (arguments.length === 0 || typeof arg === 'undefined') return undefined;
+  return JSON.stringify(arg);
+}
+
+function decodeRustValue(value, seen = new Map()) {
+  if (Array.isArray(value)) return value.map((item) => decodeRustValue(item, seen));
+  if (!value || typeof value !== 'object') return value;
+
+  if (hasOwn(value, '__rustwright_cdp_ref__')) {
+    return seen.get(value.__rustwright_cdp_ref__);
+  }
+  if (hasOwn(value, '__rustwright_cdp_array__')) {
+    const ref = value.__rustwright_cdp_array__;
+    const result = [];
+    seen.set(ref, result);
+    for (const item of value.items || []) result.push(decodeRustValue(item, seen));
+    return result;
+  }
+  if (hasOwn(value, '__rustwright_cdp_object__')) {
+    const ref = value.__rustwright_cdp_object__;
+    const result = {};
+    seen.set(ref, result);
+    for (const [key, item] of Object.entries(value.entries || {})) {
+      result[key] = decodeRustValue(item, seen);
+    }
+    return result;
+  }
+  if (hasOwn(value, '__rustwright_cdp_undefined__')) return undefined;
+  if (hasOwn(value, '__rustwright_cdp_symbol__')) return undefined;
+  if (hasOwn(value, '__rustwright_cdp_function__')) return undefined;
+  if (hasOwn(value, '__rustwright_cdp_date__')) return new Date(value.__rustwright_cdp_date__);
+  if (hasOwn(value, '__rustwright_cdp_regexp__')) {
+    const spec = value.__rustwright_cdp_regexp__ || {};
+    return new RegExp(String(spec.pattern || ''), String(spec.flags || ''));
+  }
+  if (hasOwn(value, '__rustwright_cdp_url__')) return new URL(value.__rustwright_cdp_url__);
+  if (hasOwn(value, '__rustwright_cdp_error__')) {
+    const spec = value.__rustwright_cdp_error__ || {};
+    const error = new Error(String(spec.message || ''));
+    error.name = String(spec.name || 'Error');
+    if (spec.stack) error.stack = String(spec.stack);
+    return error;
+  }
+  if (hasOwn(value, '__rustwright_cdp_number__')) {
+    const marker = value.__rustwright_cdp_number__;
+    if (marker === 'NaN') return NaN;
+    if (marker === 'Infinity') return Infinity;
+    if (marker === '-Infinity') return -Infinity;
+    if (marker === '-0') return -0;
+    if (typeof marker === 'string' && marker.endsWith('n')) return BigInt(marker.slice(0, -1));
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, decodeRustValue(item, seen)])
+  );
+}
+
+function parseRustJson(json) {
+  return decodeRustValue(JSON.parse(json));
+}
+
+class Browser {
+  constructor(inner) {
+    this._inner = inner;
+  }
+
+  async newPage() {
+    return new Page(await this._inner.newPage());
+  }
+
+  async close() {
+    await this._inner.close();
+  }
+
+  wsEndpoint() {
+    return this._inner.wsEndpoint();
+  }
+}
+
+class Page {
+  constructor(inner) {
+    this._inner = inner;
+  }
+
+  async goto(url, options = {}) {
+    const response = await this._inner.goto(
+      String(url),
+      options.waitUntil == null ? undefined : String(options.waitUntil),
+      options.timeout == null ? undefined : Number(options.timeout),
+      options.referer == null ? undefined : String(options.referer)
+    );
+    return response === 'null' ? null : parseRustJson(response);
+  }
+
+  async click(selector, options = {}) {
+    await this._inner.click(String(selector), options.timeout == null ? undefined : Number(options.timeout));
+  }
+
+  async fill(selector, value, options = {}) {
+    await this._inner.fill(
+      String(selector),
+      String(value),
+      options.timeout == null ? undefined : Number(options.timeout)
+    );
+  }
+
+  async title(options = {}) {
+    return this._inner.title(options.timeout == null ? undefined : Number(options.timeout));
+  }
+
+  async textContent(selector, options = {}) {
+    return this._inner.textContent(
+      String(selector),
+      options.timeout == null ? undefined : Number(options.timeout)
+    );
+  }
+
+  async evaluate(expression, arg, options = {}) {
+    const source = typeof expression === 'function' ? expression.toString() : String(expression);
+    const timeout = options.timeout == null ? undefined : Number(options.timeout);
+    const json = await this._inner.evaluate(source, encodeEvaluateArg(arg), timeout);
+    return parseRustJson(json);
+  }
+
+  async screenshot(options = {}) {
+    const normalized = normalizeScreenshotOptions(options);
+    const bytes = await this._inner.screenshot(JSON.stringify(normalized));
+    return Buffer.from(bytes);
+  }
+
+  async close(options = {}) {
+    await this._inner.close(
+      options.timeout == null ? undefined : Number(options.timeout),
+      options.runBeforeUnload == null ? undefined : Boolean(options.runBeforeUnload)
+    );
+  }
+}
+
+const chromium = {
+  async launch(options = {}) {
+    const inner = await native.launchChromium(JSON.stringify(normalizeLaunchOptions(options)));
+    return new Browser(inner);
+  },
+  async executablePath() {
+    return (await native.chromiumExecutablePath()) || '';
+  }
+};
+
+module.exports = {
+  chromium,
+  Browser,
+  Page,
+  _native: native
+};

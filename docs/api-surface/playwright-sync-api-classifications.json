@@ -1,0 +1,90 @@
+{
+  "APIResponse.status": {
+    "reason": "dataclass instance field",
+    "status": "implemented"
+  },
+  "APIResponse.url": {
+    "reason": "dataclass instance field",
+    "status": "implemented"
+  },
+  "BrowserContext.request": {
+    "reason": "instance attribute created on context construction",
+    "status": "implemented"
+  },
+  "BrowserType.name": {
+    "reason": "instance attribute",
+    "status": "implemented"
+  },
+  "ConsoleMessage.args": {
+    "reason": "instance attribute populated from CDP payload",
+    "status": "implemented"
+  },
+  "ConsoleMessage.location": {
+    "reason": "instance attribute populated from CDP payload",
+    "status": "implemented"
+  },
+  "ConsoleMessage.page": {
+    "reason": "instance attribute populated from CDP payload",
+    "status": "implemented"
+  },
+  "ConsoleMessage.text": {
+    "reason": "instance attribute populated from CDP payload",
+    "status": "implemented"
+  },
+  "ConsoleMessage.timestamp": {
+    "reason": "instance attribute populated from CDP payload or receive time",
+    "status": "implemented"
+  },
+  "ConsoleMessage.type": {
+    "reason": "instance attribute populated from CDP payload",
+    "status": "implemented"
+  },
+  "Dialog.default_value": {
+    "reason": "instance attribute populated from CDP payload",
+    "status": "implemented"
+  },
+  "Dialog.message": {
+    "reason": "instance attribute populated from CDP payload",
+    "status": "implemented"
+  },
+  "Dialog.type": {
+    "reason": "instance attribute populated from CDP payload",
+    "status": "implemented"
+  },
+  "Download.suggested_filename": {
+    "reason": "instance attribute populated from CDP payload",
+    "status": "implemented"
+  },
+  "Download.url": {
+    "reason": "instance attribute populated from CDP payload",
+    "status": "implemented"
+  },
+  "Playwright.chromium": {
+    "reason": "instance attribute created on Playwright construction",
+    "status": "implemented"
+  },
+  "Playwright.firefox": {
+    "reason": "instance attribute created on Playwright construction",
+    "status": "implemented"
+  },
+  "Playwright.request": {
+    "reason": "instance attribute created on Playwright construction",
+    "status": "implemented"
+  },
+  "Playwright.selectors": {
+    "reason": "instance attribute created on Playwright construction",
+    "status": "implemented"
+  },
+  "Playwright.webkit": {
+    "reason": "instance attribute created on Playwright construction",
+    "status": "implemented"
+  },
+  "Request.url": {
+    "reason": "dataclass instance field",
+    "status": "implemented"
+  },
+  "Response.url": {
+    "reason": "dataclass instance field",
+    "status": "implemented"
+  }
+}

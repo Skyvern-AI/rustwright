@@ -1,0 +1,9 @@
+{
+  "id": "telescope",
+  "category": "page-load-user-journey",
+  "primary_use": "Collect cross-browser timing, HAR, screenshot, and video diagnostics for URLs.",
+  "source_url": "https://telescopetest.io/",
+  "default_command": "python benchmarks/telescope/run.py --url https://example.com --browser chrome",
+  "setup_command": "python benchmarks/telescope/run.py --setup",
+  "outputs": ".benchmark-data/browser-speed/results/telescope/"
+}

@@ -1,0 +1,9 @@
+{
+  "id": "crossbench",
+  "category": "browser-engine-config",
+  "primary_use": "Run Speedometer, JetStream, MotionMark, and custom browser performance stories against selected browser binaries.",
+  "source_url": "https://chromium.googlesource.com/crossbench/",
+  "default_command": "python benchmarks/crossbench/run.py --benchmark speedometer --repeat 20 --browser chrome-stable",
+  "setup_command": "python benchmarks/crossbench/run.py --setup",
+  "outputs": ".benchmark-data/browser-speed/results/crossbench/"
+}

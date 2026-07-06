@@ -1,0 +1,9 @@
+{
+  "id": "tachometer",
+  "category": "browser-microbenchmark",
+  "primary_use": "Run statistically sampled in-browser DOM/JS microbenchmarks with confidence intervals.",
+  "source_url": "https://www.npmjs.com/package/tachometer",
+  "default_command": "python benchmarks/tachometer/run.py --browser chrome-headless",
+  "setup_command": "python benchmarks/tachometer/run.py --setup",
+  "outputs": ".benchmark-data/browser-speed/results/tachometer/"
+}

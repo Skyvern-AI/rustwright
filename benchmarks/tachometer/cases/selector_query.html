@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tachometer selector query</title>
+<section id="root"></section>
+<script type="module">
+  import * as bench from '/bench.js';
+
+  const root = document.querySelector('#root');
+  for (let group = 0; group < 50; group += 1) {
+    const section = document.createElement('section');
+    section.setAttribute('aria-label', `Group ${group}`);
+    for (let item = 0; item < 40; item += 1) {
+      const button = document.createElement('button');
+      button.className = item % 3 === 0 ? 'primary action' : 'secondary action';
+      button.textContent = `Group ${group} Item ${item}`;
+      section.append(button);
+    }
+    root.append(section);
+  }
+
+  bench.start();
+  let matched = 0;
+  for (let index = 0; index < 200; index += 1) {
+    matched += document.querySelectorAll('section[aria-label] button.primary.action').length;
+  }
+  window.tachometerResult = matched;
+  bench.stop();
+</script>
