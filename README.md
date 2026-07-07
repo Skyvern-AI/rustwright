@@ -2,13 +2,13 @@
 
 <img src="docs/assets/banner.png" alt="Rustwright — Keep the Playwright API. Drop the driver." width="840" />
 
-**Browser automation with the Playwright API you already know — powered by an in-process Rust engine that speaks Chrome DevTools Protocol directly. No Node driver subprocess. No Playwright automation fingerprint. Available for Python and Node.js.**
+**Change one import and your existing Playwright code — Python or Node — runs on an in-process Rust CDP engine. No Node driver subprocess. No Playwright fingerprint.**
 
 [![status: alpha](https://img.shields.io/badge/status-alpha-orange)](#project-status)
+[![tests](https://img.shields.io/github/actions/workflow/status/Skyvern-AI/rustwright/test.yml?label=tests)](https://github.com/Skyvern-AI/rustwright/actions/workflows/test.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![Node.js](https://img.shields.io/badge/node.js-experimental-5FA04E?logo=node.js&logoColor=white)](node/)
-[![built with Rust](https://img.shields.io/badge/built%20with-Rust-DE5A2B?logo=rust&logoColor=white)](Cargo.toml)
 [![Chromium only](https://img.shields.io/badge/browser-Chromium-4285F4?logo=googlechrome&logoColor=white)](#limitations)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/fG2XXEuQX3)
 
@@ -16,27 +16,9 @@
 
 ---
 
-> [!WARNING]
-> **Rustwright is an alpha.** It is Chromium-only, targets the Playwright **API shape** (not full behavioral parity yet), and has no package published yet — you build it from source today. See [Limitations](#limitations) before you depend on it.
-
-## What is Rustwright?
-
-[`playwright-python`](https://github.com/microsoft/playwright-python) is a Python client that drives a **bundled Node.js driver subprocess** — every call crosses a Python↔Node pipe before it reaches the browser.
-
-Rustwright keeps the same ergonomic API but replaces that driver with a **native Rust engine** (built with [PyO3](https://pyo3.rs) for Python and [napi-rs](https://napi.rs) for Node) that talks to Chromium over raw [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/). No Node runtime in the Python path. No driver process. And because it never loads Playwright's driver, it never emits Playwright's automation fingerprint.
-
-```text
-Rustwright:          Your code  →  Rust CDP engine  →  Chromium
-playwright-python:   Python     →  Node driver subprocess  →  Chromium
-```
-
 ## Change one import
 
-Rustwright is designed to be a drop-in for existing Playwright code. In most cases, you change a **single line** — the import — and keep the rest.
-
-<table>
-<tr>
-<td width="50%" valign="top">
+Rustwright is a drop-in for existing Playwright code — in most cases the import is the only line that changes.
 
 **Python**
 
@@ -52,31 +34,51 @@ Rustwright is designed to be a drop-in for existing Playwright code. In most cas
       browser.close()
 ```
 
-</td>
-<td width="50%" valign="top">
-
 **Node.js**
 
 ```diff
-- const { chromium } = require('playwright');
-+ const { chromium } = require('rustwright');
+- import { chromium } from 'playwright';
++ import { chromium } from 'rustwright';
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch();
   const page = await browser.newPage();
   await page.goto('https://example.com');
   console.log(await page.title());
   await browser.close();
 ```
 
-</td>
-</tr>
-</table>
+**515/515** shared parity cases pass against real Playwright (growing suite; full behavioral parity in progress). `rustwright.async_api` mirrors Playwright's async API (concurrency notes in [Limitations](#limitations)).
 
 Prefer not to touch imports at all? Python offers an opt-in shim — `rustwright.enable_playwright_compat()` — that redirects `import playwright...` to Rustwright at runtime.
 
+> [!WARNING]
+> **Alpha.** Chromium-only, built from source (PyPI/npm publishing is the top roadmap item). Need Firefox/WebKit or production maturity today? Use [`playwright-python`](https://github.com/microsoft/playwright-python). Full list: [Limitations](#limitations).
+
+## What is Rustwright?
+
+Rustwright is a browser automation library for Python and Node.js that keeps the Playwright API you already know but drives Chromium from a **native Rust engine** speaking raw [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) — no driver subprocess in the path.
+
+```text
+playwright-python:  your code ──pipe──► Node driver (separate process) ──CDP──► Chromium
+rustwright:         your code ────────────────── raw CDP ─────────────────────► Chromium
+```
+
+## Why Rustwright?
+
+- **No Node driver subprocess.** `playwright-python` launches and pipes to a bundled Node driver. Rustwright's engine is native — the browser-control code runs in-process.
+- **Raw CDP, in Rust.** A from-scratch async CDP client — not a wrapper around another automation library.
+- **No Playwright automation fingerprint.** The driver never loads, so its signatures never appear. See [Signal hygiene](#signal-hygiene).
+- **Trusted input by default.** Clicks and typing go through real CDP input events (`Input.dispatchMouseEvent`), not synthetic `element.click()` DOM calls. Untrusted DOM shortcuts are opt-in only.
+- **Cross-origin iframes (OOPIF).** Auto-attaches out-of-process iframe targets with flattened CDP sessions and routes `frame_locator()` across origins.
+- **One engine, two languages.** The same Rust core backs the Python and Node bindings.
+
+## How it works
+
+One Rust core — an async CDP client built on Tokio (WebSocket, with opt-in Unix-pipe transport) — talks to Chromium directly, and thin [PyO3](https://pyo3.rs) (Python) and [napi-rs](https://napi.rs) (Node) bindings expose it in-process. The two-line diagram above is the entire architecture.
+
 ## Install
 
-No package is published yet — Rustwright is built from source. You need a [Rust toolchain](https://rustup.rs/) (1.85+).
+No package is published yet — **publishing to PyPI and npm is the top roadmap item**; [star or watch the repo](https://github.com/Skyvern-AI/rustwright) to catch the release. Until then, Rustwright builds from source on Linux, macOS, and Windows with a [Rust toolchain](https://rustup.rs/) (1.85+).
 
 **Python** (3.8+)
 
@@ -84,73 +86,54 @@ No package is published yet — Rustwright is built from source. You need a [Rus
 git clone https://github.com/Skyvern-AI/rustwright && cd rustwright
 python -m venv .venv && source .venv/bin/activate
 python -m pip install -U pip maturin
-maturin develop --release               # compile the Rust engine + install the package
+maturin develop --release               # compiles the Rust engine (~5 min on first build)
 python -m rustwright install chromium   # fetch a Chromium build
 ```
 
-Keep the virtual environment activated when running `maturin develop`; maturin can print a success message while installing nothing into a non-active environment. If `import rustwright` later raises `ModuleNotFoundError`, activate it with `source .venv/bin/activate` and rerun `maturin develop --release`.
+Keep the virtual environment activated when running `maturin develop` — maturin can print a success message while installing nothing into a non-active environment. If `import rustwright` later raises `ModuleNotFoundError`, run `source .venv/bin/activate` and rerun `maturin develop --release`.
 
-**Node.js** (experimental)
+**Node.js** (experimental — contributors only for now)
 
 ```bash
 cd rustwright/node
 npm install
-npm run build                            # builds the native addon via napi-rs
+npm run build          # builds the native addon via napi-rs
 ```
+
+The build produces a local package; consume it from another project with `npm install /path/to/rustwright/node` (or `npm link`). Only a subset of the API surface is bridged — see [Limitations](#limitations).
 
 Already have a Chromium/Chrome binary? Point Rustwright at it with `RUSTWRIGHT_CHROMIUM`, `CHROME`, or `CHROMIUM`.
 
-## Why Rustwright?
-
-- **No Node driver subprocess.** `playwright-python` launches and pipes to a bundled Node driver. Rustwright's engine is native — the browser-control code runs in-process.
-- **Raw CDP, in Rust.** A from-scratch async CDP client (Tokio + WebSocket, opt-in Unix-pipe transport) — not a wrapper around another automation library.
-- **No Playwright automation fingerprint.** See [Signal hygiene](#signal-hygiene) below.
-- **Trusted input by default.** Clicks and typing go through real CDP input events (`Input.dispatchMouseEvent`), not synthetic `element.click()` DOM calls. Untrusted DOM shortcuts are opt-in only.
-- **Cross-origin iframes (OOPIF).** Auto-attaches out-of-process iframe targets with flattened CDP sessions and routes `frame_locator()` across origins.
-- **One engine, two languages.** The same Rust core backs the Python and Node bindings.
-
 ## Signal hygiene
 
-Rustwright drives Chromium through its **own raw-CDP Rust core** and never ships Playwright's Node driver. That means it does not emit the automation signatures that ship *with* that driver:
+Because Rustwright never loads Playwright's Node driver, it never emits the automation signatures that ship with it:
 
 - **No Playwright driver signatures** — no `__playwright__binding__` / utility-world globals, no driver bootstrap. The backend reports `playwright_driver: "none"`.
 - **No `Runtime.enable` on the default path** — a normal launch + navigate never enables the CDP Runtime domain, closing the `Runtime.enable` console-serialization leak behind `isAutomatedWithCDP`. (Console/page-error/binding opt-ins still enable it lazily — detectable by design.)
 - **Headless identity normalized by default** — launches with `--disable-blink-features=AutomationControlled`, rewrites `HeadlessChrome/` → `Chrome/` in the UA and client hints, and installs a `navigator.webdriver` cleanup init script.
-- **Measured, not marketed** — in local fingerprint runs Rustwright now reads clean on SannySoft, BrowserScan, and DeviceAndBrowserInfo (the last flipped after the Runtime-domain cleanup); CreepJS still reports high headless confidence. Default Playwright failed webdriver/headless checks that Rustwright passed. These are local diagnostics, not a guarantee.
+
+Local fingerprint runs — default Playwright failed webdriver/headless checks that Rustwright passed; these are local diagnostics, not a guarantee:
+
+| Probe | Result |
+|---|---|
+| SannySoft | ✅ Clean |
+| BrowserScan | ✅ Clean |
+| DeviceAndBrowserInfo | ✅ Clean (after the Runtime-domain cleanup) |
+| CreepJS | ⚠️ Detects headless |
 
 > [!IMPORTANT]
-> **Rustwright is not "undetectable."** It is not a CAPTCHA or Cloudflare bypass, and it is not fully CDP-invisible — it still uses CDP primitives (`Target.setAutoAttach`, init scripts, and lazy `Runtime.enable` for console event/pageerror event/binding opt-ins). The honest claim is narrow and true: **no Playwright-specific automation fingerprint**, plus baseline signal hygiene.
-
-## How it works
-
-```mermaid
-flowchart LR
-    subgraph RW["Rustwright"]
-        direction LR
-        A["Your code<br/>(Python / Node)"] --> B["PyO3 / napi-rs<br/>native binding"]
-        B --> C["Rust CDP engine<br/>Tokio · WebSocket / pipe"]
-        C --> E[("Chromium")]
-    end
-    subgraph PW["playwright-python"]
-        direction LR
-        F[Python client] -. pipe .-> G["Node.js driver<br/>subprocess"]
-        G --> I[("Chromium")]
-    end
-```
+> **Rustwright is not "undetectable."** It is not a CAPTCHA or Cloudflare bypass, and it is not fully CDP-invisible — it still uses CDP primitives (`Target.setAutoAttach`, init scripts, and lazy `Runtime.enable` for console event/pageerror event/binding opt-ins). The claim is narrow: **no Playwright-specific automation fingerprint**, plus baseline signal hygiene.
 
 ## Benchmarks
 
-> [!NOTE]
-> **We do not headline a speed number yet.** Rustwright's benchmark policy requires launch-facing claims to come from reproducible, isolated CI (Testbox + capped Docker). That evidence is **not yet published**. Treat the figures below as **local diagnostics**, not a launch claim.
+Rustwright does not headline a speed number yet: launch-facing claims are held to reproducible, isolated CI evidence (Testbox + capped Docker), which is not yet published. Two diagnostic runs exist today — a local dev-host run where Rustwright won 16/17 case means, and a hosted strict run with a narrower gap:
 
-Local diagnostic — `equivalent` suite, 17 cases, 5 iterations, warm browser, single dev host:
+| Run | Cases | Rustwright | playwright-python | Speedup |
+|---|---:|---:|---:|---:|
+| Local dev host (warm browser, 5 iterations) | 17 | 5,256 ms | 13,418 ms | **2.55×** |
+| Hosted strict run | 78 | — | — | **~1.37×** |
 
-| | Total mean | Relative |
-|---|---:|---:|
-| **Rustwright** | **5,256 ms** | 1.0× |
-| playwright-python | 13,418 ms | 2.55× |
-
-Rustwright won 16/17 case means. **Caveats:** local host, warm-browser, not capped-Docker or CI evidence; a hosted 78-case strict run showed a narrower ~37% gap. Methodology in [`BENCHMARK.md`](BENCHMARK.md).
+Treat both as diagnostics, not launch claims — neither is capped-Docker/CI evidence. Methodology: [`BENCHMARK.md`](BENCHMARK.md).
 
 ## Rustwright vs the alternatives
 
@@ -158,14 +141,14 @@ Rustwright won 16/17 case means. **Caveats:** local host, warm-browser, not capp
 |---|---|---|---|---|
 | **API** | Playwright-shaped (Py + Node) | Official Python Playwright | JS/TS Puppeteer | Playwright drop-in fork |
 | **Engine / transport** | Rust core, raw CDP | Python → Node driver | Node over CDP | Patched PW driver |
-| **Node driver process** | ❌ none | ✅ bundled | (Node is runtime) | ✅ Playwright-style |
+| **In-process engine (no driver subprocess)** | ✅ | ❌ bundled Node driver | ✅ Node is the runtime | ❌ Playwright-style driver |
 | **Browsers** | Chromium only | Chromium, Firefox, WebKit | Chrome, Firefox | Chromium-based |
 | **Default input** | Trusted CDP events | Browser-level | Browser / CDP | Playwright + stealth |
 | **Cross-origin iframes** | OOPIF (alpha) | Mature | Frame APIs | Inherits Playwright |
-| **Playwright fingerprint** | ❌ not emitted | ✅ present | n/a | patched |
+| **Playwright fingerprint** | No | Yes | n/a | Patched |
 | **Maturity** | 🟠 Alpha | 🟢 Mature | 🟢 Mature | 🟡 Focused fork |
 
-Rustwright's honest lane: **a Rust CDP engine under the Playwright API, for Chromium.** If you need Firefox/WebKit or production maturity, reach for `playwright-python` today.
+Rustwright's lane: **a Rust CDP engine under the Playwright API, for Chromium.**
 
 ## Limitations
 
@@ -180,11 +163,20 @@ See [`LIMITATIONS.md`](LIMITATIONS.md) for detail.
 
 ## Roadmap
 
+- [ ] **Publish to PyPI and npm** — top priority
 - [ ] CI / Testbox-backed benchmark evidence
 - [ ] Native async engine (remove the Python thread-pool bridge)
 - [ ] Broaden the Node.js surface (contexts, routing, locators)
 - [ ] Close remaining OOPIF gaps
 - [ ] Split the core into maintainable modules
+
+Recently shipped:
+
+- [x] OOPIF auto-attach with flattened CDP sessions
+- [x] 515/515 shared parity suite green against real Playwright
+- [x] `Runtime.enable` console-serialization leak closed on the default path
+
+Firefox and WebKit are **not planned** — Rustwright is deliberately Chromium-only.
 
 ## Contributing
 
@@ -194,7 +186,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for build details and the code-layout r
 
 ## Project status
 
-Rustwright is an early alpha from [Skyvern](https://github.com/Skyvern-AI), developed in the open and honestly labeled. If the architecture resonates, [give it a ⭐](https://github.com/Skyvern-AI/rustwright).
+Rustwright is an early alpha from [Skyvern](https://github.com/Skyvern-AI), developed in the open. If the architecture resonates, [give it a ⭐](https://github.com/Skyvern-AI/rustwright).
 
 Questions, ideas, or want to help? Join the Skyvern community on [**Discord**](https://discord.gg/fG2XXEuQX3).
 
