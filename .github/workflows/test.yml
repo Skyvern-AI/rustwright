@@ -22,7 +22,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Python build and test dependencies
-        run: python -m pip install -U pip maturin pytest pytest-benchmark
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+          .venv/bin/python -m pip install -U pip maturin pytest pytest-benchmark
 
       - name: Cargo check
         run: cargo check --locked
