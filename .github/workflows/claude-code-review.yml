@@ -2,6 +2,7 @@ name: Claude Code Review
 
 # Automated PR review by Claude, on every opened/updated pull request.
 # Requires a repository secret CLAUDE_CODE_OAUTH_TOKEN (create with `claude setup-token`).
+# If the secret is not set, the review is skipped (the job still succeeds) instead of failing.
 # The review prompt is loaded from the BASE branch so untrusted PRs cannot alter
 # review behavior by editing the prompt file in the same PR.
 
@@ -21,12 +22,26 @@ jobs:
       issues: read
       id-token: write
     steps:
+      - name: Check for Claude token
+        id: gate
+        env:
+          CLAUDE_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -n "$CLAUDE_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set — skipping Claude review. Add it with 'gh secret set CLAUDE_CODE_OAUTH_TOKEN'."
+          fi
+
       - name: Checkout repository
+        if: steps.gate.outputs.enabled == 'true'
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 1
 
       - name: Delete previous Claude review comment
+        if: steps.gate.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -42,6 +57,7 @@ jobs:
             done
 
       - name: Load review prompt from base branch
+        if: steps.gate.outputs.enabled == 'true'
         id: prompt
         run: |
           # Load the prompt from the PR's BASE commit (trusted), not the PR head.
@@ -55,6 +71,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Run Claude Code Review
+        if: steps.gate.outputs.enabled == 'true'
         uses: anthropics/claude-code-action@ff9acae5886d41a99ed4ec14b7dc147d55834722 # v1.0.77
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
