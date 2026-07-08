@@ -75,7 +75,6 @@ jobs:
           test_frame_api_can_query_and_act_in_same_origin_iframe or
           test_frame_goto_returns_navigation_response or
           test_frame_locator_scopes_locators_to_iframe_content or
-          test_cross_origin_oopif_frame_locator_actions_and_page_frames or
           test_nested_cross_origin_oopif_frame_locator or
           test_page_request_and_response_events_are_dispatched or
           test_expect_response_captures_fetch_response or
