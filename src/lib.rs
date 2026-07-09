@@ -27,7 +27,8 @@ use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::http::uri::PathAndQuery;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Uri};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
@@ -153,6 +154,41 @@ fn map_chromium_permissions(permissions: &Value, fallback: bool) -> RwResult<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    fn request_target(endpoint: &str) -> String {
+        let mut request = endpoint.into_client_request().unwrap();
+        ensure_ws_request_path(&mut request);
+        request
+            .uri()
+            .path_and_query()
+            .map(|paq| paq.as_str().to_string())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn empty_path_ws_endpoint_gets_origin_form_target() {
+        // Anchor Browser's CDP URL shape: empty path, query-only.
+        assert_eq!(
+            request_target("wss://connect.example.io?apiKey=secret&sessionId=abc"),
+            "/?apiKey=secret&sessionId=abc"
+        );
+        // No query, empty path -> bare "/".
+        assert_eq!(request_target("wss://connect.example.io"), "/");
+    }
+
+    #[test]
+    fn non_empty_path_ws_endpoint_is_unchanged() {
+        assert_eq!(
+            request_target("ws://127.0.0.1:9222/devtools/browser/abc?token=xyz"),
+            "/devtools/browser/abc?token=xyz"
+        );
+        assert_eq!(
+            request_target("ws://127.0.0.1:9222/devtools/browser/abc"),
+            "/devtools/browser/abc"
+        );
+    }
 
     #[test]
     fn chromium_permissions_match_playwright_protocol_names() {
@@ -599,6 +635,35 @@ fn close_pending_cdp_commands(pending: CdpPendingMap) {
     }
 }
 
+/// Ensure the WebSocket handshake request-target is in origin-form (starts with `/`).
+///
+/// tungstenite builds the request line directly from `uri.path_and_query()`. For CDP
+/// endpoints whose URL has an empty path but a query string — e.g. Anchor Browser's
+/// `wss://host?apiKey=...&sessionId=...` — `http::Uri` yields `?apiKey=...` with no
+/// leading slash, producing a malformed request line `GET ?apiKey=... HTTP/1.1`.
+/// Strict front-ends (nginx) reject that with `400 Bad Request`. Playwright's client
+/// always sends origin-form `GET /?...`, so normalize the target to match.
+fn ensure_ws_request_path(
+    request: &mut tokio_tungstenite::tungstenite::handshake::client::Request,
+) {
+    let uri = request.uri().clone();
+    // tungstenite writes `uri.path_and_query()` verbatim as the request target, so
+    // inspect that exact string rather than `uri.path()` (which normalizes "" to "/").
+    let current = uri.path_and_query().map(PathAndQuery::as_str).unwrap_or("");
+    if current.starts_with('/') {
+        return;
+    }
+    let normalized = format!("/{current}");
+    let Ok(path_and_query) = normalized.parse::<PathAndQuery>() else {
+        return;
+    };
+    let mut parts = uri.into_parts();
+    parts.path_and_query = Some(path_and_query);
+    if let Ok(new_uri) = Uri::from_parts(parts) {
+        *request.uri_mut() = new_uri;
+    }
+}
+
 impl CdpClient {
     async fn connect(ws_endpoint: &str) -> RwResult<Arc<Self>> {
         Self::connect_with_headers(ws_endpoint, &[]).await
@@ -609,6 +674,7 @@ impl CdpClient {
         headers: &[(String, String)],
     ) -> RwResult<Arc<Self>> {
         let mut request = ws_endpoint.into_client_request()?;
+        ensure_ws_request_path(&mut request);
         for (name, value) in headers {
             let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
                 RwError::Message(format!("invalid CDP header name {name:?}: {error}"))
