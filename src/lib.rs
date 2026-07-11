@@ -416,6 +416,51 @@ mod tests {
             json!({ "angle": 0, "type": "landscapePrimary" })
         );
     }
+
+    #[test]
+    fn plain_string_script_is_wrapped_in_indirect_eval() {
+        // A plain statement script (not a function, no arg) must not be handed
+        // to Runtime.evaluate verbatim: top-level `let`/`const` would leak into
+        // the global lexical environment and break repeated evaluation. It is
+        // instead wrapped in an indirect `eval` that scopes those declarations
+        // to the call while preserving the script's completion value.
+        let script = "let browserNameForWorkarounds = 'chromium';\nhelper();";
+        let wrapped = make_evaluate_expression(script, None);
+        assert_eq!(
+            wrapped,
+            r#"(0, eval)("let browserNameForWorkarounds = 'chromium';\nhelper();")"#
+        );
+    }
+
+    #[test]
+    fn plain_expression_is_wrapped_in_indirect_eval() {
+        assert_eq!(
+            make_evaluate_expression("1 + 2", None),
+            r#"(0, eval)("1 + 2")"#
+        );
+        assert_eq!(
+            make_evaluate_expression("document.title", None),
+            r#"(0, eval)("document.title")"#
+        );
+    }
+
+    #[test]
+    fn indirect_eval_wrapper_escapes_embedded_quotes_and_newlines() {
+        // The source is embedded as a JS string literal, so any quotes,
+        // backslashes, or newlines in the script must be escaped safely.
+        let script = "const s = \"a\\tb\";\ns;";
+        let wrapped = make_evaluate_expression(script, None);
+        assert_eq!(wrapped, r#"(0, eval)("const s = \"a\\tb\";\ns;")"#);
+    }
+
+    #[test]
+    fn function_and_arg_scripts_are_not_double_wrapped_in_eval() {
+        // Functions and arg-bearing calls keep their IIFE wrapping, which
+        // already scopes their internals; they should not be routed through
+        // the indirect-eval branch.
+        assert!(!make_evaluate_expression("() => 1", None).contains("(0, eval)"));
+        assert!(!make_evaluate_expression("(x) => x + 1", Some("2")).contains("(0, eval)"));
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -10522,7 +10567,18 @@ fn make_evaluate_expression(expression: &str, arg_json: Option<&str>) -> String 
     } else if looks_like_function(trimmed) {
         format!("(async () => {{ const __rw_fn = ({trimmed}); return await __rw_fn(); }})()")
     } else {
-        trimmed.to_string()
+        // Plain expression/statement string. Run it through an indirect `eval`
+        // so that top-level `let`/`const`/`class` declarations are scoped to
+        // this single evaluation instead of leaking into the global lexical
+        // environment. Passing the raw source to `Runtime.evaluate` executes it
+        // at the REPL-style global top level, where those declarations persist
+        // across calls and make repeated evaluation of the same script fail
+        // with "Identifier '...' has already been declared". Playwright avoids
+        // this by running non-function expressions via indirect `eval` in its
+        // utility script; this mirrors that, including preserving the script's
+        // completion value and the standard `var`/`function` global hoisting.
+        let literal = serde_json::to_string(trimmed).unwrap_or_else(|_| "\"\"".to_string());
+        format!("(0, eval)({literal})")
     }
 }
 

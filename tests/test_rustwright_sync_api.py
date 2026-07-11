@@ -1632,6 +1632,31 @@ def test_launch_goto_title_and_url(browser):
     page.close()
 
 
+def test_repeated_evaluate_of_top_level_let_const_does_not_redeclare(page):
+    # Skyvern (and Playwright) re-evaluate the same string script — e.g.
+    # domUtils.js — many times on a page. Such scripts declare top-level
+    # `let`/`const` identifiers. Matching Playwright, repeated evaluation must
+    # not leak those declarations into the global lexical environment, which
+    # would otherwise raise "Identifier '...' has already been declared".
+    page.goto(data_url("<title>redeclare</title>"))
+    script = (
+        "let browserNameForWorkarounds = 'chromium';\n"
+        "const marker = 7;\n"
+        "class Helper { value() { return browserNameForWorkarounds.length + marker; } }\n"
+        "new Helper().value();"
+    )
+    for _ in range(3):
+        assert page.evaluate(script) == len("chromium") + 7
+
+
+def test_evaluate_plain_expression_still_returns_completion_value(page):
+    # The indirect-eval wrapping must preserve the completion value of a plain
+    # expression string.
+    page.goto(data_url("<title>expr</title>"))
+    assert page.evaluate("1 + 2") == 3
+    assert page.evaluate("document.title") == "expr"
+
+
 def test_chromium_connect_uses_direct_cdp_endpoint(playwright):
     launched = playwright.chromium.launch(headless=True)
     connected = None
