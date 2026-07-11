@@ -126,14 +126,13 @@ Local fingerprint runs — default Playwright failed webdriver/headless checks t
 
 ## Benchmarks
 
-Rustwright does not headline a speed number yet: launch-facing claims are held to reproducible, isolated CI evidence (Testbox + capped Docker), which is not yet published. Two diagnostic runs exist today — a local dev-host run where Rustwright won 16/17 case means, and a hosted strict run with a narrower gap:
+Rustwright does not headline a speed number yet: launch-facing claims are held to reproducible, isolated CI evidence (Testbox + capped Docker), and publishing that evidence is a [roadmap](#roadmap) item. One diagnostic run exists today — a local dev-host run where Rustwright won 16/17 case means:
 
 | Run | Cases | Rustwright | playwright-python | Speedup |
 |---|---:|---:|---:|---:|
 | Local dev host (warm browser, 5 iterations) | 17 | 5,256 ms | 13,418 ms | **2.55×** |
-| Hosted strict run | 78 | — | — | **~1.37×** |
 
-Treat both as diagnostics, not launch claims — neither is capped-Docker/CI evidence. Methodology: [`BENCHMARK.md`](BENCHMARK.md).
+Treat it as a diagnostic, not a launch claim — it is not capped-Docker/CI evidence. Methodology: [`BENCHMARK.md`](BENCHMARK.md).
 
 ## Rustwright vs the alternatives
 
