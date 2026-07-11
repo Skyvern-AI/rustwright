@@ -157,6 +157,50 @@ mod tests {
 
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+    #[test]
+    fn cached_main_frame_url_prefers_last_navigated_url() {
+        let mut state = PageFrameState::new("session-main".to_string());
+
+        // No main frame known yet -> caller must fall back to the live probe.
+        assert_eq!(resolve_cached_main_frame_url(None, &state), None);
+
+        // Frame attached but no committed url yet -> still fall back.
+        state.record_frame(
+            "MAIN".to_string(),
+            None,
+            None,
+            None,
+            "session-main".to_string(),
+        );
+        assert_eq!(resolve_cached_main_frame_url(Some("MAIN"), &state), None);
+
+        // After Page.frameNavigated the cached url is served with no round-trip.
+        state.record_frame(
+            "MAIN".to_string(),
+            None,
+            None,
+            Some("https://example.com/".to_string()),
+            "session-main".to_string(),
+        );
+        assert_eq!(
+            resolve_cached_main_frame_url(Some("MAIN"), &state),
+            Some("https://example.com/".to_string()),
+        );
+
+        // A subsequent navigation updates the cached value (Playwright parity).
+        state.record_frame(
+            "MAIN".to_string(),
+            None,
+            None,
+            Some("https://example.com/submit".to_string()),
+            "session-main".to_string(),
+        );
+        assert_eq!(
+            resolve_cached_main_frame_url(Some("MAIN"), &state),
+            Some("https://example.com/submit".to_string()),
+        );
+    }
+
     fn request_target(endpoint: &str) -> String {
         let mut request = endpoint.into_client_request().unwrap();
         ensure_ws_request_path(&mut request);
@@ -1301,6 +1345,18 @@ impl PageFrameState {
     }
 }
 
+fn resolve_cached_main_frame_url(
+    main_frame_id: Option<&str>,
+    state: &PageFrameState,
+) -> Option<String> {
+    let frame_id = main_frame_id?;
+    state
+        .frames
+        .get(frame_id)
+        .map(|record| record.url.clone())
+        .filter(|url| !url.is_empty())
+}
+
 impl PageInner {
     async fn main_frame_id(
         &self,
@@ -1331,6 +1387,12 @@ impl PageInner {
             .get(frame_id)
             .cloned()
             .unwrap_or_else(|| self.session_id.clone())
+    }
+
+    fn cached_main_frame_url(&self) -> Option<String> {
+        let main_id = self.main_frame_id.lock().unwrap().clone();
+        let state = self.frame_state.lock().unwrap();
+        resolve_cached_main_frame_url(main_id.as_deref(), &state)
     }
 
     fn frame_tree_payload(&self) -> Value {
@@ -4056,6 +4118,13 @@ impl PyPage {
 
     #[pyo3(signature = (timeout_ms=None))]
     fn url(&self, timeout_ms: Option<f64>) -> PyResult<String> {
+        // Playwright's page.url is a synchronous read of the last-known main-frame
+        // url, never a round-trip. Serve it from the frame cache the page already
+        // maintains from Page.frameNavigated so the getter cannot block on (or time
+        // out against) an execution context that is being torn down mid-navigation.
+        if let Some(url) = self.inner.cached_main_frame_url() {
+            return Ok(url);
+        }
         let json = self
             .evaluate_expression("location.href", timeout_ms)
             .map_err(py_err)?;
