@@ -28,11 +28,11 @@ dev = [
   "pytest>=8",
   "pytest-benchmark>=4",
 ]
-# PyPI rejects direct URL dependencies, so browser-harness (used by the
-# comparison benchmarks) cannot live here; install it from git manually:
-# pip install "browser-harness @ git+https://github.com/browser-use/browser-harness.git"
 compare = [
   "playwright>=1.50",
+  # browser-harness needs Python 3.11+; the marker keeps this extra
+  # installable on rustwright's older supported Pythons.
+  "browser-harness>=0.1.5 ; python_version >= '3.11'",
 ]
 
 [tool.maturin]
