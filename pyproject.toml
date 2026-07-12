@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rustwright"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 description = "A Rust-backed, CDP-first Python automation library with a Playwright-compatible sync API"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -28,9 +28,11 @@ dev = [
   "pytest>=8",
   "pytest-benchmark>=4",
 ]
+# PyPI rejects direct URL dependencies, so browser-harness (used by the
+# comparison benchmarks) cannot live here; install it from git manually:
+# pip install "browser-harness @ git+https://github.com/browser-use/browser-harness.git"
 compare = [
   "playwright>=1.50",
-  "browser-harness @ git+https://github.com/browser-use/browser-harness.git",
 ]
 
 [tool.maturin]
