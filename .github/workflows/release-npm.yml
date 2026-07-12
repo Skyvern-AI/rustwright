@@ -1,0 +1,281 @@
+name: Release Node.js package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and upload artifacts without publishing"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-npm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: validate package versions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Validate release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import tomllib
+
+          root = pathlib.Path(".")
+          cargo_lock = tomllib.loads((root / "Cargo.lock").read_text())
+          cargo_versions = {
+              package["name"]: package["version"]
+              for package in cargo_lock["package"]
+              if package["name"] in {"rustwright-core", "rustwright-node"}
+          }
+          node_lock = json.loads((root / "node/package-lock.json").read_text())
+          versions = {
+              "pyproject.toml": tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"],
+              "Cargo.toml": tomllib.loads((root / "Cargo.toml").read_text())["package"]["version"],
+              "node/Cargo.toml": tomllib.loads((root / "node/Cargo.toml").read_text())["package"]["version"],
+              "node/package.json": json.loads((root / "node/package.json").read_text())["version"],
+              "Cargo.lock rustwright-core": cargo_versions["rustwright-core"],
+              "Cargo.lock rustwright-node": cargo_versions["rustwright-node"],
+              "node/package-lock.json": node_lock["version"],
+              'node/package-lock.json packages[""]': node_lock["packages"][""]["version"],
+          }
+
+          expected = next(iter(versions.values()))
+          if any(version != expected for version in versions.values()):
+              raise SystemExit(f"Package versions do not match: {versions}")
+
+          if os.environ["GITHUB_REF_TYPE"] == "tag":
+              tag_version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+              if tag_version != expected:
+                  raise SystemExit(
+                      f"Tag version {tag_version!r} does not match package version {expected!r}"
+                  )
+          print(f"Validated package version {expected}")
+          PY
+
+  native:
+    name: native addon - ${{ matrix.platform.target }}
+    needs: metadata
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            zig: false
+            extra_args: ""
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            zig: false
+            extra_args: ""
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            zig: true
+            extra_args: --zig --zig-abi-suffix 2.17
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            zig: true
+            extra_args: --zig --zig-abi-suffix 2.17
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            zig: false
+            extra_args: ""
+
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.13"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: node/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.platform.target }}
+
+      - name: Set up Zig
+        if: ${{ matrix.platform.zig }}
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        if: ${{ matrix.platform.zig }}
+        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145 # v2.83.1
+        with:
+          tool: cargo-zigbuild
+
+      - name: Install Node.js build dependencies
+        working-directory: node
+        run: npm ci --ignore-scripts
+
+      - name: Build native addon
+        working-directory: node
+        shell: bash
+        run: >-
+          npm exec -- napi build
+          --platform
+          --release
+          -p rustwright-node
+          --dts native.d.ts
+          --js false
+          --target ${{ matrix.platform.target }}
+          ${{ matrix.platform.extra_args }}
+
+      - name: Upload native addon
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-native-${{ matrix.platform.target }}
+          path: node/*.node
+          if-no-files-found: error
+
+  package:
+    name: assemble npm package
+    needs: native
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: node/package-lock.json
+
+      - name: Install Node.js build dependencies
+        working-directory: node
+        run: npm ci --ignore-scripts
+
+      - name: Download native addons
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: npm-native-*
+          path: node/prebuilds
+          merge-multiple: true
+
+      - name: Assemble publishable package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' addons < <(find node/prebuilds -type f -name '*.node' -print0)
+          if [ "${#addons[@]}" -ne 5 ]; then
+            echo "Expected 5 native addons, found ${#addons[@]}" >&2
+            exit 1
+          fi
+          cp "${addons[@]}" node/
+          rm -rf node/prebuilds
+          node - <<'JS'
+          const fs = require('node:fs');
+          const path = 'node/package.json';
+          const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+          delete pkg.private;
+          fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);
+          JS
+          (cd node && node scripts/generate-types.mjs)
+          mkdir -p npm-dist
+          (cd node && npm pack --pack-destination "$GITHUB_WORKSPACE/npm-dist")
+
+      - name: Smoke-test packed addon
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="$(find npm-dist -type f -name '*.tgz' -print -quit)"
+          test -n "$tarball"
+          test_project="$(mktemp -d)"
+          cd "$test_project"
+          npm init --yes >/dev/null
+          npm install --ignore-scripts "$GITHUB_WORKSPACE/$tarball"
+          node -e "require('rustwright')"
+
+      - name: Upload npm package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-package
+          path: npm-dist/*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: publish to npm
+    needs: package
+    if: >-
+      ${{
+        github.repository == 'Skyvern-AI/rustwright' &&
+        github.ref_type == 'tag' &&
+        (
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+        )
+      }}
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/rustwright
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Download npm package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-package
+          path: npm-dist
+
+      - name: Require a prerelease version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          case "$version" in
+            *-*) ;;
+            *)
+              echo "The experimental npm package requires a prerelease version such as 0.2.0-alpha.1" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Publish experimental package with provenance
+        run: npm publish npm-dist/*.tgz --provenance --access public --tag next
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
