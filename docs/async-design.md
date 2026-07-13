@@ -1,9 +1,65 @@
 # Async Concurrency Findings
 
+## Update: high-concurrency fixes (2026-07)
+
+The original findings below are retained as the historical record; the
+bottleneck diagnosis led to two engine changes that supersede the original
+no-go recommendation:
+
+1. **GIL release during CDP waits.** Every PyO3-boundary blocking wait
+   (the `BrowserInner::block_on` command funnel, launch/connect, close)
+   now detaches from the interpreter while parked on Tokio. Non-Python
+   consumers (the Rust API and Node bindings) use a raw, Python-free path,
+   and destructors never attach, so drops during interpreter finalization
+   stay safe.
+2. **One event pump per page.** The per-(page, event) polling threads
+   (~7 per page) were replaced by a Rust-side combined event stream per
+   page — cursor-backed against the shared event log, sequence-ordered,
+   with explicit overflow envelopes and immediate close wake-up — consumed
+   by a single Python pump thread that dispatches through the pre-existing
+   per-event handlers. Control paths (route, auth, binding, download,
+   popup, worker, websocket, file chooser, crash) keep dedicated waiters.
+
+Re-measurement on the same benchmark (macOS arm64, 10 cores, Python
+3.13.5), all scenarios passing with zero task errors:
+
+| Stack | Variant | N | tps | loop lag p99 | py threads | tree RSS MB |
+|---|---|---:|---:|---:|---:|---:|
+| Rustwright (before) | shared | 100 | 9.2 | 292 ms | 517 | 7,936 |
+| Rustwright (after) | shared | 100 | 23.9 | 31 ms | 118 | 9,409 |
+| Playwright | shared | 100 | 24.3 | 59 ms | 8 | 8,899 |
+| Rustwright (after) | multi | 100 | 25.5 | 106 ms | 118 | 1,598 |
+| Playwright | multi | 100 | 26.0 | 64 ms | 12 | 8,585 |
+
+Shared-browser N=25 improved from 15.4 to 26.8 tps with loop lag p99
+dropping from ~410 ms to well under 100 ms.
+
+Memory: the client-side stack (no Node driver) idles at ~41 MB versus
+~121 MB for playwright-python (31 MB Python + 89 MB Node driver), a
+~3× reduction in the part the library controls. Whole-process-tree
+peaks under load are dominated by Chromium and vary by scenario: in
+this run Rustwright's tree peaked lower in six of eight scenarios —
+most sharply in the four-browser variant (1.6 GB vs 8.6 GB at N=100)
+— but slightly higher at shared N=5 and N=100. The multi-browser gap
+is consistent across runs but not yet root-caused or reproduced on
+CI-backed runners, so treat it as an observation, not a claim. Thread count now grows
+O(pages) instead of O(pages × events); an idle page costs one pump
+thread. `configure_async_executor(max_workers=32..100)` adds roughly
+7–14% throughput at N=100 now that workers no longer contend on the GIL,
+but the default executor remains the recommended configuration.
+
+The async facade still runs sync calls on a thread pool; a native-async
+engine (real `asyncio` futures completed from the Tokio runtime, O(1)
+threads) remains future work per the proposal at the end of this
+document, now motivated by thread footprint rather than correctness or
+throughput.
+
+---
+
 ## Scope
 
 This is a measurement-first evaluation of `rustwright.async_api` under a
-Skyvern-like concurrency profile. No native-async rewrite was attempted.
+high-concurrency browser-automation profile. No native-async rewrite was attempted.
 
 The benchmark is `benchmarks/async_concurrency_load.py`. It starts a local
 HTTP server and runs concurrent workflows at N=5, 25, 50, and 100. Each
@@ -28,7 +84,7 @@ VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" .venv/bin/maturin develop -
   --output benchmark-results/rustwright-before.json \
   --traceback-dir benchmark-results/tracebacks
 
-/Users/suchintan/.superset/worktrees/skyright/suchintan/suchintan-singh/can-you-create-a-rust-version-of-playwright-that-i/.venv_playwright_compare/bin/python \
+.venv_playwright_compare/bin/python \
   benchmarks/async_concurrency_load.py \
   --impl playwright \
   --concurrency 5 25 50 100 \
@@ -137,11 +193,11 @@ By default behavior is unchanged. If configured, async wrapper calls use the Rus
 | executor=32 | multi | 100 | failed | 0.54 | 181,808 | 44,460 | 35 | 45 |
 | executor=100 | multi | 100 | failed | 0.65 | 152,063 | 57,022 | 551 | 86 |
 
-Conclusion: increasing executor size is not a safe default fix. It can improve a few four-browser mid-concurrency cases, but it regresses shared-browser throughput and does not make N=100 reliable. Keep the configurability for experiments, but do not present it as solving Skyvern-scale concurrency.
+Conclusion: increasing executor size is not a safe default fix. It can improve a few four-browser mid-concurrency cases, but it regresses shared-browser throughput and does not make N=100 reliable. Keep the configurability for experiments, but do not present it as solving high-concurrency workloads.
 
-## Recommendation
+## Recommendation (superseded — see the 2026-07 update above)
 
-Current `asyncio.to_thread` Rustwright is **no-go** for Skyvern's high-concurrency replacement path.
+At the time of the original measurement, `asyncio.to_thread` Rustwright was **no-go** for high-concurrency replacement paths.
 
 Concrete threshold:
 
@@ -149,7 +205,7 @@ Concrete threshold:
 - Risky at 50 concurrent workflows: Rustwright shared passed but required ~400 Python threads, which is operationally fragile.
 - Not acceptable at 100 concurrent workflows: shared-browser Rustwright failed every task with `CDP websocket is closed`; four-browser Rustwright also failed and had very high event-loop lag.
 
-The surprising result is that Rustwright can be faster than Playwright in the shared-browser happy path up to N=50, but its failure mode at N=100 is not acceptable for Skyvern. Numbers over narrative: the current model is fast until it collapses.
+The surprising result is that Rustwright can be faster than Playwright in the shared-browser happy path up to N=50, but its failure mode at N=100 is not acceptable for production. Numbers over narrative: the current model is fast until it collapses.
 
 ## Native-Async Design Proposal
 
@@ -171,7 +227,7 @@ Implementation options:
 Estimated scope:
 
 - 1 week: prototype one browser/page path (`launch`, `new_context`, `new_page`, `goto`, `click`) and prove no Python worker thread is occupied during CDP waits.
-- 2-4 weeks: convert core Skyvern path operations and remove per-page listener threads for request/console/pageerror events.
+- 2-4 weeks: convert core hot-path operations and remove per-page listener threads for request/console/pageerror events.
 - 4-8+ weeks: parity hardening across locators, downloads, routes, event context managers, cancellation, timeouts, and sync facade compatibility.
 
 The native-async success criterion should be explicit: at N=100, no all-task CDP websocket failure, Python thread count close to O(browsers + event-loop support) rather than O(pages), p99 event-loop lag under 1s on this local benchmark, and task error rate no worse than Playwright's baseline under the same Chromium pressure.
