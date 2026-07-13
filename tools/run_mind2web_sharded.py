@@ -16,7 +16,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / ".benchmark-data/manifests/mind2web-train-100pct-action-fixtures.json"
-DEFAULT_IMPLS = ["rustwright-py", "playwright", "rustwright-ts", "typescript-playwright", "typescript-puppeteer", "browser-harness"]
+DEFAULT_IMPLS = ["rustwright-py", "playwright", "rustwright-ts", "typescript-playwright", "typescript-puppeteer"]
 EXPERIMENTAL_IMPLS = ["rustwright-ts-cdp"]
 LEGACY_IMPL_ALIASES = {
     "rustwright": "rustwright-py",

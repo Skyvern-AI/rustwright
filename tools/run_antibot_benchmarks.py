@@ -7,18 +7,14 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
-import socket
 import statistics
 import subprocess
 import sys
 import tempfile
-import textwrap
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
-import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_ROOT = ROOT / "python"
@@ -89,11 +85,6 @@ FINGERPRINT_TARGETS: dict[str, dict[str, str]] = {
         "description": "BrowserScan bot detection",
     },
 }
-
-
-class BrowserHarnessUnavailable(RuntimeError):
-    pass
-
 
 @contextmanager
 def header_capture_server():
@@ -1044,303 +1035,6 @@ def _collect_playwright_page_sample(
     return sample
 
 
-def find_chromium_executable() -> str:
-    explicit = os.environ.get("RUSTWRIGHT_CHROMIUM") or os.environ.get("CHROME") or os.environ.get("CHROMIUM")
-    if explicit and Path(explicit).is_file():
-        return explicit
-    home = Path.home()
-    cache = home / "Library/Caches/ms-playwright"
-    candidates = []
-    if cache.is_dir():
-        for path in sorted(cache.iterdir(), key=lambda item: item.name, reverse=True):
-            if path.name.startswith("chromium_headless_shell"):
-                candidates.append(path / "chrome-headless-shell-mac-arm64/chrome-headless-shell")
-                candidates.append(path / "chromium_headless_shell-mac/headless_shell")
-            if path.name.startswith("chromium-"):
-                candidates.append(
-                    path / "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
-                )
-    candidates.extend(
-        [
-            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-            Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
-        ]
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-    raise RuntimeError("Could not find a Chromium executable for browser-harness comparison")
-
-
-def pick_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def wait_for_cdp(port: int, timeout: float = 10.0) -> None:
-    deadline = time.time() + timeout
-    url = f"http://127.0.0.1:{port}/json/version"
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=0.3) as response:
-                json.loads(response.read().decode())
-                return
-        except OSError:
-            time.sleep(0.05)
-    raise RuntimeError(f"Chrome did not expose CDP on port {port}")
-
-
-def browser_harness_code(iterations: int, server_url: str) -> str:
-    return textwrap.dedent(
-        f"""
-        import json, time
-
-        smoke_js = {json.dumps(SMOKE_JS)}
-        server_url = {json.dumps(server_url)}
-        samples = []
-
-        def close_current():
-            try:
-                tab = current_tab()
-                cdp("Target.closeTarget", targetId=tab["targetId"])
-            except Exception:
-                pass
-
-        for index in range({iterations}):
-            started = time.perf_counter()
-            new_tab(server_url + "/headers?iteration=" + str(index))
-            wait_for_load()
-            headers_payload = js("JSON.parse(document.querySelector('#payload').textContent)")
-            observed = js("(" + smoke_js + ")()")
-            samples.append({{
-                "iteration": index,
-                "elapsed_ms": (time.perf_counter() - started) * 1000,
-                "url": js("location.href"),
-                "headers": headers_payload["headers"],
-                "header_order": headers_payload.get("header_order") or [],
-                "request_version": headers_payload.get("request_version"),
-                "observed": observed,
-            }})
-            close_current()
-
-        print("ANTIBOT_RAW_JSON " + json.dumps(samples, sort_keys=True))
-        """
-    )
-
-
-def browser_harness_fingerprint_code(targets: list[str], iterations: int, settle_ms: int) -> str:
-    target_payload = [
-        {"target": target, "url": FINGERPRINT_TARGETS[target]["url"]}
-        for target in targets
-    ]
-    return textwrap.dedent(
-        f"""
-        import json, time
-
-        smoke_js = {json.dumps(SMOKE_JS)}
-        targets = {json.dumps(target_payload)}
-        settle_seconds = {settle_ms / 1000.0!r}
-        samples = []
-
-        def close_current():
-            try:
-                tab = current_tab()
-                cdp("Target.closeTarget", targetId=tab["targetId"])
-            except Exception:
-                pass
-
-        index = 0
-        for target_iteration in range({iterations}):
-            for item in targets:
-                started = time.perf_counter()
-                error = None
-                title = ""
-                url = item["url"]
-                text = ""
-                observed = {{}}
-                try:
-                    new_tab(item["url"])
-                    wait_for_load()
-                    if settle_seconds:
-                        time.sleep(settle_seconds)
-                    url = js("location.href")
-                    title = js("document.title")
-                    text = js("document.body ? document.body.innerText : ''") or ""
-                    observed = js("(" + smoke_js + ")()")
-                except Exception as exc:
-                    error = str(exc)
-                samples.append({{
-                    "target": item["target"],
-                    "iteration": index,
-                    "target_iteration": target_iteration,
-                    "elapsed_ms": (time.perf_counter() - started) * 1000,
-                    "url": url,
-                    "title": title,
-                    "text": text,
-                    "text_excerpt": " ".join(str(text).split())[:1200],
-                    "observed": observed,
-                    **({{"error": error}} if error else {{}}),
-                }})
-                index += 1
-                close_current()
-
-        print("ANTIBOT_RAW_JSON " + json.dumps(samples, sort_keys=True))
-        """
-    )
-
-
-def _run_browser_harness_smoke_in_profile(
-    iterations: int,
-    profile_dir: Path,
-    *,
-    profile: str | None = None,
-) -> dict[str, Any]:
-    executable = find_chromium_executable()
-    harness_executable = str(Path(sys.executable).with_name("browser-harness"))
-    if not Path(harness_executable).is_file():
-        found = shutil.which("browser-harness")
-        if found is None:
-            raise BrowserHarnessUnavailable(
-                "browser-harness executable is not installed; install the GitHub browser-use/browser-harness CLI "
-                "to include it in the anti-bot benchmark comparison"
-            )
-        harness_executable = found
-    port = pick_port()
-    browser_name = f"rustwright-antibot-{os.getpid()}"
-    launch_args = [
-        executable,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={profile_dir}",
-        "--headless=new",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "about:blank",
-    ]
-    if sys.platform == "darwin":
-        launch_args.insert(-1, "--single-process")
-    browser = subprocess.Popen(launch_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        wait_for_cdp(port)
-        with header_capture_server() as server_url:
-            proc = subprocess.run(
-                [harness_executable],
-                input=browser_harness_code(iterations, server_url),
-                text=True,
-                capture_output=True,
-                env={**os.environ, "BU_NAME": browser_name, "BU_CDP_URL": f"http://127.0.0.1:{port}"},
-                timeout=120,
-            )
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr or proc.stdout)
-        for line in reversed(proc.stdout.splitlines()):
-            if line.startswith("ANTIBOT_RAW_JSON "):
-                samples = json.loads(line.removeprefix("ANTIBOT_RAW_JSON "))
-                if profile is not None:
-                    for sample in samples:
-                        sample["profile"] = profile
-                return build_smoke_result("browser-harness", samples)
-        raise RuntimeError(f"browser-harness did not print anti-bot JSON:\n{proc.stdout}")
-    finally:
-        subprocess.run(
-            [harness_executable, "--reload"],
-            env={**os.environ, "BU_NAME": browser_name, "BU_CDP_URL": f"http://127.0.0.1:{port}"},
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        browser.terminate()
-        try:
-            browser.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            browser.kill()
-
-
-def run_browser_harness_smoke(iterations: int) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="browser-harness-antibot-") as profile_dir:
-        return _run_browser_harness_smoke_in_profile(iterations, Path(profile_dir))
-
-
-def run_browser_harness_network(iterations: int) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="browser-harness-antibot-network-") as profile_dir:
-        smoke_result = _run_browser_harness_smoke_in_profile(iterations, Path(profile_dir))
-    return build_network_result("browser-harness", smoke_result.get("samples") or [])
-
-
-def run_browser_harness_matrix(iterations: int) -> dict[str, Any]:
-    profile_results: dict[str, dict[str, Any]] = {}
-    with tempfile.TemporaryDirectory(prefix="browser-harness-fresh-antibot-") as profile_dir:
-        profile_results["fresh_profile"] = _run_browser_harness_smoke_in_profile(
-            iterations,
-            Path(profile_dir),
-            profile="fresh_profile",
-        )
-    with tempfile.TemporaryDirectory(prefix="browser-harness-warm-antibot-") as profile_dir:
-        _run_browser_harness_smoke_in_profile(1, Path(profile_dir), profile="persistent_warm_profile_warmup")
-        profile_results["persistent_warm_profile"] = _run_browser_harness_smoke_in_profile(
-            iterations,
-            Path(profile_dir),
-            profile="persistent_warm_profile",
-        )
-    return build_matrix_result("browser-harness", profile_results)
-
-
-def run_browser_harness_fingerprint(targets: list[str], iterations: int = 1, settle_ms: int = 2500) -> dict[str, Any]:
-    executable = find_chromium_executable()
-    harness_executable = str(Path(sys.executable).with_name("browser-harness"))
-    if not Path(harness_executable).is_file():
-        found = shutil.which("browser-harness")
-        if found is None:
-            raise BrowserHarnessUnavailable(
-                "browser-harness executable is not installed; install the GitHub browser-use/browser-harness CLI "
-                "to include it in the anti-bot benchmark comparison"
-            )
-        harness_executable = found
-    port = pick_port()
-    browser_name = f"rustwright-antibot-{os.getpid()}"
-    with tempfile.TemporaryDirectory(prefix="browser-harness-antibot-") as profile:
-        launch_args = [
-            executable,
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={profile}",
-            "--headless=new",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "about:blank",
-        ]
-        if sys.platform == "darwin":
-            launch_args.insert(-1, "--single-process")
-        browser = subprocess.Popen(launch_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            wait_for_cdp(port)
-            proc = subprocess.run(
-                [harness_executable],
-                input=browser_harness_fingerprint_code(targets, iterations, settle_ms),
-                text=True,
-                capture_output=True,
-                env={**os.environ, "BU_NAME": browser_name, "BU_CDP_URL": f"http://127.0.0.1:{port}"},
-                timeout=max(120, len(targets) * iterations * 45),
-            )
-            if proc.returncode != 0:
-                raise RuntimeError(proc.stderr or proc.stdout)
-            for line in reversed(proc.stdout.splitlines()):
-                if line.startswith("ANTIBOT_RAW_JSON "):
-                    samples = json.loads(line.removeprefix("ANTIBOT_RAW_JSON "))
-                    return build_fingerprint_result("browser-harness", samples, targets)
-            raise RuntimeError(f"browser-harness did not print anti-bot JSON:\n{proc.stdout}")
-        finally:
-            subprocess.run(
-                [harness_executable, "--reload"],
-                env={**os.environ, "BU_NAME": browser_name, "BU_CDP_URL": f"http://127.0.0.1:{port}"},
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            browser.terminate()
-            try:
-                browser.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                browser.kill()
-
-
 def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     evidence_dir = Path(args.evidence_dir) if args.evidence_dir else None
     if args.impl == "all":
@@ -1358,18 +1052,12 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 )
             except Exception as error:
                 results.append({"implementation": implementation, "suite": "smoke", "status": "skipped", "reason": str(error)})
-        try:
-            results.append(run_browser_harness_smoke(args.iterations))
-        except Exception as error:
-            results.append({"implementation": "browser-harness", "suite": "smoke", "status": "skipped", "reason": str(error)})
         return {
             "implementation": "all",
             "suite": "smoke",
             "iterations": args.iterations,
             "results": results,
         }
-    if args.impl == "browser-harness":
-        return run_browser_harness_smoke(args.iterations)
     return run_playwright_like_smoke(
         args.impl,
         args.iterations,
@@ -1395,10 +1083,6 @@ def run_network(args: argparse.Namespace) -> dict[str, Any]:
                 )
             except Exception as error:
                 results.append({"implementation": implementation, "suite": "network", "status": "skipped", "reason": str(error)})
-        try:
-            results.append(run_browser_harness_network(args.iterations))
-        except Exception as error:
-            results.append({"implementation": "browser-harness", "suite": "network", "status": "skipped", "reason": str(error)})
         return {
             "implementation": "all",
             "suite": "network",
@@ -1406,8 +1090,6 @@ def run_network(args: argparse.Namespace) -> dict[str, Any]:
             "results": results,
             "scope": "local_l7_header_and_client_hint_consistency",
         }
-    if args.impl == "browser-harness":
-        return run_browser_harness_network(args.iterations)
     return run_playwright_like_network(
         args.impl,
         args.iterations,
@@ -1433,10 +1115,6 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
                 )
             except Exception as error:
                 results.append({"implementation": implementation, "suite": "matrix", "status": "skipped", "reason": str(error)})
-        try:
-            results.append(run_browser_harness_matrix(args.iterations))
-        except Exception as error:
-            results.append({"implementation": "browser-harness", "suite": "matrix", "status": "skipped", "reason": str(error)})
         return {
             "implementation": "all",
             "suite": "matrix",
@@ -1444,8 +1122,6 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
             "profiles": ["fresh_profile", "persistent_warm_profile"],
             "results": results,
         }
-    if args.impl == "browser-harness":
-        return run_browser_harness_matrix(args.iterations)
     return run_playwright_like_matrix(
         args.impl,
         args.iterations,
@@ -1483,18 +1159,6 @@ def run_fingerprint(args: argparse.Namespace) -> dict[str, Any]:
                         "reason": str(error),
                     }
                 )
-        try:
-            results.append(run_browser_harness_fingerprint(targets, iterations=args.iterations, settle_ms=args.settle_ms))
-        except Exception as error:
-            results.append(
-                {
-                    "implementation": "browser-harness",
-                    "suite": "fingerprint",
-                    "targets": targets,
-                    "status": "skipped",
-                    "reason": str(error),
-                }
-            )
         return {
             "implementation": "all",
             "suite": "fingerprint",
@@ -1502,8 +1166,6 @@ def run_fingerprint(args: argparse.Namespace) -> dict[str, Any]:
             "iterations": len(targets) * args.iterations,
             "results": results,
         }
-    if args.impl == "browser-harness":
-        return run_browser_harness_fingerprint(targets, iterations=args.iterations, settle_ms=args.settle_ms)
     return run_playwright_like_fingerprint(
         args.impl,
         targets,
@@ -1518,7 +1180,7 @@ def run_fingerprint(args: argparse.Namespace) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run Rustwright anti-bot and fingerprint benchmark subsets.")
     parser.add_argument("--suite", choices=["smoke", "network", "fingerprint", "matrix"], default="smoke")
-    parser.add_argument("--impl", choices=["rustwright", "playwright", "browser-harness", "all"], default="rustwright")
+    parser.add_argument("--impl", choices=["rustwright", "playwright", "all"], default="rustwright")
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument(
         "--target",

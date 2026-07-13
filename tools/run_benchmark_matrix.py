@@ -14,7 +14,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_IMPLS = ["rustwright", "playwright", "typescript-playwright", "browser-harness"]
+DEFAULT_IMPLS = ["rustwright", "playwright", "typescript-playwright"]
 STRICT_IMPLS = ["rustwright", "playwright"]
 
 
@@ -492,14 +492,6 @@ def main() -> int:
         unsupported = [implementation for implementation in implementations if implementation not in STRICT_IMPLS]
         if unsupported:
             raise SystemExit(f"--suite strict only supports: {', '.join(STRICT_IMPLS)}; got {', '.join(unsupported)}")
-    if args.case_filters:
-        unsupported = [implementation for implementation in implementations if implementation == "browser-harness"]
-        if unsupported:
-            raise SystemExit(
-                "--case currently supports rustwright, playwright, TypeScript Playwright, and Puppeteer; "
-                f"got {', '.join(unsupported)}"
-            )
-
     planned_runs = [(repetition, implementation) for repetition in range(args.repetitions) for implementation in implementations]
     docker_preflight = docker_health_check(args.docker_preflight_timeout)
     if docker_preflight.get("status") != "healthy":
