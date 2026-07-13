@@ -18,8 +18,11 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use futures_util::{future::try_join_all, SinkExt, StreamExt};
+#[cfg(feature = "python")]
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::{PyBytes, PyModule};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -56,6 +59,7 @@ pub enum RwError {
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
 }
 
+#[cfg(feature = "python")]
 fn py_err(error: RwError) -> PyErr {
     match error {
         RwError::Message(message) => PyRuntimeError::new_err(message),
@@ -1591,6 +1595,7 @@ impl LaunchedCdpTransport {
     }
 }
 
+#[cfg(feature = "python")]
 fn run_detached<T, F>(operation: F) -> T
 where
     T: Send,
@@ -1609,6 +1614,15 @@ where
             .take()
             .expect("unattached operation should still be available")()
     }
+}
+
+#[cfg(not(feature = "python"))]
+fn run_detached<T, F>(operation: F) -> T
+where
+    T: Send,
+    F: FnOnce() -> T + Send,
+{
+    operation()
 }
 
 fn run_blocking_detached<Fut>(runtime: &tokio::runtime::Runtime, future: Fut) -> Fut::Output
@@ -2046,21 +2060,25 @@ fn build_frame_tree_node(state: &PageFrameState, frame_id: &str) -> Option<Value
     Some(node)
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "Browser")]
 struct PyBrowser {
     inner: Arc<BrowserInner>,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "BrowserContext")]
 struct PyBrowserContext {
     inner: Arc<ContextInner>,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "Page")]
 struct PyPage {
     inner: Arc<PageInner>,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "CDPSession")]
 struct PyCdpSession {
     browser: Arc<BrowserInner>,
@@ -2068,6 +2086,7 @@ struct PyCdpSession {
     detached: AtomicBool,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_CdpEventWaiter")]
 struct PyCdpEventWaiter {
     browser: Arc<BrowserInner>,
@@ -2076,6 +2095,7 @@ struct PyCdpEventWaiter {
     method: String,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "Worker")]
 struct PyWorker {
     browser: Arc<BrowserInner>,
@@ -2084,6 +2104,7 @@ struct PyWorker {
     url: String,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_NetworkEventWaiter")]
 struct PyNetworkEventWaiter {
     browser: Arc<BrowserInner>,
@@ -2095,6 +2116,7 @@ struct PyNetworkEventWaiter {
     requests: Arc<Mutex<NetworkRequestStore>>,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_PageEventStream")]
 struct PyPageEventStream {
     browser: Arc<BrowserInner>,
@@ -2123,6 +2145,7 @@ impl PageEventStreamState {
     }
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_RouteEventWaiter")]
 struct PyRouteEventWaiter {
     browser: Arc<BrowserInner>,
@@ -2130,6 +2153,7 @@ struct PyRouteEventWaiter {
     session_id: String,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_AuthEventWaiter")]
 struct PyAuthEventWaiter {
     browser: Arc<BrowserInner>,
@@ -2137,6 +2161,7 @@ struct PyAuthEventWaiter {
     session_id: String,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_DialogEventWaiter")]
 struct PyDialogEventWaiter {
     browser: Arc<BrowserInner>,
@@ -2144,6 +2169,7 @@ struct PyDialogEventWaiter {
     session_id: String,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_ConsoleEventWaiter")]
 struct PyConsoleEventWaiter {
     browser: Arc<BrowserInner>,
@@ -2151,6 +2177,7 @@ struct PyConsoleEventWaiter {
     session_id: String,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_WebSocketEventWaiter")]
 struct PyWebSocketEventWaiter {
     browser: Arc<BrowserInner>,
@@ -2160,6 +2187,7 @@ struct PyWebSocketEventWaiter {
     request_id: Option<String>,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_BindingEventWaiter")]
 struct PyBindingEventWaiter {
     page: Arc<PageInner>,
@@ -2167,6 +2195,7 @@ struct PyBindingEventWaiter {
     name: String,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_DownloadEventWaiter")]
 struct PyDownloadEventWaiter {
     browser: Arc<BrowserInner>,
@@ -2175,6 +2204,7 @@ struct PyDownloadEventWaiter {
     download_path: String,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_FileChooserEventWaiter")]
 struct PyFileChooserEventWaiter {
     browser: Arc<BrowserInner>,
@@ -2182,6 +2212,7 @@ struct PyFileChooserEventWaiter {
     session_id: String,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_PopupEventWaiter")]
 struct PyPopupEventWaiter {
     browser: Arc<BrowserInner>,
@@ -2189,6 +2220,7 @@ struct PyPopupEventWaiter {
     opener_target_id: String,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_WorkerEventWaiter")]
 struct PyWorkerEventWaiter {
     browser: Arc<BrowserInner>,
@@ -2196,6 +2228,7 @@ struct PyWorkerEventWaiter {
     opener_target_id: String,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_WorkerCloseEventWaiter")]
 struct PyWorkerCloseEventWaiter {
     browser: Arc<BrowserInner>,
@@ -2204,6 +2237,7 @@ struct PyWorkerCloseEventWaiter {
     session_id: String,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_ServiceWorkerEventWaiter")]
 struct PyServiceWorkerEventWaiter {
     browser: Arc<BrowserInner>,
@@ -2211,6 +2245,7 @@ struct PyServiceWorkerEventWaiter {
     context_id: Option<String>,
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "_BackgroundPageEventWaiter")]
 struct PyBackgroundPageEventWaiter {
     browser: Arc<BrowserInner>,
@@ -2218,6 +2253,7 @@ struct PyBackgroundPageEventWaiter {
     context_id: Option<String>,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyBrowser {
     fn new_page(&self) -> PyResult<PyPage> {
@@ -2410,6 +2446,7 @@ impl PyBrowser {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyBrowserContext {
     #[getter]
@@ -2608,6 +2645,7 @@ impl PyBrowserContext {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyCdpSession {
     #[pyo3(signature = (method, params_json=None, timeout_ms=None))]
@@ -2682,6 +2720,7 @@ impl PyCdpSession {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyCdpEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -3499,6 +3538,7 @@ async fn resolve_screenshot_clip(
     }))
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyPage {
     #[getter]
@@ -5946,6 +5986,7 @@ return new Promise(resolve => {{
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyWorker {
     #[getter]
@@ -6242,6 +6283,7 @@ impl PyWorker {
     }
 }
 
+#[cfg(feature = "python")]
 impl PyWorker {
     fn call_function_on_handle(
         &self,
@@ -6280,6 +6322,7 @@ impl PyWorker {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyNetworkEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -6315,6 +6358,7 @@ impl PyNetworkEventWaiter {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyPageEventStream {
     fn enable_runtime(&self) -> PyResult<()> {
@@ -6409,6 +6453,7 @@ impl PyPageEventStream {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyRouteEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -6432,6 +6477,7 @@ impl PyRouteEventWaiter {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyAuthEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -6455,6 +6501,7 @@ impl PyAuthEventWaiter {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyDialogEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -6478,6 +6525,7 @@ impl PyDialogEventWaiter {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyConsoleEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -6501,6 +6549,7 @@ impl PyConsoleEventWaiter {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyWebSocketEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -6531,6 +6580,7 @@ impl PyWebSocketEventWaiter {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyBindingEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -6559,6 +6609,7 @@ impl PyBindingEventWaiter {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyDownloadEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -6588,6 +6639,7 @@ impl PyDownloadEventWaiter {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyFileChooserEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -6614,6 +6666,7 @@ impl PyFileChooserEventWaiter {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyPopupEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -6642,6 +6695,7 @@ impl PyPopupEventWaiter {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyWorkerEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -6670,6 +6724,7 @@ impl PyWorkerEventWaiter {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyWorkerCloseEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -6698,6 +6753,7 @@ impl PyWorkerCloseEventWaiter {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyServiceWorkerEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -6724,6 +6780,7 @@ impl PyServiceWorkerEventWaiter {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyBackgroundPageEventWaiter {
     #[pyo3(signature = (timeout_ms=None))]
@@ -6750,6 +6807,7 @@ impl PyBackgroundPageEventWaiter {
     }
 }
 
+#[cfg(feature = "python")]
 impl PyPage {
     fn navigate_history(
         &self,
@@ -6956,6 +7014,7 @@ fn launch_chromium_with_options(mut options: LaunchOptions) -> RwResult<Arc<Brow
     }))
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn launch_chromium(py: Python<'_>, options_json: &str) -> PyResult<PyBrowser> {
     let options: LaunchOptions = serde_json::from_str(options_json)
@@ -6966,6 +7025,7 @@ fn launch_chromium(py: Python<'_>, options_json: &str) -> PyResult<PyBrowser> {
     Ok(PyBrowser { inner })
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (endpoint, timeout_ms=None, headers_json=None))]
 fn connect_over_cdp(
@@ -7006,6 +7066,7 @@ fn connect_over_cdp(
     Ok(PyBrowser { inner })
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn chromium_executable_path() -> PyResult<Option<String>> {
     Ok(find_chromium_executable(None, None, true).map(|path| path.to_string_lossy().to_string()))
@@ -7034,8 +7095,9 @@ pub fn rustwright_chromium_executable_path() -> Option<String> {
 
 impl RustwrightBrowser {
     pub fn new_page(&self) -> RwResult<RustwrightPage> {
-        let page = create_page_raw(Arc::clone(&self.inner), None)?;
-        Ok(RustwrightPage { inner: page.inner })
+        Ok(RustwrightPage {
+            inner: create_page_raw(Arc::clone(&self.inner), None)?,
+        })
     }
 
     pub fn close(&self) -> RwResult<()> {
@@ -7408,12 +7470,18 @@ fn unquote_selector_argument(value: &str) -> String {
     result
 }
 
+#[cfg(feature = "python")]
 fn create_page(browser: Arc<BrowserInner>, context_id: Option<String>) -> RwResult<PyPage> {
     let browser_for_task = Arc::clone(&browser);
-    browser.block_on(create_page_async(browser_for_task, context_id))
+    browser
+        .block_on(create_page_async(browser_for_task, context_id))
+        .map(|inner| PyPage { inner })
 }
 
-fn create_page_raw(browser: Arc<BrowserInner>, context_id: Option<String>) -> RwResult<PyPage> {
+fn create_page_raw(
+    browser: Arc<BrowserInner>,
+    context_id: Option<String>,
+) -> RwResult<Arc<PageInner>> {
     let browser_for_task = Arc::clone(&browser);
     browser.block_on_raw(create_page_async(browser_for_task, context_id))
 }
@@ -7421,7 +7489,7 @@ fn create_page_raw(browser: Arc<BrowserInner>, context_id: Option<String>) -> Rw
 async fn create_page_async(
     browser: Arc<BrowserInner>,
     context_id: Option<String>,
-) -> RwResult<PyPage> {
+) -> RwResult<Arc<PageInner>> {
     let mut params = json!({ "url": "about:blank" });
     if let Some(context_id) = &context_id {
         params["browserContextId"] = Value::String(context_id.clone());
@@ -7443,7 +7511,7 @@ async fn attach_existing_page(
     target_id: String,
     context_id: Option<String>,
     timeout: Duration,
-) -> RwResult<PyPage> {
+) -> RwResult<Arc<PageInner>> {
     let attached = browser
         .client
         .send(
@@ -7486,9 +7554,10 @@ async fn attach_existing_page(
     });
     let _ = refresh_page_frame_tree(&page_inner, Duration::from_secs(5)).await;
     spawn_page_oopif_event_listener(Arc::clone(&page_inner));
-    Ok(PyPage { inner: page_inner })
+    Ok(page_inner)
 }
 
+#[cfg(feature = "python")]
 async fn attach_existing_worker(
     browser: Arc<BrowserInner>,
     target_id: String,
@@ -10436,6 +10505,7 @@ async fn wait_for_file_chooser_event(
     }
 }
 
+#[cfg(feature = "python")]
 async fn wait_for_popup_page(
     events: &mut broadcast::Receiver<Value>,
     browser: Arc<BrowserInner>,
@@ -10477,7 +10547,9 @@ async fn wait_for_popup_page(
                     .get("browserContextId")
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
-                return attach_existing_page(browser, target_id, context_id, remaining).await;
+                return attach_existing_page(browser, target_id, context_id, remaining)
+                    .await
+                    .map(|inner| PyPage { inner });
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(_)) => return Err(RwError::Message("CDP event stream closed".to_string())),
@@ -10531,6 +10603,7 @@ fn target_context_matches(info: &Value, context_id: Option<&str>) -> bool {
     }
 }
 
+#[cfg(feature = "python")]
 fn list_pages_for_context(
     browser: Arc<BrowserInner>,
     context_id: Option<String>,
@@ -10565,7 +10638,7 @@ fn list_pages_for_context(
                     .get("browserContextId")
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
-                if let Ok(page) = attach_existing_page(
+                if let Ok(inner) = attach_existing_page(
                     Arc::clone(&browser_for_task),
                     target_id.to_string(),
                     page_context_id,
@@ -10573,7 +10646,7 @@ fn list_pages_for_context(
                 )
                 .await
                 {
-                    pages.push(page);
+                    pages.push(PyPage { inner });
                 }
             }
             Ok(pages)
@@ -10581,6 +10654,7 @@ fn list_pages_for_context(
         .map_err(py_err)
 }
 
+#[cfg(feature = "python")]
 fn list_service_workers_for_context(
     browser: Arc<BrowserInner>,
     context_id: Option<String>,
@@ -10632,6 +10706,7 @@ fn list_service_workers_for_context(
         .map_err(py_err)
 }
 
+#[cfg(feature = "python")]
 fn service_worker_event_waiter_for_context(
     browser: Arc<BrowserInner>,
     context_id: Option<String>,
@@ -10659,6 +10734,7 @@ fn service_worker_event_waiter_for_context(
     })
 }
 
+#[cfg(feature = "python")]
 fn list_background_pages_for_context(
     browser: Arc<BrowserInner>,
     context_id: Option<String>,
@@ -10693,7 +10769,7 @@ fn list_background_pages_for_context(
                     .get("browserContextId")
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
-                if let Ok(page) = attach_existing_page(
+                if let Ok(inner) = attach_existing_page(
                     Arc::clone(&browser_for_task),
                     target_id.to_string(),
                     page_context_id,
@@ -10701,7 +10777,7 @@ fn list_background_pages_for_context(
                 )
                 .await
                 {
-                    pages.push(page);
+                    pages.push(PyPage { inner });
                 }
             }
             Ok(pages)
@@ -10709,6 +10785,7 @@ fn list_background_pages_for_context(
         .map_err(py_err)
 }
 
+#[cfg(feature = "python")]
 fn background_page_event_waiter_for_context(
     browser: Arc<BrowserInner>,
     context_id: Option<String>,
@@ -10736,6 +10813,7 @@ fn background_page_event_waiter_for_context(
     })
 }
 
+#[cfg(feature = "python")]
 async fn wait_for_worker(
     events: &mut broadcast::Receiver<Value>,
     browser: Arc<BrowserInner>,
@@ -10796,6 +10874,7 @@ async fn wait_for_worker(
     }
 }
 
+#[cfg(feature = "python")]
 async fn wait_for_background_page(
     events: &mut broadcast::Receiver<Value>,
     browser: Arc<BrowserInner>,
@@ -10835,7 +10914,9 @@ async fn wait_for_background_page(
                     .get("browserContextId")
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
-                return attach_existing_page(browser, target_id, page_context_id, remaining).await;
+                return attach_existing_page(browser, target_id, page_context_id, remaining)
+                    .await
+                    .map(|inner| PyPage { inner });
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(_)) => return Err(RwError::Message("CDP event stream closed".to_string())),
@@ -10844,6 +10925,7 @@ async fn wait_for_background_page(
     }
 }
 
+#[cfg(feature = "python")]
 async fn wait_for_service_worker(
     events: &mut broadcast::Receiver<Value>,
     browser: Arc<BrowserInner>,
@@ -13371,6 +13453,7 @@ fn locator_script(locator_json: &str, index: usize, body: &str) -> String {
         .replace("__BODY__", body)
 }
 
+#[cfg(feature = "python")]
 #[pymodule]
 fn _rustwright(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyBrowser>()?;
