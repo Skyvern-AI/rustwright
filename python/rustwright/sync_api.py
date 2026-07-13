@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import uuid
+import warnings
 import zipfile
 from datetime import datetime, timezone
 from dataclasses import InitVar, dataclass, field
@@ -4616,6 +4617,23 @@ def _handle_event_wait_timeout(owner: Any, event: str, timeout_display: str, dea
     raise TimeoutError(_event_timeout_message(event, timeout_display))
 
 
+def _owner_event_pump_threads(owner: Any) -> "set[threading.Thread]":
+    pumps: set[threading.Thread] = set()
+    pump = getattr(owner, "_event_pump_thread", None)
+    if pump is not None:
+        pumps.add(pump)
+    try:
+        pages = getattr(owner, "pages", None)
+    except Exception:
+        pages = None
+    if isinstance(pages, (list, tuple)):
+        for page in pages:
+            page_pump = getattr(page, "_event_pump_thread", None)
+            if page_pump is not None:
+                pumps.add(page_pump)
+    return pumps
+
+
 def _wait_for_ready_event_or_owner_close(
     ready: threading.Event,
     owner: Any,
@@ -4623,6 +4641,20 @@ def _wait_for_ready_event_or_owner_close(
     timeout_ms: Optional[float],
     timeout_display: str,
 ) -> None:
+    if owner is not None and threading.current_thread() in _owner_event_pump_threads(owner):
+        # This wait's event is delivered by one of the owner's event pump
+        # threads: the page's own pump, or — for a BrowserContext owner — the
+        # pump of any of its pages. Blocking that same thread here means the
+        # event can never be dispatched: fail fast instead of deadlocking
+        # until timeout. Waits issued from an unrelated page's pump thread
+        # stay allowed — their events arrive on the owner's own pumps and do
+        # complete.
+        raise Error(
+            f"cannot wait for event {event!r} from inside one of the owner's "
+            "event handlers: the handler runs on an event pump thread that "
+            "delivers the event, so the wait would deadlock; capture the "
+            "event inside the handler instead"
+        )
     if owner is not None:
         _prepare_owner_event_rejection(owner)
     deadline = None if timeout_ms is None else time.monotonic() + (timeout_ms / 1000)
@@ -7742,7 +7774,6 @@ class _EventContextManager:
             self._log_offset = len(self._page._request_log)
         elif self._kind == "response":
             self._log_offset = len(self._page._response_log)
-            self._page._ensure_network_event_thread("response")
         self._waiter = self._page._core.network_event_waiter(self._kind)
         return self
 
@@ -7970,21 +8001,39 @@ class _DialogEventContextManager:
         self._page = page
         self._matcher = matcher
         self._timeout = timeout
-        self._waiter: Any = None
         self._value: Dialog | None = None
+        self._ready = threading.Event()
+        self._handler: Optional[Callable[..., Any]] = None
 
     def __enter__(self) -> "_DialogEventContextManager":
-        self._waiter = self._page._core.dialog_event_waiter()
+        def handler(dialog: Dialog) -> None:
+            if self._value is None and _dialog_event_matches(self._matcher, dialog):
+                self._value = dialog
+                self._ready.set()
+
+        self._handler = handler
+        self._page.on("dialog", handler)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            self._value = self._page._wait_for_dialog_event(
-                self._matcher,
-                timeout=self._timeout,
-                waiter=self._waiter,
-            )
-        self._waiter = None
+        try:
+            if exc_type is None:
+                timeout_ms, timeout_display = _event_timeout_for_target(
+                    self._page,
+                    self._timeout,
+                    method="Page.wait_for_event",
+                )
+                _wait_for_ready_event_or_owner_close(
+                    self._ready,
+                    self._page,
+                    "dialog",
+                    timeout_ms,
+                    timeout_display,
+                )
+        finally:
+            if self._handler is not None:
+                self._page.remove_listener("dialog", self._handler)
+            self._handler = None
 
     @property
     def value(self) -> "Dialog":
@@ -8436,16 +8485,20 @@ class _ContextDialogEventContextManager:
         self._ready = threading.Event()
         self._value: Optional[Dialog] = None
         self._context_handler: Optional[Callable[..., Any]] = None
+        self._page_handlers: dict[Page, Callable[..., Any]] = {}
 
     def __enter__(self) -> "_ContextDialogEventContextManager":
         def page_handler(page: "Page") -> None:
-            thread = threading.Thread(
-                target=self._wait_on_page,
-                args=(page,),
-                daemon=True,
-                name="rustwright-context-dialog-waiter",
-            )
-            thread.start()
+            if page in self._page_handlers or page.is_closed():
+                return
+
+            def dialog_handler(dialog: Dialog) -> None:
+                if self._value is None and _dialog_event_matches(self._predicate, dialog):
+                    self._value = dialog
+                    self._ready.set()
+
+            self._page_handlers[page] = dialog_handler
+            page.on("dialog", dialog_handler)
 
         for page in self._context.pages:
             page_handler(page)
@@ -8472,24 +8525,15 @@ class _ContextDialogEventContextManager:
             if self._context_handler is not None:
                 self._context.remove_listener("page", self._context_handler)
                 self._context_handler = None
+            for page, handler in list(self._page_handlers.items()):
+                page.remove_listener("dialog", handler)
+            self._page_handlers.clear()
 
     @property
     def value(self) -> Dialog:
         if self._value is None:
             raise Error("event value is not available until the context manager exits")
         return self._value
-
-    def _wait_on_page(self, page: "Page") -> None:
-        if self._ready.is_set() or page.is_closed():
-            return
-        try:
-            event = page._wait_for_dialog_event(self._predicate, timeout=self._timeout or self._context._default_timeout)
-        except Exception:
-            return
-        if not self._ready.is_set():
-            self._value = event
-            self._ready.set()
-
 
 class _LocalEventContextManager:
     def __init__(self, target: Any, event: str, predicate: Any, timeout: Optional[float]):
@@ -10510,6 +10554,7 @@ class Browser:
         self._closed = True
         self._mark_owned_cdp_sessions_closed()
         if self._connected_over_cdp:
+            self._stop_page_event_pumps()
             try:
                 _call(self._core.close)
             except Error as exc:
@@ -10576,9 +10621,15 @@ class Browser:
             if not connected:
                 self._closed = True
                 self._mark_owned_cdp_sessions_closed()
+                self._stop_page_event_pumps()
                 self._emit_disconnected()
                 return
             time.sleep(0.05)
+
+    def _stop_page_event_pumps(self) -> None:
+        for context in list(self._contexts):
+            for page in list(context.pages):
+                page._stop_event_pump()
 
     @property
     def version(self) -> str:
@@ -14240,6 +14291,22 @@ class FrameLocator(_EventEmitter):
     def get_by_title(self, text: str, *, exact: bool = False) -> "Locator":
         return Locator(self._page, _frame_spec_with_inner(self._frame_spec, {"kind": "title", "value": _attribute_text_matcher(text), "exact": exact}))
 
+_PAGE_OBSERVATION_EVENTS = {
+    "request",
+    "response",
+    "requestfinished",
+    "requestfailed",
+    "console",
+    "pageerror",
+    "dialog",
+    "load",
+    "domcontentloaded",
+    "framenavigated",
+    "frameattached",
+    "framedetached",
+}
+
+
 class Page:
     def __init__(self, core: Any, context: Optional[BrowserContext] = None):
         self._core = core
@@ -14275,8 +14342,6 @@ class Page:
         self._video: Optional[Video] = None
         self._request = context.request if context is not None else APIRequestContext()
         self._event_handlers: dict[str, list[Callable[..., Any]]] = {}
-        self._event_threads: dict[str, threading.Thread] = {}
-        self._event_waiters: dict[str, Any] = {}
         self._main_frame = Frame(self, name="", url="", is_main=True)
         self._set_content_html_document_known: Optional[bool] = True
         self._frame_object_cache: dict[str, Frame] = {}
@@ -14309,6 +14374,7 @@ class Page:
         self._page_errors_condition = threading.Condition()
         self._page_errors_generation = 0
         self._page_errors_skip_wait_until = 0.0
+        self._runtime_observation_enabled = False
         self._routes: list[_RouteRegistration] = []
         self._har_recordings: list[tuple[str | Path, Any, Optional[str], Optional[str]]] = []
         self._route_thread: Optional[threading.Thread] = None
@@ -14321,13 +14387,7 @@ class Page:
         self._auth_waiter: Any = None
         self._proxy_auth_credentials: Optional[tuple[str, str]] = None
         self._http_auth_credentials: Optional[tuple[str, str, Optional[str]]] = None
-        self._dialog_thread: Optional[threading.Thread] = None
-        self._dialog_waiter: Any = None
         self._dialog_dispatch_count = 0
-        self._console_thread: Optional[threading.Thread] = None
-        self._console_waiter: Any = None
-        self._page_error_thread: Optional[threading.Thread] = None
-        self._page_error_waiter: Any = None
         self._crash_thread: Optional[threading.Thread] = None
         self._crash_session: Optional[CDPSession] = None
         self._crash_waiter: Any = None
@@ -14385,9 +14445,15 @@ class Page:
         self._closing = False
         self._closed = False
         self._closed_reason: Optional[str] = None
-        self._ensure_network_event_thread("request")
-        self._ensure_network_event_thread("requestfinished")
-        self._ensure_network_event_thread("requestfailed")
+        self._event_pump_stop_lock = threading.Lock()
+        self._event_pump_stopped = False
+        self._event_stream = self._core.combined_event_stream()
+        self._event_pump_thread = threading.Thread(
+            target=self._event_pump,
+            daemon=True,
+            name="rustwright-page-events",
+        )
+        self._event_pump_thread.start()
 
     def _slow_mo(self) -> None:
         if self._slow_mo_ms > 0:
@@ -14880,6 +14946,7 @@ class Page:
             if self._crashed:
                 return
             self._crashed = True
+        self._stop_event_pump()
         _emit_event(self._event_handlers, "crash", self)
 
     def _mark_request_cookie_sync_required(self) -> None:
@@ -14923,7 +14990,6 @@ class Page:
             self._retain_navigation_response_bodies()
             self._mark_navigation_history_boundary()
             self._set_content_html_document_known = None
-            self._ensure_network_event_thread("response")
             try:
                 target_scheme = url_parse.urlparse(target_url).scheme.lower()
             except ValueError:
@@ -15360,7 +15426,9 @@ class Page:
         reject_on_close: bool = True,
     ) -> ConsoleMessage:
         deadline, timeout_display = _event_deadline_for_target(self, timeout, method="Page.wait_for_event")
-        waiter = waiter or self._core.console_event_waiter()
+        if waiter is None:
+            waiter = self._core.console_event_waiter()
+            self._runtime_observation_enabled = True
         owner = self if reject_on_close else None
         while True:
             remaining = _event_remaining_ms("console", timeout_display, deadline)
@@ -15413,6 +15481,7 @@ class Page:
     def _page_error_event_waiter(self) -> Any:
         session = _call(self._core.cdp_session)
         _call(session.send, "Runtime.enable", json_module_dumps({}), self._default_timeout)
+        self._runtime_observation_enabled = True
         return session.event_waiter("Runtime.exceptionThrown")
 
     def _wait_for_page_error_event(
@@ -15699,6 +15768,8 @@ class Page:
         )
         if not isinstance(payloads, list):
             return
+        if self._runtime_observation_enabled:
+            return
         for payload in payloads:
             if isinstance(payload, dict):
                 self._record_console_message(ConsoleMessage(self, payload))
@@ -15718,7 +15789,7 @@ class Page:
         )
         if not isinstance(payloads, list):
             return
-        if not record:
+        if not record or self._runtime_observation_enabled:
             return
         for payload in payloads:
             if isinstance(payload, dict):
@@ -15813,54 +15884,79 @@ class Page:
                 return value
 
     def _frame_from_navigated_payload(self, payload: dict[str, Any], *, same_document: bool = False) -> Frame:
-        params = payload.get("params") if isinstance(payload, dict) else {}
+        params = payload.get("params", payload) if isinstance(payload, dict) else {}
         if same_document:
             return self.main_frame
         frame_payload = (params or {}).get("frame") if isinstance(params, dict) else {}
         if not isinstance(frame_payload, dict):
             return self.main_frame
-        if not frame_payload.get("parentId"):
-            return self.main_frame
+        frame_id = None if frame_payload.get("id") is None else str(frame_payload.get("id"))
         url = str(frame_payload.get("url") or "")
         name = str(frame_payload.get("name") or "")
+        if not frame_payload.get("parentId"):
+            self._main_frame._frame_id = frame_id or self._main_frame._frame_id
+            self._main_frame._url = url
+            return self.main_frame
+        if frame_id is not None:
+            cached = self._frame_event_cache.get(frame_id)
+            if cached is not None:
+                cached._name = name or cached._name
+                cached._url = url or cached._url
+                cached._detached = False
+                return cached
         for frame in self.frames:
+            if not frame._is_main and frame_id and frame._frame_id == frame_id:
+                frame._name = name or frame._name
+                frame._url = url or frame._url
+                snapshot = self._snapshot_frame(frame, frame_id=frame_id)
+                self._frame_event_cache[frame_id] = snapshot
+                return snapshot
             if not frame._is_main and ((url and frame.url == url) or (name and frame.name == name)):
-                return frame
-        return Frame(self, name=name, url=url, is_main=False)
+                frame._frame_id = frame_id or frame._frame_id
+                frame._name = name or frame._name
+                frame._url = url or frame._url
+                snapshot = self._snapshot_frame(frame, frame_id=frame_id)
+                if frame_id is not None:
+                    self._frame_event_cache[frame_id] = snapshot
+                return snapshot
+        frame = Frame(self, name=name, url=url, is_main=False, frame_id=frame_id)
+        if frame_id is not None:
+            self._frame_event_cache[frame_id] = frame
+        return frame
 
     def _snapshot_frame(self, frame: Frame, *, frame_id: Optional[str] = None, detached: bool = False) -> Frame:
-        try:
-            url = frame.url
-        except Error:
-            url = frame._url
         return Frame(
             self,
             frame_index=frame._frame_index,
             name=frame.name,
-            url=url,
+            url=frame._url,
             is_main=frame._is_main,
             frame_id=frame_id or frame._frame_id,
             detached=detached,
         )
 
     def _frame_from_attached_payload(self, payload: dict[str, Any]) -> Frame:
-        params = payload.get("params") if isinstance(payload, dict) else {}
+        params = payload.get("params", payload) if isinstance(payload, dict) else {}
         frame_id = None if not isinstance(params, dict) else params.get("frameId")
         frame_id = None if frame_id is None else str(frame_id)
         child_frames = [frame for frame in self.frames if not frame._is_main]
-        frame = child_frames[-1] if child_frames else Frame(self, frame_id=frame_id)
+        frame = next(
+            (candidate for candidate in child_frames if frame_id and candidate._frame_id == frame_id),
+            child_frames[-1] if child_frames else Frame(self, frame_id=frame_id),
+        )
         snapshot = self._snapshot_frame(frame, frame_id=frame_id)
         if frame_id is not None:
             self._frame_event_cache[frame_id] = snapshot
         return snapshot
 
     def _frame_from_detached_payload(self, payload: dict[str, Any]) -> Frame:
-        params = payload.get("params") if isinstance(payload, dict) else {}
+        params = payload.get("params", payload) if isinstance(payload, dict) else {}
         frame_id = None if not isinstance(params, dict) else params.get("frameId")
         frame_id = None if frame_id is None else str(frame_id)
         cached = self._frame_event_cache.pop(frame_id, None) if frame_id is not None else None
         if cached is None:
             return Frame(self, frame_id=frame_id, detached=True)
+        cached._mark_detached()
         return self._snapshot_frame(cached, frame_id=frame_id, detached=True)
 
     def _wait_for_frame_lifecycle_event(
@@ -15952,7 +16048,9 @@ class Page:
                 pass
             return event_info.value
         if event == "dialog":
-            return self._wait_for_dialog_event(predicate, timeout=timeout)
+            with _DialogEventContextManager(self, predicate, timeout) as event_info:
+                pass
+            return event_info.value
         if event == "pageerror":
             return self._wait_for_page_error_event(predicate, timeout=timeout)
         if event == "download":
@@ -18227,7 +18325,20 @@ class Page:
         return self._closed
 
     def _event_listeners_active(self) -> bool:
-        return not self._closed and not self._closing
+        return not self._closed and not self._closing and not self._crashed and not self._event_pump_stopped
+
+    def _stop_event_pump(self) -> None:
+        with self._event_pump_stop_lock:
+            if self._event_pump_stopped:
+                return
+            self._event_pump_stopped = True
+            try:
+                self._event_stream.close()
+            except Exception:
+                pass
+        pump = getattr(self, "_event_pump_thread", None)
+        if pump is not None and pump is not threading.current_thread():
+            pump.join(timeout=1.0)
 
     def _mark_owned_cdp_sessions_closed(self) -> None:
         sessions = list(self._owned_cdp_sessions)
@@ -18646,14 +18757,17 @@ class Page:
             self._crash_waiter = None
         dialog_dispatch_count = self._dialog_dispatch_count
         try:
-            _call(self._core.close, self._default_timeout, run_before_unload)
-        except Error as exc:
-            if not _is_ignorable_close_error(exc):
-                raise
-        if run_before_unload and self._event_handlers.get("dialog"):
-            deadline = time.monotonic() + min(self._default_timeout / 1000, 0.5)
-            while self._dialog_dispatch_count == dialog_dispatch_count and time.monotonic() < deadline:
-                time.sleep(0.01)
+            try:
+                _call(self._core.close, self._default_timeout, run_before_unload)
+            except Error as exc:
+                if not _is_ignorable_close_error(exc):
+                    raise
+            if run_before_unload and self._event_handlers.get("dialog"):
+                deadline = time.monotonic() + min(self._default_timeout / 1000, 0.5)
+                while self._dialog_dispatch_count == dialog_dispatch_count and time.monotonic() < deadline:
+                    time.sleep(0.01)
+        finally:
+            self._stop_event_pump()
         self._closed = True
         self._closing = True
         self._mark_owned_cdp_sessions_closed()
@@ -18713,10 +18827,6 @@ class Page:
 
     def on(self, event: str, f: Callable[..., Any]) -> None:
         _add_listener_to_handlers(self, event, f, self._event_handlers)
-        if event in {"request", "response", "requestfinished", "requestfailed"}:
-            self._ensure_network_event_thread(event)
-        if event == "dialog":
-            self._ensure_dialog_thread()
         if event == "console":
             self._ensure_console_thread()
             self._attach_existing_worker_console_propagation()
@@ -18733,16 +18843,6 @@ class Page:
             self._ensure_websocket_thread()
         if event == "worker":
             self._ensure_worker_thread()
-        if event == "load":
-            self._ensure_page_cdp_event_thread(event, "Page.loadEventFired")
-        if event == "domcontentloaded":
-            self._ensure_page_cdp_event_thread(event, "Page.domContentEventFired")
-        if event == "framenavigated":
-            self._ensure_frame_navigated_thread()
-        if event == "frameattached":
-            self._ensure_frame_lifecycle_thread(event, "Page.frameAttached")
-        if event == "framedetached":
-            self._ensure_frame_lifecycle_thread(event, "Page.frameDetached")
         if event == "crash":
             self._ensure_crash_thread()
 
@@ -18752,41 +18852,163 @@ class Page:
     def remove_listener(self, event: str, f: Callable[..., Any]) -> None:
         _remove_listener_from_handlers(self, event, f, self._event_handlers)
 
-    def _ensure_network_event_thread(self, event: str) -> None:
-        existing = self._event_threads.get(event)
-        if existing is not None and existing.is_alive():
-            return
-        waiter = self._core.network_event_waiter(event)
-        self._event_waiters[event] = waiter
-        thread = threading.Thread(
-            target=self._network_event_loop,
-            args=(event, waiter),
-            daemon=True,
-            name=f"rustwright-{event}-listener",
-        )
-        self._event_threads[event] = thread
-        thread.start()
-
-    def _network_event_loop(self, event: str, waiter: Any) -> None:
+    def _event_pump(self) -> None:
         while self._event_listeners_active():
-            if (
-                event not in {"request", "response"}
-                and event not in self._network_idle_tracked_events
-                and not self._event_handlers.get(event)
-            ):
-                time.sleep(0.05)
-                continue
             try:
-                value = self._wait_for_network_event(event, timeout=500.0, waiter=waiter)
-            except TimeoutError:
-                continue
+                batch = json.loads(_call(self._event_stream.wait_batch, 500.0, 64))
             except Error:
                 break
-            for handler in list(self._event_handlers.get(event, [])):
-                try:
-                    handler(value)
-                except Exception:
+            if not isinstance(batch, list):
+                continue
+            for envelope in batch:
+                if not isinstance(envelope, dict):
                     continue
+                kind = str(envelope.get("kind") or "")
+                if kind == "_closed":
+                    return
+                if kind == "_overflow":
+                    self._reconcile_event_stream_overflow(envelope.get("payload"))
+                    continue
+                if kind not in _PAGE_OBSERVATION_EVENTS:
+                    continue
+                self._handle_observation_event(kind, envelope.get("payload"))
+                if not self._event_listeners_active():
+                    return
+
+    def _reconcile_event_stream_overflow(self, payload: Any) -> None:
+        dropped = payload.get("dropped") if isinstance(payload, dict) else None
+        try:
+            dropped_count = max(int(dropped), 0)
+        except (TypeError, ValueError):
+            dropped_count = 0
+        warnings.warn(
+            f"rustwright page event stream overflow: dropped {dropped_count} event(s); "
+            "network-idle and dialog bookkeeping was resynchronized",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        with self._network_idle_condition:
+            self._network_idle_active_requests.clear()
+            self._network_idle_last_activity = time.monotonic()
+            self._network_idle_condition.notify_all()
+        try:
+            _call(self._core.handle_dialog, False, None, min(self._default_timeout, 500.0))
+        except Error:
+            pass
+
+    def _handle_observation_event(self, event: str, payload: Any) -> None:
+        payload = payload if isinstance(payload, dict) else {}
+        if event in {"request", "response", "requestfinished", "requestfailed"}:
+            self._handle_network_event(event, payload)
+        elif event == "dialog":
+            self._handle_dialog_event(payload)
+        elif event == "console":
+            self._handle_console_event(payload)
+        elif event == "pageerror":
+            self._handle_page_error_event(payload)
+        elif event in {"load", "domcontentloaded"}:
+            self._handle_page_cdp_event(event)
+        elif event == "framenavigated":
+            self._handle_frame_navigated_event(payload)
+        elif event in {"frameattached", "framedetached"}:
+            self._handle_frame_lifecycle_event(event, payload)
+
+    def _handle_network_event(self, event: str, payload: dict[str, Any]) -> None:
+        value: Request | Response
+        if event == "request":
+            value = _request_from_payload(payload, self) or Request(url="", _page=self)
+            value = self._record_request(value)
+        elif event == "response":
+            value = _response_from_payload(self, payload)
+            self._record_response(value)
+        else:
+            value = _request_from_payload(payload, self) or Request(url="", _page=self)
+            value = self._adopt_request(value)
+        self._dispatch_network_value(event, value)
+
+    def _dispatch_network_value(self, event: str, value: Request | Response) -> None:
+        if isinstance(value, Request):
+            self._note_network_lifecycle_event(event, value)
+        for handler in list(self._event_handlers.get(event, [])):
+            try:
+                handler(value)
+            except Exception:
+                continue
+
+    def _handle_dialog_event(self, payload: dict[str, Any]) -> None:
+        dialog = Dialog(self, payload)
+        handlers = list(self._event_handlers.get("dialog", []))
+        for handler in handlers:
+            try:
+                handler(dialog)
+            except Exception:
+                continue
+        if not handlers and not dialog._handled:
+            try:
+                dialog.dismiss()
+            except Error:
+                pass
+        self._dialog_dispatch_count += 1
+
+    def _handle_console_event(self, payload: dict[str, Any]) -> None:
+        event = ConsoleMessage(self, payload)
+        self._record_console_message(event)
+        self._dispatch_console_event(event)
+
+    def _dispatch_console_event(self, event: ConsoleMessage) -> None:
+        for handler in list(self._event_handlers.get("console", [])):
+            try:
+                handler(event)
+            except Exception:
+                continue
+        with self._console_dispatch_condition:
+            self._console_dispatch_generation += 1
+            self._console_dispatch_condition.notify_all()
+
+    def _handle_page_error_event(self, payload: dict[str, Any]) -> None:
+        event = _page_error_from_payload(payload)
+        self._record_page_error(event)
+        self._dispatch_page_error_event(event)
+
+    def _dispatch_page_error_event(self, event: Error) -> None:
+        for handler in list(self._event_handlers.get("pageerror", [])):
+            try:
+                handler(event)
+            except Exception:
+                continue
+
+    def _handle_page_cdp_event(self, event: str) -> None:
+        for handler in list(self._event_handlers.get(event, [])):
+            try:
+                handler(self)
+            except Exception:
+                continue
+
+    def _handle_frame_navigated_event(self, payload: dict[str, Any]) -> None:
+        frame = self._frame_from_navigated_payload(
+            {"params": payload},
+            same_document="frame" not in payload,
+        )
+        self._dispatch_frame_navigated_event(frame)
+
+    def _dispatch_frame_navigated_event(self, frame: Frame) -> None:
+        for handler in list(self._event_handlers.get("framenavigated", [])):
+            try:
+                handler(frame)
+            except Exception:
+                continue
+
+    def _handle_frame_lifecycle_event(self, event: str, payload: dict[str, Any]) -> None:
+        envelope = {"params": payload}
+        frame = self._frame_from_attached_payload(envelope) if event == "frameattached" else self._frame_from_detached_payload(envelope)
+        self._dispatch_frame_lifecycle_event(event, frame)
+
+    def _dispatch_frame_lifecycle_event(self, event: str, frame: Frame) -> None:
+        for handler in list(self._event_handlers.get(event, [])):
+            try:
+                handler(frame)
+            except Exception:
+                continue
 
     def _record_request(self, request: Request) -> Request:
         request = self._adopt_request(request)
@@ -18889,187 +19111,13 @@ class Page:
             for old_request_id in list(self._fulfilled_route_bodies)[:-200]:
                 self._fulfilled_route_bodies.pop(old_request_id, None)
 
-    def _ensure_page_cdp_event_thread(self, event: str, method: str) -> None:
-        existing = self._event_threads.get(event)
-        if existing is not None and existing.is_alive():
-            return
-        waiter = _call(self._core.cdp_session).event_waiter(method)
-        self._event_waiters[event] = waiter
-        thread = threading.Thread(
-            target=self._page_cdp_event_loop,
-            args=(event, method, waiter),
-            daemon=True,
-            name=f"rustwright-{event}-listener",
-        )
-        self._event_threads[event] = thread
-        thread.start()
-
-    def _page_cdp_event_loop(self, event: str, method: str, waiter: Any) -> None:
-        while self._event_listeners_active():
-            if not self._event_handlers.get(event):
-                time.sleep(0.05)
-                continue
-            try:
-                value = self._wait_for_page_cdp_event(method, timeout=500.0, waiter=waiter)
-            except TimeoutError:
-                continue
-            except Error:
-                break
-            for handler in list(self._event_handlers.get(event, [])):
-                try:
-                    handler(value)
-                except Exception:
-                    continue
-
-    def _ensure_frame_navigated_thread(self) -> None:
-        existing = self._event_threads.get("framenavigated")
-        if existing is not None and existing.is_alive():
-            return
-        session = _call(self._core.cdp_session)
-        waiter = session.event_waiter("Page.frameNavigated")
-        same_document_waiter = session.event_waiter("Page.navigatedWithinDocument")
-        self._event_waiters["framenavigated"] = (waiter, same_document_waiter)
-        thread = threading.Thread(
-            target=self._frame_navigated_loop,
-            args=(waiter, same_document_waiter),
-            daemon=True,
-            name="rustwright-framenavigated-listener",
-        )
-        self._event_threads["framenavigated"] = thread
-        thread.start()
-
-    def _frame_navigated_loop(self, waiter: Any, same_document_waiter: Any) -> None:
-        while self._event_listeners_active():
-            if not self._event_handlers.get("framenavigated"):
-                time.sleep(0.05)
-                continue
-            try:
-                frame = self._wait_for_frame_navigated_event(
-                    timeout=500.0,
-                    waiter=waiter,
-                    same_document_waiter=same_document_waiter,
-                )
-            except TimeoutError:
-                continue
-            except Error:
-                break
-            for handler in list(self._event_handlers.get("framenavigated", [])):
-                try:
-                    handler(frame)
-                except Exception:
-                    continue
-
-    def _ensure_frame_lifecycle_thread(self, event: str, method: str) -> None:
-        existing = self._event_threads.get(event)
-        if existing is not None and existing.is_alive():
-            return
-        waiter = _call(self._core.cdp_session).event_waiter(method)
-        self._event_waiters[event] = waiter
-        thread = threading.Thread(
-            target=self._frame_lifecycle_loop,
-            args=(event, method, waiter),
-            daemon=True,
-            name=f"rustwright-{event}-listener",
-        )
-        self._event_threads[event] = thread
-        thread.start()
-
-    def _frame_lifecycle_loop(self, event: str, method: str, waiter: Any) -> None:
-        while self._event_listeners_active():
-            if not self._event_handlers.get(event):
-                time.sleep(0.05)
-                continue
-            try:
-                frame = self._wait_for_frame_lifecycle_event(event, method, timeout=500.0, waiter=waiter)
-            except TimeoutError:
-                continue
-            except Error:
-                break
-            for handler in list(self._event_handlers.get(event, [])):
-                try:
-                    handler(frame)
-                except Exception:
-                    continue
-
-    def _ensure_dialog_thread(self) -> None:
-        existing = self._dialog_thread
-        if existing is not None and existing.is_alive():
-            return
-        self._dialog_waiter = self._core.dialog_event_waiter()
-        thread = threading.Thread(target=self._dialog_loop, daemon=True, name="rustwright-dialog-listener")
-        self._dialog_thread = thread
-        thread.start()
-
-    def _dialog_loop(self) -> None:
-        while self._event_listeners_active():
-            try:
-                payload = json.loads(_call(self._dialog_waiter.wait, 500.0))
-            except TimeoutError:
-                continue
-            except Error:
-                break
-            dialog = Dialog(self, payload)
-            handlers = list(self._event_handlers.get("dialog", []))
-            for handler in handlers:
-                try:
-                    handler(dialog)
-                except Exception:
-                    continue
-            if not handlers and not dialog._handled:
-                try:
-                    dialog.dismiss()
-                except Error:
-                    pass
-            self._dialog_dispatch_count += 1
-
     def _ensure_console_thread(self) -> None:
-        existing = self._console_thread
-        if existing is not None and existing.is_alive():
-            return
-        self._console_waiter = self._core.console_event_waiter()
-        thread = threading.Thread(target=self._console_loop, daemon=True, name="rustwright-console-listener")
-        self._console_thread = thread
-        thread.start()
-
-    def _console_loop(self) -> None:
-        while self._event_listeners_active():
-            try:
-                event = self._wait_for_console_event(timeout=500.0, waiter=self._console_waiter)
-            except TimeoutError:
-                continue
-            except Error:
-                break
-            for handler in list(self._event_handlers.get("console", [])):
-                try:
-                    handler(event)
-                except Exception:
-                    continue
-            with self._console_dispatch_condition:
-                self._console_dispatch_generation += 1
-                self._console_dispatch_condition.notify_all()
+        self._event_stream.enable_runtime()
+        self._runtime_observation_enabled = True
 
     def _ensure_page_error_thread(self) -> None:
-        existing = self._page_error_thread
-        if existing is not None and existing.is_alive():
-            return
-        self._page_error_waiter = self._page_error_event_waiter()
-        thread = threading.Thread(target=self._page_error_loop, daemon=True, name="rustwright-pageerror-listener")
-        self._page_error_thread = thread
-        thread.start()
-
-    def _page_error_loop(self) -> None:
-        while self._event_listeners_active():
-            try:
-                event = self._wait_for_page_error_event(timeout=500.0, waiter=self._page_error_waiter)
-            except TimeoutError:
-                continue
-            except Error:
-                break
-            for handler in list(self._event_handlers.get("pageerror", [])):
-                try:
-                    handler(event)
-                except Exception:
-                    continue
+        self._event_stream.enable_runtime()
+        self._runtime_observation_enabled = True
 
     def _page_error_duplicate(self, existing: Any, new: Error) -> bool:
         if str(existing) != str(new):
