@@ -1988,6 +1988,21 @@ impl PageInner {
         resolve_cached_main_frame_url(main_id.as_deref(), &state)
     }
 
+    fn record_frame_navigation_url(&self, frame_id: &str, url: &str, session_id: &str) {
+        self.frame_state.lock().unwrap().record_frame(
+            frame_id.to_string(),
+            None,
+            None,
+            Some(url.to_string()),
+            session_id.to_string(),
+        );
+    }
+
+    fn record_main_frame_navigation_url(&self, frame_id: &str, url: &str) {
+        *self.main_frame_id.lock().unwrap() = Some(frame_id.to_string());
+        self.record_frame_navigation_url(frame_id, url, &self.session_id);
+    }
+
     fn frame_tree_payload(&self) -> Value {
         let state = self.frame_state.lock().unwrap();
         let root_id = self.main_frame_id.lock().unwrap().clone().or_else(|| {
@@ -3822,6 +3837,9 @@ impl PyPage {
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
                 if loader_id.is_none() {
+                    if let Some(frame_id) = result.get("frameId").and_then(Value::as_str) {
+                        page.record_main_frame_navigation_url(frame_id, &target_url);
+                    }
                     return Ok(Value::Null.to_string());
                 }
                 let response = wait_for_navigation(
@@ -3893,6 +3911,14 @@ impl PyPage {
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
                 if loader_id.is_none() {
+                    if let Some(navigated_frame_id) = result.get("frameId").and_then(Value::as_str)
+                    {
+                        page.record_frame_navigation_url(
+                            navigated_frame_id,
+                            &target_url,
+                            &session_id,
+                        );
+                    }
                     return Ok(Value::Null.to_string());
                 }
                 let response = wait_for_navigation(
@@ -7066,6 +7092,9 @@ impl RustwrightPage {
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
             if loader_id.is_none() {
+                if let Some(frame_id) = result.get("frameId").and_then(Value::as_str) {
+                    page.record_main_frame_navigation_url(frame_id, &target_url);
+                }
                 return Ok(Value::Null.to_string());
             }
             let response = wait_for_navigation(
