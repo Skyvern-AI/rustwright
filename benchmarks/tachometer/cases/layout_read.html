@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tachometer layout read</title>
+<style>
+  #grid {
+    display: grid;
+    grid-template-columns: repeat(20, 1fr);
+    gap: 2px;
+  }
+  .cell {
+    min-height: 12px;
+    border: 1px solid #999;
+  }
+</style>
+<div id="grid"></div>
+<script type="module">
+  import * as bench from '/bench.js';
+
+  const grid = document.querySelector('#grid');
+  for (let index = 0; index < 800; index += 1) {
+    const cell = document.createElement('div');
+    cell.className = 'cell';
+    cell.textContent = String(index);
+    grid.append(cell);
+  }
+
+  bench.start();
+  let total = 0;
+  for (const cell of document.querySelectorAll('.cell')) {
+    const rect = cell.getBoundingClientRect();
+    total += rect.width + rect.height;
+  }
+  window.tachometerResult = total;
+  bench.stop();
+</script>

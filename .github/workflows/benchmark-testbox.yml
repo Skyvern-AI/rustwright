@@ -1,0 +1,51 @@
+name: Rustwright Benchmark Testbox
+
+on:
+  workflow_dispatch:
+    inputs:
+      testbox_id:
+        type: string
+        description: "Testbox session ID"
+        required: true
+
+jobs:
+  benchmark:
+    if: github.repository == 'Skyvern-AI/rustwright'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 120
+    env:
+      RUSTWRIGHT_DOCKER_IMAGE: rustwright-verify-testbox
+      TEST_DOCKER_MEMORY_LIMIT: 8g
+      INSTALL_BROWSER_HARNESS: "1"
+      INSTALL_PUPPETEER: "1"
+      DOCKER_BUILDKIT: "1"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Begin Testbox
+        uses: useblacksmith/begin-testbox@233448af4bfdc6fca509a7f0974411ac6d8a8043 # v2
+        with:
+          testbox_id: ${{ inputs.testbox_id }}
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Verify Docker
+        run: |
+          docker version
+          docker info
+
+      - name: Build benchmark Docker image
+        run: |
+          tools/docker_test.sh build .
+
+      - name: Run Testbox
+        uses: useblacksmith/run-testbox@5ca05834db1d3813554d1dd109e5f2087a8d7cbc # v2
+        if: always()
+        env:
+          RUSTWRIGHT_DOCKER_IMAGE: rustwright-verify-testbox
+          TEST_DOCKER_MEMORY_LIMIT: 8g
+          INSTALL_BROWSER_HARNESS: "1"
+          INSTALL_PUPPETEER: "1"
+          DOCKER_BUILDKIT: "1"

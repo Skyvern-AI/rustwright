@@ -1,0 +1,48 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "rustwright"
+version = "0.1.0-alpha.2"
+description = "A Rust-backed, CDP-first Python automation library with a Playwright-compatible sync API"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Rustwright Contributors" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Homepage = "https://github.com/Skyvern-AI/rustwright"
+Repository = "https://github.com/Skyvern-AI/rustwright"
+Issues = "https://github.com/Skyvern-AI/rustwright/issues"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-benchmark>=4",
+]
+compare = [
+  "playwright>=1.50",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "rustwright._rustwright"
+features = ["pyo3/extension-module"]
+
+[project.scripts]
+rustwright = "rustwright.cli:main"
+
+[project.entry-points.pytest11]
+rustwright = "rustwright.pytest_plugin"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

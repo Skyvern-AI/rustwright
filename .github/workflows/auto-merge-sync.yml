@@ -1,0 +1,48 @@
+name: Auto-merge sync PRs
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, labeled, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  merge-when-sync:
+    # Auto-merge only machine-generated mirror PRs:
+    #   - carry the 'sync' label applied by repo-file-sync-action
+    #   - branch created by the sync action (repo-sync/*)
+    #   - opened by the configured sync actor
+    if: >-
+      contains(join(github.event.pull_request.labels.*.name, ','), 'sync') &&
+      startsWith(github.event.pull_request.head.ref, 'repo-sync/') &&
+      github.event.pull_request.user.login == vars.RUSTWRIGHT_SYNC_ACTOR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for required checks to pass
+        uses: lewagon/wait-on-check-action@74049309dfeff245fe8009a0137eacf28136cb3c # v1.5.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 15
+          allowed-conclusions: success,skipped,neutral
+          ignore-checks: merge-when-sync,claude-review
+      - name: Verify PR is still open
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          STATE=$(gh pr view ${{ github.event.pull_request.number }} --repo "${{ github.repository }}" --json state --jq '.state')
+          if [ "$STATE" != "OPEN" ]; then
+            echo "::error::PR is $STATE — aborting merge"
+            exit 1
+          fi
+      - name: Merge sync PR with admin bypass
+        env:
+          GH_TOKEN: ${{ secrets.RUSTWRIGHT_SYNC_GH_PAT }}
+        run: |-
+          gh pr merge ${{ github.event.pull_request.number }} \
+            --squash \
+            --admin \
+            --repo "${{ github.repository }}"

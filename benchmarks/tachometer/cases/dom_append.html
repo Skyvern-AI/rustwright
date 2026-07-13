@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tachometer DOM append</title>
+<script type="module">
+  import * as bench from '/bench.js';
+
+  bench.start();
+  const root = document.createElement('main');
+  for (let index = 0; index < 500; index += 1) {
+    const button = document.createElement('button');
+    button.textContent = `Action ${index}`;
+    button.dataset.index = String(index);
+    root.append(button);
+  }
+  document.body.append(root);
+  bench.stop();
+</script>

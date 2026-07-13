@@ -1,0 +1,9 @@
+{
+  "id": "motionmark",
+  "category": "browser-engine-rendering",
+  "primary_use": "Measure graphics/rendering performance for the selected browser binary/config through Crossbench.",
+  "source_url": "https://browserbench.org/MotionMark/",
+  "default_command": "python benchmarks/motionmark/run.py --repeat 10 --browser chrome-stable",
+  "setup_command": "python benchmarks/crossbench/run.py --setup",
+  "outputs": ".benchmark-data/browser-speed/results/crossbench/"
+}

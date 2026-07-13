@@ -1,0 +1,115 @@
+name: Rustwright Tests
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  test:
+    name: cargo and fast pytest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python build and test dependencies
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+          .venv/bin/python -m pip install -U pip maturin pytest pytest-benchmark
+
+      - name: Cargo check
+        run: cargo check --locked
+
+      - name: Cargo test
+        run: cargo test --locked
+
+      - name: Build Python extension
+        run: maturin develop --release
+
+      - name: Install Chromium dependencies
+        run: python -m rustwright install-deps chromium
+
+      - name: Install Chromium
+        run: python -m rustwright install chromium
+
+      - name: Run fast representative pytest subset
+        run: >-
+          pytest tests/test_rustwright_sync_api.py
+          -k "test_launch_goto_title_and_url or
+          test_goto_returns_real_response_status_headers_and_body or
+          test_navigation_response_body_remains_readable_after_later_navigation or
+          test_goto_wait_until_commit_returns_real_response or
+          test_history_navigation_returns_real_responses or
+          test_reload_returns_real_response or
+          test_default_navigation_actions_do_not_enable_runtime or
+          test_page_errors_history_does_not_enable_runtime or
+          test_click_updates_dom or
+          test_locator_click_dispatches_trusted_mouse_sequence_by_default or
+          test_fill_sets_value_and_dispatches_events or
+          test_type_inserts_at_focus_caret_like_playwright or
+          test_focus_press_keyboard_and_hover or
+          test_locator_type_press_attached_input_behavior_matches_playwright or
+          test_keyboard_press_supports_shift_shortcut or
+          test_mouse_wheel_dispatches_single_trusted_event_like_playwright or
+          test_page_and_locator_click_support_mouse_options or
+          test_locator_count_nth_and_text or
+          test_locator_last_is_dynamic_match_playwright or
+          test_locator_explicit_index_narrows_count_and_collections or
+          test_named_role_button_click_fast_path_preserves_click_and_strictness or
+          test_label_control_fast_paths_fill_check_and_preserve_strictness or
+          test_wait_for_selector or
+          test_query_selector_returns_element_handle or
+          test_text_selector_engine_matches_playwright_text_selectors or
+          test_role_selector_engine_matches_playwright_common_role_attributes or
+          test_frame_api_can_query_and_act_in_same_origin_iframe or
+          test_frame_goto_returns_navigation_response or
+          test_frame_locator_scopes_locators_to_iframe_content or
+          test_nested_cross_origin_oopif_frame_locator or
+          test_page_request_and_response_events_are_dispatched or
+          test_expect_response_captures_fetch_response or
+          test_expect_request_captures_fetch_request or
+          test_post_request_body_helpers_and_response_link or
+          test_page_route_can_fulfill_fetch or
+          test_context_route_applies_to_new_pages or
+          test_page_route_times_unroutes_after_match or
+          test_page_route_continue_can_override_headers or
+          test_page_route_fulfill_can_override_fetched_response or
+          test_expect_download_captures_file or
+          test_download_save_as_fetches_when_cdp_path_is_not_local or
+          test_download_delete_invalidates_artifact_and_save_as_path_validation_matches_playwright or
+          test_accept_downloads_false_matches_playwright_error_shape or
+          test_dialog_event_accepts_prompt or
+          test_dialog_event_dismisses_alert or
+          test_expect_dialog_captures_prompt or
+          test_dialog_accept_dismiss_validation_matches_playwright or
+          test_pageerror_event_and_page_errors_storage or
+          test_evaluate_expression_function_and_arg or
+          test_evaluate_handle_json_property_evaluate_and_dispose or
+          test_evaluate_dom_node_serialization_and_frame_handle or
+          test_locator_evaluate_and_evaluate_all or
+          test_screenshot_returns_png_and_writes_path or
+          test_screenshot_type_quality_and_path_extension_match_playwright or
+          test_locator_screenshot_captures_element_clip or
+          test_unsupported_browser_types_raise or
+          test_async_page_navigation_response_methods or
+          test_async_navigation_helpers_yield_event_loop or
+          test_async_page_locator_and_mouse_common_wrappers or
+          test_async_expect_dialog_download_and_file_chooser_wrappers or
+          test_async_page_route_fetch_and_fulfill_response or
+          test_async_page_and_context_unroute_all_are_scoped or
+          test_async_expect_event_captures_pageerror or
+          test_async_evaluate_handle_flow or
+          test_async_keyboard_type_respects_delay or
+          test_async_frame_and_handle_identity_wrappers or
+          test_async_api_basic_flow"

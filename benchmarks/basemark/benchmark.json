@@ -1,0 +1,9 @@
+{
+  "id": "basemark",
+  "category": "browser-engine-system",
+  "primary_use": "Optional browser/system performance benchmark with JS, DOM/CSS, and graphics workloads.",
+  "source_url": "https://www.gpuscore.com/benchmarks/basemark-web/",
+  "default_command": "BASEMARK_ALLOW_COMMUNITY_MODE=1 python benchmarks/basemark/run.py --print-command",
+  "setup_command": "",
+  "outputs": ".benchmark-data/browser-speed/results/basemark/"
+}

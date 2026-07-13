@@ -1,0 +1,57 @@
+[
+  {
+    "annotation_id": "fixture-click-submit",
+    "confirmed_task": "Click the submit button",
+    "domain": "example.com",
+    "website": "Example",
+    "actions": [
+      {
+        "operation": {"op": "CLICK"},
+        "cleaned_html": "<main><button id=\"submit\" aria-label=\"Submit\">Submit</button></main>",
+        "pos_candidates": [
+          {
+            "tag": "button",
+            "text": "Submit",
+            "attributes": {"id": "submit", "aria-label": "Submit"}
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "annotation_id": "fixture-type-search",
+    "confirmed_task": "Type the search query",
+    "domain": "example.com",
+    "website": "Example",
+    "actions": [
+      {
+        "operation": {"op": "TYPE", "value": "weather"},
+        "cleaned_html": "<main><label>Search <input id=\"q\" name=\"q\" placeholder=\"Search\"></label></main>",
+        "pos_candidates": [
+          {
+            "tag": "input",
+            "attributes": {"id": "q", "name": "q", "placeholder": "Search"}
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "annotation_id": "fixture-select-plan",
+    "confirmed_task": "Select the pro plan",
+    "domain": "billing.example.com",
+    "website": "Billing Example",
+    "actions": [
+      {
+        "operation": {"op": "SELECT", "value": "pro"},
+        "cleaned_html": "<main><label>Plan <select id=\"plan\"><option value=\"basic\">Basic</option><option value=\"pro\">Pro</option></select></label></main>",
+        "pos_candidates": [
+          {
+            "tag": "select",
+            "attributes": {"id": "plan"}
+          }
+        ]
+      }
+    ]
+  }
+]

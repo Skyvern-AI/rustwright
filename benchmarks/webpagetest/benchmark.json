@@ -1,0 +1,9 @@
+{
+  "id": "webpagetest",
+  "category": "external-page-load",
+  "primary_use": "Submit page-load tests to WebPageTest for independent synthetic waterfall and performance diagnostics.",
+  "source_url": "https://docs.webpagetest.org/",
+  "default_command": "WEBPAGETEST_API_KEY=... python benchmarks/webpagetest/run.py --url https://example.com --run",
+  "setup_command": "",
+  "outputs": ".benchmark-data/browser-speed/results/webpagetest/"
+}
