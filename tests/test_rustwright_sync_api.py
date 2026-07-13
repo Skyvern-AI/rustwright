@@ -203,6 +203,24 @@ def subprocess_env(**overrides: str) -> dict[str, str]:
     return env
 
 
+def require_reference_module(module_name: str, reason: str) -> None:
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import importlib.util, sys; raise SystemExit(3 if importlib.util.find_spec(sys.argv[1]) is None else 0)",
+            module_name,
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=10,
+    )
+    if probe.returncode == 3:
+        pytest.skip(reason)
+    assert probe.returncode == 0, probe.stdout
+
+
 def webm_size(path: Path) -> tuple[int, int]:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
@@ -19817,6 +19835,10 @@ def test_cli_install_chromium_accepts_existing_executable(tmp_path: Path):
 
 
 def test_playwright_module_cli_alias_install_chromium(tmp_path: Path):
+    require_reference_module(
+        "playwright",
+        "reference Playwright package is required for the python -m playwright CLI compatibility test",
+    )
     result = subprocess.run(
         [
             sys.executable,
@@ -19878,6 +19900,10 @@ def test_rustwright_module_cli_alias_install_chromium_and_help(tmp_path: Path):
 
 
 def test_patchright_module_cli_alias_install_chromium_and_help(tmp_path: Path):
+    require_reference_module(
+        "patchright",
+        "reference Patchright package is required for the python -m patchright CLI compatibility test",
+    )
     install_result = subprocess.run(
         [
             sys.executable,
@@ -20450,6 +20476,10 @@ def test_cli_browser_aliases_delegate_to_open(monkeypatch):
 
 
 def test_cli_show_trace_renders_static_viewer(tmp_path: Path):
+    require_reference_module(
+        "playwright",
+        "reference Playwright package is required for the python -m playwright trace CLI compatibility test",
+    )
     trace_path = tmp_path / "trace.zip"
     output_path = tmp_path / "trace.html"
     trace_events = [
@@ -20532,6 +20562,10 @@ def test_cli_show_trace_renders_static_viewer(tmp_path: Path):
 
 
 def test_cli_trace_lists_actions_requests_and_errors(tmp_path: Path):
+    require_reference_module(
+        "playwright",
+        "reference Playwright package is required for the python -m playwright trace CLI compatibility test",
+    )
     trace_path = tmp_path / "trace.zip"
     trace_events = [
         {"type": "context-options", "browserName": "chromium", "sdkLanguage": "python"},
@@ -21185,6 +21219,10 @@ def test_browser_fixture_uses_connected_browser(browser):
 
 
 def test_pytest_playwright_compat_module_exports_plugin_and_types(tmp_path: Path):
+    require_reference_module(
+        "pytest_playwright",
+        "reference pytest-playwright package is required for this plugin compatibility test",
+    )
     import pytest_playwright.pytest_playwright as compat_plugin
     from pytest_playwright.pytest_playwright import CreateContextCallback
 
