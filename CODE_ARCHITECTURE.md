@@ -25,12 +25,12 @@ Last updated: 2026-05-25
 | `python/rustwright/pytest_plugin.py` | Pytest fixtures. |
 | `python/playwright/*`, `python/patchright/*`, `python/cloakbrowser/*` | Compatibility import packages. Public alpha compatibility imports should be enabled only through opt-in compatibility mode. |
 | `benchmarks/automation_cases.py` | 408 shared Playwright-style automation/parity cases and the 15-case benchmark subset, including WebVoyager/Mind2Web-style workflow cases. |
-| `benchmarks/run_benchmarks.py` | Rustwright, Playwright, and browser-harness benchmark runner for the 15-case comparable workload. |
+| `benchmarks/run_benchmarks.py` | Rustwright and Playwright benchmark runner for the 15-case comparable workload. |
 | `tests/test_rustwright_sync_api.py` | Main behavior/regression suite. |
 | `tests/test_playwright_parity_cases.py` | Shared parity harness test entry point. |
 | `tools/api_surface_audit.py` | Public API surface comparison against reference Playwright. |
 | `tools/run_parity_cases.py` | Runs shared parity cases against Rustwright or reference Playwright. |
-| `tools/run_antibot_benchmarks.py` | Anti-bot benchmark runner covering Tier 0 local smoke signals, Tier 1 public fingerprint adapters for SannySoft, CreepJS, BrowserScan, and DeviceAndBrowserInfo, and local Tier 4 fresh/warm profile matrix checks across Rustwright, Playwright, and browser-harness. |
+| `tools/run_antibot_benchmarks.py` | Anti-bot benchmark runner covering Tier 0 local smoke signals, Tier 1 public fingerprint adapters for SannySoft, CreepJS, BrowserScan, and DeviceAndBrowserInfo, and local Tier 4 fresh/warm profile matrix checks across Rustwright and Playwright. |
 
 ## Known Architecture Debt
 
