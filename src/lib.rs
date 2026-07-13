@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::future::Future;
@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::uri::PathAndQuery;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Uri};
@@ -461,6 +461,417 @@ mod tests {
         assert!(!make_evaluate_expression("() => 1", None).contains("(0, eval)"));
         assert!(!make_evaluate_expression("(x) => x + 1", Some("2")).contains("(0, eval)"));
     }
+
+    #[test]
+    fn blocking_wrapper_falls_back_when_python_is_unavailable() {
+        assert!(
+            Python::try_attach(|_| ()).is_none(),
+            "cargo test should not initialize the Python interpreter"
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+
+        let result = run_blocking_detached(&runtime, async { 42 });
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn combined_page_stream_reuses_network_state_and_preserves_lifecycle_order() {
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let requests = Arc::new(Mutex::new(NetworkRequestStore::new(1)));
+        let mut state = PageEventStreamState::new();
+        let request = json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "request-1",
+                "loaderId": "loader-1",
+                "documentURL": "https://example.test/",
+                "type": "Document",
+                "request": {
+                    "url": "https://example.test/",
+                    "method": "GET",
+                    "headers": {}
+                }
+            }
+        });
+        let response = json!({
+            "sessionId": "page-session",
+            "method": "Network.responseReceived",
+            "params": {
+                "requestId": "request-1",
+                "loaderId": "loader-1",
+                "type": "Document",
+                "hasExtraInfo": true,
+                "response": {
+                    "url": "https://example.test/",
+                    "status": 200,
+                    "statusText": "OK",
+                    "headers": {}
+                }
+            }
+        });
+        let finished = json!({
+            "sessionId": "page-session",
+            "method": "Network.loadingFinished",
+            "params": { "requestId": "request-1", "encodedDataLength": 12 }
+        });
+        let extra = json!({
+            "sessionId": "page-session",
+            "method": "Network.responseReceivedExtraInfo",
+            "params": {
+                "requestId": "request-1",
+                "headers": { "content-type": "text/html" },
+                "headersText": "HTTP/1.1 200 OK"
+            }
+        });
+
+        process_page_observation_event(
+            1,
+            &request,
+            &event_log,
+            "page-session",
+            &requests,
+            &mut state,
+        );
+        let mut batch = Vec::new();
+        append_ready_page_events(&mut batch, &mut state, 64);
+        assert_eq!(batch[0]["kind"], "request");
+        assert!(requests.lock().unwrap().requests.contains_key("request-1"));
+
+        process_page_observation_event(
+            2,
+            &response,
+            &event_log,
+            "page-session",
+            &requests,
+            &mut state,
+        );
+        process_page_observation_event(
+            3,
+            &finished,
+            &event_log,
+            "page-session",
+            &requests,
+            &mut state,
+        );
+        append_ready_page_events(&mut batch, &mut state, 64);
+        assert_eq!(batch.len(), 1);
+
+        process_page_observation_event(
+            4,
+            &extra,
+            &event_log,
+            "page-session",
+            &requests,
+            &mut state,
+        );
+        append_ready_page_events(&mut batch, &mut state, 64);
+        assert_eq!(batch[1]["seq"], 2);
+        assert_eq!(batch[1]["kind"], "response");
+        assert_eq!(
+            batch[1]["payload"]["all_headers"]["content-type"],
+            "text/html"
+        );
+        assert_eq!(batch[2]["seq"], 3);
+        assert_eq!(batch[2]["kind"], "requestfinished");
+    }
+
+    #[test]
+    fn combined_page_stream_filters_sessions_and_merges_frame_navigation_methods() {
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let requests = Arc::new(Mutex::new(NetworkRequestStore::new(5)));
+        let mut state = PageEventStreamState::new();
+        let wrong_session = json!({
+            "sessionId": "other-session",
+            "method": "Page.loadEventFired",
+            "params": { "timestamp": 1 }
+        });
+        let same_document = json!({
+            "sessionId": "page-session",
+            "method": "Page.navigatedWithinDocument",
+            "params": { "frameId": "frame-1", "url": "https://example.test/#hash" }
+        });
+
+        process_page_observation_event(
+            5,
+            &wrong_session,
+            &event_log,
+            "page-session",
+            &requests,
+            &mut state,
+        );
+        process_page_observation_event(
+            6,
+            &same_document,
+            &event_log,
+            "page-session",
+            &requests,
+            &mut state,
+        );
+        let mut batch = Vec::new();
+        append_ready_page_events(&mut batch, &mut state, 64);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0]["kind"], "framenavigated");
+        assert_eq!(batch[0]["payload"]["frameId"], "frame-1");
+    }
+
+    #[test]
+    fn network_request_mutation_is_idempotent_per_event_sequence() {
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let requests = Arc::new(Mutex::new(NetworkRequestStore::new(10)));
+        let mut stream_state = NetworkObservationState::new();
+        let mut waiter_state = NetworkObservationState::new();
+        let initial = json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "request-1",
+                "documentURL": "https://example.test/start",
+                "request": { "url": "https://example.test/start", "method": "GET", "headers": {} }
+            }
+        });
+        let redirect = json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "request-1",
+                "documentURL": "https://example.test/final",
+                "redirectResponse": { "status": 302 },
+                "request": { "url": "https://example.test/final", "method": "GET", "headers": {} }
+            }
+        });
+
+        process_network_observation_event(
+            10,
+            &initial,
+            &event_log,
+            "page-session",
+            &requests,
+            true,
+            &mut stream_state,
+        )
+        .unwrap();
+        process_network_observation_event(
+            10,
+            &initial,
+            &event_log,
+            "page-session",
+            &requests,
+            false,
+            &mut waiter_state,
+        )
+        .unwrap();
+        let first = process_network_observation_event(
+            11,
+            &redirect,
+            &event_log,
+            "page-session",
+            &requests,
+            true,
+            &mut stream_state,
+        )
+        .unwrap()
+        .unwrap()
+        .2;
+        let duplicate = process_network_observation_event(
+            11,
+            &redirect,
+            &event_log,
+            "page-session",
+            &requests,
+            false,
+            &mut waiter_state,
+        )
+        .unwrap()
+        .unwrap()
+        .2;
+
+        assert_eq!(first, duplicate);
+        assert_eq!(duplicate["url"], "https://example.test/final");
+        assert_eq!(
+            duplicate["redirected_from"]["url"],
+            "https://example.test/start"
+        );
+        assert!(duplicate["redirected_from"]["redirected_from"].is_null());
+    }
+
+    #[test]
+    fn network_request_mutation_backfills_redirect_when_later_sequence_arrives_first() {
+        let mut log = CdpEventLog {
+            next_seq: 10,
+            events: VecDeque::with_capacity(CDP_EVENT_LOG_LIMIT),
+        };
+        let initial = json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "request-1",
+                "documentURL": "https://example.test/start",
+                "request": { "url": "https://example.test/start", "method": "GET", "headers": {} }
+            }
+        });
+        let redirect = json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "request-1",
+                "documentURL": "https://example.test/final",
+                "redirectResponse": { "status": 302 },
+                "request": { "url": "https://example.test/final", "method": "GET", "headers": {} }
+            }
+        });
+        log.push(initial.clone());
+        log.push(redirect.clone());
+        let event_log = Arc::new(Mutex::new(log));
+        let requests = Arc::new(Mutex::new(NetworkRequestStore::new(10)));
+        let mut consumer_a = NetworkObservationState::new();
+        let mut consumer_b = NetworkObservationState::new();
+
+        let first_redirect = process_network_observation_event(
+            11,
+            &redirect,
+            &event_log,
+            "page-session",
+            &requests,
+            false,
+            &mut consumer_b,
+        )
+        .unwrap()
+        .unwrap()
+        .2;
+        process_network_observation_event(
+            10,
+            &initial,
+            &event_log,
+            "page-session",
+            &requests,
+            true,
+            &mut consumer_a,
+        )
+        .unwrap();
+        let consumer_b_redirect = process_network_observation_event(
+            11,
+            &redirect,
+            &event_log,
+            "page-session",
+            &requests,
+            false,
+            &mut consumer_b,
+        )
+        .unwrap()
+        .unwrap()
+        .2;
+        let consumer_a_redirect = process_network_observation_event(
+            11,
+            &redirect,
+            &event_log,
+            "page-session",
+            &requests,
+            true,
+            &mut consumer_a,
+        )
+        .unwrap()
+        .unwrap()
+        .2;
+
+        assert_eq!(first_redirect, consumer_b_redirect);
+        assert_eq!(consumer_b_redirect, consumer_a_redirect);
+        assert_eq!(
+            consumer_a_redirect["redirected_from"]["url"],
+            "https://example.test/start"
+        );
+    }
+
+    #[test]
+    fn combined_page_stream_releases_overlapping_responses_in_sequence_order() {
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let requests = Arc::new(Mutex::new(NetworkRequestStore::new(20)));
+        let mut state = PageEventStreamState::new();
+        let response = |request_id: &str, url: &str| {
+            json!({
+                "sessionId": "page-session",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": request_id,
+                    "hasExtraInfo": true,
+                    "response": { "url": url, "status": 200, "headers": {} }
+                }
+            })
+        };
+        let extra = |request_id: &str| {
+            json!({
+                "sessionId": "page-session",
+                "method": "Network.responseReceivedExtraInfo",
+                "params": { "requestId": request_id, "headers": {} }
+            })
+        };
+        let console = json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": { "type": "log", "args": [{ "type": "string", "value": "ready" }] }
+        });
+
+        process_page_observation_event(
+            20,
+            &response("request-a", "https://example.test/a"),
+            &event_log,
+            "page-session",
+            &requests,
+            &mut state,
+        );
+        process_page_observation_event(
+            21,
+            &response("request-b", "https://example.test/b"),
+            &event_log,
+            "page-session",
+            &requests,
+            &mut state,
+        );
+        process_page_observation_event(
+            22,
+            &console,
+            &event_log,
+            "page-session",
+            &requests,
+            &mut state,
+        );
+        process_page_observation_event(
+            23,
+            &extra("request-b"),
+            &event_log,
+            "page-session",
+            &requests,
+            &mut state,
+        );
+        let mut batch = Vec::new();
+        append_ready_page_events(&mut batch, &mut state, 64);
+        assert!(batch.is_empty());
+
+        process_page_observation_event(
+            24,
+            &extra("request-a"),
+            &event_log,
+            "page-session",
+            &requests,
+            &mut state,
+        );
+        append_ready_page_events(&mut batch, &mut state, 64);
+        assert_eq!(
+            batch
+                .iter()
+                .map(|envelope| envelope["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![20, 21, 22]
+        );
+        assert_eq!(batch[0]["payload"]["url"], "https://example.test/a");
+        assert_eq!(batch[1]["payload"]["url"], "https://example.test/b");
+        assert_eq!(batch[2]["kind"], "console");
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -565,6 +976,7 @@ struct CdpClient {
     next_id: AtomicU64,
     sent_runtime_enable_count: AtomicU64,
     alive: Arc<AtomicBool>,
+    alive_tx: watch::Sender<bool>,
 }
 
 struct CdpEventLog {
@@ -601,12 +1013,11 @@ impl CdpEventLog {
             .collect()
     }
 
-    fn advance_past(&self, cursor: u64, event: &Value) -> u64 {
+    fn oldest_seq(&self) -> u64 {
         self.events
-            .iter()
-            .find(|(seq, candidate)| *seq >= cursor && candidate == event)
-            .map(|(seq, _)| seq.saturating_add(1))
-            .unwrap_or(cursor)
+            .front()
+            .map(|(seq, _)| *seq)
+            .unwrap_or(self.next_seq)
     }
 }
 
@@ -706,7 +1117,8 @@ fn dispatch_cdp_payload(
             let _ = sender.send(result);
         }
     } else {
-        event_log.lock().unwrap().push(payload.clone());
+        let mut event_log = event_log.lock().unwrap();
+        event_log.push(payload.clone());
         let _ = events.send(payload);
     }
 }
@@ -808,6 +1220,9 @@ impl CdpClient {
         let alive = Arc::new(AtomicBool::new(true));
         let alive_writer = Arc::clone(&alive);
         let alive_reader = Arc::clone(&alive);
+        let (alive_tx, _) = watch::channel(true);
+        let alive_tx_writer = alive_tx.clone();
+        let alive_tx_reader = alive_tx.clone();
 
         tokio::spawn(async move {
             while let Some(message) = write_rx.recv().await {
@@ -815,6 +1230,7 @@ impl CdpClient {
                     CdpOutgoing::Text(text) => {
                         if write.send(Message::Text(text.into())).await.is_err() {
                             alive_writer.store(false, Ordering::SeqCst);
+                            alive_tx_writer.send_replace(false);
                             break;
                         }
                     }
@@ -846,6 +1262,7 @@ impl CdpClient {
                 );
             }
             alive_reader.store(false, Ordering::SeqCst);
+            alive_tx_reader.send_replace(false);
             close_pending_cdp_commands(pending_reader);
         });
 
@@ -857,6 +1274,7 @@ impl CdpClient {
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             alive,
+            alive_tx,
         }))
     }
 
@@ -876,6 +1294,9 @@ impl CdpClient {
         let alive = Arc::new(AtomicBool::new(true));
         let alive_writer = Arc::clone(&alive);
         let alive_dispatcher = Arc::clone(&alive);
+        let (alive_tx, _) = watch::channel(true);
+        let alive_tx_writer = alive_tx.clone();
+        let alive_tx_dispatcher = alive_tx.clone();
 
         tokio::task::spawn_blocking(move || {
             while let Some(message) = write_rx.blocking_recv() {
@@ -885,6 +1306,7 @@ impl CdpClient {
                             || pipe_write.write_all(&[0]).is_err()
                         {
                             alive_writer.store(false, Ordering::SeqCst);
+                            alive_tx_writer.send_replace(false);
                             break;
                         }
                     }
@@ -929,6 +1351,7 @@ impl CdpClient {
                 );
             }
             alive_dispatcher.store(false, Ordering::SeqCst);
+            alive_tx_dispatcher.send_replace(false);
             close_pending_cdp_commands(pending_dispatcher);
         });
 
@@ -940,6 +1363,7 @@ impl CdpClient {
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             alive,
+            alive_tx,
         }))
     }
 
@@ -957,7 +1381,13 @@ impl CdpClient {
 
     fn close(&self) {
         self.alive.store(false, Ordering::SeqCst);
+        self.alive_tx.send_replace(false);
         let _ = self.write_tx.send(CdpOutgoing::Close);
+    }
+
+    fn mark_closed(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        self.alive_tx.send_replace(false);
     }
 
     fn record_sent_command(&self, method: &str) {
@@ -1001,7 +1431,7 @@ impl CdpClient {
             .send(CdpOutgoing::Text(payload.to_string()))
             .is_err()
         {
-            self.alive.store(false, Ordering::SeqCst);
+            self.mark_closed();
             self.pending.lock().unwrap().remove(&id);
             return Err(RwError::Message("CDP websocket is closed".to_string()));
         }
@@ -1048,7 +1478,7 @@ impl CdpClient {
         };
 
         if self.write_tx.send(CdpOutgoing::Text(payload)).is_err() {
-            self.alive.store(false, Ordering::SeqCst);
+            self.mark_closed();
             self.pending.lock().unwrap().remove(&id);
             return Err(RwError::Message("CDP websocket is closed".to_string()));
         }
@@ -1100,7 +1530,7 @@ impl CdpClient {
             };
 
             if self.write_tx.send(CdpOutgoing::Text(payload)).is_err() {
-                self.alive.store(false, Ordering::SeqCst);
+                self.mark_closed();
                 self.pending.lock().unwrap().remove(&id);
                 return Err(RwError::Message("CDP websocket is closed".to_string()));
             }
@@ -1161,12 +1591,51 @@ impl LaunchedCdpTransport {
     }
 }
 
+fn run_detached<T, F>(operation: F) -> T
+where
+    T: Send,
+    F: FnOnce() -> T + Send,
+{
+    let mut operation = Some(operation);
+    if let Some(result) = Python::try_attach(|py| {
+        let operation = operation
+            .take()
+            .expect("detached operation should only be consumed once");
+        py.detach(operation)
+    }) {
+        result
+    } else {
+        operation
+            .take()
+            .expect("unattached operation should still be available")()
+    }
+}
+
+fn run_blocking_detached<Fut>(runtime: &tokio::runtime::Runtime, future: Fut) -> Fut::Output
+where
+    Fut: Future + Send,
+    Fut::Output: Send,
+{
+    run_detached(|| runtime.block_on(future))
+}
+
 impl BrowserInner {
-    fn block_on<T, Fut>(&self, future: Fut) -> RwResult<T>
+    fn block_on_raw<Fut>(&self, future: Fut) -> Fut::Output
     where
-        Fut: Future<Output = RwResult<T>>,
+        Fut: Future,
     {
         self.runtime.block_on(future)
+    }
+
+    fn block_on<T, Fut>(&self, future: Fut) -> RwResult<T>
+    where
+        T: Send,
+        Fut: Future<Output = RwResult<T>> + Send,
+    {
+        // PyO3 callers should release the GIL for long CDP operations. Rust and Node callers do
+        // not initialize Python, and shutdown may make attachment unavailable, so fall back to the
+        // raw runtime path instead of panicking.
+        run_blocking_detached(&self.runtime, future)
     }
 
     fn command_timeout(timeout_ms: Option<f64>) -> Duration {
@@ -1178,6 +1647,10 @@ impl BrowserInner {
     }
 
     fn close(&self) -> RwResult<()> {
+        run_detached(|| self.close_without_gil())
+    }
+
+    fn close_without_gil(&self) -> RwResult<()> {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
@@ -1185,7 +1658,7 @@ impl BrowserInner {
         let owns_browser_process = self.process.lock().unwrap().is_some();
         if owns_browser_process {
             let client = Arc::clone(&self.client);
-            let _ = self.block_on(async move {
+            let _ = self.block_on_raw(async move {
                 client
                     .send("Browser.close", json!({}), None, Duration::from_secs(3))
                     .await
@@ -1216,7 +1689,7 @@ impl BrowserInner {
 
 impl Drop for BrowserInner {
     fn drop(&mut self) {
-        let _ = self.close();
+        let _ = self.close_without_gil();
     }
 }
 
@@ -1227,15 +1700,44 @@ struct ContextInner {
 }
 
 impl ContextInner {
-    fn close(&self) -> RwResult<()> {
+    fn context_id_to_close(&self) -> Option<Option<String>> {
         if self.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
+            None
+        } else {
+            Some(self.context_id.clone())
         }
-        if let Some(context_id) = &self.context_id {
+    }
+
+    fn close(&self) -> RwResult<()> {
+        let Some(context_id) = self.context_id_to_close() else {
+            return Ok(());
+        };
+        if let Some(context_id) = context_id {
             let browser = Arc::clone(&self.browser);
             let client = Arc::clone(&browser.client);
-            let context_id = context_id.clone();
             browser.block_on(async move {
+                client
+                    .send(
+                        "Target.disposeBrowserContext",
+                        json!({ "browserContextId": context_id }),
+                        None,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .map(|_| ())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn close_without_gil(&self) -> RwResult<()> {
+        let Some(context_id) = self.context_id_to_close() else {
+            return Ok(());
+        };
+        if let Some(context_id) = context_id {
+            let browser = Arc::clone(&self.browser);
+            let client = Arc::clone(&browser.client);
+            browser.block_on_raw(async move {
                 client
                     .send(
                         "Target.disposeBrowserContext",
@@ -1253,7 +1755,7 @@ impl ContextInner {
 
 impl Drop for ContextInner {
     fn drop(&mut self) {
-        let _ = self.close();
+        let _ = self.close_without_gil();
     }
 }
 
@@ -1264,8 +1766,54 @@ struct PageInner {
     context_id: Option<String>,
     main_frame_id: Mutex<Option<String>>,
     frame_state: Mutex<PageFrameState>,
-    network_requests: Arc<Mutex<HashMap<String, Value>>>,
+    network_requests: Arc<Mutex<NetworkRequestStore>>,
+    event_stream_start_cursor: u64,
     closed: AtomicBool,
+}
+
+struct NetworkRequestStore {
+    requests: HashMap<String, NetworkRequestEntry>,
+    next_applied_seq: u64,
+    applied_order: VecDeque<(u64, String)>,
+}
+
+impl NetworkRequestStore {
+    fn new(next_applied_seq: u64) -> Self {
+        Self {
+            requests: HashMap::new(),
+            next_applied_seq,
+            applied_order: VecDeque::new(),
+        }
+    }
+
+    fn reset_after_overflow(&mut self, next_applied_seq: u64) {
+        self.requests.clear();
+        self.next_applied_seq = next_applied_seq;
+        self.applied_order.clear();
+    }
+
+    fn record_applied_request(&mut self, seq: u64, request_id: String) {
+        self.applied_order.push_back((seq, request_id));
+        while self.applied_order.len() > CDP_EVENT_LOG_LIMIT {
+            let Some((oldest_seq, oldest_request_id)) = self.applied_order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.requests.get_mut(&oldest_request_id) {
+                entry.applied_by_seq.remove(&oldest_seq);
+            }
+        }
+    }
+}
+
+impl Default for NetworkRequestStore {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+struct NetworkRequestEntry {
+    current: Value,
+    applied_by_seq: BTreeMap<u64, Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -1529,7 +2077,35 @@ struct PyNetworkEventWaiter {
     cursor: Mutex<u64>,
     session_id: String,
     kind: String,
-    requests: Arc<Mutex<HashMap<String, Value>>>,
+    requests: Arc<Mutex<NetworkRequestStore>>,
+}
+
+#[pyclass(name = "_PageEventStream")]
+struct PyPageEventStream {
+    browser: Arc<BrowserInner>,
+    receiver: Mutex<Option<broadcast::Receiver<Value>>>,
+    event_log: Arc<Mutex<CdpEventLog>>,
+    cursor: Mutex<u64>,
+    session_id: String,
+    requests: Arc<Mutex<NetworkRequestStore>>,
+    state: Mutex<Option<PageEventStreamState>>,
+    close_tx: watch::Sender<bool>,
+    closed: AtomicBool,
+    runtime_enabled: AtomicBool,
+}
+
+struct PageEventStreamState {
+    network: NetworkObservationState,
+    ready: BTreeMap<u64, Value>,
+}
+
+impl PageEventStreamState {
+    fn new() -> Self {
+        Self {
+            network: NetworkObservationState::new(),
+            ready: BTreeMap::new(),
+        }
+    }
 }
 
 #[pyclass(name = "_RouteEventWaiter")]
@@ -2106,7 +2682,7 @@ impl PyCdpEventWaiter {
         let method = self.method.clone();
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
-            let result = browser.block_on(wait_for_cdp_event(
+            let result = browser.block_on_raw(wait_for_cdp_event(
                 &mut receiver,
                 session_id.as_deref(),
                 &method,
@@ -2126,11 +2702,30 @@ fn evaluate_expression_for_page(
 ) -> RwResult<String> {
     let timeout = BrowserInner::command_timeout(timeout_ms);
     let browser = Arc::clone(&page.browser);
-    let client = Arc::clone(&browser.client);
-    let session_id = page.session_id.clone();
-    browser.block_on(async move {
-        evaluate_expression_in_session(&client, &session_id, expression, timeout).await
-    })
+    browser.block_on(evaluate_expression_for_page_async(
+        page, expression, timeout,
+    ))
+}
+
+fn evaluate_expression_for_page_raw(
+    page: Arc<PageInner>,
+    expression: String,
+    timeout_ms: Option<f64>,
+) -> RwResult<String> {
+    let timeout = BrowserInner::command_timeout(timeout_ms);
+    let browser = Arc::clone(&page.browser);
+    browser.block_on_raw(evaluate_expression_for_page_async(
+        page, expression, timeout,
+    ))
+}
+
+async fn evaluate_expression_for_page_async(
+    page: Arc<PageInner>,
+    expression: String,
+    timeout: Duration,
+) -> RwResult<String> {
+    evaluate_expression_in_session(&page.browser.client, &page.session_id, expression, timeout)
+        .await
 }
 
 fn evaluate_expression_for_frame(
@@ -2393,15 +2988,14 @@ async fn resolve_locator_session(
         } else {
             (spec.clone(), None)
         };
-        let Some((next_session_id, remaining_spec)) =
-            resolve_next_oopif_frame(
-                Arc::clone(&page),
-                &session_id,
-                frame_id.as_deref(),
-                &candidate_spec,
-                timeout,
-            )
-            .await?
+        let Some((next_session_id, remaining_spec)) = resolve_next_oopif_frame(
+            Arc::clone(&page),
+            &session_id,
+            frame_id.as_deref(),
+            &candidate_spec,
+            timeout,
+        )
+        .await?
         else {
             break;
         };
@@ -3911,10 +4505,8 @@ impl PyPage {
         let expression = make_evaluate_expression(expression, arg_json);
         let page = Arc::clone(&self.inner);
         let frame_id = frame_id.to_string();
-        py.detach(move || {
-            evaluate_expression_for_frame(page, frame_id, expression, timeout_ms)
-        })
-        .map_err(py_err)
+        py.detach(move || evaluate_expression_for_frame(page, frame_id, expression, timeout_ms))
+            .map_err(py_err)
     }
 
     #[pyo3(signature = (expression, arg_json=None, timeout_ms=None))]
@@ -4681,6 +5273,32 @@ return new Promise(resolve => {{
                 "unsupported network event kind: {other}"
             ))),
         }
+    }
+
+    fn combined_event_stream(&self) -> PyResult<PyPageEventStream> {
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let client = Arc::clone(&browser.client);
+        let event_log = Arc::clone(&client.event_log);
+        let (receiver, cursor) = {
+            let _log = event_log.lock().unwrap();
+            let receiver = client.subscribe();
+            (receiver, page.event_stream_start_cursor)
+        };
+        let (close_tx, _) = watch::channel(false);
+        let stream = PyPageEventStream {
+            browser: Arc::clone(&browser),
+            receiver: Mutex::new(Some(receiver)),
+            event_log,
+            cursor: Mutex::new(cursor),
+            session_id: page.session_id.clone(),
+            requests: Arc::clone(&page.network_requests),
+            state: Mutex::new(Some(PageEventStreamState::new())),
+            close_tx,
+            closed: AtomicBool::new(false),
+            runtime_enabled: AtomicBool::new(false),
+        };
+        Ok(stream)
     }
 
     fn route_event_waiter(&self) -> PyRouteEventWaiter {
@@ -5654,7 +6272,7 @@ impl PyNetworkEventWaiter {
         let cursor = *self.cursor.lock().unwrap();
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver, cursor) = py.detach(move || {
-            let (result, cursor) = browser.runtime.block_on(wait_for_network_event(
+            let (result, cursor) = browser.block_on_raw(wait_for_network_event(
                 &mut receiver,
                 event_log,
                 cursor,
@@ -5668,6 +6286,100 @@ impl PyNetworkEventWaiter {
         *self.receiver.lock().unwrap() = Some(receiver);
         *self.cursor.lock().unwrap() = cursor;
         result.map_err(py_err)
+    }
+}
+
+#[pymethods]
+impl PyPageEventStream {
+    fn enable_runtime(&self) -> PyResult<()> {
+        if self.runtime_enabled.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let browser = Arc::clone(&self.browser);
+        let client = Arc::clone(&browser.client);
+        let session_id = self.session_id.clone();
+        if let Err(error) = browser.block_on(async move {
+            client
+                .send(
+                    "Runtime.enable",
+                    json!({}),
+                    Some(&session_id),
+                    Duration::from_secs(5),
+                )
+                .await
+                .map(|_| ())
+        }) {
+            self.runtime_enabled.store(false, Ordering::SeqCst);
+            return Err(py_err(error));
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (timeout_ms=None, max_events=64))]
+    fn wait_batch(
+        &self,
+        py: Python<'_>,
+        timeout_ms: Option<f64>,
+        max_events: usize,
+    ) -> PyResult<String> {
+        if max_events == 0 {
+            return Err(PyValueError::new_err(
+                "max_events must be greater than zero",
+            ));
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            let cursor = *self.cursor.lock().unwrap();
+            return Ok(
+                Value::Array(vec![page_event_envelope(cursor, "_closed", Value::Null)]).to_string(),
+            );
+        }
+        let mut receiver = self
+            .receiver
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("page event stream is already waiting"))?;
+        let state = self
+            .state
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("page event stream is already waiting"))?;
+        let browser = Arc::clone(&self.browser);
+        let event_log = Arc::clone(&self.event_log);
+        let cursor = *self.cursor.lock().unwrap();
+        let session_id = self.session_id.clone();
+        let requests = Arc::clone(&self.requests);
+        let close_rx = self.close_tx.subscribe();
+        let alive_rx = browser.client.alive_tx.subscribe();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let (batch, cursor, state, terminal, receiver) = py.detach(move || {
+            let (batch, cursor, state, terminal) = browser.block_on_raw(wait_for_page_event_batch(
+                &mut receiver,
+                event_log,
+                cursor,
+                &session_id,
+                requests,
+                state,
+                close_rx,
+                alive_rx,
+                timeout,
+                max_events,
+            ));
+            (batch, cursor, state, terminal, receiver)
+        });
+        *self.receiver.lock().unwrap() = Some(receiver);
+        *self.cursor.lock().unwrap() = cursor;
+        *self.state.lock().unwrap() = Some(state);
+        if terminal {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+        Ok(Value::Array(batch).to_string())
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.close_tx.send_replace(true);
     }
 }
 
@@ -5686,7 +6398,7 @@ impl PyRouteEventWaiter {
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
             let result =
-                browser.block_on(wait_for_route_event(&mut receiver, &session_id, timeout));
+                browser.block_on_raw(wait_for_route_event(&mut receiver, &session_id, timeout));
             (result, receiver)
         });
         *self.receiver.lock().unwrap() = Some(receiver);
@@ -5708,7 +6420,8 @@ impl PyAuthEventWaiter {
         let session_id = self.session_id.clone();
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
-            let result = browser.block_on(wait_for_auth_event(&mut receiver, &session_id, timeout));
+            let result =
+                browser.block_on_raw(wait_for_auth_event(&mut receiver, &session_id, timeout));
             (result, receiver)
         });
         *self.receiver.lock().unwrap() = Some(receiver);
@@ -5731,7 +6444,7 @@ impl PyDialogEventWaiter {
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
             let result =
-                browser.block_on(wait_for_dialog_event(&mut receiver, &session_id, timeout));
+                browser.block_on_raw(wait_for_dialog_event(&mut receiver, &session_id, timeout));
             (result, receiver)
         });
         *self.receiver.lock().unwrap() = Some(receiver);
@@ -5754,7 +6467,7 @@ impl PyConsoleEventWaiter {
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
             let result =
-                browser.block_on(wait_for_console_event(&mut receiver, &session_id, timeout));
+                browser.block_on_raw(wait_for_console_event(&mut receiver, &session_id, timeout));
             (result, receiver)
         });
         *self.receiver.lock().unwrap() = Some(receiver);
@@ -5778,7 +6491,7 @@ impl PyWebSocketEventWaiter {
         let request_id = self.request_id.clone();
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
-            let result = browser.block_on(wait_for_websocket_event(
+            let result = browser.block_on_raw(wait_for_websocket_event(
                 &mut receiver,
                 &session_id,
                 &kind,
@@ -5807,7 +6520,7 @@ impl PyBindingEventWaiter {
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
             let browser = Arc::clone(&page.browser);
-            let result = browser.block_on(wait_for_binding_event_for_page(
+            let result = browser.block_on_raw(wait_for_binding_event_for_page(
                 &mut receiver,
                 &page,
                 &name,
@@ -5835,7 +6548,7 @@ impl PyDownloadEventWaiter {
         let download_path = self.download_path.clone();
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver, active_downloads) = py.detach(move || {
-            let result = browser.block_on(wait_for_download_event(
+            let result = browser.block_on_raw(wait_for_download_event(
                 &mut receiver,
                 &download_path,
                 &mut active_downloads,
@@ -5863,7 +6576,7 @@ impl PyFileChooserEventWaiter {
         let session_id = self.session_id.clone();
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
-            let result = browser.block_on(wait_for_file_chooser_event(
+            let result = browser.block_on_raw(wait_for_file_chooser_event(
                 &mut receiver,
                 &session_id,
                 timeout,
@@ -5890,7 +6603,7 @@ impl PyPopupEventWaiter {
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
             let browser_for_wait = Arc::clone(&browser);
-            let result = browser.block_on(wait_for_popup_page(
+            let result = browser.block_on_raw(wait_for_popup_page(
                 &mut receiver,
                 browser_for_wait,
                 &opener_target_id,
@@ -5918,7 +6631,7 @@ impl PyWorkerEventWaiter {
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
             let browser_for_wait = Arc::clone(&browser);
-            let result = browser.block_on(wait_for_worker(
+            let result = browser.block_on_raw(wait_for_worker(
                 &mut receiver,
                 browser_for_wait,
                 &opener_target_id,
@@ -5946,7 +6659,7 @@ impl PyWorkerCloseEventWaiter {
         let session_id = self.session_id.clone();
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
-            let result = browser.block_on(wait_for_worker_close(
+            let result = browser.block_on_raw(wait_for_worker_close(
                 &mut receiver,
                 &target_id,
                 &session_id,
@@ -5972,7 +6685,7 @@ impl PyServiceWorkerEventWaiter {
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
             let browser_for_wait = Arc::clone(&browser);
-            let result = browser.block_on(wait_for_service_worker(
+            let result = browser.block_on_raw(wait_for_service_worker(
                 &mut receiver,
                 browser_for_wait,
                 context_id.as_deref(),
@@ -5998,7 +6711,7 @@ impl PyBackgroundPageEventWaiter {
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
             let browser_for_wait = Arc::clone(&browser);
-            let result = browser.block_on(wait_for_background_page(
+            let result = browser.block_on_raw(wait_for_background_page(
                 &mut receiver,
                 browser_for_wait,
                 context_id.as_deref(),
@@ -6218,12 +6931,13 @@ fn launch_chromium_with_options(mut options: LaunchOptions) -> RwResult<Arc<Brow
 }
 
 #[pyfunction]
-fn launch_chromium(options_json: &str) -> PyResult<PyBrowser> {
+fn launch_chromium(py: Python<'_>, options_json: &str) -> PyResult<PyBrowser> {
     let options: LaunchOptions = serde_json::from_str(options_json)
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    Ok(PyBrowser {
-        inner: launch_chromium_with_options(options).map_err(py_err)?,
-    })
+    let inner = py
+        .detach(move || launch_chromium_with_options(options))
+        .map_err(py_err)?;
+    Ok(PyBrowser { inner })
 }
 
 #[pyfunction]
@@ -6237,24 +6951,21 @@ fn connect_over_cdp(
     let timeout = BrowserInner::command_timeout(timeout_ms);
     let headers = parse_header_pairs(headers_json).map_err(py_err)?;
     let endpoint = endpoint.to_string();
-    py.detach(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(2)
-            .build()
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        let resolve_headers = headers.clone();
-        let ws_endpoint = runtime
-            .block_on(
-                async move { resolve_ws_endpoint(&endpoint, timeout, &resolve_headers).await },
-            )
-            .map_err(py_err)?;
-        let client = runtime
-            .block_on(CdpClient::connect_with_headers(&ws_endpoint, &headers))
-            .map_err(py_err)?;
-        start_service_worker_stealth_auto_attach(&runtime, Arc::clone(&client)).map_err(py_err)?;
-        Ok(PyBrowser {
-            inner: Arc::new(BrowserInner {
+    let inner = py
+        .detach(move || -> RwResult<Arc<BrowserInner>> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .build()
+                .map_err(|error| RwError::Message(error.to_string()))?;
+            let resolve_headers = headers.clone();
+            let ws_endpoint = runtime.block_on(async move {
+                resolve_ws_endpoint(&endpoint, timeout, &resolve_headers).await
+            })?;
+            let client =
+                runtime.block_on(CdpClient::connect_with_headers(&ws_endpoint, &headers))?;
+            start_service_worker_stealth_auto_attach(&runtime, Arc::clone(&client))?;
+            Ok(Arc::new(BrowserInner {
                 runtime,
                 client,
                 process: Mutex::new(None),
@@ -6263,9 +6974,10 @@ fn connect_over_cdp(
                 stealth_user_agent_override: Mutex::new(None),
                 single_process_fallback: false,
                 closed: AtomicBool::new(false),
-            }),
+            }))
         })
-    })
+        .map_err(py_err)?;
+    Ok(PyBrowser { inner })
 }
 
 #[pyfunction]
@@ -6296,12 +7008,12 @@ pub fn rustwright_chromium_executable_path() -> Option<String> {
 
 impl RustwrightBrowser {
     pub fn new_page(&self) -> RwResult<RustwrightPage> {
-        let page = create_page(Arc::clone(&self.inner), None)?;
+        let page = create_page_raw(Arc::clone(&self.inner), None)?;
         Ok(RustwrightPage { inner: page.inner })
     }
 
     pub fn close(&self) -> RwResult<()> {
-        self.inner.close()
+        self.inner.close_without_gil()
     }
 
     pub fn ws_endpoint(&self) -> String {
@@ -6329,7 +7041,7 @@ impl RustwrightPage {
         let browser = Arc::clone(&page.browser);
         let client = Arc::clone(&browser.client);
         let session_id = page.session_id.clone();
-        browser.block_on(async move {
+        browser.block_on_raw(async move {
             let mut events = client.subscribe();
             let target_url = url.clone();
             let mut params = json!({ "url": url });
@@ -6392,7 +7104,7 @@ impl RustwrightPage {
         timeout_ms: Option<f64>,
     ) -> RwResult<String> {
         let expression = make_evaluate_expression(expression, arg_json);
-        evaluate_expression_for_page(Arc::clone(&self.inner), expression, timeout_ms)
+        evaluate_expression_for_page_raw(Arc::clone(&self.inner), expression, timeout_ms)
     }
 
     pub fn click(&self, selector: &str, timeout_ms: Option<f64>) -> RwResult<()> {
@@ -6470,7 +7182,7 @@ return true;
         let session_id = page.session_id.clone();
         let omit_background = omit_background.unwrap_or(false);
         let transparent_background = omit_background && image_type != "jpeg";
-        let bytes = browser.block_on(async move {
+        let bytes = browser.block_on_raw(async move {
             if transparent_background {
                 client
                     .send_raw_params_json(
@@ -6539,7 +7251,7 @@ return true;
         let client = Arc::clone(&browser.client);
         let target_id = page.target_id.clone();
         let session_id = page.session_id.clone();
-        browser.block_on(async move {
+        browser.block_on_raw(async move {
             if run_before_unload {
                 client
                     .send(
@@ -6564,7 +7276,11 @@ return true;
     }
 
     fn evaluate_expression(&self, expression: &str, timeout_ms: Option<f64>) -> RwResult<String> {
-        evaluate_expression_for_page(Arc::clone(&self.inner), expression.to_string(), timeout_ms)
+        evaluate_expression_for_page_raw(
+            Arc::clone(&self.inner),
+            expression.to_string(),
+            timeout_ms,
+        )
     }
 
     fn evaluate_locator_json(
@@ -6577,7 +7293,7 @@ return true;
         let page = Arc::clone(&self.inner);
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
-        browser.block_on(async move {
+        browser.block_on_raw(async move {
             evaluate_locator_for_page(page, locator_json, index, body, timeout).await
         })
     }
@@ -6665,28 +7381,32 @@ fn unquote_selector_argument(value: &str) -> String {
 
 fn create_page(browser: Arc<BrowserInner>, context_id: Option<String>) -> RwResult<PyPage> {
     let browser_for_task = Arc::clone(&browser);
-    browser.block_on(async move {
-        let mut params = json!({ "url": "about:blank" });
-        if let Some(context_id) = &context_id {
-            params["browserContextId"] = Value::String(context_id.clone());
-        }
-        let target = browser_for_task
-            .client
-            .send("Target.createTarget", params, None, Duration::from_secs(10))
-            .await?;
-        let target_id = target
-            .get("targetId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RwError::Message("CDP did not return a targetId".to_string()))?
-            .to_string();
-        attach_existing_page(
-            browser_for_task,
-            target_id,
-            context_id,
-            Duration::from_secs(10),
-        )
-        .await
-    })
+    browser.block_on(create_page_async(browser_for_task, context_id))
+}
+
+fn create_page_raw(browser: Arc<BrowserInner>, context_id: Option<String>) -> RwResult<PyPage> {
+    let browser_for_task = Arc::clone(&browser);
+    browser.block_on_raw(create_page_async(browser_for_task, context_id))
+}
+
+async fn create_page_async(
+    browser: Arc<BrowserInner>,
+    context_id: Option<String>,
+) -> RwResult<PyPage> {
+    let mut params = json!({ "url": "about:blank" });
+    if let Some(context_id) = &context_id {
+        params["browserContextId"] = Value::String(context_id.clone());
+    }
+    let target = browser
+        .client
+        .send("Target.createTarget", params, None, Duration::from_secs(10))
+        .await?;
+    let target_id = target
+        .get("targetId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RwError::Message("CDP did not return a targetId".to_string()))?
+        .to_string();
+    attach_existing_page(browser, target_id, context_id, Duration::from_secs(10)).await
 }
 
 async fn attach_existing_page(
@@ -6709,6 +7429,7 @@ async fn attach_existing_page(
         .and_then(Value::as_str)
         .ok_or_else(|| RwError::Message("CDP did not return a sessionId".to_string()))?
         .to_string();
+    let event_stream_start_cursor = browser.client.event_cursor();
     try_join_all(
         ["Page.enable", "DOM.enable", "Network.enable"]
             .into_iter()
@@ -6728,7 +7449,10 @@ async fn attach_existing_page(
         context_id,
         main_frame_id: Mutex::new(None),
         frame_state: Mutex::new(PageFrameState::new(session_id.clone())),
-        network_requests: Arc::new(Mutex::new(HashMap::new())),
+        network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(
+            event_stream_start_cursor,
+        ))),
+        event_stream_start_cursor,
         closed: AtomicBool::new(false),
     });
     let _ = refresh_page_frame_tree(&page_inner, Duration::from_secs(5)).await;
@@ -7145,7 +7869,8 @@ fn start_service_worker_stealth_auto_attach(
                 continue;
             }
             let info = event.pointer("/params/targetInfo").unwrap_or(&Value::Null);
-            let Some(session_id) = event.pointer("/params/sessionId").and_then(Value::as_str) else {
+            let Some(session_id) = event.pointer("/params/sessionId").and_then(Value::as_str)
+            else {
                 continue;
             };
             if info.get("type").and_then(Value::as_str) != Some("service_worker") {
@@ -8291,7 +9016,9 @@ fn parse_header_pairs(headers_json: Option<&str>) -> RwResult<Vec<(String, Strin
     };
     let headers: Value = serde_json::from_str(headers_json)?;
     let Some(object) = headers.as_object() else {
-        return Err(RwError::Message("CDP headers must be a JSON object".to_string()));
+        return Err(RwError::Message(
+            "CDP headers must be a JSON object".to_string(),
+        ));
     };
     object
         .iter()
@@ -8691,58 +9418,193 @@ async fn wait_for_load_state(
     }
 }
 
-fn cdp_event_log_entries_since(
-    event_log: &Arc<Mutex<CdpEventLog>>,
-    cursor: u64,
-) -> Vec<(u64, Value)> {
-    event_log.lock().unwrap().entries_since(cursor)
+struct NetworkObservationState {
+    response_extra_infos: HashMap<String, Value>,
+    pending_responses: HashMap<String, PendingNetworkResponse>,
 }
 
-fn cdp_event_log_advance_past(
-    event_log: &Arc<Mutex<CdpEventLog>>,
-    cursor: u64,
-    event: &Value,
-) -> u64 {
-    event_log.lock().unwrap().advance_past(cursor, event)
+struct PendingNetworkResponse {
+    seq: u64,
+    response: Value,
+    deadline: tokio::time::Instant,
 }
 
-fn process_network_wait_event(
+impl NetworkObservationState {
+    fn new() -> Self {
+        Self {
+            response_extra_infos: HashMap::new(),
+            pending_responses: HashMap::new(),
+        }
+    }
+
+    fn earliest_pending_seq(&self) -> Option<u64> {
+        self.pending_responses
+            .values()
+            .map(|pending| pending.seq)
+            .min()
+    }
+
+    fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        self.pending_responses
+            .values()
+            .map(|pending| pending.deadline)
+            .min()
+    }
+
+    fn take_expired(&mut self) -> Vec<(u64, Value)> {
+        let now = tokio::time::Instant::now();
+        let expired_ids = self
+            .pending_responses
+            .iter()
+            .filter(|(_, pending)| now >= pending.deadline)
+            .map(|(request_id, _)| request_id.clone())
+            .collect::<Vec<_>>();
+        let mut expired = expired_ids
+            .into_iter()
+            .filter_map(|request_id| {
+                self.pending_responses
+                    .remove(&request_id)
+                    .map(|pending| (pending.seq, pending.response))
+            })
+            .collect::<Vec<_>>();
+        expired.sort_by_key(|(seq, _)| *seq);
+        expired
+    }
+}
+
+fn apply_network_request_mutation(
+    seq: u64,
     event: &Value,
     session_id: &str,
-    kind: &str,
-    requests: &Arc<Mutex<HashMap<String, Value>>>,
-    response_extra_infos: &mut HashMap<String, Value>,
-    pending_response: &mut Option<(String, Value)>,
-    pending_response_deadline: &mut Option<tokio::time::Instant>,
-) -> Option<String> {
+    requests: &mut NetworkRequestStore,
+    advance_current: bool,
+) -> Option<Value> {
+    let matches_session = event.get("sessionId").and_then(Value::as_str) == Some(session_id);
+    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+    if !matches_session || method != "Network.requestWillBeSent" {
+        return None;
+    }
+    let request_id = event
+        .pointer("/params/requestId")
+        .and_then(Value::as_str)?
+        .to_string();
+    if let Some(applied) = requests
+        .requests
+        .get(&request_id)
+        .and_then(|entry| entry.applied_by_seq.get(&seq))
+        .cloned()
+    {
+        return Some(applied);
+    }
+    let prior_request = requests.requests.get(&request_id).and_then(|entry| {
+        if advance_current {
+            Some(entry.current.clone())
+        } else {
+            entry
+                .applied_by_seq
+                .range(..seq)
+                .next_back()
+                .map(|(_, request)| request.clone())
+        }
+    });
+    let request = request_from_event(event, prior_request)?;
+    match requests.requests.get_mut(&request_id) {
+        Some(entry) => {
+            if advance_current {
+                entry.current = request.clone();
+            }
+            entry.applied_by_seq.insert(seq, request.clone());
+        }
+        None => {
+            requests.requests.insert(
+                request_id.clone(),
+                NetworkRequestEntry {
+                    current: request.clone(),
+                    applied_by_seq: BTreeMap::from([(seq, request.clone())]),
+                },
+            );
+        }
+    }
+    requests.record_applied_request(seq, request_id);
+    Some(request)
+}
+
+fn process_network_observation_event(
+    seq: u64,
+    event: &Value,
+    event_log: &Arc<Mutex<CdpEventLog>>,
+    session_id: &str,
+    requests: &Arc<Mutex<NetworkRequestStore>>,
+    track_responses: bool,
+    state: &mut NetworkObservationState,
+) -> Result<Option<(u64, &'static str, Value)>, u64> {
+    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+    let request_payload = {
+        let mut requests = requests.lock().unwrap();
+        if seq > requests.next_applied_seq {
+            let (oldest_seq, entries) = {
+                let log = event_log.lock().unwrap();
+                (
+                    log.oldest_seq(),
+                    log.entries_since(requests.next_applied_seq),
+                )
+            };
+            if requests.next_applied_seq < oldest_seq {
+                let dropped = oldest_seq - requests.next_applied_seq;
+                requests.reset_after_overflow(seq.saturating_add(1));
+                return Err(dropped);
+            }
+            let mut expected_seq = requests.next_applied_seq;
+            for (missed_seq, missed_event) in entries {
+                if missed_seq >= seq {
+                    break;
+                }
+                if missed_seq != expected_seq {
+                    let dropped = missed_seq.saturating_sub(expected_seq).max(1);
+                    requests.reset_after_overflow(seq.saturating_add(1));
+                    return Err(dropped);
+                }
+                apply_network_request_mutation(
+                    missed_seq,
+                    &missed_event,
+                    session_id,
+                    &mut requests,
+                    true,
+                );
+                expected_seq = missed_seq.saturating_add(1);
+            }
+            if expected_seq != seq {
+                let dropped = seq.saturating_sub(expected_seq).max(1);
+                requests.reset_after_overflow(seq.saturating_add(1));
+                return Err(dropped);
+            }
+            requests.next_applied_seq = seq;
+        }
+
+        let advance_current = seq == requests.next_applied_seq;
+        let request_payload = if method == "Network.requestWillBeSent" {
+            apply_network_request_mutation(seq, event, session_id, &mut requests, advance_current)
+        } else {
+            None
+        };
+        if advance_current {
+            requests.next_applied_seq = seq.saturating_add(1);
+        }
+        request_payload
+    };
+
+    if method == "Network.requestWillBeSent" {
+        return Ok(request_payload.map(|request| (seq, "request", request)));
+    }
     let matches_session = event
         .get("sessionId")
         .and_then(Value::as_str)
         .map(|value| value == session_id)
         .unwrap_or(false);
     if !matches_session {
-        return None;
+        return Ok(None);
     }
-    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
-    if method == "Network.requestWillBeSent" {
-        let prior_request = event
-            .pointer("/params/requestId")
-            .and_then(Value::as_str)
-            .and_then(|request_id| requests.lock().unwrap().get(request_id).cloned());
-        if let Some(request) = request_from_event(event, prior_request) {
-            if let Some(request_id) = request.get("request_id").and_then(Value::as_str) {
-                requests
-                    .lock()
-                    .unwrap()
-                    .insert(request_id.to_string(), request.clone());
-            }
-            if kind == "request" {
-                return Some(request.to_string());
-            }
-        }
-        return None;
-    }
-    if method == "Network.responseReceived" && kind == "response" {
+    if method == "Network.responseReceived" && track_responses {
         let request_id = event
             .pointer("/params/requestId")
             .and_then(Value::as_str)
@@ -8750,42 +9612,47 @@ fn process_network_wait_event(
         let response_extra = event
             .pointer("/params/requestId")
             .and_then(Value::as_str)
-            .and_then(|request_id| response_extra_infos.get(request_id));
-        if let Some(response) = response_from_event(event, requests, response_extra) {
-            if response_needs_extra_info(event, response_extra) {
+            .and_then(|request_id| state.response_extra_infos.remove(request_id));
+        if let Some(response) = response_from_event(event, requests, response_extra.as_ref()) {
+            if response_needs_extra_info(event, response_extra.as_ref()) {
                 if let Some(request_id) = request_id {
-                    *pending_response = Some((request_id, response));
-                    *pending_response_deadline =
-                        Some(tokio::time::Instant::now() + Duration::from_millis(100));
-                    return None;
+                    state.pending_responses.insert(
+                        request_id,
+                        PendingNetworkResponse {
+                            seq,
+                            response,
+                            deadline: tokio::time::Instant::now() + Duration::from_millis(100),
+                        },
+                    );
+                    return Ok(None);
                 }
             }
-            return Some(response.to_string());
+            return Ok(Some((seq, "response", response)));
         }
-        return None;
+        return Ok(None);
     }
     if method == "Network.responseReceivedExtraInfo" {
         if let (Some(request_id), Some(params)) = (
             event.pointer("/params/requestId").and_then(Value::as_str),
             event.get("params"),
         ) {
-            if let Some((pending_request_id, response)) = pending_response.as_mut() {
-                if pending_request_id == request_id {
-                    apply_response_extra_info(response, params);
-                    return Some(response.to_string());
-                }
+            if let Some(mut pending) = state.pending_responses.remove(request_id) {
+                apply_response_extra_info(&mut pending.response, params);
+                return Ok(Some((pending.seq, "response", pending.response)));
             }
-            response_extra_infos.insert(request_id.to_string(), params.clone());
+            state
+                .response_extra_infos
+                .insert(request_id.to_string(), params.clone());
         }
-        return None;
+        return Ok(None);
     }
-    if method == "Network.loadingFinished" && kind == "requestfinished" {
+    if method == "Network.loadingFinished" {
         if let Some(request) = request_lifecycle_from_event(event, requests, None) {
-            return Some(request.to_string());
+            return Ok(Some((seq, "requestfinished", request)));
         }
-        return None;
+        return Ok(None);
     }
-    if method == "Network.loadingFailed" && kind == "requestfailed" {
+    if method == "Network.loadingFailed" {
         let failure_text = event
             .pointer("/params/errorText")
             .and_then(Value::as_str)
@@ -8797,10 +9664,260 @@ fn process_network_wait_event(
                     .map(ToString::to_string)
             });
         if let Some(request) = request_lifecycle_from_event(event, requests, failure_text) {
-            return Some(request.to_string());
+            return Ok(Some((seq, "requestfailed", request)));
         }
     }
-    None
+    Ok(None)
+}
+
+fn process_network_wait_event(
+    seq: u64,
+    event: &Value,
+    event_log: &Arc<Mutex<CdpEventLog>>,
+    session_id: &str,
+    kind: &str,
+    requests: &Arc<Mutex<NetworkRequestStore>>,
+    state: &mut NetworkObservationState,
+) -> Result<Option<(u64, String)>, u64> {
+    process_network_observation_event(
+        seq,
+        event,
+        event_log,
+        session_id,
+        requests,
+        kind == "response",
+        state,
+    )
+    .map(|matched| {
+        matched.and_then(|(matched_seq, matched_kind, payload)| {
+            (matched_kind == kind).then(|| (matched_seq, payload.to_string()))
+        })
+    })
+}
+
+fn page_event_envelope(seq: u64, kind: &str, payload: Value) -> Value {
+    json!({
+        "seq": seq,
+        "kind": kind,
+        "payload": payload,
+    })
+}
+
+fn process_page_observation_event(
+    seq: u64,
+    event: &Value,
+    event_log: &Arc<Mutex<CdpEventLog>>,
+    session_id: &str,
+    requests: &Arc<Mutex<NetworkRequestStore>>,
+    state: &mut PageEventStreamState,
+) {
+    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+    let matched = match process_network_observation_event(
+        seq,
+        event,
+        event_log,
+        session_id,
+        requests,
+        true,
+        &mut state.network,
+    ) {
+        Ok(matched) => matched,
+        Err(dropped) => {
+            *state = PageEventStreamState::new();
+            state.ready.insert(
+                seq,
+                page_event_envelope(seq, "_overflow", json!({ "dropped": dropped })),
+            );
+            return;
+        }
+    };
+    if method.starts_with("Network.") {
+        if let Some((matched_seq, kind, payload)) = matched {
+            state
+                .ready
+                .insert(matched_seq, page_event_envelope(matched_seq, kind, payload));
+        }
+        return;
+    }
+
+    let matches_session = event.get("sessionId").and_then(Value::as_str) == Some(session_id);
+    if !matches_session {
+        return;
+    }
+    let matched = match method {
+        "Runtime.consoleAPICalled" => console_from_event(event).map(|payload| ("console", payload)),
+        "Runtime.exceptionThrown" => event
+            .get("params")
+            .cloned()
+            .map(|payload| ("pageerror", payload)),
+        "Page.javascriptDialogOpening" => {
+            dialog_from_event(event).map(|payload| ("dialog", payload))
+        }
+        "Page.loadEventFired" => event
+            .get("params")
+            .cloned()
+            .map(|payload| ("load", payload)),
+        "Page.domContentEventFired" => event
+            .get("params")
+            .cloned()
+            .map(|payload| ("domcontentloaded", payload)),
+        "Page.frameNavigated" | "Page.navigatedWithinDocument" => event
+            .get("params")
+            .cloned()
+            .map(|payload| ("framenavigated", payload)),
+        "Page.frameAttached" => event
+            .get("params")
+            .cloned()
+            .map(|payload| ("frameattached", payload)),
+        "Page.frameDetached" => event
+            .get("params")
+            .cloned()
+            .map(|payload| ("framedetached", payload)),
+        _ => None,
+    };
+    if let Some((kind, payload)) = matched {
+        state
+            .ready
+            .insert(seq, page_event_envelope(seq, kind, payload));
+    }
+}
+
+fn expire_page_responses(state: &mut PageEventStreamState) {
+    for (seq, response) in state.network.take_expired() {
+        state
+            .ready
+            .insert(seq, page_event_envelope(seq, "response", response));
+    }
+}
+
+fn append_ready_page_events(
+    batch: &mut Vec<Value>,
+    state: &mut PageEventStreamState,
+    max_events: usize,
+) {
+    while batch.len() < max_events {
+        let Some((&seq, _)) = state.ready.first_key_value() else {
+            break;
+        };
+        if state
+            .network
+            .earliest_pending_seq()
+            .map(|pending_seq| seq > pending_seq)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        let (_, envelope) = state.ready.pop_first().unwrap();
+        batch.push(envelope);
+    }
+}
+
+async fn wait_for_page_event_batch(
+    events: &mut broadcast::Receiver<Value>,
+    event_log: Arc<Mutex<CdpEventLog>>,
+    mut cursor: u64,
+    session_id: &str,
+    requests: Arc<Mutex<NetworkRequestStore>>,
+    mut state: PageEventStreamState,
+    mut close_rx: watch::Receiver<bool>,
+    mut alive_rx: watch::Receiver<bool>,
+    timeout: Duration,
+    max_events: usize,
+) -> (Vec<Value>, u64, PageEventStreamState, bool) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut batch = Vec::with_capacity(max_events);
+    loop {
+        if *close_rx.borrow() {
+            batch.push(page_event_envelope(cursor, "_closed", Value::Null));
+            return (batch, cursor, state, true);
+        }
+        if !*alive_rx.borrow() {
+            batch.push(page_event_envelope(cursor, "_closed", Value::Null));
+            return (batch, cursor, state, true);
+        }
+        expire_page_responses(&mut state);
+        append_ready_page_events(&mut batch, &mut state, max_events);
+        if batch.len() >= max_events {
+            return (batch, cursor, state, false);
+        }
+
+        let (oldest_seq, entries) = {
+            let log = event_log.lock().unwrap();
+            (log.oldest_seq(), log.entries_since(cursor))
+        };
+        if cursor < oldest_seq {
+            let dropped = oldest_seq - cursor;
+            cursor = oldest_seq;
+            state = PageEventStreamState::new();
+            requests.lock().unwrap().reset_after_overflow(oldest_seq);
+            batch.push(page_event_envelope(
+                cursor,
+                "_overflow",
+                json!({ "dropped": dropped }),
+            ));
+            if batch.len() >= max_events {
+                return (batch, cursor, state, false);
+            }
+        }
+        for (seq, event) in entries {
+            if seq < cursor {
+                continue;
+            }
+            cursor = seq.saturating_add(1);
+            process_page_observation_event(
+                seq, &event, &event_log, session_id, &requests, &mut state,
+            );
+            expire_page_responses(&mut state);
+            append_ready_page_events(&mut batch, &mut state, max_events);
+            if batch.len() >= max_events {
+                return (batch, cursor, state, false);
+            }
+        }
+        if !batch.is_empty() {
+            return (batch, cursor, state, false);
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return (batch, cursor, state, false);
+        }
+        let mut remaining = deadline - now;
+        if let Some(response_deadline) = state.network.next_deadline() {
+            remaining = remaining.min(response_deadline.saturating_duration_since(now));
+        }
+        tokio::select! {
+            changed = close_rx.changed() => {
+                if changed.is_err() || *close_rx.borrow() {
+                    batch.push(page_event_envelope(cursor, "_closed", Value::Null));
+                    return (batch, cursor, state, true);
+                }
+            }
+            changed = alive_rx.changed() => {
+                if changed.is_err() || !*alive_rx.borrow() {
+                    batch.push(page_event_envelope(cursor, "_closed", Value::Null));
+                    return (batch, cursor, state, true);
+                }
+            }
+            received = tokio::time::timeout(remaining, events.recv()) => {
+                match received {
+                    Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                    Ok(Err(broadcast::error::RecvError::Closed)) => {
+                        batch.push(page_event_envelope(cursor, "_closed", Value::Null));
+                        return (batch, cursor, state, true);
+                    }
+                    Err(_) => {
+                        if state.network.next_deadline()
+                            .map(|pending_deadline| tokio::time::Instant::now() >= pending_deadline)
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        return (batch, cursor, state, false);
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn wait_for_network_event(
@@ -8809,59 +9926,92 @@ async fn wait_for_network_event(
     cursor: u64,
     session_id: &str,
     kind: &str,
-    requests: Arc<Mutex<HashMap<String, Value>>>,
+    requests: Arc<Mutex<NetworkRequestStore>>,
     timeout: Duration,
 ) -> (RwResult<String>, u64) {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut cursor = cursor;
-    let mut response_extra_infos: HashMap<String, Value> = HashMap::new();
-    let mut pending_response: Option<(String, Value)> = None;
-    let mut pending_response_deadline: Option<tokio::time::Instant> = None;
+    let mut state = NetworkObservationState::new();
+    let mut ready_responses = BTreeMap::<u64, String>::new();
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
             return (Err(RwError::Timeout(timeout.as_millis() as u64)), cursor);
         }
-        if let (Some((_, response)), Some(extra_deadline)) =
-            (pending_response.as_ref(), pending_response_deadline)
-        {
-            if now >= extra_deadline {
-                return (Ok(response.to_string()), cursor);
+        for (seq, response) in state.take_expired() {
+            ready_responses.insert(seq, response.to_string());
+        }
+        if kind == "response" {
+            if let Some((&seq, _)) = ready_responses.first_key_value() {
+                if state
+                    .earliest_pending_seq()
+                    .map(|pending_seq| seq > pending_seq)
+                    .unwrap_or(false)
+                {
+                    // An earlier response is still waiting for its own extra-info deadline.
+                } else {
+                    return (Ok(ready_responses.pop_first().unwrap().1), cursor);
+                }
             }
         }
-        for (seq, event) in cdp_event_log_entries_since(&event_log, cursor) {
+        let (oldest_seq, entries) = {
+            let log = event_log.lock().unwrap();
+            (log.oldest_seq(), log.entries_since(cursor))
+        };
+        if cursor < oldest_seq {
+            let dropped = oldest_seq - cursor;
+            requests.lock().unwrap().reset_after_overflow(oldest_seq);
+            return (
+                Err(RwError::Message(format!(
+                    "CDP event log overflow: dropped {dropped} event(s)"
+                ))),
+                oldest_seq,
+            );
+        }
+        for (seq, event) in entries {
             cursor = seq.saturating_add(1);
-            if let Some(result) = process_network_wait_event(
-                &event,
-                session_id,
-                kind,
-                &requests,
-                &mut response_extra_infos,
-                &mut pending_response,
-                &mut pending_response_deadline,
+            let matched = match process_network_wait_event(
+                seq, &event, &event_log, session_id, kind, &requests, &mut state,
             ) {
-                return (Ok(result), cursor);
-            }
-        }
-        let mut remaining = deadline - now;
-        if let Some(extra_deadline) = pending_response_deadline {
-            remaining = remaining.min(extra_deadline - now);
-        }
-        match tokio::time::timeout(remaining, events.recv()).await {
-            Ok(Ok(event)) => {
-                cursor = cdp_event_log_advance_past(&event_log, cursor, &event);
-                if let Some(result) = process_network_wait_event(
-                    &event,
-                    session_id,
-                    kind,
-                    &requests,
-                    &mut response_extra_infos,
-                    &mut pending_response,
-                    &mut pending_response_deadline,
-                ) {
+                Ok(matched) => matched,
+                Err(dropped) => {
+                    return (
+                        Err(RwError::Message(format!(
+                            "CDP event log overflow: dropped {dropped} event(s)"
+                        ))),
+                        cursor,
+                    )
+                }
+            };
+            if let Some((matched_seq, result)) = matched {
+                if kind == "response" {
+                    ready_responses.insert(matched_seq, result);
+                } else {
                     return (Ok(result), cursor);
                 }
             }
+            for (expired_seq, response) in state.take_expired() {
+                ready_responses.insert(expired_seq, response.to_string());
+            }
+            if kind == "response" {
+                if let Some((&ready_seq, _)) = ready_responses.first_key_value() {
+                    if state
+                        .earliest_pending_seq()
+                        .map(|pending_seq| ready_seq > pending_seq)
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    return (Ok(ready_responses.pop_first().unwrap().1), cursor);
+                }
+            }
+        }
+        let mut remaining = deadline - now;
+        if let Some(extra_deadline) = state.next_deadline() {
+            remaining = remaining.min(extra_deadline.saturating_duration_since(now));
+        }
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Ok(_)) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(_)) => {
                 return (
@@ -8870,8 +10020,11 @@ async fn wait_for_network_event(
                 )
             }
             Err(_) => {
-                if let Some((_, response)) = pending_response.as_ref() {
-                    return (Ok(response.to_string()), cursor);
+                for (seq, response) in state.take_expired() {
+                    ready_responses.insert(seq, response.to_string());
+                }
+                if let Some((_, response)) = ready_responses.pop_first() {
+                    return (Ok(response), cursor);
                 }
                 return (Err(RwError::Timeout(timeout.as_millis() as u64)), cursor);
             }
@@ -9857,6 +11010,7 @@ fn console_from_event(event: &Value) -> Option<Value> {
         "text": text,
         "args": handle_args,
         "location": location,
+        "timestamp": params.get("timestamp").cloned().unwrap_or(Value::Null),
     }))
 }
 
@@ -9950,14 +11104,21 @@ fn request_from_event(event: &Value, redirected_from: Option<Value>) -> Option<V
 
 fn response_from_event(
     event: &Value,
-    requests: &Arc<Mutex<HashMap<String, Value>>>,
+    requests: &Arc<Mutex<NetworkRequestStore>>,
     response_extra: Option<&Value>,
 ) -> Option<Value> {
     let params = event.get("params")?;
     let response = params.get("response")?;
     let request_id = params.get("requestId").and_then(Value::as_str);
     let mut request = request_id
-        .and_then(|id| requests.lock().unwrap().get(id).cloned())
+        .and_then(|id| {
+            requests
+                .lock()
+                .unwrap()
+                .requests
+                .get(id)
+                .map(|entry| entry.current.clone())
+        })
         .unwrap_or_else(|| {
             json!({
                 "request_id": params.get("requestId").cloned().unwrap_or(Value::Null),
@@ -10020,13 +11181,20 @@ fn apply_response_extra_info(payload: &mut Value, response_extra: &Value) {
 
 fn request_lifecycle_from_event(
     event: &Value,
-    requests: &Arc<Mutex<HashMap<String, Value>>>,
+    requests: &Arc<Mutex<NetworkRequestStore>>,
     failure_text: Option<String>,
 ) -> Option<Value> {
     let params = event.get("params")?;
     let request_id = params.get("requestId").and_then(Value::as_str);
     let mut request = request_id
-        .and_then(|id| requests.lock().unwrap().get(id).cloned())
+        .and_then(|id| {
+            requests
+                .lock()
+                .unwrap()
+                .requests
+                .get(id)
+                .map(|entry| entry.current.clone())
+        })
         .unwrap_or_else(|| {
             json!({
                 "request_id": params.get("requestId").cloned().unwrap_or(Value::Null),
@@ -12183,6 +13351,7 @@ fn _rustwright(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyCdpEventWaiter>()?;
     module.add_class::<PyWorker>()?;
     module.add_class::<PyNetworkEventWaiter>()?;
+    module.add_class::<PyPageEventStream>()?;
     module.add_class::<PyRouteEventWaiter>()?;
     module.add_class::<PyAuthEventWaiter>()?;
     module.add_class::<PyDialogEventWaiter>()?;
