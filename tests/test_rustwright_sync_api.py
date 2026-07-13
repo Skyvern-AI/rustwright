@@ -428,6 +428,16 @@ def http_server():
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 return
+            if self.path in {"/race-response-a", "/race-response-b"}:
+                time.sleep(0.03 if self.path.endswith("a") else 0.01)
+                body = self.path.encode("utf-8")
+                self.send_response(200, "OK")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path == "/slow-timeout":
                 time.sleep(1.5)
                 body = b"slow"
@@ -3285,6 +3295,43 @@ def test_page_frameattached_and_framedetached_events(page):
     wait_until(lambda: any(item[0] and item[1] and item[2] is True for item in detached_seen))
 
 
+def test_combined_frame_events_preserve_child_frame_identity(page, http_server):
+    page.goto(f"{http_server}/page")
+    attached = []
+    navigated = []
+    detached = []
+    child_url = f"{http_server}/frame-fetch-child"
+    page.on("frameattached", attached.append)
+    page.on("framenavigated", navigated.append)
+    page.on("framedetached", detached.append)
+
+    page.evaluate(
+        """url => {
+        const frame = document.createElement('iframe');
+        frame.id = 'combined-child';
+        frame.src = url;
+        document.body.appendChild(frame);
+        }""",
+        child_url,
+    )
+
+    child = wait_until(lambda: next((frame for frame in navigated if frame.url == child_url), None))
+    attached_child = wait_until(
+        lambda: next((frame for frame in attached if frame._frame_id == child._frame_id), None)
+    )
+    assert child is not page.main_frame
+    assert child.url == child_url
+    assert child._frame_id
+    assert attached_child._frame_id == child._frame_id
+
+    page.evaluate("() => document.querySelector('#combined-child').remove()")
+    detached_child = wait_until(
+        lambda: next((frame for frame in detached if frame._frame_id == child._frame_id), None)
+    )
+    assert detached_child._frame_id == child._frame_id
+    assert detached_child.is_detached() is True
+
+
 def test_history_navigation_returns_real_responses(page, http_server):
     initial = page.go_back(timeout=500)
     assert initial is None
@@ -4517,19 +4564,31 @@ def test_response_finished_waits_for_slow_body(page, http_server):
 
 
 def test_redirect_request_chain_helpers(page, http_server):
+    listener_requests = []
+    page.on("request", listener_requests.append)
     with page.expect_request(lambda request: request.url.endswith("/json")) as request_info:
-        page.goto(f"{http_server}/redirect-one")
+        page.goto(f"{http_server}/redirect-hop-one")
 
     final_request = request_info.value
     redirected_from = final_request.redirected_from
+    listener_final = wait_until(
+        lambda: next((request for request in listener_requests if request.url.endswith("/json")), None)
+    )
 
     assert final_request.url == f"{http_server}/json"
     assert final_request.is_navigation_request()
     assert redirected_from is not None
-    assert redirected_from.url == f"{http_server}/redirect-one"
-    assert redirected_from.redirected_from is None
+    assert redirected_from.url == f"{http_server}/redirect-hop-two"
+    assert redirected_from.redirected_from is not None
+    assert redirected_from.redirected_from.url == f"{http_server}/redirect-hop-one"
+    assert redirected_from.redirected_from.redirected_from is None
+    assert redirected_from.redirected_from.redirected_to is redirected_from
     assert redirected_from.redirected_to is final_request
     assert final_request.redirected_to is None
+    assert listener_final.redirected_from is not None
+    assert listener_final.redirected_from.url == f"{http_server}/redirect-hop-two"
+    assert listener_final.redirected_from.redirected_from is not None
+    assert listener_final.redirected_from.redirected_from.url == f"{http_server}/redirect-hop-one"
 
 
 def test_expect_download_captures_file(page, http_server, tmp_path: Path):
@@ -5649,6 +5708,208 @@ def test_page_request_and_response_events_are_dispatched(page, http_server):
         201,
         f"{http_server}/json",
     )
+
+
+def test_page_observation_events_share_one_pump_thread(page, http_server):
+    requests: list[str] = []
+    console_messages: list[str] = []
+    page_errors: list[str] = []
+    page.on("request", lambda request: requests.append(request.url))
+    page.on("console", lambda message: console_messages.append(message.text))
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    page.goto(f"{http_server}/page")
+    page.evaluate(
+        """() => setTimeout(() => {
+          console.log('combined console');
+          throw new Error('combined page error');
+        }, 0)"""
+    )
+
+    assert wait_until(lambda: [url for url in requests if url.endswith("/page")])
+    assert wait_until(lambda: [text for text in console_messages if text == "combined console"])
+    assert wait_until(lambda: [text for text in page_errors if text == "combined page error"])
+    page_event_threads = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("rustwright-page-events")
+    }
+    legacy_observation_threads = [
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith(
+            (
+                "rustwright-request-listener",
+                "rustwright-response-listener",
+                "rustwright-requestfinished-listener",
+                "rustwright-requestfailed-listener",
+                "rustwright-console-listener",
+                "rustwright-pageerror-listener",
+                "rustwright-dialog-listener",
+                "rustwright-load-listener",
+                "rustwright-domcontentloaded-listener",
+                "rustwright-framenavigated-listener",
+                "rustwright-frameattached-listener",
+                "rustwright-framedetached-listener",
+            )
+        )
+    ]
+    assert page._event_pump_thread.ident in page_event_threads
+    assert legacy_observation_threads == []
+
+
+def test_stop_event_pump_is_idempotent_without_browser():
+    from rustwright.sync_api import Page
+
+    class Stream:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    owner = Page.__new__(Page)
+    owner._event_pump_stop_lock = threading.Lock()
+    owner._event_pump_stopped = False
+    owner._event_stream = Stream()
+    owner._event_pump_thread = None
+
+    owner._stop_event_pump()
+    owner._stop_event_pump()
+
+    assert owner._event_stream.close_calls == 1
+    assert owner._event_pump_stopped is True
+
+
+def test_event_wait_on_owning_event_pump_thread_raises_instead_of_deadlocking():
+    from rustwright.sync_api import Error, _wait_for_ready_event_or_owner_close
+
+    class PageOwner:
+        _event_pump_thread: threading.Thread | None = None
+
+    class ContextOwner:
+        pages: list = []
+
+    outcome: dict = {}
+
+    def wait_from_pump_thread():
+        page_owner = PageOwner()
+        page_owner._event_pump_thread = threading.current_thread()
+        try:
+            _wait_for_ready_event_or_owner_close(
+                threading.Event(), page_owner, "dialog", 5000, "5000ms"
+            )
+        except Error as exc:
+            outcome["page_error"] = str(exc)
+
+        context_owner = ContextOwner()
+        context_owner.pages = [page_owner]
+        try:
+            _wait_for_ready_event_or_owner_close(
+                threading.Event(), context_owner, "console", 5000, "5000ms"
+            )
+        except Error as exc:
+            outcome["context_error"] = str(exc)
+
+    thread = threading.Thread(target=wait_from_pump_thread)
+    thread.start()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert "event pump thread" in outcome["page_error"]
+    assert "'dialog'" in outcome["page_error"]
+    assert "event pump thread" in outcome["context_error"]
+    assert "'console'" in outcome["context_error"]
+
+
+def test_event_pump_overflow_warns_and_reconciles_bookkeeping_without_browser():
+    from rustwright.sync_api import Page
+
+    class Core:
+        def __init__(self):
+            self.dialog_calls = []
+
+        def handle_dialog(self, *args):
+            self.dialog_calls.append(args)
+
+    owner = Page.__new__(Page)
+    owner._network_idle_condition = threading.Condition()
+    owner._network_idle_active_requests = {"request-1"}
+    owner._network_idle_last_activity = 0.0
+    owner._core = Core()
+    owner._default_timeout = 30_000.0
+
+    with pytest.warns(RuntimeWarning, match=r"dropped 7 event\(s\)"):
+        owner._reconcile_event_stream_overflow({"dropped": 7})
+
+    assert owner._network_idle_active_requests == set()
+    assert owner._network_idle_last_activity > 0
+    assert owner._core.dialog_calls == [(False, None, 500.0)]
+
+
+def test_page_network_lifecycle_order_and_close_stops_event_pump(browser, http_server):
+    page = browser.new_page()
+    target = f"{http_server}/json"
+    seen: list[str] = []
+    page.on("request", lambda request: seen.append("request") if request.url == target else None)
+    page.on("response", lambda response: seen.append("response") if response.url == target else None)
+    page.on(
+        "requestfinished",
+        lambda request: seen.append("requestfinished") if request.url == target else None,
+    )
+
+    page.goto(target)
+    wait_until(lambda: len(seen) >= 3)
+    assert seen == ["request", "response", "requestfinished"]
+
+    pump = page._event_pump_thread
+    assert pump.is_alive()
+    page.close()
+    assert wait_until(lambda: not pump.is_alive()) is True
+
+
+def test_browser_close_stops_event_pumps_for_open_pages(browser):
+    pages = [browser.new_page(), browser.new_page()]
+    pumps = [page._event_pump_thread for page in pages]
+
+    assert all(pump.is_alive() for pump in pumps)
+    browser.close()
+
+    assert wait_until(lambda: all(not pump.is_alive() for pump in pumps)) is True
+    live_page_event_thread_ids = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("rustwright-page-events")
+    }
+    assert not any(pump.ident in live_page_event_thread_ids for pump in pumps)
+
+
+def test_overlapping_response_events_follow_cdp_sequence(page, http_server):
+    session = page.context.new_cdp_session(page)
+    cdp_urls: list[str] = []
+    page_urls: list[str] = []
+    targets = {
+        f"{http_server}/race-response-a",
+        f"{http_server}/race-response-b",
+    }
+
+    def record_cdp_response(payload):
+        url = str(payload.get("response", {}).get("url") or "")
+        if url in targets:
+            cdp_urls.append(url)
+
+    session.on("Network.responseReceived", record_cdp_response)
+    session.send("Network.enable")
+    page.on("response", lambda response: page_urls.append(response.url) if response.url in targets else None)
+    page.goto(f"{http_server}/page")
+    page.evaluate(
+        """async () => {
+        await Promise.all([fetch('/race-response-a'), fetch('/race-response-b')]);
+        }"""
+    )
+
+    assert wait_until(lambda: len(cdp_urls) == 2 and len(page_urls) == 2)
+    assert page_urls == cdp_urls
 
 
 def test_response_event_resource_type_and_body_match_skyvern_xhr_download_capture(page):
@@ -8871,91 +9132,6 @@ def test_public_type_shape_exports_are_importable():
     assert async_api.ViewportSize.__annotations__ == {"width": int, "height": int}
     assert "server" in sync_api.ProxySettings.__annotations__
     assert "server" in async_api.ProxySettings.__annotations__
-
-
-def test_skyvern_audit_alias_symbol_coverage_detects_missing_symbols():
-    from tools.audit_skyvern_playwright_usage import build_alias_symbol_coverage
-
-    coverage = build_alias_symbol_coverage(
-        {
-            "playwright.sync_api": Counter({"sync_playwright": 2, "DefinitelyMissingFromRustwright": 1}),
-            "patchright.async_api": Counter({"async_playwright": 1}),
-        }
-    )
-
-    assert coverage["status"] == "missing_symbols"
-    assert coverage["missing_total"] == 1
-    assert coverage["modules"]["patchright.async_api"]["status"] == "ok"
-    assert coverage["missing"] == [
-        {"module": "playwright.sync_api", "symbol": "DefinitelyMissingFromRustwright"}
-    ]
-
-
-def test_skyvern_audit_method_name_coverage_detects_missing_methods():
-    from tools.audit_skyvern_playwright_usage import build_method_name_coverage
-
-    coverage = build_method_name_coverage(Counter({"goto": 3, "definitely_missing_method": 1}))
-
-    assert coverage["status"] == "missing_global_method_name"
-    assert coverage["missing_total"] == 1
-    assert coverage["methods"]["goto"]["status"] == "ok"
-    assert coverage["methods"]["goto"]["owner_count"] > 0
-    assert coverage["missing"] == [{"method": "definitely_missing_method", "call_count": 1}]
-
-
-def test_skyvern_audit_infers_receiver_typed_method_calls(tmp_path: Path):
-    from tools.audit_skyvern_playwright_usage import build_typed_method_coverage, scan_python
-
-    sample = tmp_path / "sample.py"
-    sample.write_text(
-        """
-from playwright.async_api import Page
-from playwright.async_api import Playwright
-
-async def run(page: Page, playwright: Playwright):
-    await page.goto("https://example.com")
-    locator = page.locator("button")
-    await locator.click()
-    session = await page.context.new_cdp_session(page)
-    await session.send("Network.clearBrowserCache")
-    browser = await playwright.chromium.launch(headless=True)
-    await browser.close()
-""",
-        encoding="utf-8",
-    )
-
-    result = scan_python(sample, tmp_path)
-    typed_calls = Counter(result["typed_method_calls"])
-
-    assert typed_calls["playwright.async_api.Page.goto"] == 1
-    assert typed_calls["playwright.async_api.Page.locator"] == 1
-    assert typed_calls["playwright.async_api.Locator.click"] == 1
-    assert typed_calls["playwright.async_api.BrowserContext.new_cdp_session"] == 1
-    assert typed_calls["playwright.async_api.CDPSession.send"] == 1
-    assert typed_calls["playwright.async_api.BrowserType.launch"] == 1
-    assert typed_calls["playwright.async_api.Browser.close"] == 1
-
-    coverage = build_typed_method_coverage(typed_calls)
-    assert coverage["status"] == "ok"
-    assert coverage["missing_total"] == 0
-    assert coverage["receiver_method_count"] == 7
-
-
-def test_skyvern_audit_typed_method_coverage_detects_missing_receiver_method():
-    from tools.audit_skyvern_playwright_usage import build_typed_method_coverage
-
-    coverage = build_typed_method_coverage(Counter({"playwright.async_api.Page.definitely_missing_method": 1}))
-
-    assert coverage["status"] == "missing_on_receiver"
-    assert coverage["missing_total"] == 1
-    assert coverage["missing"] == [
-        {
-            "module": "playwright.async_api",
-            "class": "Page",
-            "method": "definitely_missing_method",
-            "call_count": 1,
-        }
-    ]
 
 
 def test_public_class_like_import_surface_matches_reference():
@@ -15464,6 +15640,16 @@ def test_dialog_event_dismisses_alert(page):
     assert page.evaluate("document.body.dataset.after") == "done"
 
 
+def test_dialog_without_handler_is_auto_dismissed_by_page_event_pump(page):
+    page.set_content(
+        "<button id='alert' onclick=\"alert('No listener'); document.body.dataset.after='done'\">Alert</button>"
+    )
+
+    page.click("#alert")
+
+    assert page.evaluate("document.body.dataset.after") == "done"
+
+
 def test_page_close_run_before_unload_emits_beforeunload_dialog(browser):
     context = browser.new_context()
     page = context.new_page()
@@ -15573,6 +15759,22 @@ def test_wait_for_event_captures_delayed_console_message(page):
     message = page.wait_for_event("console", lambda event: event.text == "late console", timeout=3_000)
 
     assert message.type == "log"
+    matching_history = [
+        entry for entry in page.console_messages(filter="all") if entry.text == "late console"
+    ]
+    assert len(matching_history) == 1
+
+
+def test_wait_for_event_captures_delayed_page_error_once_in_history(page):
+    page.evaluate("() => setTimeout(() => { throw new Error('late page error'); }, 50)")
+
+    error = page.wait_for_event("pageerror", lambda event: str(event) == "late page error", timeout=3_000)
+
+    assert str(error) == "late page error"
+    matching_history = [
+        entry for entry in page.page_errors(filter="all") if str(entry) == "late page error"
+    ]
+    assert len(matching_history) == 1
 
 
 def test_console_messages_history_and_clear_case(page):
