@@ -5,7 +5,6 @@ FROM ${RUSTWRIGHT_DOCKER_BASE_IMAGE}
 USER root
 
 ARG PLAYWRIGHT_REFERENCE_VERSION=1.59.0
-ARG INSTALL_BROWSER_HARNESS=1
 ARG INSTALL_PUPPETEER=0
 
 ENV CARGO_HOME=/usr/local/cargo \
@@ -100,12 +99,6 @@ RUN case "$(uname -m)" in \
     esac \
     && test -n "$browser" \
     && ln -sf "$browser" "$RUSTWRIGHT_CHROMIUM"
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$INSTALL_BROWSER_HARNESS" = "1" ]; then \
-        python -m pip install "browser-harness @ git+https://github.com/browser-use/browser-harness.git" \
-        || echo "browser-harness optional install failed; benchmark runner will report it as skipped"; \
-    fi
 
 RUN --mount=type=cache,target=/root/.npm \
     if [ "$INSTALL_PUPPETEER" = "1" ]; then \
