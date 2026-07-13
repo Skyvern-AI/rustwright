@@ -7,7 +7,6 @@ HOST_WORKDIR="${RUSTWRIGHT_DOCKER_WORKDIR:-$PWD}"
 # to memory so Docker cannot spill beyond the configured test budget.
 TEST_DOCKER_MEMORY_LIMIT="${TEST_DOCKER_MEMORY_LIMIT:-8g}"
 readonly TEST_DOCKER_MEMORY_SWAP_LIMIT="$TEST_DOCKER_MEMORY_LIMIT"
-INSTALL_BROWSER_HARNESS="${INSTALL_BROWSER_HARNESS:-0}"
 INSTALL_PUPPETEER="${INSTALL_PUPPETEER:-0}"
 RUSTWRIGHT_DOCKER_BASE_IMAGE="${RUSTWRIGHT_DOCKER_BASE_IMAGE:-python:3.13-slim-bookworm}"
 RUSTWRIGHT_DOCKER_LEGACY="${RUSTWRIGHT_DOCKER_LEGACY:-0}"
@@ -22,7 +21,6 @@ Usage:
 Environment:
   RUSTWRIGHT_DOCKER_IMAGE          Image name. Defaults to rustwright-verify.
   RUSTWRIGHT_DOCKER_WORKDIR        Host worktree used for source/test file mounts. Defaults to $PWD.
-  INSTALL_BROWSER_HARNESS          Build arg for optional browser-harness install. Defaults to 0.
   INSTALL_PUPPETEER                Build arg for optional puppeteer-core install. Defaults to 0.
   RUSTWRIGHT_DOCKER_BASE_IMAGE     Build base image. Defaults to python:3.13-slim-bookworm.
   RUSTWRIGHT_DOCKER_LEGACY         Set to 1 to build without BuildKit cache mounts.
@@ -98,7 +96,6 @@ case "$mode" in
       --memory "$TEST_DOCKER_MEMORY_LIMIT"
       --memory-swap "$TEST_DOCKER_MEMORY_SWAP_LIMIT"
       --build-arg "RUSTWRIGHT_DOCKER_BASE_IMAGE=${RUSTWRIGHT_DOCKER_BASE_IMAGE}"
-      --build-arg "INSTALL_BROWSER_HARNESS=${INSTALL_BROWSER_HARNESS}"
       --build-arg "INSTALL_PUPPETEER=${INSTALL_PUPPETEER}"
       -t "$IMAGE"
     )

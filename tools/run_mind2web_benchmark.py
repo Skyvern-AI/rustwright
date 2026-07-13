@@ -9,20 +9,18 @@ import os
 import platform
 import random
 import shutil
-import socket
 import statistics
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
-import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / ".benchmark-data" / "manifests" / "mind2web_tasks.json"
-DEFAULT_IMPLS = ["rustwright-py", "playwright", "rustwright-ts", "typescript-playwright", "typescript-puppeteer", "browser-harness"]
+DEFAULT_IMPLS = ["rustwright-py", "playwright", "rustwright-ts", "typescript-playwright", "typescript-puppeteer"]
 EXPERIMENTAL_IMPLS = ["rustwright-ts-cdp"]
 LEGACY_IMPL_ALIASES = {
     "rustwright": "rustwright-py",
@@ -209,53 +207,6 @@ def close_quietly(target: Any) -> None:
         target.close()
     except Exception:
         return
-
-
-def find_chromium_executable() -> str:
-    explicit = benchmark_chromium_executable()
-    if explicit:
-        return explicit
-    candidates = [
-        Path("/usr/local/bin/rustwright-chromium"),
-        Path("/usr/bin/chromium"),
-        Path("/usr/bin/chromium-browser"),
-        Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-        Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
-    ]
-    home = Path.home()
-    cache = home / "Library/Caches/ms-playwright"
-    if cache.is_dir():
-        for path in sorted(cache.iterdir(), key=lambda item: item.name, reverse=True):
-            if path.name.startswith("chromium_headless_shell"):
-                candidates.append(path / "chrome-headless-shell-mac-arm64/chrome-headless-shell")
-                candidates.append(path / "chromium_headless_shell-mac/headless_shell")
-            if path.name.startswith("chromium-"):
-                candidates.append(
-                    path / "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
-                )
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-    raise UnsupportedImplementation("could not find a Chromium executable for browser-harness")
-
-
-def pick_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def wait_for_cdp(port: int, timeout: float = 10.0) -> None:
-    deadline = time.time() + timeout
-    url = f"http://127.0.0.1:{port}/json/version"
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=0.3) as response:
-                json.loads(response.read().decode())
-                return
-        except OSError:
-            time.sleep(0.05)
-    raise RuntimeError(f"Chrome did not expose CDP on port {port}")
 
 
 BROWSER_EVALUATOR = r"""
@@ -703,240 +654,6 @@ def run_node_adapter(
     finally:
         Path(script_path).unlink(missing_ok=True)
     return merge_node_chunk_results(implementation, iterations, chunk_results)
-
-
-def run_browser_harness_adapter(tasks: list[dict[str, Any]], iterations: int) -> dict[str, Any]:
-    executable = find_chromium_executable()
-    harness_executable = str(Path(sys.executable).with_name("browser-harness"))
-    if not Path(harness_executable).is_file():
-        found = shutil.which("browser-harness")
-        if found is None:
-            raise UnsupportedImplementation("browser-harness executable is not installed")
-        harness_executable = found
-    port = pick_port()
-    browser_name = f"mind2web-bench-{os.getpid()}"
-    payload = {"implementation": "browser-harness", "tasks": tasks, "iterations": iterations}
-    with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8", delete=False) as payload_file:
-        json.dump(payload, payload_file)
-        payload_path = payload_file.name
-    with tempfile.TemporaryDirectory(prefix="browser-harness-mind2web-profile-", ignore_cleanup_errors=True) as profile:
-        browser = subprocess.Popen(
-            [
-                executable,
-                f"--remote-debugging-port={port}",
-                f"--user-data-dir={profile}",
-                "--headless=new",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "about:blank",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            wait_for_cdp(port)
-            env = {
-                **os.environ,
-                "BU_NAME": browser_name,
-                "BU_CDP_URL": f"http://127.0.0.1:{port}",
-                "MIND2WEB_PAYLOAD": payload_path,
-                "MIND2WEB_BROWSER_EXECUTABLE": executable,
-                "MIND2WEB_BROWSER_HARNESS_EXECUTABLE": harness_executable,
-            }
-            proc = subprocess.run(
-                [harness_executable],
-                input=browser_harness_code(),
-                text=True,
-                capture_output=True,
-                env=env,
-                timeout=max(120, len(tasks) * iterations * 10),
-            )
-            if proc.returncode != 0:
-                raise RuntimeError(proc.stderr or proc.stdout)
-            for line in reversed(proc.stdout.splitlines()):
-                if line.startswith("MIND2WEB_JSON "):
-                    result = json.loads(line.removeprefix("MIND2WEB_JSON "))
-                    result.setdefault("metadata", {})["browser_executable"] = executable
-                    result.setdefault("metadata", {})["harness_executable"] = harness_executable
-                    return result
-            raise RuntimeError(f"browser-harness did not print Mind2Web JSON:\n{proc.stdout}")
-        finally:
-            Path(payload_path).unlink(missing_ok=True)
-            subprocess.run(
-                [harness_executable, "--reload"],
-                env={**os.environ, "BU_NAME": browser_name, "BU_CDP_URL": f"http://127.0.0.1:{port}"},
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            browser.terminate()
-            try:
-                browser.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                browser.kill()
-
-
-def browser_harness_code() -> str:
-    evaluator = json.dumps(BROWSER_EVALUATOR)
-    return textwrap.dedent(
-        f"""
-        import json, os, statistics, sys, tempfile, time
-        from pathlib import Path
-
-        EVALUATOR = {evaluator}
-
-        def set_html(html):
-            handle = tempfile.NamedTemporaryFile("w", suffix=".html", encoding="utf-8", delete=False)
-            try:
-                handle.write(html)
-                handle.close()
-                cdp("Page.navigate", url=Path(handle.name).as_uri())
-                wait_for_load()
-            finally:
-                try:
-                    os.unlink(handle.name)
-                except OSError:
-                    pass
-
-        def close_current():
-            try:
-                tab = current_tab()
-                cdp("Target.closeTarget", targetId=tab["targetId"])
-            except Exception:
-                pass
-
-        def fixtures(task):
-            values = task.get("action_fixtures")
-            if not isinstance(values, list):
-                return []
-            return [item for item in values if isinstance(item, dict) and item.get("html")]
-
-        def execute_fixture(fixture):
-            set_html(fixture["html"])
-            compact_fixture = {{key: value for key, value in fixture.items() if key != "html"}}
-            return js("(" + EVALUATOR + ")(" + json.dumps(compact_fixture) + ")")
-
-        def percentile(values, percent):
-            if not values:
-                return 0.0
-            ordered = sorted(values)
-            if len(ordered) == 1:
-                return ordered[0]
-            position = (len(ordered) - 1) * percent
-            lower = int(position)
-            upper = min(lower + 1, len(ordered) - 1)
-            fraction = position - lower
-            return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
-
-        def timing_summary(values):
-            if not values:
-                return {{"mean_ms": 0.0, "median_ms": 0.0, "p25_ms": 0.0, "p75_ms": 0.0, "min_ms": 0.0, "max_ms": 0.0, "stdev_ms": 0.0}}
-            ms = [value * 1000 for value in values]
-            return {{
-                "mean_ms": statistics.mean(ms),
-                "median_ms": statistics.median(ms),
-                "p25_ms": percentile(ms, 0.25),
-                "p75_ms": percentile(ms, 0.75),
-                "min_ms": min(ms),
-                "max_ms": max(ms),
-                "stdev_ms": statistics.stdev(ms) if len(ms) > 1 else 0.0,
-            }}
-
-        payload = json.loads(open(os.environ["MIND2WEB_PAYLOAD"], encoding="utf-8").read())
-        task_runs = {{str(task.get("task_id")): [] for task in payload["tasks"]}}
-        try:
-            for _ in range(payload["iterations"]):
-                for task in payload["tasks"]:
-                    task_id = str(task.get("task_id"))
-                    task_fixtures = fixtures(task)
-                    if not task_fixtures:
-                        task_runs[task_id].append({{"status": "skipped", "failure_kind": "no_action_fixtures", "duration_s": 0.0}})
-                        continue
-                    started = time.perf_counter()
-                    status = "passed"
-                    failure_kind = ""
-                    detail = ""
-                    completed_actions = 0
-                    try:
-                        for fixture in task_fixtures:
-                            result = execute_fixture(fixture)
-                            if not result.get("ok"):
-                                status = "failed"
-                                failure_kind = result.get("failure_kind") or "quality_failure"
-                                detail = result.get("detail") or ""
-                                break
-                            completed_actions += 1
-                    except Exception as error:
-                        status = "failed"
-                        failure_kind = "automation_failure"
-                        detail = str(error)
-                    finally:
-                        duration_s = time.perf_counter() - started
-                        close_current()
-                    task_runs[task_id].append({{
-                        "status": status,
-                        "failure_kind": failure_kind,
-                        "detail": detail,
-                        "duration_s": duration_s,
-                        "completed_actions": completed_actions,
-                        "action_count": len(task_fixtures),
-                    }})
-        finally:
-            close_current()
-
-        tasks = {{}}
-        cases = {{}}
-        passed = failed = skipped = 0
-        for task in payload["tasks"]:
-            task_id = str(task.get("task_id"))
-            runs = task_runs.get(task_id, [])
-            passed_runs = sum(1 for run in runs if run["status"] == "passed")
-            failed_runs = sum(1 for run in runs if run["status"] == "failed")
-            skipped_runs = sum(1 for run in runs if run["status"] == "skipped")
-            passed += passed_runs
-            failed += failed_runs
-            skipped += skipped_runs
-            durations = [float(run["duration_s"]) for run in runs if run["status"] != "skipped"]
-            tasks[task_id] = {{
-                "task_id": task_id,
-                "website": task.get("website"),
-                "domain": task.get("domain"),
-                "action_count": task.get("action_count"),
-                "executable_action_count": len(fixtures(task)),
-                "passed_runs": passed_runs,
-                "failed_runs": failed_runs,
-                "skipped_runs": skipped_runs,
-                "runs": runs,
-            }}
-            cases[task_id] = timing_summary(durations)
-
-        result = {{
-            "implementation": "browser-harness",
-            "iterations": payload["iterations"],
-            "metadata": {{
-                "suite": "mind2web",
-                "comparison_mode": "mind2web_offline_action_replay",
-                "case_count": len(payload["tasks"]),
-                "python": sys.version.split()[0],
-                "browser_executable": os.environ.get("MIND2WEB_BROWSER_EXECUTABLE"),
-                "harness_executable": os.environ.get("MIND2WEB_BROWSER_HARNESS_EXECUTABLE"),
-            }},
-            "quality": {{
-                "task_count": len(payload["tasks"]),
-                "total_runs": len(payload["tasks"]) * payload["iterations"],
-                "passed_runs": passed,
-                "failed_runs": failed,
-                "skipped_runs": skipped,
-                "success_rate": passed / (passed + failed) if passed + failed else 0.0,
-            }},
-            "tasks": tasks,
-            "cases": cases,
-            "total_mean_ms": sum(case["mean_ms"] for case in cases.values()),
-        }}
-        print("MIND2WEB_JSON " + json.dumps(result, sort_keys=True))
-        """
-    )
 
 
 def node_adapter_code(kind: str) -> str:
@@ -1418,8 +1135,6 @@ def run_impl(args: argparse.Namespace, implementation: str, tasks: list[dict[str
         )
     if implementation in {"typescript-playwright", "typescript-puppeteer", "rustwright-ts-cdp", "rustwright-ts"}:
         return run_node_adapter(implementation, tasks, args.iterations, args.reference_path)
-    if implementation == "browser-harness":
-        return run_browser_harness_adapter(tasks, args.iterations)
     raise UnsupportedImplementation(f"unknown implementation: {implementation}")
 
 

@@ -15,7 +15,6 @@ REFERENCE_IMPLEMENTATIONS = (
     ("python_playwright_reference", "Python Playwright reference", "vs_python_playwright_reference"),
     ("typescript_playwright_reference", "TypeScript Playwright", "vs_typescript_playwright_reference"),
     ("typescript_puppeteer_reference", "TypeScript Puppeteer", "vs_typescript_puppeteer_reference"),
-    ("browser_harness", "browser-harness", "vs_browser_harness"),
 )
 
 
@@ -168,26 +167,6 @@ def benchmark_table() -> str:
                 latest["iterations"],
                 ms(means[key]),
                 comparison_for(speedup, speedup_prefix, "total_mean"),
-            ]
-        )
-    if "browser_harness" in means:
-        rows.append(
-            [
-                "browser-harness",
-                latest["sample_count"],
-                latest["iterations"],
-                ms(means["browser_harness"]),
-                comparison_for(speedup, "vs_browser_harness", "total_mean"),
-            ]
-        )
-    else:
-        rows.append(
-            [
-                "browser-harness",
-                "n/a",
-                "n/a",
-                "skipped",
-                latest.get("skipped", {}).get("browser_harness", "not measured"),
             ]
         )
     result_table = markdown_table(
