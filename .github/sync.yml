@@ -1,0 +1,53 @@
+# Shared Rustwright files mirrored from rustwright to rustwright-cloud.
+# Repository-specific GitHub workflows and metadata are intentionally excluded.
+# Cloud-only additions must live outside the mirrored paths below.
+Skyvern-AI/rustwright-cloud:
+  - source: benchmarks/
+    dest: benchmarks/
+    deleteOrphaned: true
+  - source: docs/
+    dest: docs/
+    deleteOrphaned: true
+  - source: node/
+    dest: node/
+    deleteOrphaned: true
+  - source: python/
+    dest: python/
+    deleteOrphaned: true
+  - source: src/
+    dest: src/
+    deleteOrphaned: true
+  - source: tests/
+    dest: tests/
+    deleteOrphaned: true
+  - source: tools/
+    dest: tools/
+    deleteOrphaned: true
+  - source: .dockerignore
+    dest: .dockerignore
+  - source: .gitignore
+    dest: .gitignore
+  - source: BENCHMARK.md
+    dest: BENCHMARK.md
+  - source: CODE_ARCHITECTURE.md
+    dest: CODE_ARCHITECTURE.md
+  - source: CODE_OF_CONDUCT.md
+    dest: CODE_OF_CONDUCT.md
+  - source: CONTRIBUTING.md
+    dest: CONTRIBUTING.md
+  - source: Cargo.lock
+    dest: Cargo.lock
+  - source: Cargo.toml
+    dest: Cargo.toml
+  - source: Dockerfile
+    dest: Dockerfile
+  - source: LICENSE
+    dest: LICENSE
+  - source: LIMITATIONS.md
+    dest: LIMITATIONS.md
+  - source: README.md
+    dest: README.md
+  - source: SECURITY.md
+    dest: SECURITY.md
+  - source: pyproject.toml
+    dest: pyproject.toml
