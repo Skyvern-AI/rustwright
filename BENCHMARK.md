@@ -50,7 +50,7 @@ changed after the testbox was warmed, rebuild the image inside the testbox after
 the local changes sync:
 
 ```bash
-blacksmith testbox run --id <ID> "TEST_DOCKER_MEMORY_LIMIT=8g RUSTWRIGHT_DOCKER_IMAGE=rustwright-verify-testbox INSTALL_BROWSER_HARNESS=1 INSTALL_PUPPETEER=1 tools/docker_test.sh build ."
+blacksmith testbox run --id <ID> "TEST_DOCKER_MEMORY_LIMIT=8g RUSTWRIGHT_DOCKER_IMAGE=rustwright-verify-testbox INSTALL_PUPPETEER=1 tools/docker_test.sh build ."
 ```
 
 For large task suites such as Mind2Web, prefer the sharded Docker runner so each
