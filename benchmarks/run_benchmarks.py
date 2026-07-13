@@ -6,14 +6,12 @@ import json
 import os
 import platform
 import shutil
-import socket
 import statistics
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
-import urllib.request
 from pathlib import Path
 from typing import Callable
 
@@ -22,11 +20,7 @@ from automation_cases import BENCHMARK_STRICT_CASES
 
 ROOT = Path(__file__).resolve().parents[1]
 STRICT_IMPLS = {"rustwright", "playwright"}
-EQUIVALENT_IMPLS = {"rustwright", "playwright", "typescript-playwright", "typescript-puppeteer", "browser-harness"}
-
-
-class BrowserHarnessUnavailable(RuntimeError):
-    pass
+EQUIVALENT_IMPLS = {"rustwright", "playwright", "typescript-playwright", "typescript-puppeteer"}
 
 
 class PlaywrightReferenceUnavailable(RuntimeError):
@@ -281,101 +275,7 @@ def find_chromium_executable() -> str:
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
-    raise RuntimeError("Could not find a Chromium executable for browser-harness comparison")
-
-
-def pick_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def wait_for_cdp(port: int, timeout: float = 10.0) -> None:
-    deadline = time.time() + timeout
-    url = f"http://127.0.0.1:{port}/json/version"
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=0.3) as response:
-                json.loads(response.read().decode())
-                return
-        except OSError:
-            time.sleep(0.05)
-    raise RuntimeError(f"Chrome did not expose CDP on port {port}")
-
-
-def run_browser_harness(iterations: int, *, suite: str = "equivalent", lifecycle: str = "warm-browser") -> dict:
-    if suite != "equivalent":
-        raise BrowserHarnessUnavailable("browser-harness only supports the equivalent workflow benchmark suite")
-    if lifecycle not in {"warm-browser", "cold-container"}:
-        raise BrowserHarnessUnavailable("browser-harness currently supports warm-browser lifecycle only")
-    executable = find_chromium_executable()
-    harness_executable = str(Path(sys.executable).with_name("browser-harness"))
-    if not Path(harness_executable).is_file():
-        found = shutil.which("browser-harness")
-        if found is None:
-            raise BrowserHarnessUnavailable(
-                "browser-harness executable is not installed; install the GitHub browser-use/browser-harness CLI "
-                "to include it in the benchmark comparison"
-            )
-        harness_executable = found
-    port = pick_port()
-    browser_name = f"rustwright-bench-{os.getpid()}"
-    code = browser_harness_code(iterations)
-    with tempfile.TemporaryDirectory(prefix="browser-harness-profile-", ignore_cleanup_errors=True) as profile:
-        launch_args = [
-            executable,
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={profile}",
-            "--headless=new",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ]
-        if sys.platform == "darwin":
-            launch_args.append("--single-process")
-        launch_args.append("about:blank")
-        browser = subprocess.Popen(
-            launch_args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            wait_for_cdp(port)
-            env = {
-                **os.environ,
-                "BU_NAME": browser_name,
-                "BU_CDP_URL": f"http://127.0.0.1:{port}",
-            }
-            proc = subprocess.run(
-                [harness_executable],
-                input=code,
-                text=True,
-                capture_output=True,
-                env=env,
-                timeout=120,
-            )
-            if proc.returncode != 0:
-                raise RuntimeError(proc.stderr or proc.stdout)
-            for line in reversed(proc.stdout.splitlines()):
-                if line.startswith("BENCHMARK_JSON "):
-                    result = json.loads(line.removeprefix("BENCHMARK_JSON "))
-                    result.setdefault("metadata", {})["browser_executable"] = executable
-                    result.setdefault("metadata", {})["harness_executable"] = harness_executable
-                    return result
-            raise RuntimeError(f"browser-harness did not print benchmark JSON:\n{proc.stdout}")
-        finally:
-            subprocess.run(
-                [harness_executable, "--reload"],
-                env={**os.environ, "BU_NAME": browser_name, "BU_CDP_URL": f"http://127.0.0.1:{port}"},
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            browser.terminate()
-            try:
-                browser.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                browser.kill()
+    raise RuntimeError("Could not find a Chromium executable for the Puppeteer comparison")
 
 
 def run_typescript_playwright(
@@ -544,7 +444,7 @@ def speedup_report(results: list[dict]) -> dict[str, float]:
         return {}
     report: dict[str, float] = {}
     rustwright_total = float(rustwright["total_mean_ms"])
-    for baseline in ("playwright", "typescript-playwright", "typescript-puppeteer", "browser-harness"):
+    for baseline in ("playwright", "typescript-playwright", "typescript-puppeteer"):
         if baseline not in by_name:
             continue
         baseline_total = float(by_name[baseline]["total_mean_ms"])
@@ -1539,288 +1439,6 @@ def typescript_puppeteer_code(
     )
 
 
-def browser_harness_code(iterations: int) -> str:
-    return textwrap.dedent(
-        f"""
-        import json, statistics, sys, tempfile, time
-        from urllib.parse import quote
-
-        def data_url(html):
-            return "data:text/html;charset=utf-8," + quote(html)
-
-        def set_html(html):
-            new_tab("about:blank")
-            js("document.open(); document.write(" + json.dumps(html) + "); document.close();")
-
-        def close_current():
-            try:
-                tab = current_tab()
-                cdp("Target.closeTarget", targetId=tab["targetId"])
-            except Exception:
-                pass
-
-        def goto_and_title():
-            new_tab(data_url("<title>Bench</title><main>ready</main>"))
-            wait_for_load()
-            assert js("document.title").endswith("Bench")
-
-        def set_content_and_read_text():
-            set_html("<section><h1>Dashboard</h1><p id='status'>Ready</p></section>")
-            assert js("document.querySelector('#status').textContent") == "Ready"
-
-        def evaluate_json():
-            set_html("<div></div>")
-            assert js("(() => ({{sum: 1 + 2, ok: true}}))()") == {{"sum": 3, "ok": True}}
-
-        def click_button():
-            set_html("<button id='go' onclick=\\"document.body.dataset.clicked='yes'\\">Go</button>")
-            def actionable():
-                return js("(() => {{ const el = document.querySelector('#go'); const rect = el.getBoundingClientRect(); const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2); return !!el && rect.width > 0 && rect.height > 0 && (hit === el || el.contains(hit)); }})()")
-            assert actionable()
-            assert actionable()
-            assert actionable()
-            assert js("document.body.dataset.clicked || null") is None
-            js("document.querySelector('#go').click()")
-            assert js("document.body.dataset.clicked") == "yes"
-
-        def fill_input_case():
-            set_html(\"\"\"
-            <input id='email'>
-            <input id='hidden-email' style='display:none' value='hidden'>
-            <input id='disabled-email' disabled value='disabled'>
-            <input id='readonly-email' readonly value='readonly'>
-            <input id='checkbox-email' type='checkbox' value='old'>
-            <input id='number-code' type='number'>
-            <input id='date-code' type='date'>
-            <select id='plan'><option value='basic'>Basic</option><option value='pro' selected>Pro</option></select>
-            <button id='button-email' value='button-value'>Button</button>
-            <div id='editable-email' contenteditable>editable</div>
-            <div id='plain-email'>plain</div>
-            \"\"\")
-            js("const e=document.querySelector('#email'); e.focus(); e.value='user@example.com'; e.dispatchEvent(new Event('input',{{bubbles:true}})); e.dispatchEvent(new Event('change',{{bubbles:true}}));")
-            assert js("document.querySelector('#email').value") == "user@example.com"
-            assert js("document.querySelector('#plain-email').tagName") == "DIV"
-            assert js("document.querySelector('#plan').tagName") == "SELECT"
-            assert js("document.querySelector('#checkbox-email').type") == "checkbox"
-            assert js("document.querySelector('#number-code').type") == "number"
-            assert js("document.querySelector('#date-code').type") == "date"
-            assert js("document.querySelector('#plan').value") == "pro"
-            assert js("document.querySelector('#button-email').tagName") == "BUTTON"
-            js("document.querySelector('#email').value=''; document.querySelector('#email').dispatchEvent(new Event('input',{{bubbles:true}}));")
-            assert js("document.querySelector('#email').value") == ""
-            js("document.querySelector('#email').value='forced@example.com'; document.querySelector('#email').dispatchEvent(new Event('input',{{bubbles:true}}));")
-            assert js("document.querySelector('#email').value") == "forced@example.com"
-            assert js("document.querySelector('#hidden-email').value") == "hidden"
-            assert js("document.querySelector('#disabled-email').value") == "disabled"
-            assert js("document.querySelector('#readonly-email').value") == "readonly"
-            js("document.querySelector('#editable-email').textContent='forced editable';")
-            assert js("document.querySelector('#editable-email').textContent") == "forced editable"
-
-        def type_input():
-            set_html("<input id='message'>")
-            js("document.querySelector('#message').focus()")
-            type_text("hello")
-            assert js("document.querySelector('#message').value") == "hello"
-
-        def locator_count():
-            set_html("<ul>" + "".join(f"<li>Item {{i}}</li>" for i in range(25)) + "</ul>")
-            assert js("document.querySelectorAll('li').length") == 25
-
-        def locator_nth_text():
-            set_html("<ul><li>first</li><li>second</li><li>third</li></ul>")
-            assert js("document.querySelectorAll('li')[2].innerText") == "third"
-
-        def role_locator():
-            set_html("<button aria-label='Save record'>Save</button>")
-            assert js("!!document.querySelector('button[aria-label*=Save]')")
-
-        def text_locator():
-            set_html("<article><p>Quarterly revenue report</p></article>")
-            assert js("document.body.innerText.includes('revenue')")
-
-        def wait_for_selector_case():
-            set_html("<main id='root'><div id='hidden' style='display:none'>Hidden</div><div id='gone'>Gone</div><iframe srcdoc='<span id=\\"frame-hidden\\" style=\\"display:none\\">Hidden</span>'></iframe></main>")
-            js("(() => setTimeout(() => {{ const node = document.createElement('div'); node.id = 'done'; node.textContent = 'Done'; document.querySelector('#root').appendChild(node); document.querySelector('#gone').remove(); }}, 20))()")
-            deadline = time.time() + 2
-            while time.time() < deadline:
-                if js("!!document.querySelector('#done')"):
-                    break
-                time.sleep(0.005)
-            assert js("!!document.querySelector('#done')")
-            assert js("document.querySelector('#done').textContent") == "Done"
-            assert js("getComputedStyle(document.querySelector('#hidden')).display") == "none"
-            assert js("document.querySelector('#missing') === null")
-            assert js("document.querySelector('#gone') === null")
-
-        def screenshot():
-            set_html("<h1>Screenshot</h1>")
-            path = capture_screenshot()
-            assert open(path, "rb").read(8).startswith(b"\\x89PNG")
-
-        def webvoyager_checkout_workflow():
-            set_html(\"\"\"
-            <main>
-              <label>Search catalog <input id="query" placeholder="Search catalog"></label>
-              <label>Category <select id="category"><option value="all">All</option><option value="travel">Travel</option><option value="office">Office</option></select></label>
-              <label>Maximum price <input id="max-price" type="number" value="999"></label>
-              <button id="apply">Apply filters</button>
-              <section id="results" aria-label="Results"></section>
-              <output id="cart-count" aria-label="Cart count">0</output>
-              <output id="cart-total" aria-label="Cart total">$0</output>
-              <label>Email <input id="email" type="email"></label>
-              <button id="place-order">Place order</button>
-              <strong id="confirmation"></strong>
-            </main>
-            <script>
-            const products = [
-              {{ name: 'Noise cancelling headphones', category: 'travel', price: 129 }},
-              {{ name: 'Travel adapter', category: 'travel', price: 29 }},
-              {{ name: 'Desk lamp', category: 'office', price: 64 }},
-              {{ name: 'Notebook set', category: 'office', price: 18 }}
-            ];
-            const cart = [];
-            function render() {{
-              const query = document.querySelector('#query').value.toLowerCase();
-              const category = document.querySelector('#category').value;
-              const max = Number(document.querySelector('#max-price').value || 999);
-              const results = products.filter(product => product.name.toLowerCase().includes(query) && (category === 'all' || product.category === category) && product.price <= max);
-              document.querySelector('#results').innerHTML = results.map(product => '<article data-testid="result"><h2>' + product.name + '</h2><p>$' + product.price + '</p><button aria-label="Add ' + product.name + '" data-name="' + product.name + '">Add</button></article>').join('');
-            }}
-            document.querySelector('#apply').addEventListener('click', render);
-            document.querySelector('#results').addEventListener('click', event => {{
-              const button = event.target.closest('button[data-name]');
-              if (!button) return;
-              const product = products.find(item => item.name === button.dataset.name);
-              cart.push(product);
-              document.querySelector('#cart-count').textContent = String(cart.length);
-              document.querySelector('#cart-total').textContent = '$' + cart.reduce((total, item) => total + item.price, 0);
-            }});
-            document.querySelector('#place-order').addEventListener('click', () => {{
-              document.querySelector('#confirmation').textContent = 'Confirmed ' + cart.length + ' items for ' + document.querySelector('#email').value;
-            }});
-            render();
-            </script>
-            \"\"\")
-            js("document.querySelector('#query').value='travel'; document.querySelector('#apply').click()")
-            assert js("document.querySelectorAll('[data-testid=result]').length") == 1
-            js("document.querySelector('[aria-label=\\"Add Travel adapter\\"]').click()")
-            js("document.querySelector('#query').value='noise'; document.querySelector('#category').value='travel'; document.querySelector('#max-price').value='150'; document.querySelector('#apply').click()")
-            assert js("document.querySelectorAll('[data-testid=result]').length") == 1
-            js("document.querySelector('[aria-label=\\"Add Noise cancelling headphones\\"]').click()")
-            js("document.querySelector('#email').value='ada@example.com'; document.querySelector('#place-order').click()")
-            assert js("document.querySelector('#cart-count').textContent") == "2"
-            assert js("document.querySelector('#cart-total').textContent") == "$158"
-            assert js("document.querySelector('#confirmation').textContent") == "Confirmed 2 items for ada@example.com"
-
-        def mind2web_table_triage_workflow():
-            set_html(\"\"\"
-            <main>
-              <label>Status <select id="status"><option value="all">All</option><option value="open">Open</option><option value="closed">Closed</option></select></label>
-              <label>Owner <input id="owner"></label>
-              <label><input id="urgent" type="checkbox"> Urgent only</label>
-              <button id="run">Run triage</button>
-              <table><tbody></tbody></table>
-              <div id="toast" role="status"></div>
-            </main>
-            <script>
-            const tickets = [
-              {{ title: 'Invoice export', owner: 'Sam', status: 'open', priority: 'P0' }},
-              {{ title: 'Login copy', owner: 'Rae', status: 'open', priority: 'P2' }},
-              {{ title: 'Billing retry', owner: 'Sam', status: 'closed', priority: 'P1' }},
-              {{ title: 'Webhook audit', owner: 'Sam', status: 'open', priority: 'P1' }}
-            ];
-            function render() {{
-              const status = document.querySelector('#status').value;
-              const owner = document.querySelector('#owner').value.toLowerCase();
-              const urgent = document.querySelector('#urgent').checked;
-              const rows = tickets.filter(ticket => (status === 'all' || ticket.status === status) && (!owner || ticket.owner.toLowerCase().includes(owner)) && (!urgent || ticket.priority === 'P0'));
-              document.querySelector('tbody').innerHTML = rows.map(ticket => '<tr><td>' + ticket.title + '</td><td>' + ticket.owner + '</td><td>' + ticket.status + '</td><td>' + ticket.priority + '</td><td><button aria-label="Assign ' + ticket.title + '" data-title="' + ticket.title + '">Assign</button></td></tr>').join('');
-            }}
-            document.querySelector('#run').addEventListener('click', render);
-            document.querySelector('tbody').addEventListener('click', event => {{
-              const button = event.target.closest('button[data-title]');
-              if (button) document.querySelector('#toast').textContent = 'Assigned ' + button.dataset.title;
-            }});
-            render();
-            </script>
-            \"\"\")
-            js("document.querySelector('#status').value='open'; document.querySelector('#owner').value='Sam'; document.querySelector('#urgent').checked=true; document.querySelector('#run').click()")
-            assert js("document.querySelectorAll('tbody tr').length") == 1
-            assert "Invoice export" in js("document.querySelector('tbody tr').innerText")
-            js("document.querySelector('[aria-label=\\"Assign Invoice export\\"]').click()")
-            assert js("document.querySelector('#toast').textContent") == "Assigned Invoice export"
-
-        def research_navigation_workflow():
-            detail_html = "<title>Alpine Detail</title><article><h1>Alpine expansion report</h1><dl><dt>Revenue</dt><dd>$4.2M</dd><dt>Risk</dt><dd>Low</dd></dl></article>"
-            home_html = "<title>Research Home</title><main><input aria-label='Research query' value='alpine'><a href='#detail'>Open Alpine report</a><button id='save' onclick=\\"document.body.dataset.saved='alpine'\\">Save result</button></main>"
-            set_html(home_html)
-            assert js("document.querySelector('[aria-label=\\"Research query\\"]').value") == "alpine"
-            close_current()
-            set_html(detail_html)
-            assert js("document.querySelector('h1').textContent") == "Alpine expansion report"
-            assert "Revenue" in js("document.querySelector('article').innerText")
-            close_current()
-            set_html(home_html)
-            js("document.querySelector('#save').click()")
-            assert js("document.body.dataset.saved") == "alpine"
-
-        cases = [
-            ("goto_and_title", goto_and_title),
-            ("set_content_and_read_text", set_content_and_read_text),
-            ("evaluate_json", evaluate_json),
-            ("click_button", click_button),
-            ("fill_input", fill_input_case),
-            ("type_input", type_input),
-            ("locator_count", locator_count),
-            ("locator_nth_text", locator_nth_text),
-            ("role_locator", role_locator),
-            ("text_locator", text_locator),
-            ("wait_for_selector", wait_for_selector_case),
-            ("screenshot", screenshot),
-            ("webvoyager_checkout_workflow", webvoyager_checkout_workflow),
-            ("mind2web_table_triage_workflow", mind2web_table_triage_workflow),
-            ("research_navigation_workflow", research_navigation_workflow),
-        ]
-        samples = []
-        for _ in range({iterations}):
-            timings = {{}}
-            for name, fn in cases:
-                started = time.perf_counter()
-                try:
-                    fn()
-                    timings[name] = time.perf_counter() - started
-                finally:
-                    close_current()
-            samples.append(timings)
-        result = {{
-            "implementation": "browser-harness",
-            "iterations": {iterations},
-            "metadata": {{
-                "suite": "equivalent",
-                "lifecycle": "warm-browser",
-                "case_count": len(cases),
-                "comparison_mode": "lower_level_equivalent_workflows",
-                "python": sys.version.split()[0],
-            }},
-            "cases": {{
-                name: {{
-                    "mean_ms": statistics.mean(sample[name] for sample in samples) * 1000,
-                    "median_ms": statistics.median(sample[name] for sample in samples) * 1000,
-                    "p25_ms": sorted(sample[name] for sample in samples)[max(0, int((len(samples) - 1) * 0.25))] * 1000,
-                    "p75_ms": sorted(sample[name] for sample in samples)[max(0, int((len(samples) - 1) * 0.75))] * 1000,
-                    "min_ms": min(sample[name] for sample in samples) * 1000,
-                    "max_ms": max(sample[name] for sample in samples) * 1000,
-                    "stdev_ms": statistics.stdev(sample[name] for sample in samples) * 1000 if len(samples) > 1 else 0.0,
-                }}
-                for name, _ in cases
-            }},
-        }}
-        result["total_mean_ms"] = sum(value["mean_ms"] for value in result["cases"].values())
-        print("BENCHMARK_JSON " + json.dumps(result, sort_keys=True))
-        """
-    )
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1830,7 +1448,6 @@ def main() -> int:
             "playwright",
             "typescript-playwright",
             "typescript-puppeteer",
-            "browser-harness",
             "all",
         ],
         default="rustwright",
@@ -1858,10 +1475,6 @@ def main() -> int:
 
     if args.suite == "strict" and args.impl not in STRICT_IMPLS | {"all"}:
         raise SystemExit("--suite strict currently supports only --impl rustwright, --impl playwright, or --impl all")
-    if args.case_filters:
-        if args.impl == "browser-harness":
-            raise SystemExit("--case currently does not support --impl browser-harness")
-
     if args.impl == "all":
         results = [
             run_playwright_like(
@@ -1911,19 +1524,6 @@ def main() -> int:
                     )
                 except TypeScriptPuppeteerUnavailable as error:
                     results.append({"implementation": "typescript-puppeteer", "status": "skipped", "reason": str(error)})
-            if args.case_filters:
-                results.append(
-                    {
-                        "implementation": "browser-harness",
-                        "status": "skipped",
-                        "reason": "--case currently does not support browser-harness",
-                    }
-                )
-            else:
-                try:
-                    results.append(run_browser_harness(args.iterations, suite=args.suite, lifecycle=args.lifecycle))
-                except BrowserHarnessUnavailable as error:
-                    results.append({"implementation": "browser-harness", "status": "skipped", "reason": str(error)})
         result = {
             "implementation": "all",
             "iterations": args.iterations,
@@ -1932,8 +1532,6 @@ def main() -> int:
             "results": results,
             "speedups": speedup_report(results),
         }
-    elif args.impl == "browser-harness":
-        result = run_browser_harness(args.iterations, suite=args.suite, lifecycle=args.lifecycle)
     elif args.impl == "typescript-playwright":
         result = run_typescript_playwright(
             args.iterations,
