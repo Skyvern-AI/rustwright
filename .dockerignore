@@ -1,7 +1,6 @@
 .git
 .audit-playwright
 .venv
-.venv_browser_harness_compare
 .pytest_cache
 .mypy_cache
 .ruff_cache
