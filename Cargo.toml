@@ -28,7 +28,7 @@ base64 = "=0.21.7"
 futures-util = "=0.3.31"
 futures-channel = "=0.3.31"
 futures-core = "=0.3.31"
-futures-sink = "=0.3.31"
+futures-sink = "=0.3.32"
 futures-task = "=0.3.31"
 pyo3 = { version = "0.29", features = ["abi3-py38"], optional = true }
 reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls"] }
