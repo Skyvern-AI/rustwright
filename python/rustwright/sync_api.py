@@ -12952,6 +12952,7 @@ class Frame(_EventEmitter):
         self._is_main = is_main
         self._frame_id = frame_id
         self._detached = detached
+        self._uses_direct_evaluation = False
         self._child_frame_cache: list["Frame"] = []
 
     def _remember_child_frame(self, frame: "Frame") -> None:
@@ -13261,7 +13262,8 @@ class Frame(_EventEmitter):
                 frame_scheme = url_parse.urlsplit(self.url).scheme.lower()
             except ValueError:
                 frame_scheme = ""
-        if self._frame_id and frame_scheme == "data" and (arg is None or not _argument_contains_handle(arg)):
+        use_direct_frame_evaluation = frame_scheme == "data" or self._uses_direct_evaluation
+        if self._frame_id and use_direct_frame_evaluation and (arg is None or not _argument_contains_handle(arg)):
             arg_json = None if arg is None else json.dumps(arg)
             result = _call_with_method_prefix(
                 "Frame.evaluate",
@@ -13272,6 +13274,17 @@ class Frame(_EventEmitter):
                 None,
             )
             return _decode_json_result(json.loads(result))
+        if self._frame_id and arg is None:
+            result = _call_with_method_prefix(
+                "Frame.evaluate",
+                self._page._core.evaluate_frame_declaration_helper,
+                self._frame_id,
+                expression,
+                None,
+            )
+            if result is not None:
+                self._uses_direct_evaluation = True
+                return _decode_json_result(json.loads(result))
         if self._frame_spec is not None:
             return self.locator(":root")._evaluate_with_method(
                 """(el, payload) => {
@@ -14319,6 +14332,7 @@ class Page:
         self._default_timeout = 30_000.0
         self._default_navigation_timeout: Optional[float] = None
         self._base_url: Optional[str] = None
+        self._last_url = "about:blank"
         self._strict_selectors = False
         self._viewport_size: Optional[dict[str, int]] = None
         self._screen_size: Optional[dict[str, int]] = None
@@ -14476,7 +14490,12 @@ class Page:
 
     @property
     def url(self) -> str:
-        return _call(self._core.url, self._default_timeout)
+        try:
+            current_url = _call(self._core.url, self._default_timeout)
+        except TargetClosedError:
+            return self._last_url
+        self._last_url = current_url
+        return current_url
 
     @property
     def context(self) -> Optional[BrowserContext]:
