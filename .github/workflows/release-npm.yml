@@ -262,20 +262,19 @@ jobs:
           name: npm-package
           path: npm-dist
 
-      - name: Require a prerelease version
+      - name: Select dist-tag from version
+        id: dist_tag
         shell: bash
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           case "$version" in
-            *-*) ;;
-            *)
-              echo "The experimental npm package requires a prerelease version such as 0.2.0-alpha.1" >&2
-              exit 1
-              ;;
+            *-*) tag=next ;;
+            *) tag=latest ;;
           esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Publish experimental package with provenance
-        run: npm publish ./npm-dist/*.tgz --provenance --access public --tag next
+      - name: Publish package with provenance
+        run: npm publish ./npm-dist/*.tgz --provenance --access public --tag "${{ steps.dist_tag.outputs.tag }}"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
