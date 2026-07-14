@@ -1,7 +1,8 @@
 # Rustwright quickstart
 
-Rustwright is an alpha, Chromium-only project. It is not published to PyPI or
-npm yet, so the current quickstart builds it from source. Review the known
+Rustwright is an alpha, Chromium-only project. The Python package is on PyPI
+and the Node.js binding is on npm; you can also
+build from source, as shown below. Review the known
 [limitations](LIMITATIONS.md) before depending on it in production.
 
 ## Agent-assisted setup
@@ -96,26 +97,23 @@ beta.
 
 ## Node.js (experimental)
 
-The Node.js binding is intended for contributors for now. It is not published,
-has no browser downloader, and exposes only the subset listed in
-[`node/README.md`](node/README.md). You need a recent Node.js (LTS recommended)
-plus the Rust toolchain from the Python prerequisites — `npm run build` compiles
-the native addon via napi-rs.
+The Node.js binding is published to npm. It
+has no browser downloader and exposes only the subset listed in
+[`node/README.md`](node/README.md). Install Chrome/Chromium or set
+`RUSTWRIGHT_CHROMIUM`, `CHROME`, or `CHROMIUM` to an existing executable, then:
 
-Install Chrome/Chromium or set `RUSTWRIGHT_CHROMIUM`, `CHROME`, or `CHROMIUM` to
-an existing executable. Then, from the repository root:
+```bash
+npm install rustwright
+```
+
+To build from source instead — you need a recent Node.js (LTS recommended) plus
+the Rust toolchain from the Python prerequisites — from the repository root:
 
 ```bash
 cd node
 npm install
 npm run build
 npm run smoke
-```
-
-To use the built package from another project:
-
-```bash
-npm install /path/to/rustwright/node
 ```
 
 ## Troubleshooting
