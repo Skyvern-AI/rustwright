@@ -276,6 +276,6 @@ jobs:
           esac
 
       - name: Publish experimental package with provenance
-        run: npm publish npm-dist/*.tgz --provenance --access public --tag next
+        run: npm publish ./npm-dist/*.tgz --provenance --access public --tag next
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
