@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/banner.png" alt="Rustwright — a Rust rewrite of Playwright" width="840" />
+<img src="docs/assets/banner.png" alt="Rustwright — a Rust rewrite of Playwright that uses 70% less memory" width="840" />
 
 **A Rust rewrite of Playwright**, a popular browser automation library. Rustwright is interoperable with Playwright but runs on an in-process Rust CDP engine — **[2.55× faster](#benchmarks)** and **[70% less memory](BENCHMARK.md#client-memory-form-fill-diagnostic)** (no Node driver), with no Playwright automation fingerprint. Alpha; Chromium-only.
 
