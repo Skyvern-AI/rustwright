@@ -54,6 +54,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY src ./src
 COPY python ./python
+# The root Cargo.toml declares `node` as a workspace member, so cargo must be
+# able to load node/Cargo.toml (and its lib source) to resolve the workspace
+# before maturin builds the Python extension — even though this image never
+# builds the Node addon. Copy just the crate manifest and sources, not
+# node_modules.
+COPY node/Cargo.toml node/build.rs ./node/
+COPY node/src ./node/src
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/usr/local/cargo/registry \
