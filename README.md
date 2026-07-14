@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/banner.png" alt="Rustwright — a Rust rewrite of Playwright that uses 70% less memory" width="840" />
+<img src="docs/assets/banner.png" alt="Rustwright — a drop-in replacement for Playwright" width="840" />
 
 **A Rust rewrite of Playwright**, a popular browser automation library. Rustwright is interoperable with Playwright but runs on an in-process Rust CDP engine — **[2.55× faster](#benchmarks)** and **[70% less memory](BENCHMARK.md#client-memory-form-fill-diagnostic)** (no Node driver), with no Playwright automation fingerprint. Alpha; Chromium-only.
 
@@ -8,7 +8,7 @@
 [![tests](https://img.shields.io/github/actions/workflow/status/Skyvern-AI/rustwright/test.yml?label=tests)](https://github.com/Skyvern-AI/rustwright/actions/workflows/test.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
-[![Node.js](https://img.shields.io/badge/node.js-experimental-5FA04E?logo=node.js&logoColor=white)](node/)
+[![npm](https://img.shields.io/npm/v/rustwright?logo=npm&label=npm)](https://www.npmjs.com/package/rustwright)
 [![Chromium only](https://img.shields.io/badge/browser-Chromium-4285F4?logo=googlechrome&logoColor=white)](#limitations)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/fG2XXEuQX3)
 
