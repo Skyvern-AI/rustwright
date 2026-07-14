@@ -189,6 +189,29 @@ local before-fastpath timing sample is recorded here. Treat previous DOM
 fast-path benchmark claims as tainted until reproduced with trusted default
 input in a capped Testbox/Docker run.
 
+## Client Memory: Form-Fill Diagnostic
+
+A form-fill workload — one Python script, byte-identical for both backends
+except the import — recorded the **client library's** memory footprint: the
+automation process's own Python + driver residency. This is the memory
+Rustwright itself governs; Chromium runs as a separate, shared process, so
+whole-process memory is roughly equal between the two backends. Because
+Rustwright speaks CDP in-process while `playwright-python` pipes to a bundled
+Node driver, the client stack is far lighter:
+
+| Pair | playwright-python (Python + Node driver) | Rustwright (Python, no driver) | Δ |
+|---|---:|---:|---:|
+| Remote CDP, client-only (PSS peak) | 133.5 MiB | 40.6 MiB | **−69.6%** |
+| Local, client share at stack peak (PSS) | 130.0 MiB | 37.8 MiB | −71.0% |
+
+The bundled Node driver alone accounts for ~102 MiB of Playwright's client
+footprint; Rustwright ships none, which is the source of the ~70% reduction
+(the "70% less memory" figure in the README and banner). These are
+**demo-grade, single-pair recordings** — the remote pair ran over an
+uncontrolled WAN and the exact build commit was not pinned — illustrative of
+the driver-free architecture, not a durable capped-CI benchmark. Durable
+numbers should come from repeated, capped runs.
+
 ## Avoid Host/Main Chrome
 
 Do not use the host's main Chrome, an existing user profile, or an already-open
