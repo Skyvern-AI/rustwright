@@ -25,9 +25,6 @@ playwright-python:  your code ──pipe──► Node driver (separate process)
 rustwright:         your code ────────────────── raw CDP ─────────────────────► Chromium
 ```
 
-> [!WARNING]
-> **Alpha.** Chromium-only. The Python package is published on PyPI; the experimental Node.js binding still builds from source. Need Firefox/WebKit or production maturity today? Use [`playwright-python`](https://github.com/microsoft/playwright-python). Full list: [Limitations](#limitations).
-
 ## Quickstart
 
 Rustwright is interoperable with Playwright — install it, change one import, and your existing code runs on the Rust engine.
@@ -50,8 +47,6 @@ python -m rustwright install chromium
       print(page.title())
       browser.close()
 ```
-
-Prefer not to touch imports at all? Python offers an opt-in shim — `rustwright.enable_playwright_compat()` — that redirects `import playwright...` to Rustwright at runtime.
 
 **Node.js** (experimental)
 
@@ -82,7 +77,7 @@ The build produces a local `rustwright` package; consume it from another project
 
 - **No Node driver subprocess.** `playwright-python` launches and pipes to a bundled Node driver. Rustwright's engine is native — the browser-control code runs in-process.
 - **Raw CDP, in Rust.** A from-scratch async CDP client — not a wrapper around another automation library.
-- **No Playwright automation fingerprint.** The driver never loads, so its signatures never appear. See [Signal hygiene](#signal-hygiene).
+- **No Playwright automation fingerprint.** The driver never loads, so its signatures never appear. See [Anti-bot](#anti-bot).
 - **Trusted input by default.** Clicks and typing go through real CDP input events (`Input.dispatchMouseEvent`), not synthetic `element.click()` DOM calls. Untrusted DOM shortcuts are opt-in only.
 - **Cross-origin iframes (OOPIF).** Auto-attaches out-of-process iframe targets with flattened CDP sessions and routes `frame_locator()` across origins.
 - **One engine, two languages.** The same Rust core backs the Python and Node bindings.
@@ -117,7 +112,7 @@ asyncio.run(main())
 
 The sync API connects the same way: `p.chromium.connect_over_cdp(browser_address)`.
 
-## Signal hygiene
+## Anti-bot
 
 Because Rustwright never loads Playwright's Node driver, it never emits the automation signatures that ship with it:
 
@@ -149,7 +144,7 @@ Treat it as a diagnostic, not a launch claim — it is not capped-Docker/CI evid
 
 A separate local async-concurrency diagnostic measured [~41 MB for Rustwright versus ~121 MB for playwright-python's Python process plus Node driver — about 66% less client-side memory](docs/async-design.md#update-high-concurrency-fixes-2026-07). That comparison covers the part the library controls; whole-process memory is Chromium-dominated and varied by scenario. It is also diagnostic, not CI-backed launch evidence.
 
-## Rustwright vs the alternatives
+## Alternatives
 
 | | Rustwright | playwright-python | Puppeteer | Patchright |
 |---|---|---|---|---|
@@ -173,7 +168,7 @@ See [`LIMITATIONS.md`](LIMITATIONS.md) for detail.
 - **Node bindings are early** — a subset of the surface is bridged (`launch`, `newPage`, `goto`, `click`, `fill`, `title`, `textContent`, `evaluate`, `screenshot`, `close`); contexts, routing, tracing, and locators are Python-only for now.
 - **Async concurrency (Python)** — the async API wraps the sync engine via threads; recommended for **≈≤25 concurrent workflows/process**, not high fan-out.
 - **OOPIF** — residual gaps in non-main-frame `JSHandle` follow-ups and drag/screenshot/bounding-box.
-- **Signal hygiene is partial** — 3 of 4 public fingerprint targets clean in local runs (CreepJS still detects headless). **No undetectability promise.**
+- **Anti-bot is partial** — 3 of 4 public fingerprint targets clean in local runs (CreepJS still detects headless). **No undetectability promise.**
 
 ## Roadmap
 
