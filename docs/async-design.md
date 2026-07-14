@@ -48,18 +48,75 @@ thread. `configure_async_executor(max_workers=32..100)` adds roughly
 7–14% throughput at N=100 now that workers no longer contend on the GIL,
 but the default executor remains the recommended configuration.
 
-The async facade still runs sync calls on a thread pool; a native-async
-engine (real `asyncio` futures completed from the Tokio runtime, O(1)
-threads) remains future work per the proposal at the end of this
-document, now motivated by thread footprint rather than correctness or
-throughput.
+## Update: native-async engine (2026-07)
+
+The native-async engine proposed at the end of this document is now
+implemented for the default Chromium launch and supported configurations of
+`new_context`/`new_page`, plus the page `goto`/`click`/`fill`/`evaluate`/
+`wait_for_selector`/`screenshot`/`close` hot paths. Those paths register a
+Rust future on the browser's Tokio runtime and return a real `asyncio.Future`
+settled via `loop.call_soon_threadsafe`, instead of dispatching the sync call
+on a thread pool. Unsupported option combinations fall back to the executor,
+as do `connect`/`connect_over_cdp`, `wait_for_event`, and waits such as
+`wait_for_url`, `wait_for_load_state`, and `wait_for_function`. Per-page event
+delivery normally uses a single asyncio task over the combined Rust event
+stream, with no per-page pump thread on these native paths.
+
+Re-measurement on the same benchmark (macOS arm64, 10 cores, Python 3.13.5),
+`benchmarks/async_concurrency_load.py --concurrency 100`, all scenarios
+passing with zero task errors:
+
+| Stack | Variant | N | active threads | loop lag p99 | errors |
+|---|---|---:|---:|---:|---:|
+| Rustwright (event-pump phase) | shared | 100 | 118 | 31 ms | 0 |
+| Rustwright (native async) | shared | 100 | 18 | 138–296 ms | 0 |
+| Rustwright (native async) | multi | 100 | 18–19 | 116–235 ms | 0 |
+
+For the native benchmark hot paths, active threads are O(browsers + event
+loop) rather than O(pages): 18 threads drive 100 concurrent pages, down from
+118. This does not cover executor-backed operations and waits; pages adopted
+through synchronous popup waiters can also retain a legacy pump thread.
+Throughput is comparable to the thread-pool facade and load-sensitive on a
+shared machine; the win here is thread footprint and real single-loop
+integration, not raw tps. The `cargo` unit suite (34 tests) and the async
+regression selection (596 tests) pass. Subinterpreters remain unsupported
+(see the shutdown-settlement limitation below).
+
+### Shutdown settlement guarantees and known limitation
+
+Native future settlement now registers a repository-owned `atexit` gate.
+Orderly interpreter shutdown closes that gate before finalization, releases
+the GIL while draining settlement callbacks already inside the attachment
+window (bounded to two seconds), and makes later workers leak their final
+process-lifetime Python references instead of attempting a background
+attachment. If an owner asyncio loop has already closed during normal
+runtime, failed `call_soon_threadsafe` delivery directly cancels the pending
+future so it does not remain pending forever.
+
+**Subinterpreters are unsupported.** The settlement gate and active-settlement
+counter are process-global, so shutting down one subinterpreter can disable
+future delivery in another still-running subinterpreter. Use one main Python
+interpreter per process for the async API.
+
+**Known limitation — embedding teardown that bypasses Python `atexit`:** an
+embedding host that begins `Py_FinalizeEx` (or destroys a subinterpreter)
+without running the registered `atexit` callback, at the exact time a Rust
+operation enters its settlement attachment window, still depends on PyO3's
+best-effort `Python::try_attach` finalization detection. The same residual
+applies if a settlement callback remains inside that window longer than the
+two-second drain bound. Removing this last pathological race requires host
+lifecycle integration (an explicit pre-finalize hook for every embedding and
+subinterpreter), which this library cannot install portably from an extension
+module.
 
 ---
 
 ## Scope
 
-This is a measurement-first evaluation of `rustwright.async_api` under a
-high-concurrency browser-automation profile. No native-async rewrite was attempted.
+This section records the original measurement-first evaluation of
+`rustwright.async_api` under a high-concurrency browser-automation profile,
+before any engine change. The native-async rewrite it deferred has since
+been implemented — see "Update: native-async engine (2026-07)" above.
 
 The benchmark is `benchmarks/async_concurrency_load.py`. It starts a local
 HTTP server and runs concurrent workflows at N=5, 25, 50, and 100. Each

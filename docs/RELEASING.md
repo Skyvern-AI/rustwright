@@ -22,7 +22,7 @@ No crates.io settings or token are currently required. Do not publish `rustwrigh
 
 ## Prepare a release
 
-- [ ] Choose a SemVer version. Prereleases (for example `0.2.0-alpha.1`) publish to the npm `next` dist-tag; stable versions (for example `0.1.0`) publish to `latest`.
+- [ ] Choose one version in prerelease SemVer form, for example `0.2.0-alpha.1`. The npm workflow deliberately publishes under the `next` dist-tag and rejects a stable version.
 - [ ] Set that exact string in these source-of-truth fields:
   - `pyproject.toml` → `[project].version`
   - `Cargo.toml` → `[package].version` for `rustwright-core`
@@ -66,7 +66,7 @@ The four source manifests and both lockfiles are all `0.1.0` today; there is no 
 
 - [ ] Approve the `pypi` and `npm` GitHub environment deployments. The tag starts both workflows; publishing is also guarded to `Skyvern-AI/rustwright`.
 - [ ] If a publish job alone must be retried, dispatch that workflow from the existing tag and clear `dry_run`. A branch dispatch cannot publish.
-- [ ] Never move or reuse a published version tag. Fix forward with a new version.
+- [ ] Never move or reuse a published version tag. Fix forward with a new prerelease version.
 
 ## Verify the registries
 
