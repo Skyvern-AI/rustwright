@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="docs/assets/banner.png" alt="Rustwright — Keep the Playwright API. Drop the driver." width="840" />
+<img src="docs/assets/banner.png" alt="Rustwright — a Rust rewrite of Playwright" width="840" />
 
-**A Rust rewrite of Playwright** for Python and Node.js. Keep the API you know while an in-process Rust CDP engine drives Chromium — no Node driver subprocess and no Playwright-specific automation fingerprint. Alpha; Chromium-only.
+**A Rust rewrite of Playwright**, a popular browser automation library. Rustwright is interoperable with Playwright but runs on an in-process Rust CDP engine — **[2.55× faster](#benchmarks)** and **[70% less memory](BENCHMARK.md#client-memory-form-fill-diagnostic)** (no Node driver), with no Playwright automation fingerprint. Alpha; Chromium-only.
 
 [![status: alpha](https://img.shields.io/badge/status-alpha-orange)](#project-status)
 [![tests](https://img.shields.io/github/actions/workflow/status/Skyvern-AI/rustwright/test.yml?label=tests)](https://github.com/Skyvern-AI/rustwright/actions/workflows/test.yml)
@@ -50,13 +50,13 @@ python -m rustwright install chromium
 
 **Node.js** (experimental)
 
-The Node.js binding is **not yet published on npm**. Build it from source:
+Install from npm:
 
 ```bash
-git clone https://github.com/Skyvern-AI/rustwright && cd rustwright/node
-npm install
-npm run build
+npm install rustwright
 ```
+
+The Node binding drives an existing Chromium/Chrome — point Rustwright at it with `RUSTWRIGHT_CHROMIUM`, `CHROME`, or `CHROMIUM`. Prefer to build from source? `git clone` the repo and run `npm install && npm run build` in `node/`.
 
 ```diff
 - import { chromium } from 'playwright';
@@ -69,15 +69,13 @@ npm run build
   await browser.close();
 ```
 
-The build produces a local `rustwright` package; consume it from another project with `npm install /path/to/rustwright/node` (or `npm link`). Only a subset of the API surface is bridged — see [Limitations](#limitations).
-
-**515/515** shared parity cases pass against real Playwright (growing suite; full behavioral parity in progress). `rustwright.async_api` mirrors Playwright's async API (concurrency notes in [Limitations](#limitations)).
+Only a subset of the API surface is bridged — see [Limitations](#limitations).
 
 ## Why Rustwright?
 
 - **No Node driver subprocess.** `playwright-python` launches and pipes to a bundled Node driver. Rustwright's engine is native — the browser-control code runs in-process.
 - **Raw CDP, in Rust.** A from-scratch async CDP client — not a wrapper around another automation library.
-- **No Playwright automation fingerprint.** The driver never loads, so its signatures never appear. See [Anti-bot](#anti-bot).
+- **No Playwright automation fingerprint.** The driver never loads, so its signatures never appear. See [Automation detection](#automation-detection).
 - **Trusted input by default.** Clicks and typing go through real CDP input events (`Input.dispatchMouseEvent`), not synthetic `element.click()` DOM calls. Untrusted DOM shortcuts are opt-in only.
 - **Cross-origin iframes (OOPIF).** Auto-attaches out-of-process iframe targets with flattened CDP sessions and routes `frame_locator()` across origins.
 - **One engine, two languages.** The same Rust core backs the Python and Node bindings.
@@ -112,7 +110,7 @@ asyncio.run(main())
 
 The sync API connects the same way: `p.chromium.connect_over_cdp(browser_address)`.
 
-## Anti-bot
+## Automation detection
 
 Because Rustwright never loads Playwright's Node driver, it never emits the automation signatures that ship with it:
 
@@ -134,7 +132,7 @@ Local fingerprint runs — default Playwright failed webdriver/headless checks t
 
 ## Benchmarks
 
-Rustwright does not headline a speed number yet: launch-facing claims are held to reproducible, isolated CI evidence (Testbox + capped Docker), which is not yet published. One local dev-host diagnostic exists today, where Rustwright won 16/17 case means:
+The headline numbers are local diagnostics, not yet capped-CI evidence. On speed, one dev-host run (warm browser, 5 iterations) won 16 of 17 case means:
 
 | Run | Cases | Rustwright | playwright-python | Speedup |
 |---|---:|---:|---:|---:|
@@ -142,7 +140,7 @@ Rustwright does not headline a speed number yet: launch-facing claims are held t
 
 Treat it as a diagnostic, not a launch claim — it is not capped-Docker/CI evidence. Methodology: [`BENCHMARK.md`](BENCHMARK.md).
 
-A separate local async-concurrency diagnostic measured [~41 MB for Rustwright versus ~121 MB for playwright-python's Python process plus Node driver — about 66% less client-side memory](docs/async-design.md#update-high-concurrency-fixes-2026-07). That comparison covers the part the library controls; whole-process memory is Chromium-dominated and varied by scenario. It is also diagnostic, not CI-backed launch evidence.
+On memory, a [form-fill diagnostic](BENCHMARK.md#client-memory-form-fill-diagnostic) recorded the client library's footprint at **133.5 MiB for playwright-python (Python + Node driver) versus 40.6 MiB for Rustwright (no driver) — about 70% less**; a separate [async-concurrency diagnostic](docs/async-design.md#update-high-concurrency-fixes-2026-07) measured ~66% less on the same client-stack basis. Both cover the part the library controls — Chromium-dominated whole-process memory is roughly equal — and both are demo-grade diagnostics, not capped-CI evidence.
 
 ## Alternatives
 
@@ -164,24 +162,25 @@ Rustwright's lane: **a Rust CDP engine under the Playwright API, for Chromium.**
 See [`LIMITATIONS.md`](LIMITATIONS.md) for detail.
 
 - **Alpha** — API shape covered; full **behavioral** parity not yet proven.
+- **API coverage** — ~96% of Playwright's Python sync API (**515 of 536** methods; **411** exercised by the shared parity registry); the async API provides **488 of 536**. Full report: [`docs/PARITY.md`](docs/PARITY.md).
 - **Chromium only** — Firefox and WebKit error explicitly.
 - **Node bindings are early** — a subset of the surface is bridged (`launch`, `newPage`, `goto`, `click`, `fill`, `title`, `textContent`, `evaluate`, `screenshot`, `close`); contexts, routing, tracing, and locators are Python-only for now.
 - **Async concurrency (Python)** — the async API wraps the sync engine via threads; recommended for **≈≤25 concurrent workflows/process**, not high fan-out.
 - **OOPIF** — residual gaps in non-main-frame `JSHandle` follow-ups and drag/screenshot/bounding-box.
-- **Anti-bot is partial** — 3 of 4 public fingerprint targets clean in local runs (CreepJS still detects headless). **No undetectability promise.**
+- **Automation detection is partial** — 3 of 4 public fingerprint targets clean in local runs (CreepJS still detects headless). **No undetectability promise.**
 
 ## Roadmap
 
-- [ ] **Publish the Node.js binding to npm**
+- [ ] **Language bindings** — one Rust engine, many languages: Go, Java, C#/.NET, Ruby, and PHP (plus a native Rust API)
 - [ ] CI / Testbox-backed benchmark evidence
-- [ ] Native async engine (remove the Python thread-pool bridge)
 - [ ] Broaden the Node.js surface (contexts, routing, locators)
 - [ ] Close remaining OOPIF gaps
-- [ ] Split the core into maintainable modules
 
 Recently shipped:
 
 - [x] Python package published to PyPI
+- [x] Node.js binding published to npm
+- [x] Native async engine over the Tokio CDP core
 - [x] OOPIF auto-attach with flattened CDP sessions
 - [x] 515/515 shared parity suite green against real Playwright
 - [x] `Runtime.enable` console-serialization leak closed on the default path
