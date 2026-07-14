@@ -7554,6 +7554,90 @@ def test_evaluate_expression_function_and_arg(page):
     assert page.evaluate("() => ({ ok: true, items: [1, 2, 3] })") == {"ok": True, "items": [1, 2, 3]}
 
 
+def test_evaluate_can_reinject_declaration_helper_script(page):
+    script = """
+    // Skyvern helper prelude comment
+    let browserNameForWorkarounds = "chromium";
+    class __RustwrightSmokeCounter {
+        constructor() {
+            this.value = browserNameForWorkarounds;
+        }
+    }
+    function __rustwrightSmokeHelper() {
+        return new __RustwrightSmokeCounter().value;
+    }
+    // comment with punctuation, matching Skyvern helper comments,
+    async function __rustwrightAsyncSmokeHelper() {
+        return new __RustwrightSmokeCounter().value;
+    }
+    /*
+     * block comment before a top-level helper
+     */
+    function __rustwrightOuterSmokeHelper() {
+        function __rustwrightNestedSmokeHelper() {
+            return "nested";
+        }
+        return __rustwrightNestedSmokeHelper();
+    }
+    """
+
+    assert page.evaluate("let localValue = 1; localValue") == 1
+    page.evaluate("() => { globalThis.eval = () => { throw new Error('eval disabled'); }; }")
+    assert page.evaluate(script) is None
+    assert page.evaluate("() => typeof browserNameForWorkarounds") == "undefined"
+    assert page.evaluate("() => __rustwrightSmokeHelper()") == "chromium"
+    assert page.evaluate("async () => await __rustwrightAsyncSmokeHelper()") == "chromium"
+    assert page.evaluate("() => __rustwrightOuterSmokeHelper()") == "nested"
+    assert page.evaluate("() => typeof __rustwrightNestedSmokeHelper") == "undefined"
+    assert page.evaluate(script) is None
+    assert page.evaluate("() => __rustwrightSmokeHelper()") == "chromium"
+    assert page.evaluate("async () => await __rustwrightAsyncSmokeHelper()") == "chromium"
+    assert page.evaluate("() => __rustwrightOuterSmokeHelper()") == "nested"
+    assert page.evaluate("() => typeof __rustwrightNestedSmokeHelper") == "undefined"
+
+
+def test_frame_evaluate_can_reinject_declaration_helper_script(page):
+    page.set_content("<iframe name='child' srcdoc='<main>child</main>'></iframe>")
+    frame = wait_until(lambda: page.frame(name="child"))
+    script = """
+    // Skyvern helper prelude comment
+    let browserNameForWorkarounds = "chromium";
+    class __RustwrightFrameSmokeCounter {
+        constructor() {
+            this.value = browserNameForWorkarounds;
+        }
+    }
+    function __rustwrightFrameSmokeHelper() {
+        return new __RustwrightFrameSmokeCounter().value;
+    }
+    // comment with punctuation, matching Skyvern helper comments,
+    async function __rustwrightAsyncFrameSmokeHelper() {
+        return new __RustwrightFrameSmokeCounter().value;
+    }
+    /*
+     * block comment before a top-level helper
+     */
+    function __rustwrightOuterFrameSmokeHelper() {
+        function __rustwrightNestedFrameSmokeHelper() {
+            return "nested";
+        }
+        return __rustwrightNestedFrameSmokeHelper();
+    }
+    """
+
+    frame.evaluate("() => { globalThis.eval = () => { throw new Error('eval disabled'); }; }")
+    assert frame.evaluate(script) is None
+    assert frame.evaluate("() => __rustwrightFrameSmokeHelper()") == "chromium"
+    assert frame.evaluate("async () => await __rustwrightAsyncFrameSmokeHelper()") == "chromium"
+    assert frame.evaluate("() => __rustwrightOuterFrameSmokeHelper()") == "nested"
+    assert frame.evaluate("() => typeof __rustwrightNestedFrameSmokeHelper") == "undefined"
+    assert frame.evaluate(script) is None
+    assert frame.evaluate("() => __rustwrightFrameSmokeHelper()") == "chromium"
+    assert frame.evaluate("async () => await __rustwrightAsyncFrameSmokeHelper()") == "chromium"
+    assert frame.evaluate("() => __rustwrightOuterFrameSmokeHelper()") == "nested"
+    assert frame.evaluate("() => typeof __rustwrightNestedFrameSmokeHelper") == "undefined"
+
+
 def test_evaluate_unserializable_primitive_values_match_playwright(page):
     nan_value = page.evaluate("() => Number.NaN")
     assert isinstance(nan_value, float)
@@ -16334,6 +16418,22 @@ def test_goto_special_scheme_responses_match_playwright(page):
     assert page.url == before
     assert page.title() == ""
     assert page.evaluate("() => document.body.innerText") == "changed"
+
+
+def test_page_url_returns_last_known_value_after_close(page, monkeypatch):
+    data_target = data_url("<title>Closed URL</title><main>closed</main>")
+    page.goto(data_target)
+    assert page.url == data_target
+
+    page.close()
+    assert page.url == data_target
+
+    class ClosedCore:
+        def url(self, _timeout):
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    monkeypatch.setattr(page, "_core", ClosedCore())
+    assert page.url == data_target
 
 
 def test_goto_same_document_hash_returns_none(page, http_server):
