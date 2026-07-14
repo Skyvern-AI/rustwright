@@ -9380,6 +9380,7 @@ def test_fill_sets_value_and_dispatches_events(page):
         <input id="checkbox-name" type="checkbox" value="old">
         <input id="number-code" type="number">
         <input id="date-code" type="date">
+        <textarea id="notes">old notes</textarea>
         <select id="plan"><option value="basic">Basic</option><option value="pro" selected>Pro</option></select>
         <button id="button-name" value="button-value">Button</button>
         <div id="editable-name" contenteditable>editable</div>
@@ -9397,6 +9398,10 @@ def test_fill_sets_value_and_dispatches_events(page):
 
     assert page.evaluate("document.querySelector('#name').value") == "Ada"
     assert page.text_content("#seen") == "Ada"
+    page.locator("#notes").fill("updated notes")
+    assert page.locator("#notes").input_value() == "updated notes"
+    page.locator("#editable-name").fill("updated editable")
+    assert page.text_content("#editable-name") == "updated editable"
     with pytest.raises(Error, match="not an <input>.*role allowing"):
         page.locator("#plain-name").fill("normal plain", timeout=500)
     with pytest.raises(Error, match="\\[contenteditable\\] element"):
@@ -9432,6 +9437,67 @@ def test_fill_sets_value_and_dispatches_events(page):
         page.locator("#plain-name").fill("forced plain", force=True)
     with pytest.raises(Error, match='Input of type "checkbox"'):
         page.locator("#checkbox-name").fill("forced checkbox", force=True)
+
+
+def test_fill_commits_react_controlled_input_value(page):
+    page.set_content(
+        """
+        <input id="controlled" value="Initial">
+        <script>
+        const input = document.querySelector('#controlled');
+        const nativeValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+        let trackedValue = nativeValue.get.call(input);
+        let stateValue = trackedValue;
+
+        // React-controlled inputs install an instance-level value setter. A direct
+        // assignment updates this tracker before `input` fires, so React dedupes the
+        // event and restores its previous state. This reproduces that boundary
+        // without adding React as a test dependency.
+        Object.defineProperty(input, 'value', {
+          configurable: true,
+          get() {
+            return nativeValue.get.call(this);
+          },
+          set(value) {
+            trackedValue = String(value);
+            nativeValue.set.call(this, value);
+          },
+        });
+
+        window.committedValue = stateValue;
+        window.inputEvents = [];
+        input.addEventListener('input', event => {
+          window.inputEvents.push({
+            bubbles: event.bubbles,
+            composed: event.composed,
+            isTrusted: event.isTrusted,
+            constructor: event.constructor.name,
+          });
+          const nextValue = nativeValue.get.call(input);
+          if (nextValue === trackedValue) {
+            nativeValue.set.call(input, stateValue);
+            return;
+          }
+          stateValue = nextValue;
+          input.value = stateValue;
+          window.committedValue = stateValue;
+        });
+        </script>
+        """
+    )
+
+    page.locator("#controlled").fill("Alex")
+
+    assert page.locator("#controlled").input_value() == "Alex"
+    assert page.evaluate("window.committedValue") == "Alex"
+    assert page.evaluate("window.inputEvents") == [
+        {
+            "bubbles": True,
+            "composed": True,
+            "isTrusted": True,
+            "constructor": "InputEvent",
+        }
+    ]
 
 
 def test_type_inserts_at_focus_caret_like_playwright(page):

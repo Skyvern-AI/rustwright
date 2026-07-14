@@ -22482,11 +22482,12 @@ const value = String(payload.value ?? '');
 const forced = !!payload.forced;
 const tagName = String(el.tagName || '').toUpperCase();
 const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
-const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
+const valueInputTypes = new Set(['color', 'date', 'time', 'datetime-local', 'month', 'range', 'week']);
+const textInputTypes = new Set(['', 'email', 'number', 'password', 'search', 'tel', 'text', 'url']);
 const disabled = typeof el.matches === 'function' && el.matches(':disabled');
 const readonly = !!el.readOnly;
 const info = {
-  non_fillable_input: tagName === 'INPUT' && nonFillableInputTypes.has(inputType),
+  non_fillable_input: tagName === 'INPUT' && !valueInputTypes.has(inputType) && !textInputTypes.has(inputType),
   input_type: inputType,
   is_select: tagName === 'SELECT',
 };
@@ -22496,26 +22497,45 @@ const fillable = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEd
 if (!fillable) return { ok: false, type: forced ? 'force-non-fillable' : 'non-fillable', info };
 if (forced && (!visible(el) || disabled || readonly)) return { ok: true };
 if (!forced && (!visible(el) || disabled || readonly)) return { ok: false, type: 'fallback' };
-if ('value' in el) {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.value = value;
-  if (value !== '' && el.value !== value) {
-    return {
-      ok: false,
-      type: inputType === 'number' ? 'number-text' : 'malformed',
-      value: el.value,
-      info,
-    };
-  }
-} else {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.textContent = value;
+let fillValue = value;
+if (inputType === 'number') {
+  fillValue = value.trim();
+  if (Number.isNaN(Number(fillValue))) return { ok: false, type: 'number-text', info };
 }
-el.dispatchEvent(new Event('input', { bubbles: true }));
-el.dispatchEvent(new Event('change', { bubbles: true }));
-return { ok: true };
+el.scrollIntoView({ block: 'center', inline: 'center' });
+if ('value' in el) {
+  if (valueInputTypes.has(inputType)) {
+    fillValue = value.trim();
+    if (inputType === 'color') fillValue = fillValue.toLowerCase();
+    if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+    const valueSetter = Object.getOwnPropertyDescriptor(
+      el.ownerDocument.defaultView.HTMLInputElement.prototype,
+      'value'
+    ).set;
+    valueSetter.call(el, fillValue);
+    if (el.value !== fillValue) return { ok: false, type: 'malformed', value: el.value, info };
+    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return { ok: true };
+  }
+  if (tagName === 'INPUT') {
+    el.select();
+  } else {
+    el.selectionStart = 0;
+    el.selectionEnd = el.value.length;
+  }
+  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+} else {
+  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+  const range = el.ownerDocument.createRange();
+  range.selectNodeContents(el);
+  const selection = el.ownerDocument.defaultView.getSelection();
+  if (selection) {
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+}
+return { ok: true, needsInput: true, fillValue };
 }""",
             payload,
             timeout=timeout,
@@ -22525,6 +22545,8 @@ return { ok: true };
             return False
         result_type = result.get("type")
         if result.get("ok"):
+            if result.get("needsInput"):
+                self._insert_fill_text(str(result.get("fillValue", value)))
             self._page._slow_mo()
             return True
         if result_type == "fallback":
@@ -22542,6 +22564,12 @@ return { ok: true };
         if result_type == "select":
             info = {**info, "is_select": True}
         raise self._fill_type_error(action, info, force=result_type == "force-non-fillable")
+
+    def _insert_fill_text(self, value: str) -> None:
+        if value:
+            self._page.keyboard.insert_text(value)
+        else:
+            self._page.keyboard.press("Delete")
 
     def _try_fast_simple_css_dom_click(self, *, timeout: Optional[float]) -> bool:
         if not _unsafe_dom_fastpath_enabled():
@@ -23112,11 +23140,12 @@ const value = String(payload.value ?? '');
 const forced = !!payload.forced;
 const tagName = String(el.tagName || '').toUpperCase();
 const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
-const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
+const valueInputTypes = new Set(['color', 'date', 'time', 'datetime-local', 'month', 'range', 'week']);
+const textInputTypes = new Set(['', 'email', 'number', 'password', 'search', 'tel', 'text', 'url']);
 const disabled = disabledState(el);
 const readonly = !!el.readOnly;
 const info = {
-  non_fillable_input: tagName === 'INPUT' && nonFillableInputTypes.has(inputType),
+  non_fillable_input: tagName === 'INPUT' && !valueInputTypes.has(inputType) && !textInputTypes.has(inputType),
   input_type: inputType,
   is_select: tagName === 'SELECT',
 };
@@ -23126,26 +23155,45 @@ const fillable = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEd
 if (!fillable) return { ok: false, type: forced ? 'force-non-fillable' : 'non-fillable', info };
 if (forced && (!visible(el) || disabled || readonly)) return { ok: true };
 if (!forced && (!visible(el) || disabled || readonly)) return { ok: false, type: 'fallback' };
-if ('value' in el) {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.value = value;
-  if (value !== '' && el.value !== value) {
-    return {
-      ok: false,
-      type: inputType === 'number' ? 'number-text' : 'malformed',
-      value: el.value,
-      info,
-    };
-  }
-} else {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.textContent = value;
+let fillValue = value;
+if (inputType === 'number') {
+  fillValue = value.trim();
+  if (Number.isNaN(Number(fillValue))) return { ok: false, type: 'number-text', info };
 }
-el.dispatchEvent(new Event('input', { bubbles: true }));
-el.dispatchEvent(new Event('change', { bubbles: true }));
-return { ok: true };
+el.scrollIntoView({ block: 'center', inline: 'center' });
+if ('value' in el) {
+  if (valueInputTypes.has(inputType)) {
+    fillValue = value.trim();
+    if (inputType === 'color') fillValue = fillValue.toLowerCase();
+    if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+    const valueSetter = Object.getOwnPropertyDescriptor(
+      el.ownerDocument.defaultView.HTMLInputElement.prototype,
+      'value'
+    ).set;
+    valueSetter.call(el, fillValue);
+    if (el.value !== fillValue) return { ok: false, type: 'malformed', value: el.value, info };
+    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return { ok: true };
+  }
+  if (tagName === 'INPUT') {
+    el.select();
+  } else {
+    el.selectionStart = 0;
+    el.selectionEnd = el.value.length;
+  }
+  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+} else {
+  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+  const range = el.ownerDocument.createRange();
+  range.selectNodeContents(el);
+  const selection = el.ownerDocument.defaultView.getSelection();
+  if (selection) {
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+}
+return { ok: true, needsInput: true, fillValue };
 """
             ),
             payload,
@@ -23156,6 +23204,8 @@ return { ok: true };
             return False
         result_type = result.get("type")
         if result.get("ok"):
+            if result.get("needsInput"):
+                self._insert_fill_text(str(result.get("fillValue", value)))
             self._page._slow_mo()
             return True
         if result_type == "fallback":
@@ -23315,11 +23365,12 @@ const value = String(payload.value ?? '');
 const forced = !!payload.forced;
 const tagName = String(el.tagName || '').toUpperCase();
 const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
-const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
+const valueInputTypes = new Set(['color', 'date', 'time', 'datetime-local', 'month', 'range', 'week']);
+const textInputTypes = new Set(['', 'email', 'number', 'password', 'search', 'tel', 'text', 'url']);
 const disabled = disabledState(el);
 const readonly = !!el.readOnly;
 const info = {
-  non_fillable_input: tagName === 'INPUT' && nonFillableInputTypes.has(inputType),
+  non_fillable_input: tagName === 'INPUT' && !valueInputTypes.has(inputType) && !textInputTypes.has(inputType),
   input_type: inputType,
   is_select: tagName === 'SELECT',
 };
@@ -23329,26 +23380,45 @@ const fillable = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEd
 if (!fillable) return { ok: false, type: forced ? 'force-non-fillable' : 'non-fillable', info };
 if (forced && (!visible(el) || disabled || readonly)) return { ok: true };
 if (!forced && (!visible(el) || disabled || readonly)) return { ok: false, type: 'fallback' };
-if ('value' in el) {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.value = value;
-  if (value !== '' && el.value !== value) {
-    return {
-      ok: false,
-      type: inputType === 'number' ? 'number-text' : 'malformed',
-      value: el.value,
-      info,
-    };
-  }
-} else {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.textContent = value;
+let fillValue = value;
+if (inputType === 'number') {
+  fillValue = value.trim();
+  if (Number.isNaN(Number(fillValue))) return { ok: false, type: 'number-text', info };
 }
-el.dispatchEvent(new Event('input', { bubbles: true }));
-el.dispatchEvent(new Event('change', { bubbles: true }));
-return { ok: true };
+el.scrollIntoView({ block: 'center', inline: 'center' });
+if ('value' in el) {
+  if (valueInputTypes.has(inputType)) {
+    fillValue = value.trim();
+    if (inputType === 'color') fillValue = fillValue.toLowerCase();
+    if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+    const valueSetter = Object.getOwnPropertyDescriptor(
+      el.ownerDocument.defaultView.HTMLInputElement.prototype,
+      'value'
+    ).set;
+    valueSetter.call(el, fillValue);
+    if (el.value !== fillValue) return { ok: false, type: 'malformed', value: el.value, info };
+    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return { ok: true };
+  }
+  if (tagName === 'INPUT') {
+    el.select();
+  } else {
+    el.selectionStart = 0;
+    el.selectionEnd = el.value.length;
+  }
+  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+} else {
+  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+  const range = el.ownerDocument.createRange();
+  range.selectNodeContents(el);
+  const selection = el.ownerDocument.defaultView.getSelection();
+  if (selection) {
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+}
+return { ok: true, needsInput: true, fillValue };
 """
             ),
             payload,
@@ -23359,6 +23429,8 @@ return { ok: true };
             return False
         result_type = result.get("type")
         if result.get("ok"):
+            if result.get("needsInput"):
+                self._insert_fill_text(str(result.get("fillValue", value)))
             self._page._slow_mo()
             return True
         if result_type == "fallback":
@@ -23403,18 +23475,19 @@ if (strict && (strictFrameViolation || matches.length > 1)) {{
 if (!el) return {{ ok: false, type: 'pending', info }};
 const value = {value_json};
 const forced = {force_literal};
-const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
+const valueInputTypes = new Set(['color', 'date', 'time', 'datetime-local', 'month', 'range', 'week']);
+const textInputTypes = new Set(['', 'email', 'number', 'password', 'search', 'tel', 'text', 'url']);
 const tagName = String(el.tagName || '').toUpperCase();
 const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
 info.visible = visible(el);
 info.enabled = !disabledState(el);
 info.tag_name = tagName;
 info.input_type = inputType;
-info.non_fillable_input = tagName === 'INPUT' && nonFillableInputTypes.has(inputType);
+info.non_fillable_input = tagName === 'INPUT' && !valueInputTypes.has(inputType) && !textInputTypes.has(inputType);
 info.is_select = tagName === 'SELECT';
 info.fillable_for_fill = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
 info.editable_for_fill = info.fillable_for_fill && !disabledState(el) && !el.readOnly;
-if (tagName === 'INPUT' && nonFillableInputTypes.has(inputType)) {{
+if (info.non_fillable_input) {{
   return {{ ok: false, type: 'input-type', inputType, info }};
 }}
 if (tagName === 'SELECT') {{
@@ -23428,26 +23501,45 @@ if (forced && (!visible(el) || disabledState(el) || el.readOnly)) return {{ ok: 
 if (!forced && (!visible(el) || disabledState(el) || el.readOnly)) {{
   return {{ ok: false, type: 'pending', info }};
 }}
-if ('value' in el) {{
-  el.scrollIntoView({{ block: 'center', inline: 'center' }});
-  if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
-  el.value = value;
-  if (value !== '' && el.value !== value) {{
-    return {{
-      ok: false,
-      type: inputType === 'number' ? 'number-text' : 'malformed',
-      value: el.value,
-      info,
-    }};
-  }}
-}} else {{
-  el.scrollIntoView({{ block: 'center', inline: 'center' }});
-  if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
-  el.textContent = value;
+let fillValue = value;
+if (inputType === 'number') {{
+  fillValue = value.trim();
+  if (Number.isNaN(Number(fillValue))) return {{ ok: false, type: 'number-text', info }};
 }}
-el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-return {{ ok: true, info }};
+el.scrollIntoView({{ block: 'center', inline: 'center' }});
+if ('value' in el) {{
+  if (valueInputTypes.has(inputType)) {{
+    fillValue = value.trim();
+    if (inputType === 'color') fillValue = fillValue.toLowerCase();
+    if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
+    const valueSetter = Object.getOwnPropertyDescriptor(
+      el.ownerDocument.defaultView.HTMLInputElement.prototype,
+      'value'
+    ).set;
+    valueSetter.call(el, fillValue);
+    if (el.value !== fillValue) return {{ ok: false, type: 'malformed', value: el.value, info }};
+    el.dispatchEvent(new Event('input', {{ bubbles: true, composed: true }}));
+    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    return {{ ok: true, info }};
+  }}
+  if (tagName === 'INPUT') {{
+    el.select();
+  }} else {{
+    el.selectionStart = 0;
+    el.selectionEnd = el.value.length;
+  }}
+  if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
+}} else {{
+  if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
+  const range = el.ownerDocument.createRange();
+  range.selectNodeContents(el);
+  const selection = el.ownerDocument.defaultView.getSelection();
+  if (selection) {{
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }}
+}}
+return {{ ok: true, needsInput: true, fillValue, info }};
 """
         last_info: dict[str, Any] = {}
         while True:
@@ -23469,6 +23561,8 @@ return {{ ok: true, info }};
                         f"strict mode violation: locator resolved to {count} elements while trying to {action}"
                     )
             if isinstance(result, dict) and result.get("ok"):
+                if result.get("needsInput"):
+                    self._insert_fill_text(str(result.get("fillValue", value)))
                 self._page._slow_mo()
                 return
             if isinstance(result, dict) and result.get("type") == "pending":
