@@ -17,6 +17,7 @@ from typing import Callable
 
 from automation_cases import BENCHMARK_CASES as EQUIVALENT_CASES
 from automation_cases import BENCHMARK_STRICT_CASES
+from process_tree_memory import attach_peak_process_tree_rss
 
 ROOT = Path(__file__).resolve().parents[1]
 STRICT_IMPLS = {"rustwright", "playwright"}
@@ -278,6 +279,7 @@ def find_chromium_executable() -> str:
     raise RuntimeError("Could not find a Chromium executable for the Puppeteer comparison")
 
 
+@attach_peak_process_tree_rss
 def run_typescript_playwright(
     iterations: int,
     reference_path: str | None = None,
@@ -312,6 +314,7 @@ def run_typescript_playwright(
     raise RuntimeError(f"TypeScript Playwright did not print benchmark JSON:\n{proc.stdout}")
 
 
+@attach_peak_process_tree_rss
 def run_typescript_puppeteer(
     iterations: int,
     reference_path: str | None = None,
@@ -352,6 +355,7 @@ def run_typescript_puppeteer(
     raise RuntimeError(f"TypeScript Puppeteer did not print benchmark JSON:\n{proc.stdout}")
 
 
+@attach_peak_process_tree_rss
 def run_playwright_like(
     implementation: str,
     iterations: int,
