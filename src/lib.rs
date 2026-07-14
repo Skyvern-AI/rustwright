@@ -449,6 +449,31 @@ mod tests {
     }
 
     #[test]
+    fn declaration_helper_script_is_block_scoped_and_exports_functions() {
+        let script = r#"
+            // helper prelude
+            const browserName = "chromium";
+            function helper() { return browserName; }
+            async function asyncHelper() { return browserName; }
+        "#;
+
+        let wrapped = make_evaluate_expression(script, None);
+
+        assert!(wrapped.starts_with("{\n"));
+        assert!(!wrapped.contains("(0, eval)"));
+        assert!(wrapped.contains("globalThis.helper = helper;"));
+        assert!(wrapped.contains("globalThis.asyncHelper = asyncHelper;"));
+    }
+
+    #[test]
+    fn declaration_without_function_stays_in_indirect_eval() {
+        assert_eq!(
+            make_evaluate_expression("let localValue = 1; localValue", None),
+            r#"(0, eval)("let localValue = 1; localValue")"#
+        );
+    }
+
+    #[test]
     fn indirect_eval_wrapper_escapes_embedded_quotes_and_newlines() {
         // The source is embedded as a JS string literal, so any quotes,
         // backslashes, or newlines in the script must be escaped safely.
@@ -4572,6 +4597,24 @@ impl PyPage {
         let page = Arc::clone(&self.inner);
         let frame_id = frame_id.to_string();
         py.detach(move || evaluate_expression_for_frame(page, frame_id, expression, timeout_ms))
+            .map_err(py_err)
+    }
+
+    #[pyo3(signature = (frame_id, expression, timeout_ms=None))]
+    fn evaluate_frame_declaration_helper(
+        &self,
+        py: Python<'_>,
+        frame_id: &str,
+        expression: &str,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<Option<String>> {
+        let Some(expression) = wrap_declaration_helper_script(expression.trim()) else {
+            return Ok(None);
+        };
+        let page = Arc::clone(&self.inner);
+        let frame_id = frame_id.to_string();
+        py.detach(move || evaluate_expression_for_frame(page, frame_id, expression, timeout_ms))
+            .map(Some)
             .map_err(py_err)
     }
 
@@ -11845,6 +11888,8 @@ fn make_evaluate_expression(expression: &str, arg_json: Option<&str>) -> String 
         )
     } else if looks_like_function(trimmed) {
         format!("(async () => {{ const __rw_fn = ({trimmed}); return await __rw_fn(); }})()")
+    } else if let Some(wrapped) = wrap_declaration_helper_script(trimmed) {
+        wrapped
     } else {
         // Plain expression/statement string. Run it through an indirect `eval`
         // so that top-level `let`/`const`/`class` declarations are scoped to
@@ -11859,6 +11904,182 @@ fn make_evaluate_expression(expression: &str, arg_json: Option<&str>) -> String 
         let literal = serde_json::to_string(trimmed).unwrap_or_else(|_| "\"\"".to_string());
         format!("(0, eval)({literal})")
     }
+}
+
+fn wrap_declaration_helper_script(expression: &str) -> Option<String> {
+    if !starts_with_lexical_declaration(expression) {
+        return None;
+    }
+    let function_names = statement_function_declaration_names(expression);
+    if function_names.is_empty() {
+        return None;
+    }
+    let exports = function_names
+        .iter()
+        .map(|name| format!("if (typeof {name} !== \"undefined\") globalThis.{name} = {name};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!("{{\n{expression}\n{exports}\n}}"))
+}
+
+fn starts_with_lexical_declaration(expression: &str) -> bool {
+    let expression = trim_leading_js_comments(expression);
+    starts_with_js_keyword(expression, "let") || starts_with_js_keyword(expression, "const")
+}
+
+fn trim_leading_js_comments(mut expression: &str) -> &str {
+    loop {
+        expression = expression.trim_start();
+        if let Some(rest) = expression.strip_prefix("//") {
+            if let Some(newline_index) = rest.find('\n') {
+                expression = &rest[newline_index + 1..];
+                continue;
+            }
+            return "";
+        }
+        if let Some(rest) = expression.strip_prefix("/*") {
+            if let Some(end_index) = rest.find("*/") {
+                expression = &rest[end_index + 2..];
+                continue;
+            }
+            return "";
+        }
+        return expression;
+    }
+}
+
+fn starts_with_js_keyword(expression: &str, keyword: &str) -> bool {
+    let Some(rest) = expression.strip_prefix(keyword) else {
+        return false;
+    };
+    rest.chars()
+        .next()
+        .map(|ch| !is_js_identifier_continue(ch))
+        .unwrap_or(true)
+}
+
+fn statement_function_declaration_names(expression: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut index = 0usize;
+
+    while index < expression.len() {
+        let rest = &expression[index..];
+        if rest.starts_with("//") {
+            index += rest.find('\n').unwrap_or(rest.len());
+            continue;
+        }
+        if rest.starts_with("/*") {
+            index += rest
+                .find("*/")
+                .map(|comment_end| comment_end + 2)
+                .unwrap_or(rest.len());
+            continue;
+        }
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        if matches!(ch, '"' | '\'' | '`') {
+            index = skip_js_string(expression, index, ch);
+            continue;
+        }
+        if let Some(function_index) = function_keyword_index(expression, index) {
+            if let Some(name) =
+                function_declaration_name(&expression[function_index + "function".len()..])
+            {
+                names.push(name);
+            }
+        }
+        index += ch.len_utf8();
+    }
+
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn function_keyword_index(expression: &str, index: usize) -> Option<usize> {
+    if is_js_keyword_at(expression, index, "function") {
+        return Some(index);
+    }
+    if is_js_keyword_at(expression, index, "async") {
+        let after_async = index + "async".len();
+        let function_index = expression[after_async..]
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+            .map(|(offset, _)| after_async + offset)?;
+        if is_js_keyword_at(expression, function_index, "function") {
+            return Some(function_index);
+        }
+    }
+    None
+}
+
+fn is_js_keyword_at(expression: &str, index: usize, keyword: &str) -> bool {
+    let Some(rest) = expression.get(index..) else {
+        return false;
+    };
+    if !rest.starts_with(keyword) {
+        return false;
+    }
+    let before_boundary = expression[..index]
+        .chars()
+        .next_back()
+        .map(|ch| !is_js_identifier_continue(ch))
+        .unwrap_or(true);
+    let after_boundary = expression[index + keyword.len()..]
+        .chars()
+        .next()
+        .map(|ch| !is_js_identifier_continue(ch))
+        .unwrap_or(true);
+    before_boundary && after_boundary
+}
+
+fn skip_js_string(expression: &str, start: usize, quote: char) -> usize {
+    let mut escaped = false;
+    let mut index = start + quote.len_utf8();
+    while index < expression.len() {
+        let rest = &expression[index..];
+        let Some(ch) = rest.chars().next() else {
+            return expression.len();
+        };
+        index += ch.len_utf8();
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            break;
+        }
+    }
+    index
+}
+
+fn function_declaration_name(after_function: &str) -> Option<String> {
+    let mut rest = after_function.trim_start();
+    if let Some(after_generator) = rest.strip_prefix('*') {
+        rest = after_generator.trim_start();
+    }
+    parse_js_identifier_prefix(rest)
+}
+
+fn parse_js_identifier_prefix(value: &str) -> Option<String> {
+    let mut chars = value.chars();
+    let first = chars.next()?;
+    if !is_js_identifier_start(first) {
+        return None;
+    }
+    let mut identifier = String::from(first);
+    for ch in chars {
+        if !is_js_identifier_continue(ch) {
+            break;
+        }
+        identifier.push(ch);
+    }
+    Some(identifier)
 }
 
 fn looks_like_function(expression: &str) -> bool {
@@ -11885,10 +12106,18 @@ fn is_js_identifier(value: &str) -> bool {
     let Some(first) = chars.next() else {
         return false;
     };
-    if !(first == '_' || first == '$' || first.is_ascii_alphabetic()) {
+    if !is_js_identifier_start(first) {
         return false;
     }
-    chars.all(|char| char == '_' || char == '$' || char.is_ascii_alphanumeric())
+    chars.all(is_js_identifier_continue)
+}
+
+fn is_js_identifier_start(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphabetic()
+}
+
+fn is_js_identifier_continue(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
 }
 
 fn runtime_exception_message(exception: &Value) -> String {
