@@ -1,9 +1,14 @@
 # Rustwright for Node
 
 This package exposes Rustwright's Rust CDP core to Node.js through napi-rs.
-It is not published to npm from this worktree.
 
-Build locally:
+An experimental prerelease is published to npm's `next` tag:
+
+```bash
+npm install rustwright@next
+```
+
+To build from source instead, from this directory:
 
 ```bash
 npm install
