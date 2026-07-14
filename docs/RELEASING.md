@@ -2,6 +2,14 @@
 
 This guide is for the release owner.
 
+## Agent-assisted release
+
+Use `/version-upgrade <version> prepare` to create and validate a release PR
+without publishing. Use `/version-upgrade <version> full release` only when the
+agent should merge the prepared release, run final dry runs on the merged
+commit, tag it, and publish to both PyPI and npm. The skill is defined in
+`.claude/skills/version-upgrade/SKILL.md`.
+
 ## One-time setup
 
 - [ ] Confirm the `rustwright` name is still available on both PyPI and npm. A name is not reserved until the first successful publish.
@@ -28,6 +36,11 @@ No crates.io settings or token are currently required. Do not publish `rustwrigh
   - `Cargo.toml` → `[package].version` for `rustwright-core`
   - `node/Cargo.toml` → `[package].version` for `rustwright-node`
   - `node/package.json` → `version`
+- [ ] Set the same string in the shipped runtime metadata:
+  - `python/rustwright/sync_api.py` → Rustwright creator `version` in `_write_har`
+  - `python/rustwright/sync_api.py` → `playwrightVersion` in `_write_trace_zip`
+  - `python/rustwright/cli.py` → source-checkout fallback in `_version`
+  - `python/rustwright/_backend.py` → source-checkout fallback in `_version` (before `+local`)
 - [ ] Regenerate the lockfiles; do not edit generated entries by hand:
 
   ```bash
@@ -36,7 +49,7 @@ No crates.io settings or token are currently required. Do not publish `rustwrigh
   ```
 
 - [ ] Confirm `Cargo.lock` now has the same version for `rustwright-core` and `rustwright-node`, and `node/package-lock.json` has it in both top-level version fields.
-- [ ] Confirm all six files are staged: `pyproject.toml`, `Cargo.toml`, `node/Cargo.toml`, `node/package.json`, `Cargo.lock`, and `node/package-lock.json`.
+- [ ] Confirm all nine files are staged: `pyproject.toml`, `Cargo.toml`, `node/Cargo.toml`, `node/package.json`, `python/rustwright/sync_api.py`, `python/rustwright/cli.py`, `python/rustwright/_backend.py`, `Cargo.lock`, and `node/package-lock.json`.
 - [ ] Run local release checks:
 
   ```bash
@@ -45,7 +58,7 @@ No crates.io settings or token are currently required. Do not publish `rustwrigh
   (cd node && npm ci --ignore-scripts && npm run build && npm run smoke)
   ```
 
-The four source manifests and both lockfiles are all `0.1.0` today; there is no current version mismatch. The source `node/package.json` intentionally remains `"private": true`; the npm workflow removes that field only in its temporary assembled package.
+Before tagging, the four source manifests, shipped runtime metadata, and both lockfiles must have one matching version. The source `node/package.json` intentionally remains `"private": true`; the npm workflow removes that field only in its temporary assembled package.
 
 ## Dry run
 

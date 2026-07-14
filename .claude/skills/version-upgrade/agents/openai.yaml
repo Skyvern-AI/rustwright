@@ -1,0 +1,4 @@
+interface:
+  display_name: "Version Upgrade"
+  short_description: "Bump and publish Rustwright releases"
+  default_prompt: "Use $version-upgrade to prepare the next Rustwright version and publish it only if I explicitly request a full release."
