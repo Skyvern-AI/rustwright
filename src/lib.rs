@@ -4,6 +4,7 @@ use std::fs;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::ops::Deref;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -13,7 +14,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -23,7 +24,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 #[cfg(feature = "python")]
-use pyo3::types::{PyBytes, PyModule};
+use pyo3::types::{PyAny, PyBytes, PyModule};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tempfile::{NamedTempFile, TempDir};
@@ -37,6 +38,149 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
 pub type RwResult<T> = Result<T, RwError>;
 type CdpPendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<RwResult<Value>>>>>;
+
+#[derive(Clone, Debug)]
+struct CloseOutcome {
+    error: Option<String>,
+}
+
+impl CloseOutcome {
+    fn from_result(result: &RwResult<()>) -> Self {
+        Self {
+            error: result.as_ref().err().map(ToString::to_string),
+        }
+    }
+
+    fn into_result(self) -> RwResult<()> {
+        self.error
+            .map_or(Ok(()), |error| Err(RwError::Message(error)))
+    }
+}
+
+enum ClosePhase {
+    Open,
+    Closing(watch::Sender<Option<CloseOutcome>>),
+    Closed(CloseOutcome),
+}
+
+struct CloseLifecycle {
+    phase: Mutex<ClosePhase>,
+}
+
+enum CloseStart {
+    Lead(watch::Sender<Option<CloseOutcome>>),
+    Wait(watch::Receiver<Option<CloseOutcome>>),
+    Done(CloseOutcome),
+}
+
+impl CloseLifecycle {
+    fn new() -> Self {
+        Self {
+            phase: Mutex::new(ClosePhase::Open),
+        }
+    }
+
+    fn start(&self) -> CloseStart {
+        let mut phase = self.phase.lock().unwrap();
+        match &*phase {
+            ClosePhase::Open => {
+                let (sender, _) = watch::channel(None);
+                *phase = ClosePhase::Closing(sender.clone());
+                CloseStart::Lead(sender)
+            }
+            ClosePhase::Closing(sender) => CloseStart::Wait(sender.subscribe()),
+            ClosePhase::Closed(outcome) => CloseStart::Done(outcome.clone()),
+        }
+    }
+
+    fn finish(
+        &self,
+        sender: watch::Sender<Option<CloseOutcome>>,
+        result: &RwResult<()>,
+        close_on_error: bool,
+    ) {
+        let outcome = CloseOutcome::from_result(result);
+        {
+            let mut phase = self.phase.lock().unwrap();
+            if result.is_ok() || close_on_error {
+                *phase = ClosePhase::Closed(outcome.clone());
+            } else {
+                *phase = ClosePhase::Open;
+            }
+        }
+        sender.send_replace(Some(outcome));
+    }
+
+    fn is_closed(&self) -> bool {
+        matches!(*self.phase.lock().unwrap(), ClosePhase::Closed(_))
+    }
+
+    fn is_closing_or_closed(&self) -> bool {
+        !matches!(*self.phase.lock().unwrap(), ClosePhase::Open)
+    }
+}
+
+async fn wait_for_close_outcome(
+    mut receiver: watch::Receiver<Option<CloseOutcome>>,
+) -> RwResult<()> {
+    loop {
+        if let Some(outcome) = receiver.borrow().clone() {
+            return outcome.into_result();
+        }
+        receiver
+            .changed()
+            .await
+            .map_err(|_| RwError::Message("close operation ended without a result".to_string()))?;
+    }
+}
+
+async fn single_flight_close<F, Fut>(
+    lifecycle: Arc<CloseLifecycle>,
+    close_on_error: bool,
+    cleanup: F,
+) -> RwResult<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = RwResult<()>>,
+{
+    match lifecycle.start() {
+        CloseStart::Done(outcome) => outcome.into_result(),
+        CloseStart::Wait(receiver) => wait_for_close_outcome(receiver).await,
+        CloseStart::Lead(sender) => {
+            let result = cleanup().await;
+            lifecycle.finish(sender, &result, close_on_error);
+            result
+        }
+    }
+}
+
+struct PendingCommandGuard {
+    id: u64,
+    pending: CdpPendingMap,
+}
+
+struct SpawnedTaskAbortGuard(tokio::task::AbortHandle);
+
+impl PendingCommandGuard {
+    fn new(id: u64, pending: &CdpPendingMap) -> Self {
+        Self {
+            id,
+            pending: Arc::clone(pending),
+        }
+    }
+}
+
+impl Drop for PendingCommandGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
+impl Drop for SpawnedTaskAbortGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 const CDP_EVENT_LOG_LIMIT: usize = 8192;
 const FRAME_UTILITY_WORLD_NAME: &str = "__utility_world__";
@@ -66,6 +210,358 @@ fn py_err(error: RwError) -> PyErr {
         RwError::Timeout(ms) => PyRuntimeError::new_err(format!("timed out after {ms} ms")),
         other => PyRuntimeError::new_err(other.to_string()),
     }
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "_RustFutureAbort")]
+struct PyRustFutureAbort {
+    cancellation: RustFutureCancellation,
+}
+
+#[cfg(feature = "python")]
+enum RustFutureCancellation {
+    Tokio(tokio::task::AbortHandle),
+    Thread(Arc<AtomicBool>),
+}
+
+#[cfg(feature = "python")]
+impl RustFutureCancellation {
+    fn cancel(&self) {
+        match self {
+            Self::Tokio(abort_handle) => abort_handle.abort(),
+            Self::Thread(cancelled) => cancelled.store(true, Ordering::SeqCst),
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "_RustFutureSettler")]
+struct PyRustFutureSettler {
+    future: Py<PyAny>,
+    method: String,
+    value: Py<PyAny>,
+    on_delivered: Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+}
+
+#[cfg(feature = "python")]
+static PYTHON_SETTLEMENTS_ENABLED: AtomicBool = AtomicBool::new(true);
+
+#[cfg(feature = "python")]
+fn active_python_settlements() -> &'static (Mutex<usize>, Condvar) {
+    static ACTIVE: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+    ACTIVE.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+#[cfg(feature = "python")]
+struct PythonSettlementActivity;
+
+#[cfg(feature = "python")]
+impl PythonSettlementActivity {
+    fn begin() -> Option<Self> {
+        let (active, _) = active_python_settlements();
+        let mut active = active.lock().unwrap();
+        if !PYTHON_SETTLEMENTS_ENABLED.load(Ordering::SeqCst) {
+            return None;
+        }
+        *active += 1;
+        Some(Self)
+    }
+}
+
+#[cfg(feature = "python")]
+impl Drop for PythonSettlementActivity {
+    fn drop(&mut self) {
+        let (active, changed) = active_python_settlements();
+        let mut active = active.lock().unwrap();
+        *active = active.saturating_sub(1);
+        changed.notify_all();
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "_RustShutdownGate")]
+struct PyRustShutdownGate;
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyRustShutdownGate {
+    fn __call__(&self, py: Python<'_>) {
+        let (active, _) = active_python_settlements();
+        {
+            let _active = active.lock().unwrap();
+            PYTHON_SETTLEMENTS_ENABLED.store(false, Ordering::SeqCst);
+        }
+        py.detach(|| {
+            let (active, changed) = active_python_settlements();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut count = active.lock().unwrap();
+            while *count > 0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next, timeout) = changed.wait_timeout(count, remaining).unwrap();
+                count = next;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyRustFutureAbort {
+    fn __call__(&self, future: &Bound<'_, PyAny>) -> PyResult<()> {
+        if future.call_method0("cancelled")?.extract::<bool>()? {
+            self.cancellation.cancel();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "python")]
+impl Drop for PyRustFutureAbort {
+    fn drop(&mut self) {
+        // asyncio schedules done callbacks. If Future.cancel() is immediately followed by
+        // loop.close(), the loop discards that callback queue. Dropping the queued callback is
+        // therefore the final cancellation signal and must abort the Rust work synchronously.
+        self.cancellation.cancel();
+    }
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyRustFutureSettler {
+    fn __call__(&self, py: Python<'_>) -> PyResult<()> {
+        let future = self.future.bind(py);
+        if future.call_method0("done")?.extract::<bool>()? {
+            return Ok(());
+        }
+        future.call_method1(self.method.as_str(), (self.value.bind(py),))?;
+        if let Some(on_delivered) = self.on_delivered.lock().unwrap().take() {
+            on_delivered();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "python")]
+struct PythonFutureOutput {
+    value: Py<PyAny>,
+    on_delivered: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+#[cfg(feature = "python")]
+fn settle_python_future_output<T, C>(
+    event_loop: Py<PyAny>,
+    future: Py<PyAny>,
+    result: RwResult<T>,
+    convert: C,
+) where
+    T: Send + 'static,
+    C: for<'py> FnOnce(Python<'py>, T) -> PyResult<PythonFutureOutput> + Send + 'static,
+{
+    let Some(_activity) = PythonSettlementActivity::begin() else {
+        // Python references cannot be decremented safely after orderly interpreter shutdown has
+        // begun. Leaking these final process-lifetime references is preferable to reattaching.
+        std::mem::forget(event_loop);
+        std::mem::forget(future);
+        return;
+    };
+    let mut event_loop = Some(event_loop);
+    let mut future = Some(future);
+    let _ = Python::try_attach(|py| {
+        let event_loop = event_loop.take().unwrap();
+        let future = future.take().unwrap();
+        let cancelled = future
+            .bind(py)
+            .call_method0("cancelled")
+            .and_then(|value| value.extract::<bool>())
+            .unwrap_or(false);
+        if cancelled {
+            return;
+        }
+        let settled = match result {
+            Ok(value) => convert(py, value).map(|output| ("set_result", output)),
+            Err(error) => Err(py_err(error)),
+        };
+        let (method, output) = match settled {
+            Ok(value) => value,
+            Err(error) => (
+                "set_exception",
+                PythonFutureOutput {
+                    value: error.into_value(py).into_any(),
+                    on_delivered: None,
+                },
+            ),
+        };
+        let callback = match Py::new(
+            py,
+            PyRustFutureSettler {
+                future,
+                method: method.to_string(),
+                value: output.value,
+                on_delivered: Mutex::new(output.on_delivered),
+            },
+        ) {
+            Ok(callback) => callback,
+            Err(error) => {
+                error.write_unraisable(py, Some(event_loop.bind(py)));
+                return;
+            }
+        };
+        let fallback_future = callback.borrow(py).future.clone_ref(py);
+        if let Err(error) = event_loop
+            .bind(py)
+            .call_method1("call_soon_threadsafe", (callback,))
+        {
+            let fallback = fallback_future.bind(py);
+            let already_settled = fallback
+                .call_method0("done")
+                .and_then(|value| value.extract::<bool>())
+                .unwrap_or(false);
+            if !already_settled {
+                let _ = fallback.call_method0("cancel");
+            }
+            let was_settled = fallback
+                .call_method0("done")
+                .and_then(|value| value.extract::<bool>())
+                .unwrap_or(false);
+            if !was_settled {
+                eprintln!(
+                    "rustwright: native future could not be delivered to its owner event loop"
+                );
+                error.write_unraisable(py, Some(event_loop.bind(py)));
+            }
+        }
+    });
+    if let Some(event_loop) = event_loop.take() {
+        std::mem::forget(event_loop);
+    }
+    if let Some(future) = future.take() {
+        std::mem::forget(future);
+    }
+}
+
+#[cfg(feature = "python")]
+fn settle_python_future<T, C>(
+    event_loop: Py<PyAny>,
+    future: Py<PyAny>,
+    result: RwResult<T>,
+    convert: C,
+) where
+    T: Send + 'static,
+    C: for<'py> FnOnce(Python<'py>, T) -> PyResult<Py<PyAny>> + Send + 'static,
+{
+    settle_python_future_output(event_loop, future, result, move |py, value| {
+        convert(py, value).map(|value| PythonFutureOutput {
+            value,
+            on_delivered: None,
+        })
+    });
+}
+
+#[cfg(feature = "python")]
+fn python_future_on<F, T, C>(
+    py: Python<'_>,
+    handle: tokio::runtime::Handle,
+    rust_future: F,
+    convert: C,
+) -> PyResult<Py<PyAny>>
+where
+    F: Future<Output = RwResult<T>> + Send + 'static,
+    T: Send + 'static,
+    C: for<'py> FnOnce(Python<'py>, T) -> PyResult<Py<PyAny>> + Send + 'static,
+{
+    let asyncio = PyModule::import(py, "asyncio")?;
+    let event_loop = asyncio.call_method0("get_running_loop")?.unbind();
+    let future = event_loop.call_method0(py, "create_future")?;
+    let returned = future.clone_ref(py);
+    let task = handle.spawn(async move {
+        let result = rust_future.await;
+        settle_python_future(event_loop, future, result, convert);
+    });
+    let aborter = Py::new(
+        py,
+        PyRustFutureAbort {
+            cancellation: RustFutureCancellation::Tokio(task.abort_handle()),
+        },
+    )?;
+    if let Err(error) = returned
+        .bind(py)
+        .call_method1("add_done_callback", (aborter,))
+    {
+        task.abort();
+        return Err(error);
+    }
+    Ok(returned)
+}
+
+#[cfg(feature = "python")]
+fn python_future_on_with_delivery<F, T, C>(
+    py: Python<'_>,
+    handle: tokio::runtime::Handle,
+    rust_future: F,
+    convert: C,
+) -> PyResult<Py<PyAny>>
+where
+    F: Future<Output = RwResult<T>> + Send + 'static,
+    T: Send + 'static,
+    C: for<'py> FnOnce(Python<'py>, T) -> PyResult<PythonFutureOutput> + Send + 'static,
+{
+    let asyncio = PyModule::import(py, "asyncio")?;
+    let event_loop = asyncio.call_method0("get_running_loop")?.unbind();
+    let future = event_loop.call_method0(py, "create_future")?;
+    let returned = future.clone_ref(py);
+    let task = handle.spawn(async move {
+        let result = rust_future.await;
+        settle_python_future_output(event_loop, future, result, convert);
+    });
+    let aborter = Py::new(
+        py,
+        PyRustFutureAbort {
+            cancellation: RustFutureCancellation::Tokio(task.abort_handle()),
+        },
+    )?;
+    if let Err(error) = returned
+        .bind(py)
+        .call_method1("add_done_callback", (aborter,))
+    {
+        task.abort();
+        return Err(error);
+    }
+    Ok(returned)
+}
+
+#[cfg(feature = "python")]
+fn python_future_on_thread<F, T, C>(py: Python<'_>, work: F, convert: C) -> PyResult<Py<PyAny>>
+where
+    F: FnOnce(Arc<AtomicBool>) -> RwResult<T> + Send + 'static,
+    T: Send + 'static,
+    C: for<'py> FnOnce(Python<'py>, T) -> PyResult<Py<PyAny>> + Send + 'static,
+{
+    let asyncio = PyModule::import(py, "asyncio")?;
+    let event_loop = asyncio.call_method0("get_running_loop")?.unbind();
+    let future = event_loop.call_method0(py, "create_future")?;
+    let returned = future.clone_ref(py);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let thread_cancelled = Arc::clone(&cancelled);
+    std::thread::Builder::new()
+        .name("rustwright-native-launch".to_string())
+        .spawn(move || settle_python_future(event_loop, future, work(thread_cancelled), convert))
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let aborter = Py::new(
+        py,
+        PyRustFutureAbort {
+            cancellation: RustFutureCancellation::Thread(cancelled),
+        },
+    )?;
+    returned
+        .bind(py)
+        .call_method1("add_done_callback", (aborter,))?;
+    Ok(returned)
 }
 
 fn mouse_event_payload(
@@ -506,6 +1002,764 @@ mod tests {
         let result = run_blocking_detached(&runtime, async { 42 });
 
         assert_eq!(result, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_lifecycle_shares_one_in_flight_cleanup_and_result() {
+        let lifecycle = Arc::new(CloseLifecycle::new());
+        let cleanup_count = Arc::new(AtomicU64::new(0));
+        let first_lifecycle = Arc::clone(&lifecycle);
+        let first_count = Arc::clone(&cleanup_count);
+        let first = tokio::spawn(async move {
+            single_flight_close(first_lifecycle, false, move || async move {
+                first_count.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(())
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        let second_lifecycle = Arc::clone(&lifecycle);
+        let second_count = Arc::clone(&cleanup_count);
+        let second = tokio::spawn(async move {
+            single_flight_close(second_lifecycle, false, move || async move {
+                second_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+        });
+
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
+        assert!(lifecycle.is_closed());
+    }
+
+    #[test]
+    fn cancelled_create_target_round_trip_closes_orphan_without_closing_success() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(4);
+        let (alive_tx, _) = watch::channel(true);
+        let client = Arc::new(CdpClient {
+            write_tx,
+            pending: Arc::clone(&pending),
+            events,
+            event_log: Arc::new(Mutex::new(CdpEventLog::new())),
+            next_id: AtomicU64::new(1),
+            sent_runtime_enable_count: AtomicU64::new(0),
+            sent_target_close_count: AtomicU64::new(0),
+            sent_context_dispose_count: AtomicU64::new(0),
+            alive: Arc::new(AtomicBool::new(true)),
+            alive_tx,
+        });
+        let browser = Arc::new(BrowserInner {
+            runtime: OwnedRuntime::new(runtime),
+            client: Arc::clone(&client),
+            process: Mutex::new(None),
+            profile_dir: Mutex::new(None),
+            ws_endpoint: "ws://test.invalid".to_string(),
+            stealth_user_agent_override: Mutex::new(None),
+            single_process_fallback: false,
+            lifecycle: Arc::new(CloseLifecycle::new()),
+            attached_pages: AttachedPageRegistry::default(),
+        });
+
+        let test_browser = Arc::clone(&browser);
+        handle.block_on(async move {
+            let cancelled_browser = Arc::clone(&test_browser);
+            let cancelled = tokio::spawn(async move {
+                create_target_cancellation_safe(cancelled_browser, json!({ "url": "about:blank" }))
+                    .await
+            });
+            let create = match write_rx.recv().await.unwrap() {
+                CdpOutgoing::Text(payload) => serde_json::from_str::<Value>(&payload).unwrap(),
+                CdpOutgoing::Close => panic!("unexpected transport close"),
+            };
+            assert_eq!(create["method"], "Target.createTarget");
+            cancelled.abort();
+            assert!(matches!(cancelled.await, Err(error) if error.is_cancelled()));
+            dispatch_cdp_payload(
+                json!({ "id": create["id"], "result": { "targetId": "orphan" } }),
+                Arc::clone(&pending),
+                client.events.clone(),
+                Arc::clone(&client.event_log),
+            );
+
+            let close = tokio::time::timeout(Duration::from_secs(1), write_rx.recv())
+                .await
+                .expect("the orphan target should be closed")
+                .unwrap();
+            let close = match close {
+                CdpOutgoing::Text(payload) => serde_json::from_str::<Value>(&payload).unwrap(),
+                CdpOutgoing::Close => panic!("unexpected transport close"),
+            };
+            assert_eq!(close["method"], "Target.closeTarget");
+            assert_eq!(close["params"]["targetId"], "orphan");
+            dispatch_cdp_payload(
+                json!({ "id": close["id"], "result": { "success": true } }),
+                Arc::clone(&pending),
+                client.events.clone(),
+                Arc::clone(&client.event_log),
+            );
+
+            let successful_browser = Arc::clone(&test_browser);
+            let successful = tokio::spawn(async move {
+                create_target_cancellation_safe(successful_browser, json!({ "url": "about:blank" }))
+                    .await
+            });
+            let create = match write_rx.recv().await.unwrap() {
+                CdpOutgoing::Text(payload) => serde_json::from_str::<Value>(&payload).unwrap(),
+                CdpOutgoing::Close => panic!("unexpected transport close"),
+            };
+            dispatch_cdp_payload(
+                json!({ "id": create["id"], "result": { "targetId": "delivered" } }),
+                Arc::clone(&pending),
+                client.events.clone(),
+                Arc::clone(&client.event_log),
+            );
+            successful.await.unwrap().unwrap().disarm();
+            assert!(write_rx.try_recv().is_err());
+        });
+        drop(browser);
+    }
+
+    #[tokio::test]
+    async fn unrelated_page_attachment_reservations_do_not_head_of_line_block() {
+        let registry = AttachedPageRegistry::default();
+        let slow_lock = match registry.reserve("slow-target") {
+            AttachedPageReservation::Attach { attach_lock, .. } => attach_lock,
+            AttachedPageReservation::Existing(_) => panic!("unexpected attached page"),
+        };
+        let _slow_attach = slow_lock.lock().await;
+
+        let fast_lock = match registry.reserve("fast-target") {
+            AttachedPageReservation::Attach { attach_lock, .. } => attach_lock,
+            AttachedPageReservation::Existing(_) => panic!("unexpected attached page"),
+        };
+        let _fast_attach = tokio::time::timeout(Duration::from_millis(50), fast_lock.lock())
+            .await
+            .expect("an unrelated target must use a different attachment lock");
+    }
+
+    #[test]
+    fn failed_attachment_reservations_do_not_accumulate_target_ids() {
+        let registry = AttachedPageRegistry::default();
+        for index in 0..100 {
+            let target_id = format!("historical-target-{index}");
+            let (generation, attach_lock) = match registry.reserve(&target_id) {
+                AttachedPageReservation::Attach {
+                    generation,
+                    attach_lock,
+                } => (generation, attach_lock),
+                AttachedPageReservation::Existing(_) => panic!("unexpected attached page"),
+            };
+            registry.remove_reservation(&target_id, generation, &attach_lock);
+        }
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn stale_page_removal_does_not_erase_a_new_attachment_reservation() {
+        let registry = AttachedPageRegistry::default();
+        let old_lock = Arc::new(tokio::sync::Mutex::new(()));
+        registry.entries.lock().unwrap().insert(
+            "same-target".to_string(),
+            AttachedPageEntry {
+                generation: 1,
+                page: Weak::new(),
+                attach_lock: Arc::downgrade(&old_lock),
+                registered: false,
+            },
+        );
+
+        let new_lock = Arc::new(tokio::sync::Mutex::new(()));
+        registry.entries.lock().unwrap().insert(
+            "same-target".to_string(),
+            AttachedPageEntry {
+                generation: 2,
+                page: Weak::new(),
+                attach_lock: Arc::downgrade(&new_lock),
+                registered: false,
+            },
+        );
+
+        let new_page_pointer = registry.entries.lock().unwrap()["same-target"]
+            .page
+            .as_ptr();
+        registry.remove_page("same-target", 1, new_page_pointer);
+
+        let reserved = match registry.reserve("same-target") {
+            AttachedPageReservation::Attach { attach_lock, .. } => attach_lock,
+            AttachedPageReservation::Existing(_) => panic!("unexpected attached page"),
+        };
+        assert!(Arc::ptr_eq(&reserved, &new_lock));
+    }
+
+    #[tokio::test]
+    async fn queued_page_attachment_re_reserves_after_registered_page_drops() {
+        let (write_tx, _write_rx) = mpsc::unbounded_channel();
+        let (events, _) = broadcast::channel(4);
+        let (alive_tx, _) = watch::channel(true);
+        let browser = Arc::new(BrowserInner {
+            runtime: OwnedRuntime(None),
+            client: Arc::new(CdpClient {
+                write_tx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                events,
+                event_log: Arc::new(Mutex::new(CdpEventLog::new())),
+                next_id: AtomicU64::new(1),
+                sent_runtime_enable_count: AtomicU64::new(0),
+                sent_target_close_count: AtomicU64::new(0),
+                sent_context_dispose_count: AtomicU64::new(0),
+                alive: Arc::new(AtomicBool::new(true)),
+                alive_tx,
+            }),
+            process: Mutex::new(None),
+            profile_dir: Mutex::new(None),
+            ws_endpoint: "ws://test.invalid".to_string(),
+            stealth_user_agent_override: Mutex::new(None),
+            single_process_fallback: false,
+            lifecycle: Arc::new(CloseLifecycle::new()),
+            attached_pages: AttachedPageRegistry::default(),
+        });
+        let make_page = |generation| {
+            Arc::new(PageInner {
+                browser: Arc::clone(&browser),
+                target_id: "same-target".to_string(),
+                registry_generation: generation,
+                session_id: format!("session-{generation}"),
+                context_id: None,
+                main_frame_id: Mutex::new(None),
+                frame_state: Mutex::new(PageFrameState::new(format!("session-{generation}"))),
+                network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
+                event_stream_start_cursor: 0,
+                background_override_active: Arc::new(AtomicBool::new(false)),
+                screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+                lifecycle: Arc::new(CloseLifecycle::new()),
+                close_target_on_drop: AtomicBool::new(false),
+            })
+        };
+        let (generation, winner_lock) = match browser.attached_pages.reserve("same-target") {
+            AttachedPageReservation::Attach {
+                generation,
+                attach_lock,
+            } => (generation, attach_lock),
+            AttachedPageReservation::Existing(_) => panic!("unexpected attached page"),
+        };
+        let (waiter_generation, waiter_lock) = match browser.attached_pages.reserve("same-target") {
+            AttachedPageReservation::Attach {
+                generation,
+                attach_lock,
+            } => (generation, attach_lock),
+            AttachedPageReservation::Existing(_) => panic!("unexpected attached page"),
+        };
+        assert_eq!(waiter_generation, generation);
+        assert!(Arc::ptr_eq(&waiter_lock, &winner_lock));
+
+        let winner_guard = winner_lock.lock().await;
+        let winner_page = make_page(generation);
+        assert!(matches!(
+            browser
+                .attached_pages
+                .register("same-target", &winner_page, generation, &winner_lock),
+            AttachedPageRegistration::Registered
+        ));
+
+        let waiter_browser = Arc::clone(&browser);
+        let waiter_lock_for_task = Arc::clone(&waiter_lock);
+        let (acquired_tx, acquired_rx) = oneshot::channel();
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let waiter_proceed = Arc::clone(&proceed);
+        let waiter = tokio::spawn(async move {
+            let _waiter_guard = waiter_lock_for_task.lock().await;
+            acquired_tx.send(()).unwrap();
+            waiter_proceed.notified().await;
+            waiter_browser.attached_pages.claim_after_lock(
+                "same-target",
+                waiter_generation,
+                &waiter_lock_for_task,
+            )
+        });
+
+        drop(winner_guard);
+        acquired_rx.await.unwrap();
+        drop(winner_page);
+        proceed.notify_one();
+
+        let replacement_generation = match waiter.await.unwrap() {
+            AttachedPageClaim::Attach { generation } => generation,
+            AttachedPageClaim::Existing(_) => panic!("dropped winner must not remain live"),
+            AttachedPageClaim::Retry => panic!("waiter should claim the missing reservation"),
+        };
+        assert_ne!(replacement_generation, generation);
+        let replacement_page = make_page(replacement_generation);
+        assert!(matches!(
+            browser.attached_pages.register(
+                "same-target",
+                &replacement_page,
+                replacement_generation,
+                &waiter_lock,
+            ),
+            AttachedPageRegistration::Registered
+        ));
+        match browser.attached_pages.reserve("same-target") {
+            AttachedPageReservation::Existing(page) => {
+                assert!(Arc::ptr_eq(&page, &replacement_page));
+            }
+            AttachedPageReservation::Attach { .. } => panic!("queued observer lost its page"),
+        }
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn page_event_lease_rolls_back_and_merges_network_state_transactionally() {
+        fn store(url: &str, next_seq: u64) -> NetworkRequestStore {
+            let mut store = NetworkRequestStore::new(next_seq);
+            let snapshot = NetworkRequestSnapshot {
+                seq: next_seq - 1,
+                request: json!({ "url": url }),
+                redirect_ancestry: Vec::new(),
+            };
+            store.requests = HashMap::from([(
+                "request-1".to_string(),
+                NetworkRequestEntry {
+                    current: snapshot.clone(),
+                    applied_by_seq: BTreeMap::from([(next_seq - 1, snapshot)]),
+                },
+            )]);
+            store.applied_order = VecDeque::from([(next_seq - 1, "request-1".to_string())]);
+            store
+        }
+
+        let shared_requests = Arc::new(Mutex::new(store("https://example.test/start", 5)));
+        let working_requests = Arc::new(Mutex::new(store("https://example.test/final", 8)));
+        let (_sender, receiver) = broadcast::channel(4);
+        let receiver_slot = Arc::new(Mutex::new(None));
+        let state_slot = Arc::new(Mutex::new(None));
+        let cursor_slot = Arc::new(Mutex::new(5));
+        let lease = PageEventStreamLease {
+            receiver: Some(receiver),
+            state: Some(PageEventStreamState::new()),
+            rollback_state: Some(PageEventStreamState::new()),
+            cursor: 8,
+            rollback_cursor: 5,
+            delivered: false,
+            receiver_slot: Arc::clone(&receiver_slot),
+            state_slot: Arc::clone(&state_slot),
+            cursor_slot: Arc::clone(&cursor_slot),
+            requests: Arc::clone(&shared_requests),
+            working_requests: Arc::clone(&working_requests),
+        };
+
+        drop(lease);
+        assert_eq!(*cursor_slot.lock().unwrap(), 5);
+        assert_eq!(shared_requests.lock().unwrap().next_applied_seq, 5);
+        assert_eq!(
+            shared_requests.lock().unwrap().requests["request-1"]
+                .current
+                .request["url"],
+            "https://example.test/start"
+        );
+
+        let receiver = receiver_slot.lock().unwrap().take();
+        let state = state_slot.lock().unwrap().take();
+        let committed_lease = PageEventStreamLease {
+            receiver,
+            state,
+            rollback_state: Some(PageEventStreamState::new()),
+            cursor: 8,
+            rollback_cursor: 5,
+            delivered: false,
+            receiver_slot: Arc::clone(&receiver_slot),
+            state_slot: Arc::clone(&state_slot),
+            cursor_slot: Arc::clone(&cursor_slot),
+            requests: Arc::clone(&shared_requests),
+            working_requests,
+        };
+        {
+            let mut live = shared_requests.lock().unwrap();
+            let concurrent_request = json!({
+                "url": "https://example.test/concurrent",
+                "method": "POST",
+                "headers": { "x-concurrent": "preserved" },
+                "redirected_from": { "url": "https://example.test/start" },
+            });
+            live.requests.insert(
+                "request-1".to_string(),
+                NetworkRequestEntry {
+                    current: NetworkRequestSnapshot {
+                        seq: 9,
+                        request: concurrent_request.clone(),
+                        redirect_ancestry: vec![4],
+                    },
+                    applied_by_seq: BTreeMap::from([(
+                        9,
+                        NetworkRequestSnapshot {
+                            seq: 9,
+                            request: concurrent_request,
+                            redirect_ancestry: vec![4],
+                        },
+                    )]),
+                },
+            );
+            live.next_applied_seq = 10;
+            live.applied_order = VecDeque::from([(9, "request-1".to_string())]);
+        }
+        committed_lease.deliver();
+        assert_eq!(*cursor_slot.lock().unwrap(), 8);
+        assert_eq!(shared_requests.lock().unwrap().next_applied_seq, 10);
+        assert_eq!(
+            shared_requests.lock().unwrap().requests["request-1"]
+                .current
+                .request["url"],
+            "https://example.test/concurrent"
+        );
+        assert_eq!(
+            shared_requests.lock().unwrap().requests["request-1"]
+                .current
+                .request["method"],
+            "POST"
+        );
+        assert_eq!(
+            shared_requests.lock().unwrap().requests["request-1"]
+                .current
+                .request["headers"]["x-concurrent"],
+            "preserved"
+        );
+        assert_eq!(
+            shared_requests.lock().unwrap().requests["request-1"]
+                .current
+                .request["redirected_from"]["url"],
+            "https://example.test/start"
+        );
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn stale_page_event_ack_does_not_restore_requests_cleared_by_overflow() {
+        fn store(url: &str, next_seq: u64) -> NetworkRequestStore {
+            let mut store = NetworkRequestStore::new(next_seq);
+            let snapshot = NetworkRequestSnapshot {
+                seq: next_seq - 1,
+                request: json!({
+                    "url": url,
+                    "method": "STALE",
+                    "headers": { "x-stale": "must-not-return" },
+                }),
+                redirect_ancestry: Vec::new(),
+            };
+            store.requests = HashMap::from([(
+                "request-1".to_string(),
+                NetworkRequestEntry {
+                    current: snapshot.clone(),
+                    applied_by_seq: BTreeMap::from([(next_seq - 1, snapshot)]),
+                },
+            )]);
+            store.applied_order = VecDeque::from([(next_seq - 1, "request-1".to_string())]);
+            store
+        }
+
+        let shared_requests = Arc::new(Mutex::new(store("https://example.test/stale", 8)));
+        let working_requests = Arc::new(Mutex::new(shared_requests.lock().unwrap().clone()));
+        let (_sender, receiver) = broadcast::channel(4);
+        let receiver_slot = Arc::new(Mutex::new(None));
+        let state_slot = Arc::new(Mutex::new(None));
+        let cursor_slot = Arc::new(Mutex::new(5));
+        let lease = PageEventStreamLease {
+            receiver: Some(receiver),
+            state: Some(PageEventStreamState::new()),
+            rollback_state: Some(PageEventStreamState::new()),
+            cursor: 8,
+            rollback_cursor: 5,
+            delivered: false,
+            receiver_slot,
+            state_slot,
+            cursor_slot,
+            requests: Arc::clone(&shared_requests),
+            working_requests,
+        };
+
+        shared_requests.lock().unwrap().reset_after_overflow(20);
+        lease.deliver();
+
+        let requests = shared_requests.lock().unwrap();
+        assert_eq!(requests.next_applied_seq, 20);
+        assert!(requests.requests.is_empty());
+        assert!(requests.applied_order.is_empty());
+        drop(requests);
+
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let mut state = NetworkObservationState::new();
+        let initial = json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "request-1",
+                "documentURL": "https://example.test/fresh-start",
+                "request": {
+                    "url": "https://example.test/fresh-start",
+                    "method": "GET",
+                    "headers": { "x-fresh-start": "present" },
+                },
+            },
+        });
+        let redirect = json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "request-1",
+                "documentURL": "https://example.test/fresh-final",
+                "redirectResponse": { "status": 302 },
+                "request": {
+                    "url": "https://example.test/fresh-final",
+                    "method": "POST",
+                    "headers": { "x-fresh-final": "present" },
+                },
+            },
+        });
+        let response = json!({
+            "sessionId": "page-session",
+            "method": "Network.responseReceived",
+            "params": {
+                "requestId": "request-1",
+                "response": {
+                    "url": "https://example.test/fresh-final",
+                    "status": 200,
+                    "headers": {},
+                },
+            },
+        });
+        process_network_observation_event(
+            20,
+            &initial,
+            &event_log,
+            "page-session",
+            &shared_requests,
+            true,
+            &mut state,
+        )
+        .unwrap();
+        process_network_observation_event(
+            21,
+            &redirect,
+            &event_log,
+            "page-session",
+            &shared_requests,
+            true,
+            &mut state,
+        )
+        .unwrap();
+        let response = process_network_observation_event(
+            22,
+            &response,
+            &event_log,
+            "page-session",
+            &shared_requests,
+            true,
+            &mut state,
+        )
+        .unwrap()
+        .unwrap()
+        .2;
+        assert_eq!(response["request"]["method"], "POST");
+        assert_eq!(response["request"]["headers"]["x-fresh-final"], "present");
+        assert_eq!(
+            response["request"]["redirected_from"]["url"],
+            "https://example.test/fresh-start"
+        );
+        assert!(response["request"]["headers"]["x-stale"].is_null());
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn delayed_page_event_ack_merges_only_mutations_at_or_after_reset_cursor() {
+        fn request_event(url: &str, method: &str, headers: Value, redirect: bool) -> Value {
+            let mut params = json!({
+                "requestId": "request-1",
+                "documentURL": url,
+                "request": {
+                    "url": url,
+                    "method": method,
+                    "headers": headers,
+                },
+            });
+            if redirect {
+                params["redirectResponse"] = json!({ "status": 302 });
+            }
+            json!({
+                "sessionId": "page-session",
+                "method": "Network.requestWillBeSent",
+                "params": params,
+            })
+        }
+
+        let shared_requests = Arc::new(Mutex::new(NetworkRequestStore::new(7_999)));
+        let working_requests = Arc::new(Mutex::new(shared_requests.lock().unwrap().clone()));
+        {
+            let mut working = working_requests.lock().unwrap();
+            let stale = request_event(
+                "https://example.test/stale",
+                "STALE",
+                json!({ "x-stale": "must-not-return" }),
+                false,
+            );
+            let valid_start = request_event(
+                "https://example.test/current-start",
+                "GET",
+                json!({ "x-current-start": "present" }),
+                false,
+            );
+            let valid_redirect = request_event(
+                "https://example.test/current-final",
+                "POST",
+                json!({ "x-current-final": "present" }),
+                true,
+            );
+            apply_network_request_mutation(7_999, &stale, "page-session", &mut working, true)
+                .unwrap();
+            apply_network_request_mutation(8_999, &valid_start, "page-session", &mut working, true)
+                .unwrap();
+            apply_network_request_mutation(
+                9_000,
+                &valid_redirect,
+                "page-session",
+                &mut working,
+                true,
+            )
+            .unwrap();
+            working.next_applied_seq = 9_001;
+        }
+
+        let (_sender, receiver) = broadcast::channel(4);
+        let lease = PageEventStreamLease {
+            receiver: Some(receiver),
+            state: Some(PageEventStreamState::new()),
+            rollback_state: Some(PageEventStreamState::new()),
+            cursor: 9_001,
+            rollback_cursor: 7_999,
+            delivered: false,
+            receiver_slot: Arc::new(Mutex::new(None)),
+            state_slot: Arc::new(Mutex::new(None)),
+            cursor_slot: Arc::new(Mutex::new(7_999)),
+            requests: Arc::clone(&shared_requests),
+            working_requests,
+        };
+
+        shared_requests.lock().unwrap().reset_after_overflow(8_000);
+        lease.deliver();
+
+        {
+            let requests = shared_requests.lock().unwrap();
+            let entry = &requests.requests["request-1"];
+            assert!(!entry.applied_by_seq.contains_key(&7_999));
+            assert!(entry.applied_by_seq.contains_key(&8_999));
+            assert!(entry.applied_by_seq.contains_key(&9_000));
+        }
+
+        let response_event = json!({
+            "sessionId": "page-session",
+            "method": "Network.responseReceived",
+            "params": {
+                "requestId": "request-1",
+                "hasExtraInfo": false,
+                "response": {
+                    "url": "https://example.test/current-final",
+                    "status": 200,
+                    "headers": {},
+                },
+            },
+        });
+        let response = process_network_observation_event(
+            9_001,
+            &response_event,
+            &Arc::new(Mutex::new(CdpEventLog::new())),
+            "page-session",
+            &shared_requests,
+            true,
+            &mut NetworkObservationState::new(),
+        )
+        .unwrap()
+        .unwrap()
+        .2;
+        assert_eq!(response["request"]["method"], "POST");
+        assert_eq!(response["request"]["headers"]["x-current-final"], "present");
+        assert_eq!(
+            response["request"]["redirected_from"]["url"],
+            "https://example.test/current-start"
+        );
+        assert!(response["request"]["headers"]["x-stale"].is_null());
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn delayed_page_event_ack_prunes_redirect_ancestry_before_reset_cursor() {
+        fn request_event(url: &str, redirect: bool) -> Value {
+            let mut params = json!({
+                "requestId": "request-1",
+                "documentURL": url,
+                "request": {
+                    "url": url,
+                    "method": "GET",
+                    "headers": {},
+                },
+            });
+            if redirect {
+                params["redirectResponse"] = json!({ "status": 302 });
+            }
+            json!({
+                "sessionId": "page-session",
+                "method": "Network.requestWillBeSent",
+                "params": params,
+            })
+        }
+
+        let shared_requests = Arc::new(Mutex::new(NetworkRequestStore::new(7_999)));
+        let working_requests = Arc::new(Mutex::new(shared_requests.lock().unwrap().clone()));
+        {
+            let mut working = working_requests.lock().unwrap();
+            let initial = request_event("https://example.test/pre-reset", false);
+            let redirect = request_event("https://example.test/post-reset", true);
+            apply_network_request_mutation(7_999, &initial, "page-session", &mut working, true)
+                .unwrap();
+            apply_network_request_mutation(9_000, &redirect, "page-session", &mut working, true)
+                .unwrap();
+            working.next_applied_seq = 9_001;
+        }
+
+        let (_sender, receiver) = broadcast::channel(4);
+        let lease = PageEventStreamLease {
+            receiver: Some(receiver),
+            state: Some(PageEventStreamState::new()),
+            rollback_state: Some(PageEventStreamState::new()),
+            cursor: 9_001,
+            rollback_cursor: 7_999,
+            delivered: false,
+            receiver_slot: Arc::new(Mutex::new(None)),
+            state_slot: Arc::new(Mutex::new(None)),
+            cursor_slot: Arc::new(Mutex::new(7_999)),
+            requests: Arc::clone(&shared_requests),
+            working_requests,
+        };
+
+        shared_requests.lock().unwrap().reset_after_overflow(8_000);
+        lease.deliver();
+
+        let requests = shared_requests.lock().unwrap();
+        let entry = &requests.requests["request-1"];
+        assert!(!entry.applied_by_seq.contains_key(&7_999));
+        assert!(entry.applied_by_seq.contains_key(&9_000));
+        assert_eq!(
+            entry.current.request["url"],
+            "https://example.test/post-reset"
+        );
+        assert!(entry.current.request["redirected_from"].is_null());
     }
 
     #[test]
@@ -1004,6 +2258,8 @@ struct CdpClient {
     event_log: Arc<Mutex<CdpEventLog>>,
     next_id: AtomicU64,
     sent_runtime_enable_count: AtomicU64,
+    sent_target_close_count: AtomicU64,
+    sent_context_dispose_count: AtomicU64,
     alive: Arc<AtomicBool>,
     alive_tx: watch::Sender<bool>,
 }
@@ -1302,6 +2558,8 @@ impl CdpClient {
             event_log,
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
+            sent_target_close_count: AtomicU64::new(0),
+            sent_context_dispose_count: AtomicU64::new(0),
             alive,
             alive_tx,
         }))
@@ -1391,6 +2649,8 @@ impl CdpClient {
             event_log,
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
+            sent_target_close_count: AtomicU64::new(0),
+            sent_context_dispose_count: AtomicU64::new(0),
             alive,
             alive_tx,
         }))
@@ -1420,14 +2680,36 @@ impl CdpClient {
     }
 
     fn record_sent_command(&self, method: &str) {
-        if method == "Runtime.enable" {
-            self.sent_runtime_enable_count
-                .fetch_add(1, Ordering::SeqCst);
+        match method {
+            "Runtime.enable" => {
+                self.sent_runtime_enable_count
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            "Target.closeTarget" => {
+                self.sent_target_close_count.fetch_add(1, Ordering::SeqCst);
+            }
+            "Target.disposeBrowserContext" => {
+                self.sent_context_dispose_count
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
         }
     }
 
     fn sent_runtime_enable_count(&self) -> u64 {
         self.sent_runtime_enable_count.load(Ordering::SeqCst)
+    }
+
+    fn sent_target_close_count(&self) -> u64 {
+        self.sent_target_close_count.load(Ordering::SeqCst)
+    }
+
+    fn sent_context_dispose_count(&self) -> u64 {
+        self.sent_context_dispose_count.load(Ordering::SeqCst)
+    }
+
+    fn pending_command_count(&self) -> usize {
+        self.pending.lock().unwrap().len()
     }
 
     async fn send(
@@ -1443,6 +2725,7 @@ impl CdpClient {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
+        let _pending_guard = PendingCommandGuard::new(id, &self.pending);
 
         let mut payload = json!({
             "id": id,
@@ -1461,7 +2744,6 @@ impl CdpClient {
             .is_err()
         {
             self.mark_closed();
-            self.pending.lock().unwrap().remove(&id);
             return Err(RwError::Message("CDP websocket is closed".to_string()));
         }
         self.record_sent_command(method);
@@ -1475,10 +2757,7 @@ impl CdpClient {
                 other => other,
             }),
             Ok(Err(_)) => Err(RwError::Message("CDP response channel closed".to_string())),
-            Err(_) => {
-                self.pending.lock().unwrap().remove(&id);
-                Err(RwError::Timeout(timeout.as_millis() as u64))
-            }
+            Err(_) => Err(RwError::Timeout(timeout.as_millis() as u64)),
         }
     }
 
@@ -1495,6 +2774,7 @@ impl CdpClient {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
+        let _pending_guard = PendingCommandGuard::new(id, &self.pending);
 
         let method_json = serde_json::to_string(method)?;
         let payload = if let Some(session_id) = session_id {
@@ -1508,7 +2788,6 @@ impl CdpClient {
 
         if self.write_tx.send(CdpOutgoing::Text(payload)).is_err() {
             self.mark_closed();
-            self.pending.lock().unwrap().remove(&id);
             return Err(RwError::Message("CDP websocket is closed".to_string()));
         }
         self.record_sent_command(method);
@@ -1522,10 +2801,7 @@ impl CdpClient {
                 other => other,
             }),
             Ok(Err(_)) => Err(RwError::Message("CDP response channel closed".to_string())),
-            Err(_) => {
-                self.pending.lock().unwrap().remove(&id);
-                Err(RwError::Timeout(timeout.as_millis() as u64))
-            }
+            Err(_) => Err(RwError::Timeout(timeout.as_millis() as u64)),
         }
     }
 
@@ -1549,6 +2825,7 @@ impl CdpClient {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
             let (tx, rx) = oneshot::channel();
             self.pending.lock().unwrap().insert(id, tx);
+            let pending_guard = PendingCommandGuard::new(id, &self.pending);
 
             let payload = if let Some(session_id_json) = &session_id_json {
                 format!(
@@ -1560,15 +2837,14 @@ impl CdpClient {
 
             if self.write_tx.send(CdpOutgoing::Text(payload)).is_err() {
                 self.mark_closed();
-                self.pending.lock().unwrap().remove(&id);
                 return Err(RwError::Message("CDP websocket is closed".to_string()));
             }
             self.record_sent_command(method);
-            receivers.push((id, rx));
+            receivers.push((id, rx, pending_guard));
         }
 
         let mut results = Vec::with_capacity(receivers.len());
-        for (id, rx) in receivers {
+        for (_id, rx, _pending_guard) in receivers {
             match tokio::time::timeout(timeout, rx).await {
                 Ok(Ok(result)) => results.push(result.map_err(|error| match error {
                     RwError::Message(message) => RwError::Cdp {
@@ -1580,10 +2856,7 @@ impl CdpClient {
                 Ok(Err(_)) => {
                     return Err(RwError::Message("CDP response channel closed".to_string()));
                 }
-                Err(_) => {
-                    self.pending.lock().unwrap().remove(&id);
-                    return Err(RwError::Timeout(timeout.as_millis() as u64));
-                }
+                Err(_) => return Err(RwError::Timeout(timeout.as_millis() as u64)),
             }
         }
         Ok(results)
@@ -1591,14 +2864,214 @@ impl CdpClient {
 }
 
 struct BrowserInner {
-    runtime: tokio::runtime::Runtime,
+    runtime: OwnedRuntime,
     client: Arc<CdpClient>,
     process: Mutex<Option<Child>>,
     profile_dir: Mutex<Option<TempDir>>,
     ws_endpoint: String,
     stealth_user_agent_override: Mutex<Option<Value>>,
     single_process_fallback: bool,
-    closed: AtomicBool,
+    lifecycle: Arc<CloseLifecycle>,
+    attached_pages: AttachedPageRegistry,
+}
+
+#[derive(Default)]
+struct AttachedPageRegistry {
+    entries: Mutex<HashMap<String, AttachedPageEntry>>,
+    next_generation: AtomicU64,
+}
+
+struct AttachedPageEntry {
+    generation: u64,
+    page: Weak<PageInner>,
+    attach_lock: Weak<tokio::sync::Mutex<()>>,
+    registered: bool,
+}
+
+enum AttachedPageReservation {
+    Existing(Arc<PageInner>),
+    Attach {
+        generation: u64,
+        attach_lock: Arc<tokio::sync::Mutex<()>>,
+    },
+}
+
+enum AttachedPageRegistration {
+    Registered,
+    Existing(Arc<PageInner>),
+    ReservationLost,
+}
+
+enum AttachedPageClaim {
+    Existing(Arc<PageInner>),
+    Attach { generation: u64 },
+    Retry,
+}
+
+impl AttachedPageRegistry {
+    fn reserve(&self, target_id: &str) -> AttachedPageReservation {
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(entry) = entries.get(target_id) {
+            if let Some(page) = entry.page.upgrade() {
+                return AttachedPageReservation::Existing(page);
+            }
+            if let Some(attach_lock) = entry.attach_lock.upgrade() {
+                return AttachedPageReservation::Attach {
+                    generation: entry.generation,
+                    attach_lock,
+                };
+            }
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let attach_lock = Arc::new(tokio::sync::Mutex::new(()));
+        entries.insert(
+            target_id.to_string(),
+            AttachedPageEntry {
+                generation,
+                page: Weak::new(),
+                attach_lock: Arc::downgrade(&attach_lock),
+                registered: false,
+            },
+        );
+        AttachedPageReservation::Attach {
+            generation,
+            attach_lock,
+        }
+    }
+
+    fn claim_after_lock(
+        &self,
+        target_id: &str,
+        generation: u64,
+        attach_lock: &Arc<tokio::sync::Mutex<()>>,
+    ) -> AttachedPageClaim {
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(entry) = entries.get(target_id) {
+            if let Some(page) = entry.page.upgrade() {
+                return AttachedPageClaim::Existing(page);
+            }
+            let same_reservation = entry.generation == generation
+                && Weak::ptr_eq(&entry.attach_lock, &Arc::downgrade(attach_lock));
+            if same_reservation && !entry.registered {
+                return AttachedPageClaim::Attach { generation };
+            }
+            if !same_reservation && entry.attach_lock.upgrade().is_some() {
+                return AttachedPageClaim::Retry;
+            }
+        }
+
+        // The page registered by the task that previously owned this lock was
+        // dropped before this waiter could inspect it. Claim a fresh generation
+        // while retaining the already-acquired target lock so no third observer
+        // can start a duplicate attachment.
+        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        entries.insert(
+            target_id.to_string(),
+            AttachedPageEntry {
+                generation,
+                page: Weak::new(),
+                attach_lock: Arc::downgrade(attach_lock),
+                registered: false,
+            },
+        );
+        AttachedPageClaim::Attach { generation }
+    }
+
+    fn register(
+        &self,
+        target_id: &str,
+        page: &Arc<PageInner>,
+        generation: u64,
+        attach_lock: &Arc<tokio::sync::Mutex<()>>,
+    ) -> AttachedPageRegistration {
+        let mut entries = self.entries.lock().unwrap();
+        let Some(entry) = entries.get_mut(target_id) else {
+            return AttachedPageRegistration::ReservationLost;
+        };
+        if let Some(existing) = entry.page.upgrade() {
+            return if Arc::ptr_eq(&existing, page) {
+                AttachedPageRegistration::Registered
+            } else {
+                AttachedPageRegistration::Existing(existing)
+            };
+        }
+        if entry.generation != generation
+            || !Weak::ptr_eq(&entry.attach_lock, &Arc::downgrade(attach_lock))
+        {
+            return AttachedPageRegistration::ReservationLost;
+        }
+        entry.page = Arc::downgrade(page);
+        entry.registered = true;
+        AttachedPageRegistration::Registered
+    }
+
+    fn remove_reservation(
+        &self,
+        target_id: &str,
+        generation: u64,
+        attach_lock: &Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let mut entries = self.entries.lock().unwrap();
+        let should_remove = entries.get(target_id).is_some_and(|entry| {
+            entry.generation == generation
+                && Arc::strong_count(attach_lock) == 1
+                && entry.page.upgrade().is_none()
+                && Weak::ptr_eq(&entry.attach_lock, &Arc::downgrade(attach_lock))
+        });
+        if should_remove {
+            entries.remove(target_id);
+        }
+    }
+
+    fn remove_page(&self, target_id: &str, generation: u64, page: *const PageInner) {
+        let mut entries = self.entries.lock().unwrap();
+        if entries
+            .get(target_id)
+            .is_some_and(|entry| entry.generation == generation && entry.page.as_ptr() == page)
+        {
+            entries.remove(target_id);
+        }
+    }
+
+    fn clear(&self) {
+        self.entries.lock().unwrap().clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+}
+
+struct OwnedRuntime(Option<tokio::runtime::Runtime>);
+
+impl OwnedRuntime {
+    fn new(runtime: tokio::runtime::Runtime) -> Self {
+        Self(Some(runtime))
+    }
+}
+
+impl Deref for OwnedRuntime {
+    type Target = tokio::runtime::Runtime;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("browser runtime is available")
+    }
+}
+
+impl Drop for OwnedRuntime {
+    fn drop(&mut self) {
+        let Some(runtime) = self.0.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let _ = std::thread::Builder::new()
+                .name("rustwright-runtime-drop".to_string())
+                .spawn(move || drop(runtime));
+        } else {
+            drop(runtime);
+        }
+    }
 }
 
 enum LaunchedCdpTransport {
@@ -1685,17 +3158,14 @@ impl BrowserInner {
         }
     }
 
-    fn close(&self) -> RwResult<()> {
-        run_detached(|| self.close_without_gil())
-    }
-
-    fn close_without_gil(&self) -> RwResult<()> {
-        if self.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
-
+    fn close_last_owner_without_gil(&self) -> RwResult<()> {
+        let sender = match self.lifecycle.start() {
+            CloseStart::Done(outcome) => return outcome.into_result(),
+            CloseStart::Wait(_) => return Ok(()),
+            CloseStart::Lead(sender) => sender,
+        };
         let owns_browser_process = self.process.lock().unwrap().is_some();
-        if owns_browser_process {
+        if owns_browser_process && tokio::runtime::Handle::try_current().is_err() {
             let client = Arc::clone(&self.client);
             let _ = self.block_on_raw(async move {
                 client
@@ -1705,13 +3175,21 @@ impl BrowserInner {
         }
         self.client.close();
 
+        let mut cleanup_error = None;
         if let Some(mut child) = self.process.lock().unwrap().take() {
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut exited = false;
             while Instant::now() < deadline {
-                if child.try_wait()?.is_some() {
-                    exited = true;
-                    break;
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        exited = true;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        cleanup_error = Some(error);
+                        break;
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -1722,40 +3200,135 @@ impl BrowserInner {
         }
 
         self.profile_dir.lock().unwrap().take();
-        Ok(())
+        let result = cleanup_error.map_or(Ok(()), |error| Err(RwError::Io(error)));
+        self.lifecycle.finish(sender, &result, true);
+        result
     }
 }
 
 impl Drop for BrowserInner {
     fn drop(&mut self) {
-        let _ = self.close_without_gil();
+        let _ = self.close_last_owner_without_gil();
     }
+}
+
+async fn close_browser_cleanup(browser: Arc<BrowserInner>) -> RwResult<()> {
+    if browser.process.lock().unwrap().is_some() {
+        let client = Arc::clone(&browser.client);
+        let _ = client
+            .send("Browser.close", json!({}), None, Duration::from_secs(3))
+            .await;
+    }
+    browser.client.close();
+    browser.attached_pages.clear();
+
+    tokio::task::spawn_blocking(move || -> RwResult<()> {
+        let mut cleanup_error = None;
+        if let Some(mut child) = browser.process.lock().unwrap().take() {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut exited = false;
+            while Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        exited = true;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        cleanup_error = Some(error);
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if !exited {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        browser.profile_dir.lock().unwrap().take();
+        cleanup_error.map_or(Ok(()), |error| Err(RwError::Io(error)))
+    })
+    .await
+    .map_err(|error| RwError::Message(error.to_string()))??;
+    Ok(())
+}
+
+async fn close_browser_async(browser: Arc<BrowserInner>) -> RwResult<()> {
+    let lifecycle = Arc::clone(&browser.lifecycle);
+    single_flight_close(lifecycle, true, move || close_browser_cleanup(browser)).await
+}
+
+fn close_browser_blocking(browser: Arc<BrowserInner>) -> RwResult<()> {
+    let runtime = browser.runtime.handle().clone();
+    run_detached(move || runtime.block_on(close_browser_async(browser)))
 }
 
 struct ContextInner {
     browser: Arc<BrowserInner>,
     context_id: Option<String>,
-    closed: AtomicBool,
+    lifecycle: Arc<CloseLifecycle>,
+}
+
+fn browser_context_create_params(options_json: Option<&str>) -> RwResult<Value> {
+    let options = match options_json {
+        Some(value) if !value.trim().is_empty() => {
+            serde_json::from_str::<BrowserContextOptions>(value)?
+        }
+        _ => BrowserContextOptions::default(),
+    };
+    let mut params = json!({ "disposeOnDetach": true });
+    if let Some(proxy) = &options.proxy {
+        params["proxyServer"] = Value::String(proxy_server(proxy)?.to_string());
+        if let Some(bypass) = normalized_proxy_bypass(proxy) {
+            params["proxyBypassList"] = Value::String(bypass);
+        }
+        if let Some(username) = proxy.username.as_deref() {
+            params["proxyUsername"] = Value::String(username.to_string());
+        }
+        if let Some(password) = proxy.password.as_deref() {
+            params["proxyPassword"] = Value::String(password.to_string());
+        }
+    }
+    Ok(params)
+}
+
+async fn close_context_cleanup(context: Arc<ContextInner>) -> RwResult<()> {
+    if let Some(context_id) = context.context_id.clone() {
+        context
+            .browser
+            .client
+            .send(
+                "Target.disposeBrowserContext",
+                json!({ "browserContextId": context_id }),
+                None,
+                Duration::from_secs(5),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn close_context_async(context: Arc<ContextInner>) -> RwResult<()> {
+    let lifecycle = Arc::clone(&context.lifecycle);
+    single_flight_close(lifecycle, false, move || close_context_cleanup(context)).await
 }
 
 impl ContextInner {
-    fn context_id_to_close(&self) -> Option<Option<String>> {
-        if self.closed.swap(true, Ordering::SeqCst) {
-            None
-        } else {
-            Some(self.context_id.clone())
+    fn close_in_background(&self) {
+        if self.lifecycle.is_closing_or_closed() {
+            return;
         }
-    }
-
-    fn close(&self) -> RwResult<()> {
-        let Some(context_id) = self.context_id_to_close() else {
-            return Ok(());
+        let Some(context_id) = self.context_id.clone() else {
+            return;
         };
-        if let Some(context_id) = context_id {
-            let browser = Arc::clone(&self.browser);
-            let client = Arc::clone(&browser.client);
-            browser.block_on(async move {
-                client
+        let browser = Arc::clone(&self.browser);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let runtime = browser.runtime.handle().clone();
+        runtime.spawn(async move {
+            let _ = single_flight_close(lifecycle, false, move || async move {
+                browser
+                    .client
                     .send(
                         "Target.disposeBrowserContext",
                         json!({ "browserContextId": context_id }),
@@ -1764,56 +3337,279 @@ impl ContextInner {
                     )
                     .await
                     .map(|_| ())
-            })?;
-        }
-        Ok(())
-    }
-
-    fn close_without_gil(&self) -> RwResult<()> {
-        let Some(context_id) = self.context_id_to_close() else {
-            return Ok(());
-        };
-        if let Some(context_id) = context_id {
-            let browser = Arc::clone(&self.browser);
-            let client = Arc::clone(&browser.client);
-            browser.block_on_raw(async move {
-                client
-                    .send(
-                        "Target.disposeBrowserContext",
-                        json!({ "browserContextId": context_id }),
-                        None,
-                        Duration::from_secs(5),
-                    )
-                    .await
-                    .map(|_| ())
-            })?;
-        }
-        Ok(())
+            })
+            .await;
+        });
     }
 }
 
 impl Drop for ContextInner {
     fn drop(&mut self) {
-        let _ = self.close_without_gil();
+        self.close_in_background();
     }
 }
 
 struct PageInner {
     browser: Arc<BrowserInner>,
     target_id: String,
+    registry_generation: u64,
     session_id: String,
     context_id: Option<String>,
     main_frame_id: Mutex<Option<String>>,
     frame_state: Mutex<PageFrameState>,
     network_requests: Arc<Mutex<NetworkRequestStore>>,
     event_stream_start_cursor: u64,
-    closed: AtomicBool,
+    background_override_active: Arc<AtomicBool>,
+    screenshot_lock: Arc<tokio::sync::Mutex<()>>,
+    lifecycle: Arc<CloseLifecycle>,
+    close_target_on_drop: AtomicBool,
 }
 
+struct CreatedTargetGuard {
+    browser: Arc<BrowserInner>,
+    target_id: Option<String>,
+}
+
+struct AttachedSessionCleanup {
+    browser: Arc<BrowserInner>,
+    session_id: Mutex<Option<String>>,
+    started: AtomicBool,
+    done: watch::Sender<bool>,
+}
+
+impl AttachedSessionCleanup {
+    fn new(browser: Arc<BrowserInner>) -> Self {
+        let (done, _) = watch::channel(false);
+        Self {
+            browser,
+            session_id: Mutex::new(None),
+            started: AtomicBool::new(false),
+            done,
+        }
+    }
+
+    fn set_session(&self, session_id: String) {
+        *self.session_id.lock().unwrap() = Some(session_id);
+    }
+
+    fn disarm(&self) {
+        self.session_id.lock().unwrap().take();
+    }
+
+    fn start(self: &Arc<Self>) -> bool {
+        if self.session_id.lock().unwrap().is_none() {
+            return self.started.load(Ordering::SeqCst);
+        }
+        if self
+            .started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return true;
+        }
+        let Some(session_id) = self.session_id.lock().unwrap().take() else {
+            self.done.send_replace(true);
+            return false;
+        };
+        let cleanup = Arc::clone(self);
+        let browser = Arc::clone(&self.browser);
+        let runtime = browser.runtime.handle().clone();
+        runtime.spawn(async move {
+            let _ = browser
+                .client
+                .send(
+                    "Target.detachFromTarget",
+                    json!({ "sessionId": session_id }),
+                    None,
+                    Duration::from_secs(1),
+                )
+                .await;
+            cleanup.done.send_replace(true);
+        });
+        true
+    }
+
+    async fn detach(self: &Arc<Self>) {
+        let mut done = self.done.subscribe();
+        if !self.start() {
+            return;
+        }
+        while !*done.borrow() {
+            if done.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+struct AttachedSessionGuard {
+    cleanup: Arc<AttachedSessionCleanup>,
+}
+
+impl AttachedSessionGuard {
+    fn new(cleanup: Arc<AttachedSessionCleanup>) -> Self {
+        Self { cleanup }
+    }
+
+    fn disarm(self) {
+        self.cleanup.disarm();
+    }
+
+    async fn detach(self) {
+        self.cleanup.detach().await;
+    }
+}
+
+impl Drop for AttachedSessionGuard {
+    fn drop(&mut self) {
+        self.cleanup.start();
+    }
+}
+
+struct UnregisteredPage {
+    page: Arc<PageInner>,
+    session_guard: AttachedSessionGuard,
+}
+
+impl CreatedTargetGuard {
+    fn new(browser: Arc<BrowserInner>, target_id: String) -> Self {
+        Self {
+            browser,
+            target_id: Some(target_id),
+        }
+    }
+
+    fn disarm(mut self) {
+        self.target_id.take();
+    }
+}
+
+async fn create_target_cancellation_safe(
+    browser: Arc<BrowserInner>,
+    params: Value,
+) -> RwResult<CreatedTargetGuard> {
+    let task_browser = Arc::clone(&browser);
+    tokio::spawn(async move {
+        let target = task_browser
+            .client
+            .send("Target.createTarget", params, None, Duration::from_secs(10))
+            .await?;
+        let target_id = target
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RwError::Message("CDP did not return a targetId".to_string()))?
+            .to_string();
+        Ok(CreatedTargetGuard::new(task_browser, target_id))
+    })
+    .await
+    .map_err(|error| RwError::Message(error.to_string()))?
+}
+
+impl Drop for CreatedTargetGuard {
+    fn drop(&mut self) {
+        let Some(target_id) = self.target_id.take() else {
+            return;
+        };
+        let browser = Arc::clone(&self.browser);
+        let runtime = browser.runtime.handle().clone();
+        runtime.spawn(async move {
+            let _ = browser
+                .client
+                .send(
+                    "Target.closeTarget",
+                    json!({ "targetId": target_id }),
+                    None,
+                    Duration::from_secs(5),
+                )
+                .await;
+        });
+    }
+}
+
+impl PageInner {
+    fn mark_delivered(&self) {
+        self.close_target_on_drop.store(false, Ordering::SeqCst);
+    }
+
+    fn close_in_background(&self) {
+        if !self.close_target_on_drop.swap(false, Ordering::SeqCst)
+            || self.lifecycle.is_closing_or_closed()
+        {
+            return;
+        }
+        let browser = Arc::clone(&self.browser);
+        let target_id = self.target_id.clone();
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let runtime = browser.runtime.handle().clone();
+        runtime.spawn(async move {
+            let _ = single_flight_close(lifecycle, false, move || async move {
+                browser
+                    .client
+                    .send(
+                        "Target.closeTarget",
+                        json!({ "targetId": target_id }),
+                        None,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .map(|_| ())
+            })
+            .await;
+        });
+    }
+}
+
+impl Drop for PageInner {
+    fn drop(&mut self) {
+        self.browser.attached_pages.remove_page(
+            &self.target_id,
+            self.registry_generation,
+            self as *const PageInner,
+        );
+        self.close_in_background();
+    }
+}
+
+#[derive(Clone)]
 struct NetworkRequestStore {
     requests: HashMap<String, NetworkRequestEntry>,
     next_applied_seq: u64,
     applied_order: VecDeque<(u64, String)>,
+    reset_clock: Arc<AtomicU64>,
+    reset_generation: u64,
+    reset_cursor: u64,
+}
+
+#[derive(Clone)]
+struct NetworkRequestSnapshot {
+    seq: u64,
+    request: Value,
+    redirect_ancestry: Vec<u64>,
+}
+
+impl NetworkRequestSnapshot {
+    fn clone_pruning_redirects_before(&self, reset_cursor: u64) -> Self {
+        let mut snapshot = self.clone();
+        let mut current = &mut snapshot.request;
+        let mut retained_ancestors = 0;
+        for ancestor_seq in &self.redirect_ancestry {
+            if *ancestor_seq < reset_cursor {
+                current.as_object_mut().unwrap().remove("redirected_from");
+                snapshot.redirect_ancestry.truncate(retained_ancestors);
+                return snapshot;
+            }
+            let Some(redirected_from) = current.get_mut("redirected_from") else {
+                snapshot.redirect_ancestry.truncate(retained_ancestors);
+                return snapshot;
+            };
+            current = redirected_from;
+            retained_ancestors += 1;
+        }
+        if current.get("redirected_from").is_some() {
+            current.as_object_mut().unwrap().remove("redirected_from");
+        }
+        snapshot
+    }
 }
 
 impl NetworkRequestStore {
@@ -1822,6 +3618,9 @@ impl NetworkRequestStore {
             requests: HashMap::new(),
             next_applied_seq,
             applied_order: VecDeque::new(),
+            reset_clock: Arc::new(AtomicU64::new(0)),
+            reset_generation: 0,
+            reset_cursor: next_applied_seq,
         }
     }
 
@@ -1829,6 +3628,8 @@ impl NetworkRequestStore {
         self.requests.clear();
         self.next_applied_seq = next_applied_seq;
         self.applied_order.clear();
+        self.reset_generation = self.reset_clock.fetch_add(1, Ordering::SeqCst) + 1;
+        self.reset_cursor = next_applied_seq;
     }
 
     fn record_applied_request(&mut self, seq: u64, request_id: String) {
@@ -1842,6 +3643,89 @@ impl NetworkRequestStore {
             }
         }
     }
+
+    fn merge_committed(&mut self, committed: &Self) {
+        if committed.reset_generation > self.reset_generation {
+            let reset_cursor = committed.reset_cursor;
+            self.applied_order.retain(|(seq, _)| *seq >= reset_cursor);
+            self.requests.retain(|_, entry| {
+                entry.applied_by_seq.retain(|seq, _| *seq >= reset_cursor);
+                for snapshot in entry.applied_by_seq.values_mut() {
+                    *snapshot = snapshot.clone_pruning_redirects_before(reset_cursor);
+                }
+                if let Some((_, newest)) = entry.applied_by_seq.last_key_value() {
+                    entry.current = newest.clone();
+                    true
+                } else {
+                    false
+                }
+            });
+            self.reset_generation = committed.reset_generation;
+            self.reset_cursor = reset_cursor;
+        }
+        let reset_cursor = self.reset_cursor;
+        let committed_predates_reset = committed.reset_generation < self.reset_generation;
+        for (request_id, committed_entry) in &committed.requests {
+            let mut committed_mutations = committed_entry.applied_by_seq.range(reset_cursor..);
+            let Some((first_seq, first_snapshot)) = committed_mutations.next() else {
+                continue;
+            };
+            let first_snapshot = if committed_predates_reset {
+                first_snapshot.clone_pruning_redirects_before(reset_cursor)
+            } else {
+                first_snapshot.clone()
+            };
+            let live_entry =
+                self.requests
+                    .entry(request_id.clone())
+                    .or_insert_with(|| NetworkRequestEntry {
+                        current: first_snapshot.clone(),
+                        applied_by_seq: BTreeMap::new(),
+                    });
+            live_entry
+                .applied_by_seq
+                .entry(*first_seq)
+                .or_insert(first_snapshot);
+            for (seq, snapshot) in committed_mutations {
+                let snapshot = if committed_predates_reset {
+                    snapshot.clone_pruning_redirects_before(reset_cursor)
+                } else {
+                    snapshot.clone()
+                };
+                live_entry.applied_by_seq.entry(*seq).or_insert(snapshot);
+            }
+            if let Some((_, newest)) = live_entry.applied_by_seq.last_key_value() {
+                live_entry.current = newest.clone();
+            }
+        }
+        self.next_applied_seq = self.next_applied_seq.max(committed.next_applied_seq);
+
+        let mut applied = BTreeMap::new();
+        for (seq, request_id) in self
+            .applied_order
+            .iter()
+            .chain(committed.applied_order.iter())
+            .filter(|(seq, _)| *seq >= reset_cursor)
+        {
+            applied.insert((*seq, request_id.clone()), ());
+        }
+        let mut retained = applied
+            .into_keys()
+            .rev()
+            .take(CDP_EVENT_LOG_LIMIT)
+            .collect::<Vec<_>>();
+        retained.reverse();
+        let retained_set = retained.iter().cloned().collect::<HashSet<_>>();
+        self.applied_order = retained.iter().cloned().collect();
+        for (request_id, entry) in &mut self.requests {
+            entry
+                .applied_by_seq
+                .retain(|seq, _| retained_set.contains(&(*seq, request_id.clone())));
+            if let Some((_, newest)) = entry.applied_by_seq.last_key_value() {
+                entry.current = newest.clone();
+            }
+        }
+    }
 }
 
 impl Default for NetworkRequestStore {
@@ -1850,9 +3734,10 @@ impl Default for NetworkRequestStore {
     }
 }
 
+#[derive(Clone)]
 struct NetworkRequestEntry {
-    current: Value,
-    applied_by_seq: BTreeMap<u64, Value>,
+    current: NetworkRequestSnapshot,
+    applied_by_seq: BTreeMap<u64, NetworkRequestSnapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -2145,20 +4030,82 @@ struct PyNetworkEventWaiter {
 #[pyclass(name = "_PageEventStream")]
 struct PyPageEventStream {
     browser: Arc<BrowserInner>,
-    receiver: Mutex<Option<broadcast::Receiver<Value>>>,
+    receiver: Arc<Mutex<Option<broadcast::Receiver<Value>>>>,
     event_log: Arc<Mutex<CdpEventLog>>,
-    cursor: Mutex<u64>,
+    cursor: Arc<Mutex<u64>>,
     session_id: String,
     requests: Arc<Mutex<NetworkRequestStore>>,
-    state: Mutex<Option<PageEventStreamState>>,
+    state: Arc<Mutex<Option<PageEventStreamState>>>,
+    pending_batch: Arc<Mutex<Option<PendingPageEventBatch>>>,
     close_tx: watch::Sender<bool>,
-    closed: AtomicBool,
-    runtime_enabled: AtomicBool,
+    closed: Arc<AtomicBool>,
+    runtime_enabled: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
 struct PageEventStreamState {
     network: NetworkObservationState,
     ready: BTreeMap<u64, Value>,
+}
+
+#[cfg(feature = "python")]
+struct PageEventStreamLease {
+    receiver: Option<broadcast::Receiver<Value>>,
+    state: Option<PageEventStreamState>,
+    rollback_state: Option<PageEventStreamState>,
+    cursor: u64,
+    rollback_cursor: u64,
+    delivered: bool,
+    receiver_slot: Arc<Mutex<Option<broadcast::Receiver<Value>>>>,
+    state_slot: Arc<Mutex<Option<PageEventStreamState>>>,
+    cursor_slot: Arc<Mutex<u64>>,
+    requests: Arc<Mutex<NetworkRequestStore>>,
+    working_requests: Arc<Mutex<NetworkRequestStore>>,
+}
+
+#[cfg(feature = "python")]
+struct PendingPageEventBatch {
+    lease: PageEventStreamLease,
+    terminal: bool,
+    closed: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "python")]
+impl PendingPageEventBatch {
+    fn acknowledge(self) {
+        let Self {
+            lease,
+            terminal,
+            closed,
+        } = self;
+        lease.deliver();
+        if terminal {
+            closed.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+impl PageEventStreamLease {
+    fn deliver(mut self) {
+        self.delivered = true;
+    }
+}
+
+#[cfg(feature = "python")]
+impl Drop for PageEventStreamLease {
+    fn drop(&mut self) {
+        *self.receiver_slot.lock().unwrap() = self.receiver.take();
+        if self.delivered {
+            *self.state_slot.lock().unwrap() = self.state.take();
+            *self.cursor_slot.lock().unwrap() = self.cursor;
+            let committed = self.working_requests.lock().unwrap().clone();
+            self.requests.lock().unwrap().merge_committed(&committed);
+        } else {
+            *self.state_slot.lock().unwrap() = self.rollback_state.take();
+            *self.cursor_slot.lock().unwrap() = self.rollback_cursor;
+        }
+    }
 }
 
 impl PageEventStreamState {
@@ -2243,6 +4190,7 @@ struct PyPopupEventWaiter {
     browser: Arc<BrowserInner>,
     receiver: Mutex<Option<broadcast::Receiver<Value>>>,
     opener_target_id: String,
+    seen_target_ids: Arc<Mutex<HashSet<String>>>,
 }
 
 #[cfg(feature = "python")]
@@ -2281,32 +4229,31 @@ struct PyBackgroundPageEventWaiter {
 #[cfg(feature = "python")]
 #[pymethods]
 impl PyBrowser {
+    fn new_page_async(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let browser = Arc::clone(&self.inner);
+        let runtime = browser.runtime.handle().clone();
+        let creation = runtime.spawn(create_page_async(browser, None));
+        let creation_abort = creation.abort_handle();
+        python_future_on(
+            py,
+            runtime,
+            async move {
+                let _creation_guard = SpawnedTaskAbortGuard(creation_abort);
+                creation
+                    .await
+                    .map_err(|error| RwError::Message(error.to_string()))?
+            },
+            |py, inner| Ok(Py::new(py, PyPage { inner })?.into_any()),
+        )
+    }
+
     fn new_page(&self) -> PyResult<PyPage> {
         create_page(Arc::clone(&self.inner), None).map_err(py_err)
     }
 
     #[pyo3(signature = (options_json=None))]
     fn new_context(&self, options_json: Option<&str>) -> PyResult<PyBrowserContext> {
-        let options = match options_json {
-            Some(value) if !value.trim().is_empty() => {
-                serde_json::from_str::<BrowserContextOptions>(value)
-                    .map_err(|error| PyValueError::new_err(error.to_string()))?
-            }
-            _ => BrowserContextOptions::default(),
-        };
-        let mut params = json!({ "disposeOnDetach": true });
-        if let Some(proxy) = &options.proxy {
-            params["proxyServer"] = Value::String(proxy_server(proxy).map_err(py_err)?.to_string());
-            if let Some(bypass) = normalized_proxy_bypass(proxy) {
-                params["proxyBypassList"] = Value::String(bypass);
-            }
-            if let Some(username) = proxy.username.as_deref() {
-                params["proxyUsername"] = Value::String(username.to_string());
-            }
-            if let Some(password) = proxy.password.as_deref() {
-                params["proxyPassword"] = Value::String(password.to_string());
-            }
-        }
+        let params = browser_context_create_params(options_json).map_err(py_err)?;
         let browser = Arc::clone(&self.inner);
         let result = browser
             .block_on(async {
@@ -2330,17 +4277,76 @@ impl PyBrowser {
             inner: Arc::new(ContextInner {
                 browser: Arc::clone(&self.inner),
                 context_id: Some(context_id),
-                closed: AtomicBool::new(false),
+                lifecycle: Arc::new(CloseLifecycle::new()),
             }),
         })
     }
 
+    #[pyo3(signature = (options_json=None))]
+    fn new_context_async(&self, py: Python<'_>, options_json: Option<&str>) -> PyResult<Py<PyAny>> {
+        let params = browser_context_create_params(options_json).map_err(py_err)?;
+        let browser = Arc::clone(&self.inner);
+        let runtime = browser.runtime.handle().clone();
+        let future_browser = Arc::clone(&browser);
+        let creation = runtime.spawn(async move {
+            let result = future_browser
+                .client
+                .send(
+                    "Target.createBrowserContext",
+                    params,
+                    None,
+                    Duration::from_secs(5),
+                )
+                .await?;
+            let context_id = result
+                .get("browserContextId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RwError::Message("CDP did not return a browserContextId".to_string())
+                })?
+                .to_string();
+            Ok(PyBrowserContext {
+                inner: Arc::new(ContextInner {
+                    browser: future_browser,
+                    context_id: Some(context_id),
+                    lifecycle: Arc::new(CloseLifecycle::new()),
+                }),
+            })
+        });
+        python_future_on(
+            py,
+            runtime,
+            async move {
+                creation
+                    .await
+                    .map_err(|error| RwError::Message(error.to_string()))?
+            },
+            |py, context| Ok(Py::new(py, context)?.into_any()),
+        )
+    }
+
     fn close(&self) -> PyResult<()> {
-        self.inner.close().map_err(py_err)
+        close_browser_blocking(Arc::clone(&self.inner)).map_err(py_err)
+    }
+
+    fn close_async(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let browser = Arc::clone(&self.inner);
+        let runtime = browser.runtime.handle().clone();
+        let cleanup = runtime.spawn(close_browser_async(browser));
+        python_future_on(
+            py,
+            runtime,
+            async move {
+                cleanup
+                    .await
+                    .map_err(|error| RwError::Message(error.to_string()))?
+            },
+            |py, ()| Ok(py.None()),
+        )
     }
 
     fn is_connected(&self) -> bool {
-        !self.inner.closed.load(Ordering::SeqCst) && self.inner.client.is_connected()
+        !self.inner.lifecycle.is_closed() && self.inner.client.is_connected()
     }
 
     fn single_process_fallback(&self) -> bool {
@@ -2349,6 +4355,18 @@ impl PyBrowser {
 
     fn sent_runtime_enable_count(&self) -> u64 {
         self.inner.client.sent_runtime_enable_count()
+    }
+
+    fn sent_target_close_count(&self) -> u64 {
+        self.inner.client.sent_target_close_count()
+    }
+
+    fn sent_context_dispose_count(&self) -> u64 {
+        self.inner.client.sent_context_dispose_count()
+    }
+
+    fn pending_command_count(&self) -> usize {
+        self.inner.client.pending_command_count()
     }
 
     fn version(&self) -> PyResult<String> {
@@ -2487,8 +4505,47 @@ impl PyBrowserContext {
         .map_err(py_err)
     }
 
+    fn new_page_async(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let browser = Arc::clone(&self.inner.browser);
+        let runtime = browser.runtime.handle().clone();
+        let context_id = self.inner.context_id.clone();
+        let creation = runtime.spawn(create_page_async(browser, context_id));
+        let creation_abort = creation.abort_handle();
+        python_future_on(
+            py,
+            runtime,
+            async move {
+                let _creation_guard = SpawnedTaskAbortGuard(creation_abort);
+                creation
+                    .await
+                    .map_err(|error| RwError::Message(error.to_string()))?
+            },
+            |py, inner| Ok(Py::new(py, PyPage { inner })?.into_any()),
+        )
+    }
+
     fn close(&self) -> PyResult<()> {
-        self.inner.close().map_err(py_err)
+        let context = Arc::clone(&self.inner);
+        let browser = Arc::clone(&context.browser);
+        browser
+            .block_on(close_context_async(context))
+            .map_err(py_err)
+    }
+
+    fn close_async(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let context = Arc::clone(&self.inner);
+        let runtime = context.browser.runtime.handle().clone();
+        let cleanup = runtime.spawn(close_context_async(context));
+        python_future_on(
+            py,
+            runtime,
+            async move {
+                cleanup
+                    .await
+                    .map_err(|error| RwError::Message(error.to_string()))?
+            },
+            |py, ()| Ok(py.None()),
+        )
     }
 
     #[pyo3(signature = (timeout_ms=None))]
@@ -3563,9 +5620,686 @@ async fn resolve_screenshot_clip(
     }))
 }
 
+async fn page_goto_async(
+    page: Arc<PageInner>,
+    url: String,
+    wait_until: String,
+    timeout: Duration,
+    referer: Option<String>,
+) -> RwResult<String> {
+    let client = Arc::clone(&page.browser.client);
+    let session_id = page.session_id.clone();
+    let mut events = client.subscribe();
+    let target_url = url.clone();
+    let mut params = json!({ "url": url });
+    if let Some(referer) = referer {
+        params["referrer"] = Value::String(referer);
+        params["referrerPolicy"] = Value::String("unsafeUrl".to_string());
+    }
+    let result = client
+        .send("Page.navigate", params, Some(&session_id), timeout)
+        .await?;
+    if let Some(error_text) = result.get("errorText").and_then(Value::as_str) {
+        let failed_url = result
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or(target_url.as_str());
+        return Err(RwError::Message(format!(
+            "Page.goto: {error_text} at {failed_url}"
+        )));
+    }
+    let loader_id = result
+        .get("loaderId")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    if loader_id.is_none() {
+        if let Some(frame_id) = result.get("frameId").and_then(Value::as_str) {
+            page.record_main_frame_navigation_url(frame_id, &target_url);
+        }
+        return Ok(Value::Null.to_string());
+    }
+    let response = wait_for_navigation(
+        &mut events,
+        &session_id,
+        &wait_until,
+        loader_id.as_deref(),
+        None,
+        "Page.goto",
+        timeout,
+    )
+    .await?;
+    Ok(response
+        .unwrap_or_else(|| {
+            json!({
+                "url": result.get("url").cloned().unwrap_or(Value::Null),
+                "loader_id": loader_id,
+            })
+        })
+        .to_string())
+}
+
+fn wait_for_selector_body(state: &str, strict: bool, timeout: Duration) -> String {
+    let state_json = serde_json::to_string(state).unwrap_or_else(|_| "\"visible\"".to_string());
+    let strict_json = if strict { "true" } else { "false" };
+    let timeout_millis = timeout.as_millis().max(1);
+    format!(
+        r#"
+const targetState = {state_json};
+const strict = {strict_json};
+const timeoutMs = {timeout_millis};
+const snapshot = () => {{
+  const currentMatches = all(spec);
+  if (strict && currentMatches.length > 1) return {{ strict: true, count: currentMatches.length }};
+  const current = currentMatches[index] || null;
+  const attached = !!current;
+  const isVisible = !!current && visible(current);
+  const matched = targetState === 'attached'
+    ? attached
+    : targetState === 'detached'
+      ? !attached
+      : targetState === 'hidden'
+        ? (!attached || !isVisible)
+        : isVisible;
+  return {{ attached, matched }};
+}};
+const first = snapshot();
+if (first.strict) return `__rustwright_strict_violation__:${{first.count}}`;
+if (first.matched) return first.attached;
+return new Promise(resolve => {{
+  let settled = false;
+  let observer = null;
+  let interval = null;
+  let timer = null;
+  const finish = value => {{
+    if (settled) return;
+    settled = true;
+    if (observer) observer.disconnect();
+    if (interval) clearInterval(interval);
+    if (timer) clearTimeout(timer);
+    resolve(value);
+  }};
+  const check = () => {{
+    const next = snapshot();
+    if (next.strict) finish(`__rustwright_strict_violation__:${{next.count}}`);
+    else if (next.matched) finish(next.attached);
+  }};
+  observer = new MutationObserver(check);
+  observer.observe(document, {{ subtree: true, childList: true, attributes: true, characterData: true }});
+  interval = setInterval(check, 5);
+  timer = setTimeout(() => finish('__rustwright_timeout__'), timeoutMs);
+}});
+"#
+    )
+}
+
+async fn page_wait_for_selector_async(
+    page: Arc<PageInner>,
+    locator_json: String,
+    index: usize,
+    state: String,
+    timeout: Duration,
+    strict: bool,
+) -> RwResult<bool> {
+    let body = wait_for_selector_body(&state, strict, timeout);
+    let eval_timeout = Duration::from_millis(timeout.as_millis().saturating_add(1_000) as u64);
+    let json = evaluate_locator_for_page(page, locator_json, index, body, eval_timeout).await?;
+    let value = serde_json::from_str::<Value>(&json).unwrap_or(Value::Null);
+    if value.as_str() == Some("__rustwright_timeout__") {
+        return Err(RwError::Timeout(timeout.as_millis() as u64));
+    }
+    if let Some(count) = value
+        .as_str()
+        .and_then(|text| text.strip_prefix("__rustwright_strict_violation__:"))
+        .and_then(|text| text.parse::<u64>().ok())
+    {
+        return Err(RwError::Message(format!(
+            "strict mode violation: locator resolved to {count} elements while trying to wait_for_selector"
+        )));
+    }
+    Ok(value.as_bool().unwrap_or(false))
+}
+
+fn locator_action_body(action: &str, strict: bool, timeout: Duration) -> String {
+    let strict_json = if strict { "true" } else { "false" };
+    let timeout_millis = timeout.as_millis().max(1);
+    format!(
+        r#"
+const strict = {strict_json};
+const timeoutMs = {timeout_millis};
+const attempt = () => {{
+  const currentMatches = all(spec);
+  if (strict && currentMatches.length > 1) return {{ done: true, value: `__rustwright_strict_violation__:${{currentMatches.length}}` }};
+  const current = currentMatches[index] || null;
+  if (!current || !visible(current) || current.disabled) return {{ done: false }};
+  const el = current;
+  {action}
+  return {{ done: true, value: true }};
+}};
+const first = attempt();
+if (first.done) return first.value;
+return new Promise(resolve => {{
+  let settled = false;
+  let observer = null;
+  let interval = null;
+  let timer = null;
+  const finish = value => {{
+    if (settled) return;
+    settled = true;
+    if (observer) observer.disconnect();
+    if (interval) clearInterval(interval);
+    if (timer) clearTimeout(timer);
+    resolve(value);
+  }};
+  const check = () => {{
+    const next = attempt();
+    if (next.done) finish(next.value);
+  }};
+  observer = new MutationObserver(check);
+  observer.observe(document, {{ subtree: true, childList: true, attributes: true, characterData: true }});
+  interval = setInterval(check, 5);
+  timer = setTimeout(() => finish('__rustwright_timeout__'), timeoutMs);
+}});
+"#
+    )
+}
+
+async fn page_locator_action_async(
+    page: Arc<PageInner>,
+    locator_json: String,
+    index: usize,
+    action: String,
+    timeout: Duration,
+    strict: bool,
+    method: &'static str,
+) -> RwResult<()> {
+    let body = locator_action_body(&action, strict, timeout);
+    let eval_timeout = Duration::from_millis(timeout.as_millis().saturating_add(1_000) as u64);
+    let json = evaluate_locator_for_page(page, locator_json, index, body, eval_timeout).await?;
+    let value = serde_json::from_str::<Value>(&json).unwrap_or(Value::Null);
+    if value.as_str() == Some("__rustwright_timeout__") {
+        return Err(RwError::Timeout(timeout.as_millis() as u64));
+    }
+    if let Some(count) = value
+        .as_str()
+        .and_then(|text| text.strip_prefix("__rustwright_strict_violation__:"))
+        .and_then(|text| text.parse::<u64>().ok())
+    {
+        return Err(RwError::Message(format!(
+            "strict mode violation: locator resolved to {count} elements while trying to {method}"
+        )));
+    }
+    Ok(())
+}
+
+struct BackgroundOverrideGuard {
+    browser: Arc<BrowserInner>,
+    session_id: String,
+    active_state: Arc<AtomicBool>,
+    screenshot_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+    active: bool,
+}
+
+impl BackgroundOverrideGuard {
+    fn new(page: &PageInner, screenshot_lock: tokio::sync::OwnedMutexGuard<()>) -> Self {
+        page.background_override_active
+            .store(true, Ordering::SeqCst);
+        Self {
+            browser: Arc::clone(&page.browser),
+            session_id: page.session_id.clone(),
+            active_state: Arc::clone(&page.background_override_active),
+            screenshot_lock: Some(screenshot_lock),
+            active: true,
+        }
+    }
+
+    async fn restore(&mut self) -> RwResult<()> {
+        self.browser
+            .client
+            .send_raw_params_json(
+                "Emulation.setDefaultBackgroundColorOverride",
+                "{}".to_string(),
+                Some(&self.session_id),
+                Duration::from_secs(5),
+            )
+            .await?;
+        self.active = false;
+        self.active_state.store(false, Ordering::SeqCst);
+        self.screenshot_lock.take();
+        Ok(())
+    }
+}
+
+impl Drop for BackgroundOverrideGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let browser = Arc::clone(&self.browser);
+        let session_id = self.session_id.clone();
+        let active_state = Arc::clone(&self.active_state);
+        let screenshot_lock = self.screenshot_lock.take();
+        let runtime = browser.runtime.handle().clone();
+        runtime.spawn(async move {
+            let _ = browser
+                .client
+                .send_raw_params_json(
+                    "Emulation.setDefaultBackgroundColorOverride",
+                    "{}".to_string(),
+                    Some(&session_id),
+                    Duration::from_secs(5),
+                )
+                .await;
+            active_state.store(false, Ordering::SeqCst);
+            drop(screenshot_lock);
+        });
+    }
+}
+
+async fn page_screenshot_async(
+    page: Arc<PageInner>,
+    path: Option<String>,
+    capture_beyond_viewport: bool,
+    clip: Option<Value>,
+    timeout: Duration,
+    image_type: String,
+    quality: Option<u32>,
+    omit_background: bool,
+) -> RwResult<Vec<u8>> {
+    let client = Arc::clone(&page.browser.client);
+    let session_id = page.session_id.clone();
+    let transparent_background = omit_background && image_type != "jpeg";
+    let mut screenshot_lock = Some(Arc::clone(&page.screenshot_lock).lock_owned().await);
+    let mut background_guard = None;
+    if transparent_background {
+        background_guard = Some(BackgroundOverrideGuard::new(
+            &page,
+            screenshot_lock.take().unwrap(),
+        ));
+        client
+            .send_raw_params_json(
+                "Emulation.setDefaultBackgroundColorOverride",
+                "{\"color\":{\"r\":0,\"g\":0,\"b\":0,\"a\":0}}".to_string(),
+                Some(&session_id),
+                timeout,
+            )
+            .await?;
+    }
+    let _screenshot_lock = screenshot_lock;
+    let clip = if let Some(clip) = clip {
+        Some(
+            resolve_screenshot_clip(&client, &session_id, clip, capture_beyond_viewport, timeout)
+                .await?,
+        )
+    } else {
+        None
+    };
+    let params = screenshot_capture_params_json(
+        &image_type,
+        capture_beyond_viewport || clip.is_some(),
+        quality,
+        clip.as_ref(),
+    )?;
+    let capture_result = client
+        .send_raw_params_json("Page.captureScreenshot", params, Some(&session_id), timeout)
+        .await;
+    if let Some(guard) = background_guard.as_mut() {
+        let restore_result = guard.restore().await;
+        if capture_result.is_ok() {
+            restore_result?;
+        }
+    }
+    let result = capture_result?;
+    let base64_data = result.get("data").and_then(Value::as_str).unwrap_or("");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_data)
+        .map_err(|error| RwError::Message(error.to_string()))?;
+    if let Some(path) = path {
+        let path_bytes = bytes.clone();
+        tokio::task::spawn_blocking(move || std::fs::write(path, path_bytes))
+            .await
+            .map_err(|error| RwError::Message(error.to_string()))??;
+    }
+    Ok(bytes)
+}
+
+async fn page_close_cleanup(
+    page: Arc<PageInner>,
+    timeout: Duration,
+    run_before_unload: bool,
+) -> RwResult<()> {
+    if run_before_unload {
+        page.browser
+            .client
+            .send(
+                "Page.close",
+                json!({ "runBeforeUnload": true }),
+                Some(&page.session_id),
+                timeout,
+            )
+            .await?;
+    } else {
+        page.browser
+            .client
+            .send(
+                "Target.closeTarget",
+                json!({ "targetId": page.target_id }),
+                None,
+                timeout,
+            )
+            .await?;
+    }
+    page.browser.attached_pages.remove_page(
+        &page.target_id,
+        page.registry_generation,
+        Arc::as_ptr(&page),
+    );
+    page.close_target_on_drop.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+async fn page_close_async(
+    page: Arc<PageInner>,
+    timeout: Duration,
+    run_before_unload: bool,
+) -> RwResult<()> {
+    let lifecycle = Arc::clone(&page.lifecycle);
+    single_flight_close(lifecycle, false, move || {
+        page_close_cleanup(page, timeout, run_before_unload)
+    })
+    .await
+}
+
 #[cfg(feature = "python")]
 #[pymethods]
 impl PyPage {
+    fn background_override_active(&self) -> bool {
+        self.inner.background_override_active.load(Ordering::SeqCst)
+    }
+
+    #[pyo3(signature = (url, wait_until=None, timeout_ms=None, referer=None))]
+    fn goto_async(
+        &self,
+        py: Python<'_>,
+        url: &str,
+        wait_until: Option<&str>,
+        timeout_ms: Option<f64>,
+        referer: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        let page = Arc::clone(&self.inner);
+        let runtime = page.browser.runtime.handle().clone();
+        let url = url.to_string();
+        let wait_until = wait_until.unwrap_or("load").to_string();
+        let referer = referer.map(ToString::to_string);
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        python_future_on(
+            py,
+            runtime,
+            page_goto_async(page, url, wait_until, timeout, referer),
+            |py, value| Ok(value.into_pyobject(py)?.unbind().into_any()),
+        )
+    }
+
+    #[pyo3(signature = (expression, arg_json=None, timeout_ms=None))]
+    fn evaluate_async(
+        &self,
+        py: Python<'_>,
+        expression: &str,
+        arg_json: Option<&str>,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<Py<PyAny>> {
+        let expression = make_evaluate_expression(expression, arg_json);
+        let page = Arc::clone(&self.inner);
+        let runtime = page.browser.runtime.handle().clone();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        python_future_on(
+            py,
+            runtime,
+            evaluate_expression_for_page_async(page, expression, timeout),
+            |py, value| Ok(value.into_pyobject(py)?.unbind().into_any()),
+        )
+    }
+
+    #[pyo3(signature = (locator_json, index, timeout_ms=None, strict=false))]
+    fn click_async(
+        &self,
+        py: Python<'_>,
+        locator_json: &str,
+        index: usize,
+        timeout_ms: Option<f64>,
+        strict: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let page = Arc::clone(&self.inner);
+        let runtime = page.browser.runtime.handle().clone();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let action = r#"
+el.scrollIntoView({ block: 'center', inline: 'center' });
+if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+el.click();
+"#
+        .to_string();
+        python_future_on(
+            py,
+            runtime,
+            page_locator_action_async(
+                page,
+                locator_json.to_string(),
+                index,
+                action,
+                timeout,
+                strict,
+                "click",
+            ),
+            |py, ()| Ok(py.None()),
+        )
+    }
+
+    #[pyo3(signature = (locator_json, index, value, timeout_ms=None, strict=false))]
+    fn fill_async(
+        &self,
+        py: Python<'_>,
+        locator_json: &str,
+        index: usize,
+        value: &str,
+        timeout_ms: Option<f64>,
+        strict: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let value_json = serde_json::to_string(value)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let action = format!(
+            r#"
+el.scrollIntoView({{ block: 'center', inline: 'center' }});
+if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
+const value = {value_json};
+if ('value' in el) el.value = value;
+else if (el.isContentEditable) el.textContent = value;
+else el.textContent = value;
+el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+"#
+        );
+        let page = Arc::clone(&self.inner);
+        let runtime = page.browser.runtime.handle().clone();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        python_future_on(
+            py,
+            runtime,
+            page_locator_action_async(
+                page,
+                locator_json.to_string(),
+                index,
+                action,
+                timeout,
+                strict,
+                "fill",
+            ),
+            |py, ()| Ok(py.None()),
+        )
+    }
+
+    #[pyo3(signature = (locator_json, index, timeout_ms=None))]
+    fn inner_text_async(
+        &self,
+        py: Python<'_>,
+        locator_json: &str,
+        index: usize,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<Py<PyAny>> {
+        let page = Arc::clone(&self.inner);
+        let runtime = page.browser.runtime.handle().clone();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let locator_json = locator_json.to_string();
+        python_future_on(
+            py,
+            runtime,
+            async move {
+                let json = evaluate_locator_for_page(
+                    page,
+                    locator_json,
+                    index,
+                    "return el ? (el.innerText || el.textContent || '') : null;".to_string(),
+                    timeout,
+                )
+                .await?;
+                Ok(serde_json::from_str::<Value>(&json)
+                    .ok()
+                    .and_then(|value| value.as_str().map(ToString::to_string)))
+            },
+            |py, value| Ok(value.into_pyobject(py)?.unbind().into_any()),
+        )
+    }
+
+    #[pyo3(signature = (locator_json, index, state=None, timeout_ms=None, strict=None))]
+    fn wait_for_selector_async(
+        &self,
+        py: Python<'_>,
+        locator_json: &str,
+        index: usize,
+        state: Option<&str>,
+        timeout_ms: Option<f64>,
+        strict: Option<bool>,
+    ) -> PyResult<Py<PyAny>> {
+        let page = Arc::clone(&self.inner);
+        let runtime = page.browser.runtime.handle().clone();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        python_future_on(
+            py,
+            runtime,
+            page_wait_for_selector_async(
+                page,
+                locator_json.to_string(),
+                index,
+                state.unwrap_or("visible").to_string(),
+                timeout,
+                strict.unwrap_or(false),
+            ),
+            |py, value| Ok(value.into_pyobject(py)?.to_owned().unbind().into_any()),
+        )
+    }
+
+    #[pyo3(signature = (path=None, full_page=None, clip_json=None, timeout_ms=None, image_type=None, quality=None, omit_background=None))]
+    fn screenshot_async(
+        &self,
+        py: Python<'_>,
+        path: Option<&str>,
+        full_page: Option<bool>,
+        clip_json: Option<&str>,
+        timeout_ms: Option<f64>,
+        image_type: Option<&str>,
+        quality: Option<u32>,
+        omit_background: Option<bool>,
+    ) -> PyResult<Py<PyAny>> {
+        let clip = clip_json
+            .map(serde_json::from_str::<Value>)
+            .transpose()
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let page = Arc::clone(&self.inner);
+        let runtime = page.browser.runtime.handle().clone();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        python_future_on(
+            py,
+            runtime,
+            page_screenshot_async(
+                page,
+                path.map(ToString::to_string),
+                full_page.unwrap_or(false),
+                clip,
+                timeout,
+                image_type.unwrap_or("png").to_string(),
+                quality,
+                omit_background.unwrap_or(false),
+            ),
+            |py, bytes| Ok(PyBytes::new(py, &bytes).unbind().into_any()),
+        )
+    }
+
+    #[pyo3(signature = (timeout_ms=None, run_before_unload=false))]
+    fn close_async(
+        &self,
+        py: Python<'_>,
+        timeout_ms: Option<f64>,
+        run_before_unload: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let page = Arc::clone(&self.inner);
+        let runtime = page.browser.runtime.handle().clone();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let cleanup = runtime.spawn(page_close_async(page, timeout, run_before_unload));
+        python_future_on(
+            py,
+            runtime,
+            async move {
+                cleanup
+                    .await
+                    .map_err(|error| RwError::Message(error.to_string()))?
+            },
+            |py, ()| Ok(py.None()),
+        )
+    }
+
+    #[pyo3(signature = (width, height, device_scale_factor=1.0, mobile=false, timeout_ms=None))]
+    fn set_device_metrics_async(
+        &self,
+        py: Python<'_>,
+        width: i64,
+        height: i64,
+        device_scale_factor: f64,
+        mobile: bool,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<Py<PyAny>> {
+        let page = Arc::clone(&self.inner);
+        let runtime = page.browser.runtime.handle().clone();
+        let client = Arc::clone(&page.browser.client);
+        let session_id = page.session_id.clone();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        python_future_on(
+            py,
+            runtime,
+            async move {
+                let screen_orientation = device_screen_orientation(width, height, mobile);
+                let mut params = json!({
+                    "width": width,
+                    "height": height,
+                    "deviceScaleFactor": device_scale_factor,
+                    "mobile": mobile,
+                    "screenOrientation": screen_orientation,
+                });
+                if width > 0 && height > 0 {
+                    params["screenWidth"] = Value::from(width);
+                    params["screenHeight"] = Value::from(height);
+                }
+                client
+                    .send(
+                        "Emulation.setDeviceMetricsOverride",
+                        params,
+                        Some(&session_id),
+                        timeout,
+                    )
+                    .await?;
+                Ok(())
+            },
+            |py, ()| Ok(py.None()),
+        )
+    }
+
     #[getter]
     fn target_id(&self) -> String {
         self.inner.target_id.clone()
@@ -5202,74 +7936,19 @@ return new Promise(resolve => {{
             None => None,
         };
         let browser = Arc::clone(&page.browser);
-        let client = Arc::clone(&browser.client);
-        let session_id = page.session_id.clone();
         let omit_background = omit_background.unwrap_or(false);
-        let transparent_background = omit_background && image_type != "jpeg";
         let bytes = py
-            .detach(move || -> RwResult<Vec<u8>> {
-                let bytes = browser.block_on(async move {
-                    if transparent_background {
-                        client
-                            .send_raw_params_json(
-                                "Emulation.setDefaultBackgroundColorOverride",
-                                "{\"color\":{\"r\":0,\"g\":0,\"b\":0,\"a\":0}}".to_string(),
-                                Some(&session_id),
-                                timeout,
-                            )
-                            .await?;
-                    }
-                    let clip = if let Some(clip) = clip {
-                        Some(
-                            resolve_screenshot_clip(
-                                &client,
-                                &session_id,
-                                clip,
-                                capture_beyond_viewport,
-                                timeout,
-                            )
-                            .await?,
-                        )
-                    } else {
-                        None
-                    };
-                    let params = screenshot_capture_params_json(
-                        &image_type,
-                        capture_beyond_viewport || clip.is_some(),
-                        quality,
-                        clip.as_ref(),
-                    )?;
-                    let capture_result = client
-                        .send_raw_params_json(
-                            "Page.captureScreenshot",
-                            params,
-                            Some(&session_id),
-                            timeout,
-                        )
-                        .await;
-                    if transparent_background {
-                        let restore_result = client
-                            .send_raw_params_json(
-                                "Emulation.setDefaultBackgroundColorOverride",
-                                "{}".to_string(),
-                                Some(&session_id),
-                                timeout,
-                            )
-                            .await;
-                        if capture_result.is_ok() {
-                            restore_result?;
-                        }
-                    }
-                    let result = capture_result?;
-                    let base64_data = result.get("data").and_then(Value::as_str).unwrap_or("");
-                    base64::engine::general_purpose::STANDARD
-                        .decode(base64_data)
-                        .map_err(|error| RwError::Message(error.to_string()))
-                })?;
-                if let Some(path) = path {
-                    std::fs::write(path, &bytes)?;
-                }
-                Ok(bytes)
+            .detach(move || {
+                browser.block_on(page_screenshot_async(
+                    page,
+                    path,
+                    capture_beyond_viewport,
+                    clip,
+                    timeout,
+                    image_type,
+                    quality,
+                    omit_background,
+                ))
             })
             .map_err(py_err)?;
         Ok(PyBytes::new(py, &bytes).unbind())
@@ -5397,15 +8076,16 @@ return new Promise(resolve => {{
         let (close_tx, _) = watch::channel(false);
         let stream = PyPageEventStream {
             browser: Arc::clone(&browser),
-            receiver: Mutex::new(Some(receiver)),
+            receiver: Arc::new(Mutex::new(Some(receiver))),
             event_log,
-            cursor: Mutex::new(cursor),
+            cursor: Arc::new(Mutex::new(cursor)),
             session_id: page.session_id.clone(),
             requests: Arc::clone(&page.network_requests),
-            state: Mutex::new(Some(PageEventStreamState::new())),
+            state: Arc::new(Mutex::new(Some(PageEventStreamState::new()))),
+            pending_batch: Arc::new(Mutex::new(None)),
             close_tx,
-            closed: AtomicBool::new(false),
-            runtime_enabled: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
+            runtime_enabled: Arc::new(AtomicBool::new(false)),
         };
         Ok(stream)
     }
@@ -5599,6 +8279,7 @@ return new Promise(resolve => {{
             browser: Arc::clone(&self.inner.browser),
             receiver: Mutex::new(Some(self.inner.browser.client.subscribe())),
             opener_target_id: self.inner.target_id.clone(),
+            seen_target_ids: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -5993,39 +8674,16 @@ return new Promise(resolve => {{
 
     #[pyo3(signature = (timeout_ms=None, run_before_unload=false))]
     fn close(&self, timeout_ms: Option<f64>, run_before_unload: bool) -> PyResult<()> {
-        if self.inner.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
         let page = Arc::clone(&self.inner);
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
-        let client = Arc::clone(&browser.client);
-        let target_id = page.target_id.clone();
-        let session_id = page.session_id.clone();
         browser
-            .block_on(async move {
-                if run_before_unload {
-                    client
-                        .send(
-                            "Page.close",
-                            json!({ "runBeforeUnload": true }),
-                            Some(&session_id),
-                            timeout,
-                        )
-                        .await?;
-                } else {
-                    client
-                        .send(
-                            "Target.closeTarget",
-                            json!({ "targetId": target_id }),
-                            None,
-                            timeout,
-                        )
-                        .await?;
-                }
-                Ok(())
-            })
+            .block_on(page_close_async(page, timeout, run_before_unload))
             .map_err(py_err)
+    }
+
+    fn mark_delivered(&self) {
+        self.inner.mark_delivered();
     }
 }
 
@@ -6402,8 +9060,29 @@ impl PyNetworkEventWaiter {
 }
 
 #[cfg(feature = "python")]
+impl PyPageEventStream {
+    fn take_pending_batch(&self) -> Option<PendingPageEventBatch> {
+        self.pending_batch.lock().unwrap().take()
+    }
+
+    fn rollback_pending_batch(&self) {
+        drop(self.take_pending_batch());
+    }
+}
+
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyPageEventStream {
+    fn ack_batch(&self) {
+        if let Some(batch) = self.take_pending_batch() {
+            batch.acknowledge();
+        }
+    }
+
+    fn rollback_batch(&self) {
+        self.rollback_pending_batch();
+    }
+
     fn enable_runtime(&self) -> PyResult<()> {
         if self.runtime_enabled.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -6428,6 +9107,41 @@ impl PyPageEventStream {
         Ok(())
     }
 
+    fn enable_runtime_async(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if self.runtime_enabled.swap(true, Ordering::SeqCst) {
+            let asyncio = PyModule::import(py, "asyncio")?;
+            let event_loop = asyncio.call_method0("get_running_loop")?;
+            let future = event_loop.call_method0("create_future")?;
+            future.call_method1("set_result", (py.None(),))?;
+            return Ok(future.unbind());
+        }
+        let browser = Arc::clone(&self.browser);
+        let runtime = browser.runtime.handle().clone();
+        let client = Arc::clone(&browser.client);
+        let session_id = self.session_id.clone();
+        let runtime_enabled = Arc::clone(&self.runtime_enabled);
+        python_future_on(
+            py,
+            runtime,
+            async move {
+                let result = client
+                    .send(
+                        "Runtime.enable",
+                        json!({}),
+                        Some(&session_id),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .map(|_| ());
+                if result.is_err() {
+                    runtime_enabled.store(false, Ordering::SeqCst);
+                }
+                result
+            },
+            |py, ()| Ok(py.None()),
+        )
+    }
+
     #[pyo3(signature = (timeout_ms=None, max_events=64))]
     fn wait_batch(
         &self,
@@ -6435,6 +9149,7 @@ impl PyPageEventStream {
         timeout_ms: Option<f64>,
         max_events: usize,
     ) -> PyResult<String> {
+        self.rollback_pending_batch();
         if max_events == 0 {
             return Err(PyValueError::new_err(
                 "max_events must be greater than zero",
@@ -6452,7 +9167,7 @@ impl PyPageEventStream {
             .unwrap()
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("page event stream is already waiting"))?;
-        let state = self
+        let mut state = self
             .state
             .lock()
             .unwrap()
@@ -6460,20 +9175,20 @@ impl PyPageEventStream {
             .ok_or_else(|| PyRuntimeError::new_err("page event stream is already waiting"))?;
         let browser = Arc::clone(&self.browser);
         let event_log = Arc::clone(&self.event_log);
-        let cursor = *self.cursor.lock().unwrap();
+        let mut cursor = *self.cursor.lock().unwrap();
         let session_id = self.session_id.clone();
         let requests = Arc::clone(&self.requests);
         let close_rx = self.close_tx.subscribe();
         let alive_rx = browser.client.alive_tx.subscribe();
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (batch, cursor, state, terminal, receiver) = py.detach(move || {
-            let (batch, cursor, state, terminal) = browser.block_on_raw(wait_for_page_event_batch(
+            let (batch, terminal) = browser.block_on_raw(wait_for_page_event_batch(
                 &mut receiver,
                 event_log,
-                cursor,
+                &mut cursor,
                 &session_id,
                 requests,
-                state,
+                &mut state,
                 close_rx,
                 alive_rx,
                 timeout,
@@ -6490,7 +9205,102 @@ impl PyPageEventStream {
         Ok(Value::Array(batch).to_string())
     }
 
+    #[pyo3(signature = (timeout_ms=None, max_events=64))]
+    fn wait_batch_async(
+        &self,
+        py: Python<'_>,
+        timeout_ms: Option<f64>,
+        max_events: usize,
+    ) -> PyResult<Py<PyAny>> {
+        self.rollback_pending_batch();
+        if max_events == 0 {
+            return Err(PyValueError::new_err(
+                "max_events must be greater than zero",
+            ));
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            let cursor = *self.cursor.lock().unwrap();
+            let payload =
+                Value::Array(vec![page_event_envelope(cursor, "_closed", Value::Null)]).to_string();
+            let asyncio = PyModule::import(py, "asyncio")?;
+            let event_loop = asyncio.call_method0("get_running_loop")?;
+            let future = event_loop.call_method0("create_future")?;
+            future.call_method1("set_result", (payload,))?;
+            return Ok(future.unbind());
+        }
+        let receiver = self
+            .receiver
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("page event stream is already waiting"))?;
+        let state = self
+            .state
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("page event stream is already waiting"))?;
+        let browser = Arc::clone(&self.browser);
+        let runtime = browser.runtime.handle().clone();
+        let event_log = Arc::clone(&self.event_log);
+        let cursor = *self.cursor.lock().unwrap();
+        let session_id = self.session_id.clone();
+        let close_rx = self.close_tx.subscribe();
+        let alive_rx = browser.client.alive_tx.subscribe();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let working_requests = Arc::new(Mutex::new(self.requests.lock().unwrap().clone()));
+        let mut lease = PageEventStreamLease {
+            receiver: Some(receiver),
+            rollback_state: Some(state.clone()),
+            state: Some(state),
+            cursor,
+            rollback_cursor: cursor,
+            delivered: false,
+            receiver_slot: Arc::clone(&self.receiver),
+            state_slot: Arc::clone(&self.state),
+            cursor_slot: Arc::clone(&self.cursor),
+            requests: Arc::clone(&self.requests),
+            working_requests: Arc::clone(&working_requests),
+        };
+        let closed = Arc::clone(&self.closed);
+        let pending_batch = Arc::clone(&self.pending_batch);
+        python_future_on_with_delivery(
+            py,
+            runtime,
+            async move {
+                let (batch, terminal) = wait_for_page_event_batch(
+                    lease.receiver.as_mut().unwrap(),
+                    event_log,
+                    &mut lease.cursor,
+                    &session_id,
+                    working_requests,
+                    lease.state.as_mut().unwrap(),
+                    close_rx,
+                    alive_rx,
+                    timeout,
+                    max_events,
+                )
+                .await;
+                Ok((Value::Array(batch).to_string(), lease, terminal))
+            },
+            move |py, (payload, lease, terminal)| {
+                let value = payload.into_pyobject(py)?.unbind().into_any();
+                Ok(PythonFutureOutput {
+                    value,
+                    on_delivered: Some(Box::new(move || {
+                        *pending_batch.lock().unwrap() = Some(PendingPageEventBatch {
+                            lease,
+                            terminal,
+                            closed,
+                        });
+                    })),
+                })
+            },
+        )
+    }
+
     fn close(&self) {
+        self.rollback_pending_batch();
         self.closed.store(true, Ordering::SeqCst);
         self.close_tx.send_replace(true);
     }
@@ -6722,6 +9532,7 @@ impl PyPopupEventWaiter {
             .ok_or_else(|| PyRuntimeError::new_err("popup waiter is already waiting"))?;
         let browser = Arc::clone(&self.browser);
         let opener_target_id = self.opener_target_id.clone();
+        let seen_target_ids = Arc::clone(&self.seen_target_ids);
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
             let browser_for_wait = Arc::clone(&browser);
@@ -6729,6 +9540,7 @@ impl PyPopupEventWaiter {
                 &mut receiver,
                 browser_for_wait,
                 &opener_target_id,
+                seen_target_ids,
                 timeout,
             ));
             (result, receiver)
@@ -7022,7 +9834,14 @@ impl PyPage {
     }
 }
 
-fn launch_chromium_with_options(mut options: LaunchOptions) -> RwResult<Arc<BrowserInner>> {
+fn launch_chromium_with_options(options: LaunchOptions) -> RwResult<Arc<BrowserInner>> {
+    launch_chromium_with_options_cancelable(options, None)
+}
+
+fn launch_chromium_with_options_cancelable(
+    mut options: LaunchOptions,
+    cancelled: Option<Arc<AtomicBool>>,
+) -> RwResult<Arc<BrowserInner>> {
     if options.timeout.is_none() {
         options.timeout = Some(30_000.0);
     }
@@ -7032,29 +9851,69 @@ fn launch_chromium_with_options(mut options: LaunchOptions) -> RwResult<Arc<Brow
         .build()
         .map_err(|error| RwError::Message(error.to_string()))?;
     let timeout = BrowserInner::command_timeout(options.timeout);
-    let (child, profile_dir, transport, single_process_fallback) =
-        launch_chromium_process(&options, &runtime, timeout)?;
+    let (mut child, profile_dir, transport, single_process_fallback) =
+        launch_chromium_process(&options, &runtime, timeout, cancelled.clone())?;
     let ws_endpoint = transport.endpoint_label();
-    let client = match transport {
-        LaunchedCdpTransport::WebSocket(endpoint) => {
-            runtime.block_on(CdpClient::connect(&endpoint))?
-        }
+    let client_result = match transport {
+        LaunchedCdpTransport::WebSocket(endpoint) => runtime.block_on(async {
+            if let Some(cancelled) = cancelled.clone() {
+                tokio::select! {
+                    result = CdpClient::connect(&endpoint) => result,
+                    () = wait_for_launch_cancellation(cancelled) => {
+                        Err(RwError::Message("browser launch was cancelled".to_string()))
+                    }
+                }
+            } else {
+                CdpClient::connect(&endpoint).await
+            }
+        }),
         #[cfg(unix)]
         LaunchedCdpTransport::Pipe { read, write } => {
-            runtime.block_on(CdpClient::connect_pipe(read, write))?
+            runtime.block_on(CdpClient::connect_pipe(read, write))
         }
     };
-    start_service_worker_stealth_auto_attach(&runtime, Arc::clone(&client))?;
-    Ok(Arc::new(BrowserInner {
-        runtime,
+    let client = match client_result {
+        Ok(client) => client,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    if let Err(error) = start_service_worker_stealth_auto_attach(&runtime, Arc::clone(&client)) {
+        client.close();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let browser = Arc::new(BrowserInner {
+        runtime: OwnedRuntime::new(runtime),
         client,
         process: Mutex::new(Some(child)),
         profile_dir: Mutex::new(profile_dir),
         ws_endpoint,
         stealth_user_agent_override: Mutex::new(None),
         single_process_fallback,
-        closed: AtomicBool::new(false),
-    }))
+        lifecycle: Arc::new(CloseLifecycle::new()),
+        attached_pages: AttachedPageRegistry::default(),
+    });
+    if launch_was_cancelled(cancelled.as_ref()) {
+        let _ = close_browser_blocking(Arc::clone(&browser));
+        return Err(RwError::Message("browser launch was cancelled".to_string()));
+    }
+    Ok(browser)
+}
+
+fn launch_was_cancelled(cancelled: Option<&Arc<AtomicBool>>) -> bool {
+    cancelled
+        .map(|cancelled| cancelled.load(Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+async fn wait_for_launch_cancellation(cancelled: Arc<AtomicBool>) {
+    while !cancelled.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 #[cfg(feature = "python")]
@@ -7066,6 +9925,22 @@ fn launch_chromium(py: Python<'_>, options_json: &str) -> PyResult<PyBrowser> {
         .detach(move || launch_chromium_with_options(options))
         .map_err(py_err)?;
     Ok(PyBrowser { inner })
+}
+
+#[cfg(feature = "python")]
+#[pyfunction]
+fn launch_chromium_async(py: Python<'_>, options_json: &str) -> PyResult<Py<PyAny>> {
+    let options: LaunchOptions = serde_json::from_str(options_json)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    python_future_on_thread(
+        py,
+        move |cancelled| {
+            Ok(PyBrowser {
+                inner: launch_chromium_with_options_cancelable(options, Some(cancelled))?,
+            })
+        },
+        |py, browser| Ok(Py::new(py, browser)?.into_any()),
+    )
 }
 
 #[cfg(feature = "python")]
@@ -7095,14 +9970,15 @@ fn connect_over_cdp(
                 runtime.block_on(CdpClient::connect_with_headers(&ws_endpoint, &headers))?;
             start_service_worker_stealth_auto_attach(&runtime, Arc::clone(&client))?;
             Ok(Arc::new(BrowserInner {
-                runtime,
+                runtime: OwnedRuntime::new(runtime),
                 client,
                 process: Mutex::new(None),
                 profile_dir: Mutex::new(None),
                 ws_endpoint,
                 stealth_user_agent_override: Mutex::new(None),
                 single_process_fallback: false,
-                closed: AtomicBool::new(false),
+                lifecycle: Arc::new(CloseLifecycle::new()),
+                attached_pages: AttachedPageRegistry::default(),
             }))
         })
         .map_err(py_err)?;
@@ -7138,13 +10014,13 @@ pub fn rustwright_chromium_executable_path() -> Option<String> {
 
 impl RustwrightBrowser {
     pub fn new_page(&self) -> RwResult<RustwrightPage> {
-        Ok(RustwrightPage {
-            inner: create_page_raw(Arc::clone(&self.inner), None)?,
-        })
+        let inner = create_page_raw(Arc::clone(&self.inner), None)?;
+        inner.mark_delivered();
+        Ok(RustwrightPage { inner })
     }
 
     pub fn close(&self) -> RwResult<()> {
-        self.inner.close_without_gil()
+        close_browser_blocking(Arc::clone(&self.inner))
     }
 
     pub fn ws_endpoint(&self) -> String {
@@ -7312,101 +10188,24 @@ return true;
             None => None,
         };
         let browser = Arc::clone(&page.browser);
-        let client = Arc::clone(&browser.client);
-        let session_id = page.session_id.clone();
         let omit_background = omit_background.unwrap_or(false);
-        let transparent_background = omit_background && image_type != "jpeg";
-        let bytes = browser.block_on_raw(async move {
-            if transparent_background {
-                client
-                    .send_raw_params_json(
-                        "Emulation.setDefaultBackgroundColorOverride",
-                        "{\"color\":{\"r\":0,\"g\":0,\"b\":0,\"a\":0}}".to_string(),
-                        Some(&session_id),
-                        timeout,
-                    )
-                    .await?;
-            }
-            let clip = if let Some(clip) = clip {
-                Some(
-                    resolve_screenshot_clip(
-                        &client,
-                        &session_id,
-                        clip,
-                        capture_beyond_viewport,
-                        timeout,
-                    )
-                    .await?,
-                )
-            } else {
-                None
-            };
-            let params = screenshot_capture_params_json(
-                &image_type,
-                capture_beyond_viewport || clip.is_some(),
-                quality,
-                clip.as_ref(),
-            )?;
-            let capture_result = client
-                .send_raw_params_json("Page.captureScreenshot", params, Some(&session_id), timeout)
-                .await;
-            if transparent_background {
-                let restore_result = client
-                    .send_raw_params_json(
-                        "Emulation.setDefaultBackgroundColorOverride",
-                        "{}".to_string(),
-                        Some(&session_id),
-                        timeout,
-                    )
-                    .await;
-                if capture_result.is_ok() {
-                    restore_result?;
-                }
-            }
-            let result = capture_result?;
-            let base64_data = result.get("data").and_then(Value::as_str).unwrap_or("");
-            base64::engine::general_purpose::STANDARD
-                .decode(base64_data)
-                .map_err(|error| RwError::Message(error.to_string()))
-        })?;
-        if let Some(path) = path {
-            std::fs::write(path, &bytes)?;
-        }
-        Ok(bytes)
+        browser.block_on_raw(page_screenshot_async(
+            page,
+            path,
+            capture_beyond_viewport,
+            clip,
+            timeout,
+            image_type,
+            quality,
+            omit_background,
+        ))
     }
 
     pub fn close(&self, timeout_ms: Option<f64>, run_before_unload: bool) -> RwResult<()> {
-        if self.inner.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
         let page = Arc::clone(&self.inner);
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
-        let client = Arc::clone(&browser.client);
-        let target_id = page.target_id.clone();
-        let session_id = page.session_id.clone();
-        browser.block_on_raw(async move {
-            if run_before_unload {
-                client
-                    .send(
-                        "Page.close",
-                        json!({ "runBeforeUnload": true }),
-                        Some(&session_id),
-                        timeout,
-                    )
-                    .await?;
-            } else {
-                client
-                    .send(
-                        "Target.closeTarget",
-                        json!({ "targetId": target_id }),
-                        None,
-                        timeout,
-                    )
-                    .await?;
-            }
-            Ok(())
-        })
+        browser.block_on_raw(page_close_async(page, timeout, run_before_unload))
     }
 
     fn evaluate_expression(&self, expression: &str, timeout_ms: Option<f64>) -> RwResult<String> {
@@ -7537,16 +10336,17 @@ async fn create_page_async(
     if let Some(context_id) = &context_id {
         params["browserContextId"] = Value::String(context_id.clone());
     }
-    let target = browser
-        .client
-        .send("Target.createTarget", params, None, Duration::from_secs(10))
-        .await?;
-    let target_id = target
-        .get("targetId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RwError::Message("CDP did not return a targetId".to_string()))?
+    let target_guard = create_target_cancellation_safe(Arc::clone(&browser), params).await?;
+    let target_id = target_guard
+        .target_id
+        .as_deref()
+        .expect("a newly created target guard is armed")
         .to_string();
-    attach_existing_page(browser, target_id, context_id, Duration::from_secs(10)).await
+    let page =
+        attach_existing_page(browser, target_id, context_id, Duration::from_secs(10)).await?;
+    page.close_target_on_drop.store(true, Ordering::SeqCst);
+    target_guard.disarm();
+    Ok(page)
 }
 
 async fn attach_existing_page(
@@ -7555,6 +10355,115 @@ async fn attach_existing_page(
     context_id: Option<String>,
     timeout: Duration,
 ) -> RwResult<Arc<PageInner>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let (reserved_generation, attach_lock) = match browser.attached_pages.reserve(&target_id) {
+            AttachedPageReservation::Existing(page) => return Ok(page),
+            AttachedPageReservation::Attach {
+                generation,
+                attach_lock,
+            } => (generation, attach_lock),
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            browser.attached_pages.remove_reservation(
+                &target_id,
+                reserved_generation,
+                &attach_lock,
+            );
+            return Err(RwError::Timeout(timeout.as_millis() as u64));
+        }
+        let target_guard = match tokio::time::timeout(remaining, attach_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                browser.attached_pages.remove_reservation(
+                    &target_id,
+                    reserved_generation,
+                    &attach_lock,
+                );
+                return Err(RwError::Timeout(timeout.as_millis() as u64));
+            }
+        };
+        let generation = match browser.attached_pages.claim_after_lock(
+            &target_id,
+            reserved_generation,
+            &attach_lock,
+        ) {
+            AttachedPageClaim::Existing(page) => return Ok(page),
+            AttachedPageClaim::Attach { generation } => generation,
+            AttachedPageClaim::Retry => {
+                drop(target_guard);
+                continue;
+            }
+        };
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            browser
+                .attached_pages
+                .remove_reservation(&target_id, generation, &attach_lock);
+            return Err(RwError::Timeout(timeout.as_millis() as u64));
+        }
+        let session_cleanup = Arc::new(AttachedSessionCleanup::new(Arc::clone(&browser)));
+        let attach = attach_existing_page_unregistered(
+            Arc::clone(&browser),
+            target_id.clone(),
+            context_id.clone(),
+            generation,
+            remaining,
+            Arc::clone(&session_cleanup),
+        );
+        let attached_page = match tokio::time::timeout(remaining, attach).await {
+            Ok(Ok(page)) => page,
+            Ok(Err(error)) => {
+                session_cleanup.detach().await;
+                browser
+                    .attached_pages
+                    .remove_reservation(&target_id, generation, &attach_lock);
+                return Err(error);
+            }
+            Err(_) => {
+                session_cleanup.detach().await;
+                browser
+                    .attached_pages
+                    .remove_reservation(&target_id, generation, &attach_lock);
+                return Err(RwError::Timeout(timeout.as_millis() as u64));
+            }
+        };
+        let UnregisteredPage {
+            page,
+            session_guard,
+        } = attached_page;
+        match browser
+            .attached_pages
+            .register(&target_id, &page, generation, &attach_lock)
+        {
+            AttachedPageRegistration::Registered => {
+                session_guard.disarm();
+                return Ok(page);
+            }
+            AttachedPageRegistration::Existing(existing) => {
+                session_guard.detach().await;
+                drop(page);
+                return Ok(existing);
+            }
+            AttachedPageRegistration::ReservationLost => {
+                session_guard.detach().await;
+                drop(page);
+                drop(target_guard);
+            }
+        }
+    }
+}
+
+async fn attach_existing_page_unregistered(
+    browser: Arc<BrowserInner>,
+    target_id: String,
+    context_id: Option<String>,
+    registry_generation: u64,
+    timeout: Duration,
+    session_cleanup: Arc<AttachedSessionCleanup>,
+) -> RwResult<UnregisteredPage> {
     let attached = browser
         .client
         .send(
@@ -7569,6 +10478,8 @@ async fn attach_existing_page(
         .and_then(Value::as_str)
         .ok_or_else(|| RwError::Message("CDP did not return a sessionId".to_string()))?
         .to_string();
+    session_cleanup.set_session(session_id.clone());
+    let session_guard = AttachedSessionGuard::new(session_cleanup);
     let event_stream_start_cursor = browser.client.event_cursor();
     try_join_all(
         ["Page.enable", "DOM.enable", "Network.enable"]
@@ -7585,6 +10496,7 @@ async fn attach_existing_page(
     let page_inner = Arc::new(PageInner {
         browser: Arc::clone(&browser),
         target_id,
+        registry_generation,
         session_id: session_id.clone(),
         context_id,
         main_frame_id: Mutex::new(None),
@@ -7593,11 +10505,17 @@ async fn attach_existing_page(
             event_stream_start_cursor,
         ))),
         event_stream_start_cursor,
-        closed: AtomicBool::new(false),
+        background_override_active: Arc::new(AtomicBool::new(false)),
+        screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+        lifecycle: Arc::new(CloseLifecycle::new()),
+        close_target_on_drop: AtomicBool::new(false),
     });
     let _ = refresh_page_frame_tree(&page_inner, Duration::from_secs(5)).await;
-    spawn_page_oopif_event_listener(Arc::clone(&page_inner));
-    Ok(page_inner)
+    spawn_page_oopif_event_listener(Arc::downgrade(&page_inner));
+    Ok(UnregisteredPage {
+        page: page_inner,
+        session_guard,
+    })
 }
 
 #[cfg(feature = "python")]
@@ -7679,8 +10597,12 @@ async fn initialize_attached_iframe_session(
     let _ = refresh_page_frame_tree(&page, Duration::from_secs(5)).await;
 }
 
-fn spawn_page_oopif_event_listener(page: Arc<PageInner>) {
-    let mut events = page.browser.client.subscribe();
+fn spawn_page_oopif_event_listener(page: Weak<PageInner>) {
+    let Some(initial_page) = page.upgrade() else {
+        return;
+    };
+    let mut events = initial_page.browser.client.subscribe();
+    drop(initial_page);
     tokio::spawn(async move {
         loop {
             let event = match events.recv().await {
@@ -7688,7 +10610,10 @@ fn spawn_page_oopif_event_listener(page: Arc<PageInner>) {
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             };
-            if page.closed.load(Ordering::SeqCst) {
+            let Some(page) = page.upgrade() else {
+                break;
+            };
+            if page.lifecycle.is_closed() {
                 break;
             }
             handle_page_oopif_event(Arc::clone(&page), event).await;
@@ -8741,6 +11666,7 @@ fn launch_chromium_process(
     options: &LaunchOptions,
     runtime: &tokio::runtime::Runtime,
     timeout: Duration,
+    cancelled: Option<Arc<AtomicBool>>,
 ) -> RwResult<(Child, Option<TempDir>, LaunchedCdpTransport, bool)> {
     let executable = find_chromium_executable(
         options.executable_path.as_deref(),
@@ -8791,6 +11717,7 @@ fn launch_chromium_process(
         user_debugging_port.is_some(),
         dynamic_debugging_port,
         use_pipe_transport,
+        cancelled.clone(),
     ) {
         Ok((child, transport)) => return Ok((child, profile_dir, transport, false)),
         Err(error) if should_retry_chromium_single_process(options, &error) => {
@@ -8805,6 +11732,7 @@ fn launch_chromium_process(
                 user_debugging_port.is_some(),
                 dynamic_debugging_port,
                 use_pipe_transport,
+                cancelled,
             ) {
                 Ok((child, transport)) => return Ok((child, profile_dir, transport, true)),
                 Err(retry_error) => {
@@ -8829,6 +11757,7 @@ fn launch_chromium_attempt(
     user_supplied_debugging_port: bool,
     dynamic_debugging_port: bool,
     use_pipe_transport: bool,
+    cancelled: Option<Arc<AtomicBool>>,
 ) -> RwResult<(Child, LaunchedCdpTransport)> {
     let stderr_file = NamedTempFile::new()?;
     let mut command = Command::new(executable);
@@ -8921,6 +11850,11 @@ fn launch_chromium_attempt(
             return Err(RwError::Io(error));
         }
     };
+    if launch_was_cancelled(cancelled.as_ref()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(RwError::Message("browser launch was cancelled".to_string()));
+    }
     #[cfg(unix)]
     let pipe_transport = if let Some(pipes) = cdp_pipes {
         Some(pipes.into_parent_files())
@@ -8938,13 +11872,21 @@ fn launch_chromium_attempt(
                 timeout,
                 &mut child,
                 stderr_file.path(),
+                cancelled.clone(),
             )
             .await
         })
     } else {
         let version_url = format!("http://127.0.0.1:{port}/json/version");
         runtime.block_on(async {
-            poll_ws_endpoint(&version_url, timeout, &mut child, stderr_file.path()).await
+            poll_ws_endpoint(
+                &version_url,
+                timeout,
+                &mut child,
+                stderr_file.path(),
+                cancelled,
+            )
+            .await
         })
     };
     let ws_endpoint = match ws_endpoint_result {
@@ -9013,10 +11955,14 @@ async fn poll_ws_endpoint(
     timeout: Duration,
     child: &mut Child,
     stderr_path: &Path,
+    cancelled: Option<Arc<AtomicBool>>,
 ) -> RwResult<String> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_error: Option<RwError> = None;
     loop {
+        if launch_was_cancelled(cancelled.as_ref()) {
+            return Err(RwError::Message("browser launch was cancelled".to_string()));
+        }
         if let Some(status) = child.try_wait()? {
             return Err(RwError::Message(chromium_launch_failure_message(
                 Some(status),
@@ -9056,11 +12002,15 @@ async fn poll_ws_endpoint_from_devtools_active_port(
     timeout: Duration,
     child: &mut Child,
     stderr_path: &Path,
+    cancelled: Option<Arc<AtomicBool>>,
 ) -> RwResult<String> {
     let deadline = tokio::time::Instant::now() + timeout;
     let active_port_file = profile_arg.join("DevToolsActivePort");
     let mut last_error: Option<RwError> = None;
     loop {
+        if launch_was_cancelled(cancelled.as_ref()) {
+            return Err(RwError::Message("browser launch was cancelled".to_string()));
+        }
         if let Some(status) = child.try_wait()? {
             return Err(RwError::Message(chromium_launch_failure_message(
                 Some(status),
@@ -9559,11 +12509,13 @@ async fn wait_for_load_state(
     }
 }
 
+#[derive(Clone)]
 struct NetworkObservationState {
     response_extra_infos: HashMap<String, Value>,
     pending_responses: HashMap<String, PendingNetworkResponse>,
 }
 
+#[derive(Clone)]
 struct PendingNetworkResponse {
     seq: u64,
     response: Value,
@@ -9635,9 +12587,9 @@ fn apply_network_request_mutation(
         .and_then(|entry| entry.applied_by_seq.get(&seq))
         .cloned()
     {
-        return Some(applied);
+        return Some(applied.request);
     }
-    let prior_request = requests.requests.get(&request_id).and_then(|entry| {
+    let prior_snapshot = requests.requests.get(&request_id).and_then(|entry| {
         if advance_current {
             Some(entry.current.clone())
         } else {
@@ -9648,20 +12600,42 @@ fn apply_network_request_mutation(
                 .map(|(_, request)| request.clone())
         }
     });
-    let request = request_from_event(event, prior_request)?;
+    let request = request_from_event(
+        event,
+        prior_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.request.clone()),
+    )?;
+    let redirect_ancestry = if request.get("redirected_from").is_some() {
+        prior_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                std::iter::once(snapshot.seq)
+                    .chain(snapshot.redirect_ancestry.iter().copied())
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let snapshot = NetworkRequestSnapshot {
+        seq,
+        request: request.clone(),
+        redirect_ancestry,
+    };
     match requests.requests.get_mut(&request_id) {
         Some(entry) => {
             if advance_current {
-                entry.current = request.clone();
+                entry.current = snapshot.clone();
             }
-            entry.applied_by_seq.insert(seq, request.clone());
+            entry.applied_by_seq.insert(seq, snapshot.clone());
         }
         None => {
             requests.requests.insert(
                 request_id.clone(),
                 NetworkRequestEntry {
-                    current: request.clone(),
-                    applied_by_seq: BTreeMap::from([(seq, request.clone())]),
+                    current: snapshot.clone(),
+                    applied_by_seq: BTreeMap::from([(seq, snapshot)]),
                 },
             );
         }
@@ -9956,71 +12930,69 @@ fn append_ready_page_events(
 async fn wait_for_page_event_batch(
     events: &mut broadcast::Receiver<Value>,
     event_log: Arc<Mutex<CdpEventLog>>,
-    mut cursor: u64,
+    cursor: &mut u64,
     session_id: &str,
     requests: Arc<Mutex<NetworkRequestStore>>,
-    mut state: PageEventStreamState,
+    state: &mut PageEventStreamState,
     mut close_rx: watch::Receiver<bool>,
     mut alive_rx: watch::Receiver<bool>,
     timeout: Duration,
     max_events: usize,
-) -> (Vec<Value>, u64, PageEventStreamState, bool) {
+) -> (Vec<Value>, bool) {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut batch = Vec::with_capacity(max_events);
     loop {
         if *close_rx.borrow() {
-            batch.push(page_event_envelope(cursor, "_closed", Value::Null));
-            return (batch, cursor, state, true);
+            batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
+            return (batch, true);
         }
         if !*alive_rx.borrow() {
-            batch.push(page_event_envelope(cursor, "_closed", Value::Null));
-            return (batch, cursor, state, true);
+            batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
+            return (batch, true);
         }
-        expire_page_responses(&mut state);
-        append_ready_page_events(&mut batch, &mut state, max_events);
+        expire_page_responses(state);
+        append_ready_page_events(&mut batch, state, max_events);
         if batch.len() >= max_events {
-            return (batch, cursor, state, false);
+            return (batch, false);
         }
 
         let (oldest_seq, entries) = {
             let log = event_log.lock().unwrap();
-            (log.oldest_seq(), log.entries_since(cursor))
+            (log.oldest_seq(), log.entries_since(*cursor))
         };
-        if cursor < oldest_seq {
-            let dropped = oldest_seq - cursor;
-            cursor = oldest_seq;
-            state = PageEventStreamState::new();
+        if *cursor < oldest_seq {
+            let dropped = oldest_seq - *cursor;
+            *cursor = oldest_seq;
+            *state = PageEventStreamState::new();
             requests.lock().unwrap().reset_after_overflow(oldest_seq);
             batch.push(page_event_envelope(
-                cursor,
+                *cursor,
                 "_overflow",
                 json!({ "dropped": dropped }),
             ));
             if batch.len() >= max_events {
-                return (batch, cursor, state, false);
+                return (batch, false);
             }
         }
         for (seq, event) in entries {
-            if seq < cursor {
+            if seq < *cursor {
                 continue;
             }
-            cursor = seq.saturating_add(1);
-            process_page_observation_event(
-                seq, &event, &event_log, session_id, &requests, &mut state,
-            );
-            expire_page_responses(&mut state);
-            append_ready_page_events(&mut batch, &mut state, max_events);
+            *cursor = seq.saturating_add(1);
+            process_page_observation_event(seq, &event, &event_log, session_id, &requests, state);
+            expire_page_responses(state);
+            append_ready_page_events(&mut batch, state, max_events);
             if batch.len() >= max_events {
-                return (batch, cursor, state, false);
+                return (batch, false);
             }
         }
         if !batch.is_empty() {
-            return (batch, cursor, state, false);
+            return (batch, false);
         }
 
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return (batch, cursor, state, false);
+            return (batch, false);
         }
         let mut remaining = deadline - now;
         if let Some(response_deadline) = state.network.next_deadline() {
@@ -10029,22 +13001,22 @@ async fn wait_for_page_event_batch(
         tokio::select! {
             changed = close_rx.changed() => {
                 if changed.is_err() || *close_rx.borrow() {
-                    batch.push(page_event_envelope(cursor, "_closed", Value::Null));
-                    return (batch, cursor, state, true);
+                    batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
+                    return (batch, true);
                 }
             }
             changed = alive_rx.changed() => {
                 if changed.is_err() || !*alive_rx.borrow() {
-                    batch.push(page_event_envelope(cursor, "_closed", Value::Null));
-                    return (batch, cursor, state, true);
+                    batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
+                    return (batch, true);
                 }
             }
             received = tokio::time::timeout(remaining, events.recv()) => {
                 match received {
                     Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
                     Ok(Err(broadcast::error::RecvError::Closed)) => {
-                        batch.push(page_event_envelope(cursor, "_closed", Value::Null));
-                        return (batch, cursor, state, true);
+                        batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
+                        return (batch, true);
                     }
                     Err(_) => {
                         if state.network.next_deadline()
@@ -10053,7 +13025,7 @@ async fn wait_for_page_event_batch(
                         {
                             continue;
                         }
-                        return (batch, cursor, state, false);
+                        return (batch, false);
                     }
                 }
             }
@@ -10553,6 +13525,7 @@ async fn wait_for_popup_page(
     events: &mut broadcast::Receiver<Value>,
     browser: Arc<BrowserInner>,
     opener_target_id: &str,
+    seen_target_ids: Arc<Mutex<HashSet<String>>>,
     timeout: Duration,
 ) -> RwResult<PyPage> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -10586,13 +13559,22 @@ async fn wait_for_popup_page(
                         RwError::Message("popup target did not include targetId".to_string())
                     })?
                     .to_string();
+                if !seen_target_ids.lock().unwrap().insert(target_id.clone()) {
+                    continue;
+                }
                 let context_id = info
                     .get("browserContextId")
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
-                return attach_existing_page(browser, target_id, context_id, remaining)
+                return match attach_existing_page(browser, target_id.clone(), context_id, remaining)
                     .await
-                    .map(|inner| PyPage { inner });
+                {
+                    Ok(inner) => Ok(PyPage { inner }),
+                    Err(error) => {
+                        seen_target_ids.lock().unwrap().remove(&target_id);
+                        Err(error)
+                    }
+                };
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(_)) => return Err(RwError::Message("CDP event stream closed".to_string())),
@@ -11271,7 +14253,7 @@ fn response_from_event(
                 .unwrap()
                 .requests
                 .get(id)
-                .map(|entry| entry.current.clone())
+                .map(|entry| entry.current.request.clone())
         })
         .unwrap_or_else(|| {
             json!({
@@ -11347,7 +14329,7 @@ fn request_lifecycle_from_event(
                 .unwrap()
                 .requests
                 .get(id)
-                .map(|entry| entry.current.clone())
+                .map(|entry| entry.current.request.clone())
         })
         .unwrap_or_else(|| {
             json!({
@@ -13684,7 +16666,13 @@ fn locator_script(locator_json: &str, index: usize, body: &str) -> String {
 
 #[cfg(feature = "python")]
 #[pymodule]
-fn _rustwright(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _rustwright(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+    PYTHON_SETTLEMENTS_ENABLED.store(true, Ordering::SeqCst);
+    let shutdown_gate = Py::new(py, PyRustShutdownGate)?;
+    PyModule::import(py, "atexit")?.call_method1("register", (shutdown_gate,))?;
+    module.add_class::<PyRustFutureAbort>()?;
+    module.add_class::<PyRustFutureSettler>()?;
+    module.add_class::<PyRustShutdownGate>()?;
     module.add_class::<PyBrowser>()?;
     module.add_class::<PyBrowserContext>()?;
     module.add_class::<PyPage>()?;
@@ -13707,6 +16695,7 @@ fn _rustwright(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyServiceWorkerEventWaiter>()?;
     module.add_class::<PyBackgroundPageEventWaiter>()?;
     module.add_function(wrap_pyfunction!(launch_chromium, module)?)?;
+    module.add_function(wrap_pyfunction!(launch_chromium_async, module)?)?;
     module.add_function(wrap_pyfunction!(connect_over_cdp, module)?)?;
     module.add_function(wrap_pyfunction!(chromium_executable_path, module)?)?;
     Ok(())
