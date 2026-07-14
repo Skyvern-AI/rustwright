@@ -51,3 +51,12 @@ Skyvern-AI/rustwright-cloud:
     dest: SECURITY.md
   - source: pyproject.toml
     dest: pyproject.toml
+  - source: examples/
+    dest: examples/
+    deleteOrphaned: true
+  - source: AGENTS.md
+    dest: AGENTS.md
+  - source: QUICKSTART.md
+    dest: QUICKSTART.md
+  - source: MEMORY_BENCH.md
+    dest: MEMORY_BENCH.md

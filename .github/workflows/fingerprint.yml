@@ -1,0 +1,198 @@
+name: Rustwright Fingerprint Evidence
+
+# Runs the anti-bot / fingerprint probes on a schedule so the Signal-hygiene
+# results in the README stay dated and versioned instead of decaying into
+# undated claims. The local `smoke` suite is the deterministic gate; the public
+# fingerprint probes hit third-party detector sites and are best-effort
+# (continue-on-error) because those sites flake and change without notice.
+#
+# Structured result summaries are uploaded as a dated artifact and rendered in
+# the job summary. Following AGENTS.md ("publish only reviewed, reproducible
+# summaries"), raw probe evidence (screenshots, page dumps, network captures)
+# is never written at all, and the workflow does NOT commit results back to
+# the repo — promoting a run into the README is a reviewed, human step.
+
+on:
+  schedule:
+    # Mondays 06:00 UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Fingerprint target (repeatable via comma) or all"
+        type: string
+        required: false
+        default: "all"
+      settle_ms:
+        description: "Extra settle wait after each public page load (ms)"
+        type: string
+        required: false
+        default: "2500"
+      navigation_timeout_ms:
+        description: "Navigation timeout for public fingerprint pages (ms)"
+        type: string
+        required: false
+        default: "20000"
+
+concurrency:
+  group: fingerprint-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  fingerprint:
+    name: fingerprint probes
+    # Never run on forks; the probes and reference install are wasteful there.
+    if: ${{ github.repository == 'Skyvern-AI/rustwright' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Pin the reference Playwright so "default Playwright failed X" stays a
+      # claim about a known version, not whatever floats to latest.
+      PLAYWRIGHT_REFERENCE_VERSION: "1.59.0"
+      TARGETS: ${{ github.event_name == 'workflow_dispatch' && inputs.targets || 'all' }}
+      SETTLE_MS: ${{ github.event_name == 'workflow_dispatch' && inputs.settle_ms || '2500' }}
+      NAV_TIMEOUT_MS: ${{ github.event_name == 'workflow_dispatch' && inputs.navigation_timeout_ms || '20000' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Install build and test dependencies
+        run: python -m pip install -U pip maturin
+
+      - name: Build and install the Python extension
+        # `maturin develop` needs an active virtualenv, which a clean runner has
+        # not created. Build a wheel and install it into the setup-python
+        # environment so subsequent `python -m rustwright` calls resolve.
+        run: |
+          maturin build --release --out dist
+          python -m pip install dist/*.whl
+
+      - name: Install Chromium (with system deps)
+        run: |
+          python -m rustwright install-deps chromium
+          python -m rustwright install chromium
+
+      - name: Install pinned reference Playwright
+        run: |
+          python -m pip install \
+            --target .audit-playwright \
+            "playwright==${PLAYWRIGHT_REFERENCE_VERSION}"
+          PYTHONPATH=.audit-playwright python -m playwright install --with-deps chromium
+
+      - name: Record environment provenance
+        id: provenance
+        run: |
+          RUN_DATE="$(date -u +%Y-%m-%d)"
+          echo "run_date=${RUN_DATE}" >> "$GITHUB_OUTPUT"
+          RUSTWRIGHT_VERSION="$(python -m rustwright --version 2>/dev/null || echo unknown)"
+          {
+            echo "## Fingerprint evidence — ${RUN_DATE}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Run date (UTC) | ${RUN_DATE} |"
+            echo "| Rustwright version | ${RUSTWRIGHT_VERSION} |"
+            echo "| Rustwright commit | \`${GITHUB_SHA}\` |"
+            echo "| Reference Playwright | ${PLAYWRIGHT_REFERENCE_VERSION} |"
+            echo "| Targets | ${TARGETS} |"
+            echo "| Runner | ${RUNNER_OS} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Local smoke suite (deterministic gate)
+        run: |
+          python tools/run_antibot_benchmarks.py \
+            --suite smoke \
+            --impl all \
+            --reference-path .audit-playwright \
+            --json | tee smoke-result.json
+          # The runner exits 0 regardless of signal results, so enforce the
+          # gate here: fail the job if Rustwright's smoke result is not clean.
+          python - <<'PY'
+          import json, sys
+          data = json.load(open("smoke-result.json"))
+          rows = data.get("results", [data]) if isinstance(data, dict) else []
+          rustwright = next((r for r in rows if r.get("implementation") == "rustwright"), None)
+          if rustwright is None:
+              sys.exit("smoke gate: no rustwright result in output")
+          if rustwright.get("status") != "passed":
+              sys.exit(
+                  f"smoke gate failed: rustwright status={rustwright.get('status')!r} "
+                  f"failures={rustwright.get('signal_fail_counts')}"
+              )
+          print("smoke gate: rustwright passed")
+          PY
+
+      - name: Public fingerprint probes (best-effort)
+        id: probes
+        continue-on-error: true
+        run: |
+          # No --evidence-dir: raw probe evidence (screenshots, page dumps)
+          # is never written, so it can never leak into a published artifact.
+          target_args=()
+          IFS=',' read -ra parts <<< "${TARGETS}"
+          for t in "${parts[@]}"; do
+            t="$(echo "$t" | xargs)"
+            [ -n "$t" ] && target_args+=(--target "$t")
+          done
+          python tools/run_antibot_benchmarks.py \
+            --suite fingerprint \
+            --impl all \
+            --reference-path .audit-playwright \
+            "${target_args[@]}" \
+            --settle-ms "${SETTLE_MS}" \
+            --navigation-timeout-ms "${NAV_TIMEOUT_MS}" \
+            --json | tee fingerprint-summary.json
+
+      - name: Summarize fingerprint results
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, pathlib
+          path = pathlib.Path("fingerprint-summary.json")
+          print("")
+          if not path.exists():
+              print("_Fingerprint probes did not produce a summary (public sites may have been unreachable)._")
+              raise SystemExit(0)
+          data = json.loads(path.read_text())
+          rows = data.get("results", [data]) if isinstance(data, dict) else []
+          print("### Fingerprint probe results")
+          print("")
+          print("| Implementation | Status | Clean iterations | Failing checks |")
+          print("|---|---|---|---|")
+          for item in rows:
+              impl = item.get("implementation", "?")
+              status = item.get("status", "?")
+              clean = f"{item.get('passed_iterations','?')}/{item.get('iterations','?')}"
+              fails = item.get("diagnostic_fail_counts") or item.get("signal_fail_counts") or {}
+              fails_str = ", ".join(f"{k}={v}" for k, v in fails.items()) if isinstance(fails, dict) else str(fails)
+              print(f"| {impl} | {status} | {clean} | {fails_str or '—'} |")
+          print("")
+          print("_Public detector sites change without notice; treat a single run as a diagnostic, not a guarantee._")
+          PY
+
+      - name: Upload fingerprint result summaries
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fingerprint-summaries-${{ steps.provenance.outputs.run_date }}
+          # Only the structured JSON summaries; raw probe evidence is never
+          # written (no --evidence-dir), so nothing else exists to publish.
+          path: |
+            fingerprint-summary.json
+            smoke-result.json
+          if-no-files-found: warn
+          retention-days: 90
