@@ -11781,6 +11781,10 @@ class BrowserContext:
 
     def _adopt_persistent_initial_pages(self) -> None:
         self._adopt_existing_pages()
+        if not self._pages:
+            # The launcher uses --no-startup-window, so preserve Playwright's one-page persistent
+            # context contract by creating the first target lazily after CDP is connected.
+            self._new_page(method="BrowserType.launch_persistent_context")
 
     @property
     def background_pages(self) -> list[Any]:

@@ -8868,21 +8868,53 @@ fn launch_chromium_attempt(
     }
 
     let mut default_args = vec![
-        "--no-first-run".to_string(),
-        "--no-default-browser-check".to_string(),
+        "--disable-field-trial-config".to_string(),
         "--disable-background-networking".to_string(),
         "--disable-background-timer-throttling".to_string(),
+        "--disable-backgrounding-occluded-windows".to_string(),
+        "--disable-back-forward-cache".to_string(),
+        "--disable-breakpad".to_string(),
+        "--disable-client-side-phishing-detection".to_string(),
+        "--disable-component-extensions-with-background-pages".to_string(),
+        "--disable-component-update".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-default-apps".to_string(),
         "--disable-dev-shm-usage".to_string(),
-        "--disable-blink-features=AutomationControlled".to_string(),
-        "--disable-renderer-backgrounding".to_string(),
+        "--disable-extensions".to_string(),
+        "--disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,BoundaryEventDispatchTracksNodeRemoval,DestroyProfileOnBrowserClose,DialMediaRouteProvider,GlobalMediaControls,HttpsUpgrades,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,Translate,AutoDeElevate,RenderDocument,OptimizationHints".to_string(),
+        "--enable-features=CDPScreenshotNewSurface".to_string(),
+        "--allow-pre-commit-input".to_string(),
+        "--disable-hang-monitor".to_string(),
+        "--disable-ipc-flooding-protection".to_string(),
         "--disable-popup-blocking".to_string(),
         "--disable-prompt-on-repost".to_string(),
-        "--enable-features=CDPScreenshotNewSurface".to_string(),
+        "--disable-renderer-backgrounding".to_string(),
+        "--force-color-profile=srgb".to_string(),
+        "--metrics-recording-only".to_string(),
+        "--no-first-run".to_string(),
+        "--password-store=basic".to_string(),
+        "--use-mock-keychain".to_string(),
+        "--no-service-autorun".to_string(),
+        "--export-tagged-pdf".to_string(),
+        "--disable-search-engine-choice-screen".to_string(),
+        "--unsafely-disable-devtools-self-xss-warnings".to_string(),
+        "--edge-skip-compat-layer-relaunch".to_string(),
+        "--disable-infobars".to_string(),
+        "--disable-sync".to_string(),
+        "--enable-unsafe-swiftshader".to_string(),
+        // Playwright also passes --enable-automation, but it exposes navigator.webdriver.
+        "--disable-blink-features=AutomationControlled".to_string(),
+        // Keep Rustwright's deliberate audio suppression in both headed and headless modes.
         "--mute-audio".to_string(),
+        "--no-startup-window".to_string(),
     ];
     if options.headless {
-        default_args.push("--headless=new".to_string());
+        default_args.push("--headless".to_string());
         default_args.push("--hide-scrollbars".to_string());
+        default_args.push(
+            "--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4"
+                .to_string(),
+        );
     }
     if !options.chromium_sandbox {
         default_args.push("--no-sandbox".to_string());
@@ -8909,7 +8941,8 @@ fn launch_chromium_attempt(
     if single_process_fallback && !has_chromium_arg(&options.args, "--single-process") {
         command.arg("--single-process");
     }
-    command.arg("about:blank");
+    // Playwright defaults to --remote-debugging-pipe. Rustwright keeps its port transport until
+    // that transport migration is complete; --no-startup-window still avoids an eager target.
 
     let mut child = match command.spawn() {
         Ok(child) => child,

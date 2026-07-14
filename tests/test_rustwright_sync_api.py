@@ -4950,6 +4950,65 @@ def test_launch_defaults_to_fast_cdp_screenshot_surface(playwright, tmp_path: Pa
         browser.close()
 
 
+def test_launch_defaults_align_with_playwright_without_automation_signals(playwright, tmp_path: Path):
+    args_file = tmp_path / "launch-playwright-default-args.txt"
+    wrapper = chromium_arg_probe_wrapper(tmp_path, playwright.chromium.executable_path, args_file)
+
+    browser = playwright.chromium.launch(headless=True, executable_path=str(wrapper))
+    try:
+        page = browser.new_page()
+        page.set_content("<title>Playwright defaults</title>")
+
+        launch_args = args_file.read_text(encoding="utf-8").splitlines()
+        expected_args = {
+            "--allow-pre-commit-input",
+            "--disable-back-forward-cache",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-breakpad",
+            "--disable-client-side-phishing-detection",
+            "--disable-component-extensions-with-background-pages",
+            "--disable-component-update",
+            "--disable-default-apps",
+            "--disable-extensions",
+            "--disable-field-trial-config",
+            "--disable-hang-monitor",
+            "--disable-infobars",
+            "--disable-ipc-flooding-protection",
+            "--disable-search-engine-choice-screen",
+            "--disable-sync",
+            "--edge-skip-compat-layer-relaunch",
+            "--enable-unsafe-swiftshader",
+            "--export-tagged-pdf",
+            "--force-color-profile=srgb",
+            "--metrics-recording-only",
+            "--no-service-autorun",
+            "--no-startup-window",
+            "--password-store=basic",
+            "--unsafely-disable-devtools-self-xss-warnings",
+            "--use-mock-keychain",
+            "--disable-blink-features=AutomationControlled",
+            "--mute-audio",
+            "--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4",
+        }
+        expected_disabled_features = (
+            "--disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,"
+            "BoundaryEventDispatchTracksNodeRemoval,DestroyProfileOnBrowserClose,"
+            "DialMediaRouteProvider,GlobalMediaControls,HttpsUpgrades,LensOverlay,"
+            "MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,Translate,"
+            "AutoDeElevate,RenderDocument,OptimizationHints"
+        )
+
+        assert expected_args <= set(launch_args)
+        assert expected_disabled_features in launch_args
+        assert "--enable-features=CDPScreenshotNewSurface" in launch_args
+        assert "about:blank" not in launch_args
+        assert "--enable-automation" not in launch_args
+        assert "--remote-debugging-pipe" not in launch_args
+        assert any(arg.startswith("--remote-debugging-port=") for arg in launch_args)
+    finally:
+        browser.close()
+
+
 def test_launch_ignore_default_args_filters_selected_defaults(playwright, tmp_path: Path):
     args_file = tmp_path / "launch-ignore-args.txt"
     wrapper = chromium_arg_probe_wrapper(tmp_path, playwright.chromium.executable_path, args_file)
