@@ -1,0 +1,155 @@
+{
+  "benchmark": {
+    "title": "Client-library memory footprint \u2014 remote browser (Skyvern)",
+    "browser_location": "remote Skyvern cloud session",
+    "memory_scope": "client container only; remote Chromium excluded",
+    "uploads": "skipped",
+    "skipped_fields": [
+      "Resume",
+      "Cover Letter"
+    ]
+  },
+  "playwright": {
+    "wall_time_s": 117.150617,
+    "launch_connect_s": 1.012885,
+    "nav_s": 2.309316,
+    "actions_s": 102.376099,
+    "pauses_s": 11.151638,
+    "timeline_total_s": 116.849938,
+    "fields_filled": 20,
+    "skipped_fields": [
+      "Resume",
+      "Cover Letter"
+    ],
+    "session_id": "redacted",
+    "context_mode": "new_context",
+    "client_memory_mib": {
+      "cgroup": {
+        "peak_total": 114.035156,
+        "avg_total": 108.638096
+      },
+      "pss": {
+        "peak_at_total_peak": {
+          "total": 133.462891,
+          "python": 29.436523,
+          "node": 104.026367
+        },
+        "avg": {
+          "total": 128.606645,
+          "python": 29.23039,
+          "node": 99.376255
+        }
+      }
+    },
+    "samples": {
+      "cgroup": 1173,
+      "pss": 1171,
+      "cgroup_rate_hz": 9.999775,
+      "pss_rate_hz": 10.000078
+    }
+  },
+  "rustwright": {
+    "wall_time_s": 96.260838,
+    "launch_connect_s": 1.235199,
+    "nav_s": 1.558312,
+    "actions_s": 81.972835,
+    "pauses_s": 11.145553,
+    "timeline_total_s": 95.911898,
+    "fields_filled": 20,
+    "skipped_fields": [
+      "Resume",
+      "Cover Letter"
+    ],
+    "session_id": "redacted",
+    "context_mode": "new_context",
+    "client_memory_mib": {
+      "cgroup": {
+        "peak_total": 60.125,
+        "avg_total": 58.438053
+      },
+      "pss": {
+        "peak_at_total_peak": {
+          "total": 40.580078,
+          "python": 40.580078,
+          "node": 0.0
+        },
+        "avg": {
+          "total": 39.931926,
+          "python": 39.931926,
+          "node": 0.0
+        }
+      }
+    },
+    "samples": {
+      "cgroup": 964,
+      "pss": 962,
+      "cgroup_rate_hz": 9.999307,
+      "pss_rate_hz": 9.999881
+    }
+  },
+  "deltas_rustwright_minus_playwright": {
+    "wall_time_s": {
+      "absolute": -20.889779,
+      "percent": -17.831557
+    },
+    "launch_connect_s": {
+      "absolute": 0.222314,
+      "percent": 21.948592
+    },
+    "nav_s": {
+      "absolute": -0.751004,
+      "percent": -32.520625
+    },
+    "actions_s": {
+      "absolute": -20.403264,
+      "percent": -19.929714
+    },
+    "pauses_s": {
+      "absolute": -0.006085,
+      "percent": -0.054566
+    },
+    "client_memory_mib": {
+      "cgroup": {
+        "peak_total": {
+          "absolute": -53.910156,
+          "percent": -47.275032
+        },
+        "avg_total": {
+          "absolute": -50.200043,
+          "percent": -46.208508
+        }
+      },
+      "pss": {
+        "peak_at_total_peak": {
+          "total": {
+            "absolute": -92.882813,
+            "percent": -69.594486
+          },
+          "python": {
+            "absolute": 11.143555,
+            "percent": 37.85622
+          },
+          "node": {
+            "absolute": -104.026367,
+            "percent": -100.0
+          }
+        },
+        "avg": {
+          "total": {
+            "absolute": -88.674719,
+            "percent": -68.95034
+          },
+          "python": {
+            "absolute": 10.701536,
+            "percent": 36.610993
+          },
+          "node": {
+            "absolute": -99.376255,
+            "percent": -100.0
+          }
+        }
+      }
+    },
+    "fields_filled": 0
+  }
+}
