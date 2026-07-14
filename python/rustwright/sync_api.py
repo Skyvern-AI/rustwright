@@ -8547,6 +8547,27 @@ class _LocalEventContextManager:
         self._handler: Optional[Callable[..., Any]] = None
         self._reject_close_handler: Optional[Callable[..., Any]] = None
         self._page_log_offsets: dict[Page, int] = {}
+        self._predicate_results: dict[int, list[tuple[Any, bool, str]]] = {}
+        self._predicate_lock = threading.Lock()
+
+    def _predicate_accepts(self, value: Any, *, source: str) -> bool:
+        if self._event not in {"request", "response"}:
+            return self._predicate is None or bool(self._predicate(value))
+
+        value_id = id(value)
+        with self._predicate_lock:
+            pending = self._predicate_results.get(value_id, [])
+            opposite = "fallback" if source == "handler" else "handler"
+            for index, (pending_value, accepted, pending_source) in enumerate(pending):
+                if pending_value is value and pending_source == opposite:
+                    pending.pop(index)
+                    if not pending:
+                        self._predicate_results.pop(value_id, None)
+                    return accepted
+            accepted = self._predicate is None or bool(self._predicate(value))
+            pending.append((value, accepted, source))
+            self._predicate_results[value_id] = pending
+            return accepted
 
     def __enter__(self) -> "_LocalEventContextManager":
         if self._event in {"request", "response"} and hasattr(self._target, "_pages"):
@@ -8564,7 +8585,7 @@ class _LocalEventContextManager:
                 value = args[0]
             else:
                 value = args
-            if self._predicate is None or self._predicate(value):
+            if self._predicate_accepts(value, source="handler"):
                 self._value = value
                 self._ready.set()
 
@@ -8625,8 +8646,9 @@ class _LocalEventContextManager:
             return None
         for page, offset in list(self._page_log_offsets.items()):
             events = page._request_log if self._event == "request" else page._response_log
+            self._page_log_offsets[page] = len(events)
             for event in events[offset:]:
-                if self._predicate is None or self._predicate(event):
+                if self._predicate_accepts(event, source="fallback"):
                     return event
         return None
 
@@ -10356,6 +10378,8 @@ class Browser:
         self._connected_over_cdp = bool(launch_options.get("_connected_over_cdp"))
         self._owned_cdp_sessions: list[CDPSession] = []
         self._closed = False
+        self._rustwright_async_close_state = "open"
+        self._rustwright_async_close_task: Any = None
         self._closed_reason: Optional[str] = None
         self._disconnected_emitted = False
         self._disconnect_thread: Optional[threading.Thread] = None
@@ -11688,6 +11712,8 @@ class BrowserContext:
         self._default_timeout = 30_000.0
         self._default_navigation_timeout: Optional[float] = None
         self._closed = False
+        self._rustwright_async_close_state = "open"
+        self._rustwright_async_close_task: Any = None
         self._closed_reason: Optional[str] = None
         self._clock = Clock(context=self)
         self._debugger = Debugger(self)
@@ -11891,6 +11917,7 @@ class BrowserContext:
         if self._event_handlers.get("page"):
             self._ensure_page_popup_bridge(page)
         _emit_event(self._event_handlers, "page", page)
+        page._core.mark_delivered()
         return page
 
     def _install_default_context_proxy_route(self, page: "Page") -> None:
@@ -12133,6 +12160,8 @@ class BrowserContext:
                 content_mode=self._record_har_content,
                 har_mode=self._record_har_mode,
             )
+        if self._owns_browser:
+            self._cleanup_default_context_state()
         for page in list(self._pages):
             try:
                 page.close(reason=reason)
@@ -14321,7 +14350,13 @@ _PAGE_OBSERVATION_EVENTS = {
 
 
 class Page:
-    def __init__(self, core: Any, context: Optional[BrowserContext] = None):
+    def __init__(
+        self,
+        core: Any,
+        context: Optional[BrowserContext] = None,
+        *,
+        _start_event_pump: bool = True,
+    ):
         self._core = core
         self._context = context
         self._opener: Optional["Page"] = None
@@ -14458,16 +14493,20 @@ class Page:
         self._clock_initialized: set[str] = set()
         self._closing = False
         self._closed = False
+        self._rustwright_async_close_state = "open"
+        self._rustwright_async_close_task: Any = None
         self._closed_reason: Optional[str] = None
         self._event_pump_stop_lock = threading.Lock()
         self._event_pump_stopped = False
         self._event_stream = self._core.combined_event_stream()
-        self._event_pump_thread = threading.Thread(
-            target=self._event_pump,
-            daemon=True,
-            name="rustwright-page-events",
-        )
-        self._event_pump_thread.start()
+        self._event_pump_thread: Optional[threading.Thread] = None
+        if _start_event_pump:
+            self._event_pump_thread = threading.Thread(
+                target=self._event_pump,
+                daemon=True,
+                name="rustwright-page-events",
+            )
+            self._event_pump_thread.start()
 
     def _slow_mo(self) -> None:
         if self._slow_mo_ms > 0:

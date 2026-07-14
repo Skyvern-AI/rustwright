@@ -8,9 +8,11 @@ import inspect
 import json
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
+from . import _rustwright
 from .sync_api import (
     APIRequest as SyncAPIRequest,
     APIRequestContext as SyncAPIRequestContext,
@@ -19,6 +21,7 @@ from .sync_api import (
     BrowserBindResult,
     Browser as SyncBrowser,
     BrowserContext as SyncBrowserContext,
+    BrowserType as SyncBrowserType,
     CDPSession as SyncCDPSession,
     Cookie,
     ConsoleMessage as SyncConsoleMessage,
@@ -65,8 +68,26 @@ from .sync_api import (
     _MISSING,
     _UNSET,
     backend_marker,
+    _decode_json_result,
+    _default_timeout_for_method,
+    _emit_event,
     _event_handler_positional_args,
+    _json,
+    _is_ignorable_close_error,
+    _navigation_timeout_for_method,
+    _normalize_action_boolean,
+    _normalize_lifecycle_state,
+    _normalize_path_arg,
+    _normalize_required_string_argument,
+    _normalize_screenshot_options,
+    _normalize_selector_option,
+    _normalize_string_option,
+    _normalize_wait_for_selector_state,
     _options_from_explicit_kwargs,
+    _response_from_payload,
+    _translate_error,
+    _unsafe_dom_fastpath_enabled,
+    _validate_timeout_value,
 )
 from .sync_api import sync_playwright as _sync_playwright
 
@@ -137,6 +158,167 @@ async def _run_sync_call(func: Callable[..., Any], /, *args: Any, **kwargs: Any)
     ctx = contextvars.copy_context()
     call = functools.partial(ctx.run, func, *args, **kwargs)
     return await loop.run_in_executor(executor, call)
+
+
+async def _await_native(awaitable: Any) -> Any:
+    try:
+        return await awaitable
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise _translate_error(exc) from None
+
+
+async def _await_native_method(method: str, awaitable: Any) -> Any:
+    try:
+        return await _await_native(awaitable)
+    except Error as exc:
+        message = str(exc)
+        if message.startswith(f"{method}:"):
+            raise
+        if isinstance(exc, TimeoutError):
+            match = re.fullmatch(r"timed out after ([0-9]+(?:\.[0-9]+)?) ms", message)
+            if match:
+                raise TimeoutError(f"{method}: Timeout {match.group(1)}ms exceeded.") from None
+        error_type = TargetClosedError if isinstance(exc, TargetClosedError) else type(exc)
+        raise error_type(f"{method}: {message}") from None
+
+
+async def _await_cleanup_completion(awaitable: Any) -> Any:
+    """Finish lifecycle cleanup before propagating cancellation to the caller."""
+    cleanup_task = asyncio.ensure_future(awaitable)
+    cancelled = False
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            cancelled = True
+    result = cleanup_task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+_CLOSE_OPEN = "open"
+_CLOSE_CLOSING = "closing"
+_CLOSE_CLOSED = "closed"
+
+
+async def _single_flight_close(sync_obj: Any, cleanup: Callable[[], Any]) -> None:
+    """Run one cancellation-safe close task and share its result with every caller."""
+    state = getattr(sync_obj, "_rustwright_async_close_state", _CLOSE_OPEN)
+    task = getattr(sync_obj, "_rustwright_async_close_task", None)
+    if state == _CLOSE_CLOSED:
+        return
+    if state == _CLOSE_CLOSING and task is not None:
+        if task is asyncio.current_task():
+            return
+        await _await_cleanup_completion(task)
+        return
+
+    task = asyncio.create_task(cleanup())
+    sync_obj._rustwright_async_close_state = _CLOSE_CLOSING
+    sync_obj._rustwright_async_close_task = task
+    try:
+        await _await_cleanup_completion(task)
+    except BaseException:
+        if task.done() and not task.cancelled() and task.exception() is None:
+            sync_obj._rustwright_async_close_state = _CLOSE_CLOSED
+            sync_obj._rustwright_async_close_task = None
+        else:
+            sync_obj._rustwright_async_close_state = _CLOSE_OPEN
+            sync_obj._rustwright_async_close_task = None
+        raise
+    else:
+        sync_obj._rustwright_async_close_state = _CLOSE_CLOSED
+        sync_obj._rustwright_async_close_task = None
+
+
+def _native_locator(sync_page: SyncPage, selector: str, strict: Optional[bool], *, method: str) -> Any:
+    missing_method = "_click" if method == "Page.click" else method.rsplit(".", 1)[-1]
+    normalized = _normalize_selector_option(
+        selector,
+        method=method,
+        missing_type_error=f"Frame.{missing_method}() missing 1 required positional argument: 'selector'",
+    )
+    return sync_page._selector_locator(
+        normalized,
+        {"strict": strict, "strict_method": method},
+    )
+
+
+def _native_page_options_supported(context: SyncBrowserContext) -> bool:
+    if not isinstance(context, SyncBrowserContext):
+        return False
+    unsupported_context_events = set(context._event_handlers) - {"page", "close"}
+    return bool(
+        context._core is not None
+        and not context._options
+        and not context._init_scripts
+        and not context._routes
+        and not context._har_routes
+        and not context._websocket_routes
+        and not context._bindings
+        and not context._record_har_path
+        and not context._record_video_dir
+        and not context._clock._installed
+        and not unsupported_context_events
+    )
+
+
+def _native_page_hot_path_supported(page: Any) -> bool:
+    if not isinstance(page, SyncPage):
+        return False
+    context = page._context
+    browser = context._browser if context is not None else None
+    return bool(
+        not page._owned_cdp_sessions
+        and not page._routes
+        and not page._bindings
+        and not page._locator_handlers
+        and not page._har_recordings
+        and not page._fetch_enabled
+        and not page._slow_mo_ms
+        and (context is None or not context._options)
+        and (browser is None or not browser._owned_cdp_sessions)
+    )
+
+
+async def _native_context_page(context: SyncBrowserContext) -> SyncPage:
+    core = await _await_native(context._core.new_page_async())
+    return await _finish_native_page(context, core)
+
+
+async def _finish_native_page(context: SyncBrowserContext, core: Any) -> SyncPage:
+    page = SyncPage(core, context=context, _start_event_pump=False)
+    registered = False
+    try:
+        await _await_native(core.set_device_metrics_async(1280, 720, 1.0, False, page._default_timeout))
+        page._viewport_size = {"width": 1280, "height": 720}
+        page.set_default_timeout(context._default_timeout)
+        if context._default_navigation_timeout is not None:
+            page.set_default_navigation_timeout(context._default_navigation_timeout)
+        context._pages.append(page)
+        registered = True
+        if context._event_handlers.get("page"):
+            await _await_cleanup_completion(_run_sync_call(context._ensure_page_popup_bridge, page))
+        core.mark_delivered()
+        _emit_event(context._event_handlers, "page", page)
+        return page
+    except BaseException:
+        if registered and page in context._pages:
+            context._pages.remove(page)
+        popup_handler = context._popup_bridge_handlers.pop(page, None)
+        if popup_handler is not None:
+            page.remove_listener("popup", popup_handler)
+        try:
+            await _await_cleanup_completion(
+                core.close_async(page._default_timeout, False)
+            )
+        except Exception as exc:
+            if not _is_ignorable_close_error(_translate_error(exc)):
+                raise
+        raise
 
 
 class _AsyncWrapper:
@@ -480,28 +662,57 @@ class AsyncBrowserType(_AsyncWrapper):
         chromium_sandbox: Optional[bool] = None,
         firefox_user_prefs: Optional[dict[str, Any]] = None,
     ) -> "AsyncBrowser":
-        return _wrap_async_browser(
-            await _run_sync_call(
-                self._sync.launch,
-                executable_path=executable_path,
-                channel=channel,
-                args=args,
-                ignore_default_args=ignore_default_args,
-                handle_sigint=handle_sigint,
-                handle_sigterm=handle_sigterm,
-                handle_sighup=handle_sighup,
-                timeout=timeout,
-                env=env,
-                headless=headless,
-                proxy=proxy,
-                downloads_path=downloads_path,
-                slow_mo=slow_mo,
-                traces_dir=traces_dir,
-                artifacts_dir=artifacts_dir,
-                chromium_sandbox=chromium_sandbox,
-                firefox_user_prefs=firefox_user_prefs,
+        if (
+            not isinstance(self._sync, SyncBrowserType)
+            or self._sync.name != "chromium"
+            or traces_dir is not None
+            or artifacts_dir is not None
+            or firefox_user_prefs is not None
+        ):
+            return _wrap_async_browser(
+                await _run_sync_call(
+                    self._sync.launch,
+                    executable_path=executable_path,
+                    channel=channel,
+                    args=args,
+                    ignore_default_args=ignore_default_args,
+                    handle_sigint=handle_sigint,
+                    handle_sigterm=handle_sigterm,
+                    handle_sighup=handle_sighup,
+                    timeout=timeout,
+                    env=env,
+                    headless=headless,
+                    proxy=proxy,
+                    downloads_path=downloads_path,
+                    slow_mo=slow_mo,
+                    traces_dir=traces_dir,
+                    artifacts_dir=artifacts_dir,
+                    chromium_sandbox=chromium_sandbox,
+                    firefox_user_prefs=firefox_user_prefs,
+                )
             )
+        options, launch_options = self._sync._normalize_launch_options(
+            headless=headless,
+            executable_path=executable_path,
+            channel=channel,
+            args=args,
+            timeout=timeout,
+            env=env,
+            chromium_sandbox=chromium_sandbox,
+            proxy=proxy,
+            user_data_dir=None,
+            downloads_path=downloads_path,
+            slow_mo=slow_mo,
+            ignore_default_args=ignore_default_args,
+            handle_sigint=handle_sigint,
+            handle_sigterm=handle_sigterm,
+            handle_sighup=handle_sighup,
+            method="BrowserType.launch",
         )
+        core = await _await_native(
+            _rustwright.launch_chromium_async(json.dumps(options, separators=(",", ":")))
+        )
+        return _wrap_async_browser(SyncBrowser(core, launch_options=launch_options))
 
     async def launch_persistent_context(
         self,
@@ -1289,7 +1500,10 @@ def _wrap_async_route_handler(handler: Any, owner: Any = None) -> Any:
                 return handler(async_route)
             return handler(async_route, async_request)
 
-        _run_callback_on_owner_loop(owner_loop, call_handler)
+        try:
+            _run_callback_on_owner_loop(owner_loop, call_handler)
+        except asyncio.CancelledError:
+            return
 
     return wrapper
 
@@ -2101,6 +2315,22 @@ class AsyncBrowser(_AsyncWrapper):
         client_certificates: Any = None,
     ) -> "AsyncPage":
         options = _options_from_explicit_kwargs(locals())
+        if (
+            isinstance(self._sync, SyncBrowser)
+            and not options
+            and not self._sync._launch_proxy
+            and not self._sync._launch_downloads_path
+        ):
+            context = SyncBrowserContext(None, browser=self._sync, options={})
+            self._sync._contexts.append(context)
+            try:
+                core = await _await_native(self._sync._core.new_page_async())
+                page = await _finish_native_page(context, core)
+            except BaseException:
+                self._sync._contexts.remove(context)
+                raise
+            page._owns_context = True
+            return _wrap_async_page(page)
         return _wrap_async_page(await _run_sync_call(self._sync.new_page, **options))
 
     async def new_context(
@@ -2144,10 +2374,58 @@ class AsyncBrowser(_AsyncWrapper):
         client_certificates: Any = None,
     ) -> "AsyncBrowserContext":
         options = _options_from_explicit_kwargs(locals())
+        if (
+            isinstance(self._sync, SyncBrowser)
+            and not options
+            and not self._sync._closed
+            and not self._sync._browser_download_behavior
+            and not self._sync._launch_proxy
+            and not self._sync._launch_downloads_path
+            and not bool(self._sync._core.single_process_fallback())
+        ):
+            core = await _await_native(self._sync._core.new_context_async(None))
+            context = SyncBrowserContext(core, browser=self._sync, options={})
+            self._sync._contexts.append(context)
+            return _wrap_async_browser_context(context)
         return _wrap_async_browser_context(await _run_sync_call(self._sync.new_context, **options))
 
     async def close(self, *, reason: Optional[str] = None) -> None:
-        await _run_sync_call(self._sync.close, reason=reason)
+        if not isinstance(self._sync, SyncBrowser):
+            await _single_flight_close(
+                self._sync,
+                lambda: _run_sync_call(self._sync.close, reason=reason),
+            )
+            return
+        if self._sync._closed or getattr(
+            self._sync, "_rustwright_async_close_state", _CLOSE_OPEN
+        ) == _CLOSE_CLOSED:
+            return
+        normalized_reason = None
+        if reason is not None:
+            normalized_reason = _normalize_string_option(reason, method="Browser.close", name="reason")
+        await _single_flight_close(
+            self._sync,
+            lambda: self._close_native(normalized_reason),
+        )
+
+    async def _close_native(self, normalized_reason: Optional[str]) -> None:
+        if self._sync._connected_over_cdp:
+            self._sync._closed_reason = normalized_reason
+            self._sync._stop_page_event_pumps()
+            await _await_native(self._sync._core.close_async())
+            self._sync._closed = True
+            self._sync._mark_owned_cdp_sessions_closed()
+            self._sync._contexts.clear()
+            self._sync._emit_disconnected()
+            return
+        for context in list(self._sync._contexts):
+            await _wrap_async_browser_context(context)._close_for_browser_close(reason=normalized_reason)
+        self._sync._closed_reason = normalized_reason
+        await _await_native(self._sync._core.close_async())
+        self._sync._closed = True
+        self._sync._mark_owned_cdp_sessions_closed()
+        self._sync._contexts.clear()
+        self._sync._emit_disconnected()
 
     def is_connected(self) -> bool:
         return self._sync.is_connected()
@@ -2238,10 +2516,60 @@ class AsyncBrowserContext(_AsyncWrapper):
         return _wrap_async_debugger(self._sync.debugger)
 
     async def new_page(self) -> "AsyncPage":
+        if _native_page_options_supported(self._sync):
+            return _wrap_async_page(await _native_context_page(self._sync))
         return _wrap_async_page(await _run_sync_call(self._sync.new_page))
 
     async def close(self, *, reason: Optional[str] = None) -> None:
-        await _run_sync_call(self._sync.close, reason=reason)
+        browser = getattr(self._sync, "_browser", None)
+        if getattr(self._sync, "_owns_browser", False) and browser is not None:
+            normalized_reason = None
+            if reason is not None:
+                normalized_reason = _normalize_string_option(
+                    reason,
+                    method="BrowserContext.close",
+                    name="reason",
+                )
+            await _wrap_async_browser(browser).close(reason=normalized_reason)
+            return
+        await self._close_native(reason=reason, for_browser_close=False)
+
+    async def _close_for_browser_close(self, *, reason: Optional[str] = None) -> None:
+        await self._close_native(reason=reason, for_browser_close=True)
+
+    async def _close_native(self, *, reason: Optional[str], for_browser_close: bool) -> None:
+        await _single_flight_close(
+            self._sync,
+            lambda: self._close_native_impl(reason=reason, for_browser_close=for_browser_close),
+        )
+
+    async def _close_native_impl(self, *, reason: Optional[str], for_browser_close: bool) -> None:
+        if not isinstance(self._sync, SyncBrowserContext) or self._sync._record_har_path:
+            close = self._sync._close_for_browser_close if for_browser_close else self._sync.close
+            await _run_sync_call(close, reason=reason)
+            return
+        if self._sync._closed:
+            return
+        normalized_reason = None
+        if reason is not None:
+            normalized_reason = _normalize_string_option(
+                reason,
+                method="BrowserContext.close",
+                name="reason",
+            )
+        self._sync._closed_reason = normalized_reason
+        if not for_browser_close or self._sync._owns_browser:
+            await _run_sync_call(self._sync._cleanup_default_context_state)
+        for page in list(self._sync._pages):
+            await _wrap_async_page(page).close(reason=normalized_reason)
+        if self._sync._core is not None:
+            await _await_native(self._sync._core.close_async())
+        await _run_sync_call(self._sync.request.dispose)
+        self._sync._closed = True
+        self._sync._pages.clear()
+        if self._sync._browser is not None and self._sync in self._sync._browser._contexts:
+            self._sync._browser._contexts.remove(self._sync)
+        _emit_event(self._sync._event_handlers, "close", self._sync)
 
     def is_closed(self) -> bool:
         return self._sync.is_closed()
@@ -2365,6 +2693,74 @@ class AsyncPage(_AsyncWrapper):
         self._mouse = AsyncMouse(sync_obj.mouse)
         self._touchscreen = AsyncTouchscreen(sync_obj.touchscreen)
         self.accessibility = AsyncAccessibility(sync_obj.accessibility)
+        self._event_pump_task: Optional[asyncio.Task[Any]] = getattr(
+            sync_obj,
+            "_rustwright_async_event_pump_task",
+            None,
+        )
+        if getattr(sync_obj, "_event_pump_thread", None) is None and self._loop is not None:
+            if self._event_pump_task is None or self._event_pump_task.done():
+                self._event_pump_task = self._loop.create_task(self._event_pump())
+                sync_obj._rustwright_async_event_pump_task = self._event_pump_task
+
+    async def _event_pump(self) -> None:
+        while self._sync._event_listeners_active():
+            try:
+                batch = json.loads(
+                    await _await_native(self._sync._event_stream.wait_batch_async(500.0, 64))
+                )
+            except asyncio.CancelledError:
+                self._sync._event_stream.rollback_batch()
+                return
+            except RuntimeError as exc:
+                if "page event stream is already waiting" not in str(exc):
+                    raise
+                await asyncio.sleep(0.01)
+                continue
+            except Error:
+                return
+            if not isinstance(batch, list):
+                self._sync._event_stream.rollback_batch()
+                continue
+            try:
+                stream_closed = await _await_cleanup_completion(self._consume_event_batch(batch))
+            except asyncio.CancelledError:
+                return
+            if stream_closed:
+                self._sync._stop_event_pump()
+                return
+
+    async def _consume_event_batch(self, batch: list[Any]) -> bool:
+        completed = False
+        stream_closed = False
+        try:
+            for envelope in batch:
+                if not isinstance(envelope, dict):
+                    continue
+                kind = str(envelope.get("kind") or "")
+                if kind == "_closed":
+                    stream_closed = True
+                    break
+                if kind == "_overflow":
+                    await _run_sync_call(
+                        self._sync._reconcile_event_stream_overflow,
+                        envelope.get("payload"),
+                    )
+                    continue
+                await _run_sync_call(
+                    self._sync._handle_observation_event,
+                    kind,
+                    envelope.get("payload"),
+                )
+                if not self._sync._event_listeners_active():
+                    break
+            completed = True
+        finally:
+            if completed:
+                self._sync._event_stream.ack_batch()
+            else:
+                self._sync._event_stream.rollback_batch()
+        return stream_closed
 
     @property
     def url(self) -> str:
@@ -2502,13 +2898,74 @@ class AsyncPage(_AsyncWrapper):
         wait_until: Optional[str] = None,
         referer: Optional[str] = None,
     ) -> Optional["AsyncResponse"]:
-        response = await _run_sync_call(
-            self._sync.goto,
+        if not _native_page_hot_path_supported(self._sync):
+            response = await _run_sync_call(
+                self._sync.goto,
+                url,
+                timeout=timeout,
+                wait_until=wait_until,
+                referer=referer,
+            )
+            return _wrap_async_response(response)
+        target = _normalize_required_string_argument(
             url,
-            timeout=timeout,
-            wait_until=wait_until,
-            referer=referer,
+            method="Page.goto",
+            name="url",
+            missing_type_error="Frame.goto() missing 1 required positional argument: 'url'",
         )
+        navigation_timeout = _navigation_timeout_for_method(self._sync, timeout, method="Page.goto")
+        normalized_state = _normalize_lifecycle_state(wait_until, label="wait_until", method="Page.goto")
+        normalized_referer = (
+            None
+            if referer is None
+            else _normalize_string_option(referer, method="Page.goto", name="referer")
+        )
+        target = self._sync._resolve_url(target)
+        self._sync._mark_request_cookie_sync_required()
+        await _run_sync_call(self._sync._retain_navigation_response_bodies)
+        await _run_sync_call(self._sync._mark_navigation_history_boundary)
+        self._sync._set_content_html_document_known = None
+        download_waiter = (
+            await _run_sync_call(self._sync._download_event_waiter)
+            if target.lower().startswith(("http://", "https://"))
+            else None
+        )
+        try:
+            payload = json.loads(
+                await _await_native_method(
+                    "Page.goto",
+                    self._sync._core.goto_async(
+                        target,
+                        normalized_state,
+                        navigation_timeout,
+                        normalized_referer,
+                    ),
+                )
+            )
+        except Error as exc:
+            message = str(exc).splitlines()[0]
+            if (
+                download_waiter is not None
+                and message.startswith("Page.goto: net::ERR_ABORTED")
+                and await _run_sync_call(
+                    self._sync._download_started_for_url,
+                    download_waiter,
+                    target,
+                    timeout=1_000.0,
+                )
+            ):
+                raise Error("Page.goto: Download is starting") from None
+            raise
+        response = (
+            None
+            if payload is None or target.lower().startswith(("about:", "data:"))
+            else _response_from_payload(self._sync, payload, fallback_url=target)
+        )
+        if response is not None:
+            self._sync._remember_navigation_response(response)
+        if self._sync._context is not None:
+            await _run_sync_call(self._sync._context._apply_storage_state_to_page, self._sync)
+        self._sync._slow_mo()
         return _wrap_async_response(response)
 
     async def reload(self, *, timeout: Optional[float] = None, wait_until: Optional[str] = None) -> Optional["AsyncResponse"]:
@@ -2539,7 +2996,30 @@ class AsyncPage(_AsyncWrapper):
         await _run_sync_call(self._sync.add_init_script, script, path=path)
 
     async def evaluate(self, expression: str, arg: Any = None) -> Any:
-        return await _run_sync_call(self._sync.evaluate, expression, _unwrap_async_arg(arg))
+        if not _native_page_hot_path_supported(self._sync):
+            return await _run_sync_call(self._sync.evaluate, expression, _unwrap_async_arg(arg))
+        normalized_expression = _normalize_string_option(
+            expression,
+            method="Page.evaluate",
+            name="expression",
+        )
+        value = _unwrap_async_arg(arg)
+        try:
+            arg_json = None if value is None else json.dumps(value)
+        except (TypeError, ValueError):
+            return await _run_sync_call(self._sync.evaluate, expression, value)
+        self._sync._mark_request_cookie_sync_required()
+        self._sync._mark_history_events_may_arrive()
+        await _run_sync_call(self._sync._maybe_start_transient_popup_adoption, normalized_expression)
+        result = await _await_native_method(
+            "Page.evaluate",
+            self._sync._core.evaluate_async(
+                normalized_expression,
+                arg_json,
+                self._sync._default_timeout,
+            )
+        )
+        return _decode_json_result(json.loads(result))
 
     async def evaluate_handle(self, expression: str, arg: Any = None) -> "AsyncJSHandle":
         return _wrap_async_js_handle(await _run_sync_call(self._sync.evaluate_handle, expression, _unwrap_async_arg(arg)))
@@ -2639,14 +3119,32 @@ class AsyncPage(_AsyncWrapper):
         state: Optional[str] = None,
         strict: Optional[bool] = None,
     ) -> Optional["AsyncElementHandle"]:
-        handle = await _run_sync_wait_sliced(
-            self._sync,
-            self._sync.wait_for_selector,
-            selector,
-            timeout=timeout,
-            state=state,
-            strict=strict,
+        if not _native_page_hot_path_supported(self._sync):
+            handle = await _run_sync_wait_sliced(
+                self._sync,
+                self._sync.wait_for_selector,
+                selector,
+                timeout=timeout,
+                state=state,
+                strict=strict,
+            )
+            return _wrap_async_element_handle(handle)
+        normalized_state = _normalize_wait_for_selector_state(state, method="Page.wait_for_selector")
+        timeout_ms = _default_timeout_for_method(self._sync, timeout, method="Page.wait_for_selector")
+        locator = _native_locator(self._sync, selector, strict, method="Page.wait_for_selector")
+        attached = await _await_native_method(
+            "Page.wait_for_selector",
+            self._sync._core.wait_for_selector_async(
+                _json(locator._spec),
+                locator._index,
+                normalized_state,
+                timeout_ms,
+                locator._strict,
+            )
         )
+        handle = None
+        if attached and normalized_state in {"attached", "visible"}:
+            handle = SyncElementHandle(locator.nth(0), handle=None)
         return _wrap_async_element_handle(handle)
 
     async def eval_on_selector(self, selector: str, expression: str, arg: Any = None, *, strict: Optional[bool] = None) -> Any:
@@ -2713,20 +3211,41 @@ class AsyncPage(_AsyncWrapper):
         trial: Optional[bool] = None,
         strict: Optional[bool] = None,
     ) -> None:
-        await _run_sync_wait_sliced(
-            self._sync,
-            self._sync.click,
-            selector,
-            modifiers=modifiers,
-            position=position,
-            delay=delay,
-            button=button,
-            click_count=click_count,
-            timeout=timeout,
-            force=force,
-            no_wait_after=no_wait_after,
-            trial=trial,
-            strict=strict,
+        if (
+            not _native_page_hot_path_supported(self._sync)
+            or not _unsafe_dom_fastpath_enabled()
+            or getattr(self._sync, "_active_page_cdp_event_contexts", 0) > 0
+            or any(
+                value is not None
+                for value in (modifiers, position, delay, button, click_count, force, no_wait_after, trial)
+            )
+        ):
+            await _run_sync_wait_sliced(
+                self._sync,
+                self._sync.click,
+                selector,
+                modifiers=modifiers,
+                position=position,
+                delay=delay,
+                button=button,
+                click_count=click_count,
+                timeout=timeout,
+                force=force,
+                no_wait_after=no_wait_after,
+                trial=trial,
+                strict=strict,
+            )
+            return
+        timeout_ms = _default_timeout_for_method(self._sync, timeout, method="Page.click")
+        locator = _native_locator(self._sync, selector, strict, method="Page.click")
+        await _await_native_method(
+            "Page.click",
+            self._sync._core.click_async(
+                _json(locator._spec),
+                locator._index,
+                timeout_ms,
+                locator._strict,
+            )
         )
 
     async def dblclick(
@@ -2768,15 +3287,41 @@ class AsyncPage(_AsyncWrapper):
         strict: Optional[bool] = None,
         force: Optional[bool] = None,
     ) -> None:
-        await _run_sync_wait_sliced(
-            self._sync,
-            self._sync.fill,
-            selector,
+        if (
+            not _native_page_hot_path_supported(self._sync)
+            or not _unsafe_dom_fastpath_enabled()
+            or getattr(self._sync, "_active_page_cdp_event_contexts", 0) > 0
+            or no_wait_after is not None
+            or force is not None
+        ):
+            await _run_sync_wait_sliced(
+                self._sync,
+                self._sync.fill,
+                selector,
+                value,
+                timeout=timeout,
+                no_wait_after=no_wait_after,
+                strict=strict,
+                force=force,
+            )
+            return
+        normalized_value = _normalize_required_string_argument(
             value,
-            timeout=timeout,
-            no_wait_after=no_wait_after,
-            strict=strict,
-            force=force,
+            method="Page.fill",
+            name="value",
+            missing_type_error="Frame.fill() missing 1 required positional argument: 'value'",
+        )
+        timeout_ms = _default_timeout_for_method(self._sync, timeout, method="Page.fill")
+        locator = _native_locator(self._sync, selector, strict, method="Page.fill")
+        await _await_native_method(
+            "Page.fill",
+            self._sync._core.fill_async(
+                _json(locator._spec),
+                locator._index,
+                normalized_value,
+                timeout_ms,
+                locator._strict,
+            )
         )
 
     async def type(
@@ -3011,7 +3556,28 @@ class AsyncPage(_AsyncWrapper):
         strict: Optional[bool] = None,
         timeout: Optional[float] = None,
     ) -> Optional[str]:
-        return await _run_sync_call(self._sync.inner_text, selector, strict=strict, timeout=timeout)
+        if not _native_page_hot_path_supported(self._sync):
+            return await _run_sync_call(self._sync.inner_text, selector, strict=strict, timeout=timeout)
+        timeout_ms = _default_timeout_for_method(self._sync, timeout, method="Page.inner_text")
+        locator = _native_locator(self._sync, selector, strict, method="Page.inner_text")
+        await _await_native_method(
+            "Page.inner_text",
+            self._sync._core.wait_for_selector_async(
+                _json(locator._spec),
+                locator._index,
+                "attached",
+                timeout_ms,
+                locator._strict,
+            )
+        )
+        return await _await_native_method(
+            "Page.inner_text",
+            self._sync._core.inner_text_async(
+                _json(locator._spec),
+                locator._index,
+                timeout_ms,
+            )
+        )
 
     async def input_value(self, selector: str, *, strict: Optional[bool] = None, timeout: Optional[float] = None) -> str:
         return await _run_sync_call(self._sync.input_value, selector, strict=strict, timeout=timeout)
@@ -3204,21 +3770,64 @@ class AsyncPage(_AsyncWrapper):
             sync_mask = sync_mask._sync
         elif isinstance(sync_mask, (list, tuple)):
             sync_mask = [item._sync if isinstance(item, _AsyncWrapper) else item for item in sync_mask]
-        return await _run_sync_call(
-            self._sync.screenshot,
-            timeout=timeout,
-            type=type,
-            path=path,
+        if not _native_page_hot_path_supported(self._sync) or any(
+            value is not None for value in (animations, caret, scale, mask, mask_color, style)
+        ):
+            return await _run_sync_call(
+                self._sync.screenshot,
+                timeout=timeout,
+                type=type,
+                path=path,
+                quality=quality,
+                omit_background=omit_background,
+                full_page=full_page,
+                clip=clip,
+                animations=animations,
+                caret=caret,
+                scale=scale,
+                mask=sync_mask,
+                mask_color=mask_color,
+                style=style,
+            )
+        normalized_path = _normalize_path_arg(path)
+        normalized_full_page = False if full_page is None else bool(
+            _normalize_action_boolean(full_page, method="Page.screenshot", name="full_page")
+        )
+        normalized_omit_background = _normalize_action_boolean(
+            omit_background,
+            method="Page.screenshot",
+            name="omit_background",
+        )
+        normalized_timeout = (
+            self._sync._default_timeout
+            if timeout is None
+            else _validate_timeout_value(timeout, method="Page.screenshot")
+        )
+        image_type, normalized_quality = _normalize_screenshot_options(
+            method="Page.screenshot",
+            path=normalized_path,
+            image_type=type,
             quality=quality,
-            omit_background=omit_background,
-            full_page=full_page,
-            clip=clip,
-            animations=animations,
-            caret=caret,
-            scale=scale,
-            mask=sync_mask,
-            mask_color=mask_color,
-            style=style,
+        )
+        normalized_clip = self._sync._normalize_screenshot_clip(
+            clip,
+            method="Page.screenshot",
+            full_page=normalized_full_page,
+            scale="device",
+        )
+        return await _await_native_method(
+            "Page.screenshot",
+            self._sync._core.screenshot_async(
+                normalized_path,
+                normalized_full_page,
+                None
+                if normalized_clip is None
+                else json.dumps(normalized_clip, separators=(",", ":")),
+                normalized_timeout,
+                image_type,
+                normalized_quality,
+                normalized_omit_background,
+            )
         )
 
     async def pdf(
@@ -3332,7 +3941,88 @@ class AsyncPage(_AsyncWrapper):
         return await _run_sync_call(self._sync.aria_snapshot, timeout=timeout, depth=depth, mode=mode)
 
     async def close(self, *, run_before_unload: Optional[bool] = None, reason: Optional[str] = None) -> None:
-        await _run_sync_call(self._sync.close, run_before_unload=run_before_unload, reason=reason)
+        if not isinstance(self._sync, SyncPage):
+            await _single_flight_close(
+                self._sync,
+                lambda: _run_sync_call(
+                    self._sync.close,
+                    run_before_unload=run_before_unload,
+                    reason=reason,
+                ),
+            )
+            return
+        if self._sync._closed or getattr(
+            self._sync, "_rustwright_async_close_state", _CLOSE_OPEN
+        ) == _CLOSE_CLOSED:
+            return
+        if (
+            self._sync._video is not None
+            or self._sync._har_recordings
+            or self._sync._fetch_enabled
+            or self._sync._binding_server is not None
+            or self._sync._crash_session is not None
+        ):
+            await _single_flight_close(
+                self._sync,
+                lambda: _run_sync_call(
+                    self._sync.close,
+                    run_before_unload=run_before_unload,
+                    reason=reason,
+                ),
+            )
+            return
+        normalized_reason = None
+        if reason is not None:
+            normalized_reason = _normalize_string_option(reason, method="Page.close", name="reason")
+        unload = bool(run_before_unload or False)
+        await _single_flight_close(
+            self._sync,
+            lambda: self._close_native(normalized_reason, unload),
+        )
+
+    async def _close_native(self, normalized_reason: Optional[str], unload: bool) -> None:
+        self._sync._closed_reason = normalized_reason
+        if self._sync._owns_context and self._sync._context is not None:
+            await _run_sync_call(self._sync._context._cleanup_default_context_state)
+        dialog_dispatch_count = self._sync._dialog_dispatch_count
+        try:
+            try:
+                await _await_native_method(
+                    "Page.close",
+                    self._sync._core.close_async(self._sync._default_timeout, unload)
+                )
+            except Error as exc:
+                if not _is_ignorable_close_error(exc):
+                    raise
+            if unload and self._sync._event_handlers.get("dialog"):
+                deadline = time.monotonic() + min(self._sync._default_timeout / 1000, 0.5)
+                while (
+                    self._sync._dialog_dispatch_count == dialog_dispatch_count
+                    and time.monotonic() < deadline
+                ):
+                    await asyncio.sleep(0.01)
+        finally:
+            self._sync._stop_event_pump()
+            pump_task = self._event_pump_task
+            if pump_task is not None and pump_task is not asyncio.current_task():
+                await asyncio.gather(pump_task, return_exceptions=True)
+        self._sync._closed = True
+        self._sync._closing = True
+        self._sync._mark_owned_cdp_sessions_closed()
+        if self._sync._context is not None and self._sync in self._sync._context._pages:
+            self._sync._context._pages.remove(self._sync)
+        _emit_event(self._sync._event_handlers, "close", self._sync)
+        if (
+            self._sync._owns_context
+            and self._sync._context is not None
+            and getattr(
+                self._sync._context,
+                "_rustwright_async_close_state",
+                _CLOSE_OPEN,
+            )
+            != _CLOSE_CLOSING
+        ):
+            await _wrap_async_browser_context(self._sync._context).close()
 
 
 class AsyncJSHandle(_AsyncWrapper):
