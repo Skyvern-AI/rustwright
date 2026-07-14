@@ -190,6 +190,12 @@ def aggregate_values(values: list[float]) -> dict[str, float]:
     }
 
 
+def aggregate_optional_values(values: list[float]) -> dict[str, float | None]:
+    if values:
+        return aggregate_values(values)
+    return {key: None for key in ("mean", "median", "p25", "p75", "min", "max", "stdev")}
+
+
 def speedups_from_results(results: list[dict[str, Any]]) -> dict[str, float]:
     by_name = {item["implementation"]: item for item in passed_results(results)}
     rustwright = by_name.get("rustwright")
@@ -276,9 +282,21 @@ def aggregate_repetitions(results: list[dict[str, Any]]) -> dict[str, Any]:
     for implementation, items in grouped.items():
         totals = [float(item["total_mean_ms"]) for item in items]
         case_names = sorted({name for item in items for name in item.get("cases", {})})
+        memory_fields = ("rss_self_kb", "rss_tree_kb")
+        memory = {
+            field: aggregate_optional_values(
+                [
+                    float(item["memory"][field])
+                    for item in items
+                    if item.get("memory", {}).get(field) is not None
+                ]
+            )
+            for field in memory_fields
+        }
         aggregate[implementation] = {
             "runs": len(items),
             "total_mean_ms": aggregate_values(totals),
+            "memory": memory,
             "cases": {
                 name: aggregate_values([float(item["cases"][name]["mean_ms"]) for item in items if name in item.get("cases", {})])
                 for name in case_names
