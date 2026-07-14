@@ -32,9 +32,3 @@ data/WebVoyager_data.jsonl
 data/GAIA_web.jsonl
 data/reference_answer.json
 benchmarks/external
-benchmarks/form_fill/out
-benchmarks/form_fill/.venv
-benchmarks/form_fill/venv
-benchmarks/form_fill/__pycache__
-benchmarks/form_fill/.env
-benchmarks/form_fill/artifacts
