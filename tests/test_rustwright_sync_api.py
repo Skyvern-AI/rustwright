@@ -4,11 +4,13 @@ from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from collections import Counter
+from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import urlopen
 
 import asyncio
 import base64
+import gc
 import hashlib
 import importlib
 import inspect
@@ -467,6 +469,12 @@ def http_server():
                     self.wfile.write(body)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+                return
+            if self.path == "/slow-redirect":
+                self.send_response(307, "Temporary Redirect")
+                self.send_header("Location", "/slow-timeout")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
                 return
             if self.path == "/slow-body":
                 body = b"<title>Slow Body</title><script>window.__slowBodyParsed = true</script>"
@@ -1338,6 +1346,201 @@ def websocket_server():
         stop.set()
         try:
             with socket.create_connection(("127.0.0.1", port_items[0][1]), timeout=1):
+                pass
+        except OSError:
+            pass
+        thread.join(timeout=2)
+
+
+@pytest.fixture()
+def slow_attach_cdp_server():
+    stop = threading.Event()
+    ready = threading.Event()
+    slow_enable_started = threading.Event()
+    slow_create_started = threading.Event()
+    state: dict[str, Any] = {
+        "commands": [],
+        "port": None,
+        "delay_create_target": False,
+        "slow_create_started": slow_create_started,
+        "slow_enable_started": slow_enable_started,
+    }
+    magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def read_exact(conn, size):
+        data = b""
+        while len(data) < size:
+            chunk = conn.recv(size - len(data))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+
+    def read_ws_frame(conn):
+        header = read_exact(conn, 2)
+        if header is None:
+            return None
+        opcode = header[0] & 0x0F
+        masked = bool(header[1] & 0x80)
+        length = header[1] & 0x7F
+        if length == 126:
+            extended = read_exact(conn, 2)
+            if extended is None:
+                return None
+            length = int.from_bytes(extended, "big")
+        elif length == 127:
+            extended = read_exact(conn, 8)
+            if extended is None:
+                return None
+            length = int.from_bytes(extended, "big")
+        mask = read_exact(conn, 4) if masked else b""
+        payload = read_exact(conn, length)
+        if payload is None:
+            return None
+        if masked:
+            payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        return opcode, payload
+
+    def ws_text_frame(message):
+        payload = message.encode("utf-8")
+        if len(payload) <= 125:
+            header = bytes([0x81, len(payload)])
+        elif len(payload) <= 0xFFFF:
+            header = bytes([0x81, 126]) + len(payload).to_bytes(2, "big")
+        else:
+            header = bytes([0x81, 127]) + len(payload).to_bytes(8, "big")
+        return header + payload
+
+    def result_for(command, target_counter):
+        method = command.get("method")
+        if method == "Target.getBrowserContexts":
+            return {"browserContextIds": []}
+        if method == "Target.getTargets":
+            return {"targetInfos": list(state.get("target_infos", []))}
+        if method == "Target.createTarget":
+            return {"targetId": f"target-{target_counter}"}
+        if method == "Target.attachToTarget":
+            target_id = command.get("params", {}).get("targetId")
+            return {"sessionId": f"session-{target_id}"}
+        if method == "Browser.getVersion":
+            return {
+                "product": "Chrome/120.0.0.0",
+                "userAgent": "Mozilla/5.0 HeadlessChrome/120.0.0.0",
+            }
+        if method == "Page.addScriptToEvaluateOnNewDocument":
+            return {"identifier": "stealth-script"}
+        if method == "Page.getFrameTree":
+            session_id = command.get("sessionId") or "browser"
+            return {
+                "frameTree": {
+                    "frame": {
+                        "id": f"frame-{session_id}",
+                        "loaderId": f"loader-{session_id}",
+                        "url": "about:blank",
+                        "securityOrigin": "://",
+                        "mimeType": "text/html",
+                    }
+                }
+            }
+        if method == "Target.closeTarget":
+            return {"success": True}
+        return {}
+
+    def handle_connection(conn):
+        with conn:
+            conn.settimeout(2)
+            request = b""
+            while b"\r\n\r\n" not in request:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                request += chunk
+            text = request.decode("latin1")
+            key = ""
+            for line in text.split("\r\n"):
+                if line.lower().startswith("sec-websocket-key:"):
+                    key = line.split(":", 1)[1].strip()
+            accept = base64.b64encode(hashlib.sha1((key + magic).encode("ascii")).digest()).decode("ascii")
+            conn.sendall(
+                (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n"
+                    "\r\n"
+                ).encode("ascii")
+            )
+            send_lock = threading.Lock()
+            target_counter = 0
+
+            def respond(command, result):
+                response = json.dumps({"id": command["id"], "result": result}, separators=(",", ":"))
+                try:
+                    with send_lock:
+                        conn.sendall(ws_text_frame(response))
+                except OSError:
+                    pass
+
+            while not stop.is_set():
+                try:
+                    frame = read_ws_frame(conn)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                if frame is None:
+                    return
+                opcode, payload = frame
+                if opcode == 8:
+                    return
+                if opcode != 1:
+                    continue
+                command = json.loads(payload.decode("utf-8"))
+                state["commands"].append(command)
+                if command.get("method") == "Target.createTarget":
+                    target_counter += 1
+                result = result_for(command, target_counter)
+                if (
+                    command.get("method") == "Target.createTarget"
+                    and state["delay_create_target"]
+                ):
+                    slow_create_started.set()
+                    threading.Timer(0.75, respond, args=(command, result)).start()
+                elif (
+                    command.get("method") == "Page.enable"
+                    and command.get("sessionId") == "session-target-1"
+                ):
+                    slow_enable_started.set()
+                    threading.Timer(0.75, respond, args=(command, result)).start()
+                else:
+                    respond(command, result)
+
+    def run_server():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            server.settimeout(0.1)
+            state["port"] = server.getsockname()[1]
+            ready.set()
+            while not stop.is_set():
+                try:
+                    conn, _ = server.accept()
+                except socket.timeout:
+                    continue
+                handle_connection(conn)
+
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
+    ready.wait(timeout=2)
+    if state["port"] is None:
+        raise RuntimeError("mock CDP server did not start")
+    try:
+        yield f"ws://127.0.0.1:{state['port']}/devtools/browser/slow-attach", state
+    finally:
+        stop.set()
+        try:
+            with socket.create_connection(("127.0.0.1", state["port"]), timeout=1):
                 pass
         except OSError:
             pass
@@ -17407,6 +17610,26 @@ def test_context_pageload_and_pageclose_events(browser, http_server):
     context.close()
 
 
+def test_context_pageload_predicate_can_accept_second_delivery_of_same_page(browser, http_server):
+    context = browser.new_context()
+    page = context.new_page()
+    predicate_calls = 0
+
+    def accepts_second_load(loaded_page) -> bool:
+        nonlocal predicate_calls
+        assert loaded_page is page
+        predicate_calls += 1
+        return predicate_calls == 2
+
+    with context.expect_event("pageload", accepts_second_load, timeout=5_000) as load_info:
+        page.goto(f"{http_server}/page")
+        page.reload()
+
+    assert load_info.value is page
+    assert predicate_calls == 2
+    context.close()
+
+
 def test_context_pageload_and_pageclose_events_cover_new_pages_and_listener_removal(browser, http_server):
     context = browser.new_context()
     loaded = []
@@ -23015,6 +23238,1072 @@ def test_async_browser_context_new_page_and_close_yield_event_loop():
         assert closed is None
         assert [name for name, *_ in sync_context.calls] == ["new_page", "close"]
         assert all(thread_id != event_loop_thread for *_, thread_id in sync_context.calls)
+
+    asyncio.run(run())
+
+
+def test_async_native_future_cancellation_aborts_and_releases_event_stream():
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+
+            pending = page._sync._core.evaluate_async("new Promise(() => {})", None, 60_000.0)
+            assert isinstance(pending, asyncio.Future)
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            assert await page.evaluate("1 + 1") == 2
+
+            pump = page._event_pump_task
+            assert pump is not None
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+            await asyncio.sleep(0)
+
+            retry = page._sync._event_stream.wait_batch_async(1.0, 64)
+            assert isinstance(retry, asyncio.Future)
+            await retry
+            page._sync._event_stream.ack_batch()
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_event_pump_closed_batch_is_terminal_and_acknowledged():
+    async def run() -> None:
+        import rustwright.async_api as async_api
+
+        class FakeEventStream:
+            def __init__(self):
+                self.wait_calls = 0
+                self.ack_calls = 0
+                self.rollback_calls = 0
+
+            async def wait_batch_async(self, _timeout, _limit):
+                self.wait_calls += 1
+                await asyncio.sleep(0)
+                return json.dumps([{"kind": "_closed"}])
+
+            def ack_batch(self):
+                self.ack_calls += 1
+
+            def rollback_batch(self):
+                self.rollback_calls += 1
+
+        class FakePage:
+            def __init__(self):
+                self._event_stream = FakeEventStream()
+                self.stop_calls = 0
+
+            def _event_listeners_active(self):
+                return True
+
+            def _stop_event_pump(self):
+                self.stop_calls += 1
+
+        sync_page = FakePage()
+        page = object.__new__(async_api.AsyncPage)
+        page._sync = sync_page
+        pump = asyncio.create_task(page._event_pump())
+        try:
+            await asyncio.wait_for(asyncio.shield(pump), timeout=0.1)
+        finally:
+            if not pump.done():
+                pump.cancel()
+                await asyncio.gather(pump, return_exceptions=True)
+
+        assert sync_page._event_stream.wait_calls == 1
+        assert sync_page._event_stream.ack_calls == 1
+        assert sync_page._event_stream.rollback_calls == 0
+        assert sync_page.stop_calls == 1
+
+    asyncio.run(run())
+
+
+def test_async_native_close_waits_for_beforeunload_dialog_dispatch():
+    async def run() -> None:
+        import rustwright.async_api as async_api
+
+        order = []
+        seen = []
+
+        class FakeCore:
+            def __init__(self, owner):
+                self.owner = owner
+
+            def close_async(self, _timeout, _run_before_unload):
+                async def close():
+                    order.append("close-command")
+
+                    async def dispatch_dialog():
+                        await asyncio.sleep(0.02)
+                        if self.owner._event_pump_stopped:
+                            return
+                        for handler in self.owner._event_handlers["dialog"]:
+                            handler("beforeunload")
+                        self.owner._dialog_dispatch_count += 1
+                        order.append("dialog")
+
+                    self.owner.dispatch_task = asyncio.create_task(dispatch_dialog())
+
+                return close()
+
+        class FakePage:
+            def __init__(self):
+                self._closed_reason = None
+                self._owns_context = False
+                self._context = None
+                self._default_timeout = 1_000.0
+                self._event_handlers = {"dialog": [seen.append]}
+                self._dialog_dispatch_count = 0
+                self._event_pump_stopped = False
+                self._closed = False
+                self._closing = False
+                self.dispatch_task = None
+                self._core = FakeCore(self)
+
+            def _stop_event_pump(self):
+                self._event_pump_stopped = True
+                order.append("stop-pump")
+
+            def _mark_owned_cdp_sessions_closed(self):
+                pass
+
+        sync_page = FakePage()
+        page = object.__new__(async_api.AsyncPage)
+        page._sync = sync_page
+        page._event_pump_task = None
+
+        await page._close_native(None, True)
+        order.append("close-complete")
+        assert sync_page.dispatch_task is not None
+        await sync_page.dispatch_task
+
+        assert seen == ["beforeunload"]
+        assert order == ["close-command", "dialog", "stop-pump", "close-complete"]
+
+    asyncio.run(run())
+
+
+def test_async_close_is_single_flight_for_page_context_browser_and_recursive_owned_context():
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            core = browser._sync._core
+
+            context = await browser.new_context()
+            page = await context.new_page()
+            page_close_events = []
+            context_close_events = []
+            page.on("close", page_close_events.append)
+            context.on("close", context_close_events.append)
+            target_closes = core.sent_target_close_count()
+            await asyncio.gather(page.close(), page.close())
+            assert core.sent_target_close_count() - target_closes == 1
+            assert len(page_close_events) == 1
+
+            context_disposals = core.sent_context_dispose_count()
+            await asyncio.gather(context.close(), context.close())
+            assert core.sent_context_dispose_count() - context_disposals == 1
+            assert len(context_close_events) == 1
+
+            owned_page = await browser.new_page()
+            owned_context = owned_page.context
+            owned_context_close_events = []
+            owned_context.on("close", owned_context_close_events.append)
+            await asyncio.wait_for(
+                asyncio.gather(owned_context.close(), owned_context.close()),
+                timeout=10,
+            )
+            assert len(owned_context_close_events) == 1
+            assert owned_page.is_closed()
+
+            disconnected = []
+            browser.on("disconnected", lambda: disconnected.append(True))
+            await asyncio.gather(browser.close(), browser.close())
+            assert disconnected == [True]
+
+    asyncio.run(run())
+
+
+def test_async_persistent_context_and_browser_concurrent_close_share_one_path(tmp_path: Path):
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            context = await p.chromium.launch_persistent_context(
+                str(tmp_path / "concurrent-close-profile"),
+                headless=True,
+            )
+            browser = context.browser
+            assert browser is not None
+            original_cleanup = context._sync._cleanup_default_context_state
+
+            def slow_default_context_cleanup() -> None:
+                time.sleep(0.2)
+                original_cleanup()
+
+            context._sync._cleanup_default_context_state = slow_default_context_cleanup
+
+            await asyncio.wait_for(
+                asyncio.gather(context.close(), browser.close()),
+                timeout=10,
+            )
+
+            assert context.is_closed()
+            assert not browser.is_connected()
+            assert browser.contexts == []
+
+    asyncio.run(run())
+
+
+def test_async_persistent_context_har_close_writes_har_and_cleans_profile_state(
+    http_server, tmp_path: Path
+):
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        profile = tmp_path / "persistent-har-cleanup-profile"
+        har_path = tmp_path / "persistent-close.har"
+        origin = str(http_server)
+
+        async with async_playwright() as p:
+            context = await p.chromium.launch_persistent_context(
+                str(profile),
+                headless=True,
+                record_har_path=str(har_path),
+            )
+            page = context.pages[0]
+            await page.goto(f"{origin}/page")
+            await context.add_cookies(
+                [{"name": "persistent", "value": "remove-me", "url": origin}]
+            )
+            await context.grant_permissions(["geolocation"], origin=origin)
+            await page.evaluate("localStorage.setItem('persistent', 'remove-me')")
+            await context.close()
+
+            assert har_path.is_file()
+            har = json.loads(har_path.read_text())
+            assert any(entry["request"]["url"] == f"{origin}/page" for entry in har["log"]["entries"])
+
+            reopened = await p.chromium.launch_persistent_context(str(profile), headless=True)
+            try:
+                reopened_page = reopened.pages[0]
+                await reopened_page.goto(f"{origin}/page")
+                assert await reopened.cookies(origin) == []
+                assert await reopened_page.evaluate("localStorage.getItem('persistent')") is None
+                assert (
+                    await reopened_page.evaluate(
+                        "navigator.permissions.query({name: 'geolocation'}).then(result => result.state)"
+                    )
+                    == "prompt"
+                )
+            finally:
+                await reopened.close()
+
+    asyncio.run(run())
+
+
+def test_async_unrelated_new_page_is_not_blocked_by_slow_attach(slow_attach_cdp_server):
+    endpoint, state = slow_attach_cdp_server
+
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(endpoint)
+            slow_page_task = asyncio.create_task(browser.new_page())
+            fast_page = None
+            try:
+                deadline = time.monotonic() + 2
+                while not state["slow_enable_started"].is_set() and time.monotonic() < deadline:
+                    await asyncio.sleep(0.005)
+                assert state["slow_enable_started"].is_set()
+
+                started = time.monotonic()
+                fast_page = await asyncio.wait_for(browser.new_page(), timeout=0.4)
+                assert time.monotonic() - started < 0.4
+                assert fast_page._sync._target_id == "target-2"
+                await asyncio.wait_for(slow_page_task, timeout=2)
+            finally:
+                if not slow_page_task.done():
+                    slow_page_task.cancel()
+                    await asyncio.gather(slow_page_task, return_exceptions=True)
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_cancelled_page_attach_detaches_created_cdp_session(slow_attach_cdp_server):
+    endpoint, state = slow_attach_cdp_server
+
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(endpoint)
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(browser.new_page(), timeout=0.1)
+
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                detached_sessions = [
+                    command.get("params", {}).get("sessionId")
+                    for command in state["commands"]
+                    if command.get("method") == "Target.detachFromTarget"
+                ]
+                if "session-target-1" in detached_sessions:
+                    break
+                await asyncio.sleep(0.01)
+            assert "session-target-1" in detached_sessions
+
+            state["target_infos"] = [
+                {"targetId": "target-1", "type": "page", "url": "about:blank"}
+            ]
+            first_pages, second_pages = await asyncio.wait_for(
+                asyncio.gather(
+                    asyncio.to_thread(browser._sync._core.list_pages, 2_000.0),
+                    asyncio.to_thread(browser._sync._core.list_pages, 2_000.0),
+                ),
+                timeout=3,
+            )
+            assert [page.target_id for page in first_pages] == ["target-1"]
+            assert [page.target_id for page in second_pages] == ["target-1"]
+            attach_commands = [
+                command
+                for command in state["commands"]
+                if command.get("method") == "Target.attachToTarget"
+            ]
+            assert [command["params"]["targetId"] for command in attach_commands] == [
+                "target-1",
+                "target-1",
+            ]
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_cancelled_create_target_response_closes_orphan_and_normal_page_survives(slow_attach_cdp_server):
+    endpoint, state = slow_attach_cdp_server
+
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(endpoint)
+            state["delay_create_target"] = True
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(browser.new_page(), timeout=0.1)
+            assert state["slow_create_started"].is_set()
+
+            deadline = time.monotonic() + 2
+            orphan_closes = []
+            while time.monotonic() < deadline:
+                orphan_closes = [
+                    command
+                    for command in state["commands"]
+                    if command.get("method") == "Target.closeTarget"
+                    and command.get("params", {}).get("targetId") == "target-1"
+                ]
+                if orphan_closes:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(orphan_closes) == 1
+
+            state["delay_create_target"] = False
+            page = await asyncio.wait_for(browser.new_page(), timeout=2)
+            assert page._sync._target_id == "target-2"
+            delivered_closes = [
+                command
+                for command in state["commands"]
+                if command.get("method") == "Target.closeTarget"
+                and command.get("params", {}).get("targetId") == "target-2"
+            ]
+            assert delivered_closes == []
+
+            await page.close()
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_connect_over_cdp_cancelled_creations_cleanup_after_last_browser_owner_drops():
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+        from rustwright import _rustwright
+
+        async with async_playwright() as p:
+            owner = await p.chromium.launch(headless=True)
+            session = await owner.new_browser_cdp_session()
+
+            async def page_target_ids() -> set[str]:
+                payload = await session.send("Target.getTargets")
+                return {
+                    str(info["targetId"])
+                    for info in payload.get("targetInfos") or []
+                    if info.get("type") == "page" and info.get("targetId")
+                }
+
+            baseline = await page_target_ids()
+            connected_core = _rustwright.connect_over_cdp(owner._ws_endpoint, 5_000.0, None)
+            creations = [connected_core.new_page_async() for _ in range(32)]
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not (await page_target_ids()) - baseline:
+                await asyncio.sleep(0.005)
+            assert (await page_target_ids()) - baseline
+
+            for creation in creations:
+                creation.cancel()
+            await asyncio.gather(*creations, return_exceptions=True)
+            del creations
+            del connected_core
+            gc.collect()
+
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and await page_target_ids() != baseline:
+                gc.collect()
+                await asyncio.sleep(0.02)
+            assert await page_target_ids() == baseline
+            await session.detach()
+            await owner.close()
+
+    asyncio.run(run())
+
+
+def test_popup_listener_and_expect_popup_share_target_when_one_wrapper_drops():
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
+            listener_pages = []
+            page.on("popup", listener_pages.append)
+
+            async with page.expect_popup() as popup_info:
+                await page.evaluate(
+                    """() => {
+                    const popup = window.open('about:blank');
+                    popup.document.write('<title>shared popup target</title>');
+                    popup.document.close();
+                    }"""
+                )
+            expected_popup = popup_info.value
+            assert await wait_until_async(lambda: len(listener_pages) >= 1)
+            assert len(listener_pages) == 1
+            listener_popup = listener_pages[0]
+            assert expected_popup._sync._target_id == listener_popup._sync._target_id
+
+            del expected_popup
+            del popup_info
+            gc.collect()
+            assert await listener_popup.title() == "shared popup target"
+            assert not listener_popup.is_closed()
+            await context.close()
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_native_future_cancel_then_loop_close_still_aborts_rust_task():
+    async def launch_browser_and_page():
+        from playwright.async_api import async_playwright
+
+        manager = async_playwright()
+        playwright = await manager.start()
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page()
+        return manager, browser, page
+
+    manager, browser, page = asyncio.run(launch_browser_and_page())
+    loop = asyncio.new_event_loop()
+
+    async def start_pending_evaluation():
+        pending = page._sync._core.evaluate_async("new Promise(() => {})", None, 0.0)
+        deadline = time.monotonic() + 1
+        while browser._sync._core.pending_command_count() == 0 and time.monotonic() < deadline:
+            await asyncio.sleep(0)
+        return pending
+
+    try:
+        pending = loop.run_until_complete(start_pending_evaluation())
+        assert browser._sync._core.pending_command_count() == 1
+        pending.cancel()
+        loop.close()
+
+        deadline = time.monotonic() + 3
+        while browser._sync._core.pending_command_count() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert browser._sync._core.pending_command_count() == 0
+    finally:
+        if not loop.is_closed():
+            loop.close()
+        browser._sync.close()
+        manager._manager._stop()
+
+
+def test_async_cancelled_event_batch_is_replayed_transactionally_without_network_corruption(http_server):
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            pump = page._event_pump_task
+            assert pump is not None
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+            await asyncio.sleep(0)
+
+            stream = page._sync._event_stream
+            while True:
+                drained = json.loads(await stream.wait_batch_async(1.0, 64))
+                stream.ack_batch()
+                if not drained:
+                    break
+            pending_batch = stream.wait_batch_async(5_000.0, 64)
+            marker_url = f"{http_server}/redirect-hop-one"
+            navigation = page._sync._core.goto_async(
+                marker_url,
+                "load",
+                5_000.0,
+                None,
+            )
+            time.sleep(0.2)
+            pending_batch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending_batch
+            await navigation
+
+            replayed = json.loads(await stream.wait_batch_async(1_000.0, 64))
+            assert any(
+                envelope.get("kind") == "request"
+                and envelope.get("payload", {}).get("url") == marker_url
+                for envelope in replayed
+            ), replayed
+            stream.ack_batch()
+
+            envelopes = list(replayed)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if any(
+                    envelope.get("kind") == "response"
+                    and str(envelope.get("payload", {}).get("url", "")).endswith("/json")
+                    for envelope in envelopes
+                ):
+                    break
+                next_batch = json.loads(await stream.wait_batch_async(500.0, 64))
+                stream.ack_batch()
+                envelopes.extend(next_batch)
+
+            delivered_sequences = [
+                envelope["seq"]
+                for envelope in envelopes
+                if envelope.get("kind") not in {"_closed", "_overflow"}
+            ]
+            assert len(delivered_sequences) == len(set(delivered_sequences))
+            responses = [
+                envelope["payload"]
+                for envelope in envelopes
+                if envelope.get("kind") == "response"
+            ]
+            assert responses
+            assert all(response["request"]["url"] == response["url"] for response in responses)
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_event_ack_preserves_concurrent_expect_response_request_state(http_server):
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            page.on("console", lambda _message: None)
+            await page.goto(f"{http_server}/page")
+            await asyncio.sleep(0.1)
+
+            original_handler = page._sync._handle_observation_event
+            handler_entered = threading.Event()
+            release_handler = threading.Event()
+
+            def block_one_pump_delivery(kind, payload):
+                if not handler_entered.is_set():
+                    handler_entered.set()
+                    release_handler.wait(5)
+                return original_handler(kind, payload)
+
+            page._sync._handle_observation_event = block_one_pump_delivery
+            try:
+                await page.evaluate("() => console.log('hold-event-ack')")
+                deadline = time.monotonic() + 2
+                while not handler_entered.is_set() and time.monotonic() < deadline:
+                    await asyncio.sleep(0.005)
+                assert handler_entered.is_set()
+
+                async def release_stale_ack() -> None:
+                    await asyncio.sleep(0.2)
+                    release_handler.set()
+
+                release_task = asyncio.create_task(release_stale_ack())
+                async with page.expect_response("**/slow-timeout", timeout=5_000) as response_info:
+                    await page.evaluate(
+                        """() => {
+                        fetch('/slow-redirect', { headers: { 'X-ACK-Race': 'preserved' } });
+                        }"""
+                    )
+
+                await release_task
+                response = response_info.value
+                request = response.request
+                assert request.method == "GET"
+                assert await request.header_value("user-agent")
+                assert request.headers
+                assert request.redirected_from is not None
+                assert request.redirected_from.url == f"{http_server}/slow-redirect"
+            finally:
+                release_handler.set()
+                page._sync._handle_observation_event = original_handler
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_event_batch_consumer_defers_mid_batch_cancellation_until_ack(http_server):
+    async def run() -> None:
+        import rustwright.async_api as async_api
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            pump = page._event_pump_task
+            assert pump is not None
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+            stream = page._sync._event_stream
+
+            while True:
+                drained = json.loads(await stream.wait_batch_async(1.0, 64))
+                stream.ack_batch()
+                if not drained:
+                    break
+            await page._sync._core.goto_async(
+                f"{http_server}/redirect-hop-one",
+                "load",
+                5_000.0,
+                None,
+            )
+            batch = json.loads(await stream.wait_batch_async(1_000.0, 64))
+            assert len(batch) >= 2
+
+            original_handler = page._sync._handle_observation_event
+            entered = threading.Event()
+            release = threading.Event()
+            handled = []
+
+            def slow_first_handler(kind, payload):
+                handled.append(kind)
+                if len(handled) == 1:
+                    entered.set()
+                    release.wait(5)
+                return original_handler(kind, payload)
+
+            page._sync._handle_observation_event = slow_first_handler
+            consumer = asyncio.create_task(
+                async_api._await_cleanup_completion(page._consume_event_batch(batch))
+            )
+            while not entered.is_set():
+                await asyncio.sleep(0)
+            consumer.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+            assert len(handled) == len(
+                [envelope for envelope in batch if envelope.get("kind") not in {"_closed"}]
+            )
+
+            following = json.loads(await stream.wait_batch_async(1.0, 64))
+            stream.ack_batch()
+            delivered = {envelope["seq"] for envelope in batch if "seq" in envelope}
+            assert delivered.isdisjoint(
+                envelope["seq"] for envelope in following if "seq" in envelope
+            )
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_cancelled_new_page_page_close_and_context_close_do_not_leak_targets():
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            session = await browser.new_browser_cdp_session()
+
+            async def snapshot() -> tuple[set[str], set[str]]:
+                contexts_payload, targets_payload = await asyncio.gather(
+                    session.send("Target.getBrowserContexts"),
+                    session.send("Target.getTargets"),
+                )
+                context_ids = set(contexts_payload.get("browserContextIds") or [])
+                target_ids = {
+                    str(target.get("targetId"))
+                    for target in targets_payload.get("targetInfos") or []
+                    if target.get("type") == "page" and target.get("targetId")
+                }
+                return context_ids, target_ids
+
+            async def wait_for_snapshot(expected: tuple[set[str], set[str]]) -> None:
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if await snapshot() == expected:
+                        return
+                    await asyncio.sleep(0.02)
+                assert await snapshot() == expected
+
+            baseline_before_contexts = await snapshot()
+            context_tasks = [asyncio.create_task(browser.new_context()) for _ in range(8)]
+            await asyncio.sleep(0)
+            for task in context_tasks:
+                task.cancel()
+            context_results = await asyncio.gather(*context_tasks, return_exceptions=True)
+            assert any(isinstance(result, asyncio.CancelledError) for result in context_results)
+            for result in context_results:
+                if not isinstance(result, BaseException):
+                    await result.close()
+            await wait_for_snapshot(baseline_before_contexts)
+
+            context = await browser.new_context()
+            baseline = await snapshot()
+            new_page_task = asyncio.create_task(context.new_page())
+            await asyncio.sleep(0)
+            time.sleep(0.2)
+            new_page_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await new_page_task
+            assert context.pages == []
+            await wait_for_snapshot(baseline)
+
+            page = await context.new_page()
+            before_page_close = await snapshot()
+            assert page._sync._target_id in before_page_close[1]
+            page_close_task = asyncio.create_task(page.close())
+            await asyncio.sleep(0)
+            page_close_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await page_close_task
+            assert page.is_closed()
+            expected_after_page_close = (before_page_close[0], before_page_close[1] - {page._sync._target_id})
+            await wait_for_snapshot(expected_after_page_close)
+
+            pages = [await context.new_page() for _ in range(3)]
+            before_context_close = await snapshot()
+            context_id = str(context._sync._core.context_id)
+            page_target_ids = {page._sync._target_id for page in pages}
+            context_close_task = asyncio.create_task(context.close())
+            await asyncio.sleep(0)
+            context_close_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await context_close_task
+            assert context.is_closed()
+            assert context.pages == []
+            expected_after_context_close = (
+                before_context_close[0] - {context_id},
+                before_context_close[1] - page_target_ids,
+            )
+            await wait_for_snapshot(expected_after_context_close)
+            await session.detach()
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_cancelled_browser_close_finishes_process_shutdown():
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+            await asyncio.gather(*(context.new_page() for _ in range(3)))
+
+            close_task = asyncio.create_task(browser.close())
+            await asyncio.sleep(0)
+            close_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await close_task
+            assert not browser.is_connected()
+            assert browser.contexts == []
+
+    asyncio.run(run())
+
+
+def test_async_native_goto_setup_never_blocks_owner_loop(http_server):
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            original_boundary = page._sync._mark_navigation_history_boundary
+            original_download_waiter = page._sync._download_event_waiter
+
+            def slow_boundary():
+                time.sleep(0.2)
+                return original_boundary()
+
+            def slow_download_waiter():
+                time.sleep(0.2)
+                return original_download_waiter()
+
+            page._sync._mark_navigation_history_boundary = slow_boundary
+            page._sync._download_event_waiter = slow_download_waiter
+            started = time.monotonic()
+            navigation = asyncio.create_task(page.goto(f"{http_server}/page"))
+            await asyncio.sleep(0.05)
+            assert time.monotonic() - started < 0.15
+            assert not navigation.done()
+            response = await navigation
+            assert response is not None and response.ok
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_finish_native_page_cancellation_rolls_back_registration_and_target():
+    async def run() -> None:
+        import rustwright.async_api as async_api
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+            context.on("page", lambda _page: None)
+            session = await browser.new_browser_cdp_session()
+
+            async def page_target_ids() -> set[str]:
+                payload = await session.send("Target.getTargets")
+                return {
+                    str(info["targetId"])
+                    for info in payload.get("targetInfos") or []
+                    if info.get("type") == "page" and info.get("targetId")
+                }
+
+            baseline = await page_target_ids()
+            entered = threading.Event()
+            release = threading.Event()
+
+            def block_executor() -> None:
+                entered.set()
+                release.wait(5)
+
+            async_api.configure_async_executor(max_workers=1, thread_name_prefix="registration-rollback")
+            blocker = asyncio.create_task(async_api._run_sync_call(block_executor))
+            try:
+                while not entered.is_set():
+                    await asyncio.sleep(0)
+                creation = asyncio.create_task(context.new_page())
+                deadline = time.monotonic() + 5
+                while not context._sync._pages and time.monotonic() < deadline:
+                    await asyncio.sleep(0.005)
+                assert len(context._sync._pages) == 1
+                creation.cancel()
+                release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await creation
+                del creation
+                await blocker
+                gc.collect()
+                assert context.pages == []
+
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and await page_target_ids() != baseline:
+                    gc.collect()
+                    await asyncio.sleep(0.02)
+                assert await page_target_ids() == baseline
+            finally:
+                release.set()
+                await asyncio.gather(blocker, return_exceptions=True)
+                async_api.configure_async_executor()
+            await session.detach()
+            await context.close()
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_native_future_settles_cancelled_when_owner_loop_is_already_closed():
+    async def launch_browser_and_page():
+        from playwright.async_api import async_playwright
+
+        manager = async_playwright()
+        playwright = await manager.start()
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page()
+        return manager, browser, page
+
+    manager, browser, page = asyncio.run(launch_browser_and_page())
+    loop = asyncio.new_event_loop()
+
+    async def delayed_native_future():
+        return page._sync._core.evaluate_async(
+            "new Promise(resolve => setTimeout(() => resolve(42), 100))",
+            None,
+            5_000.0,
+        )
+
+    future = loop.run_until_complete(delayed_native_future())
+    loop.close()
+    try:
+        deadline = time.monotonic() + 3
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert future.done()
+        assert future.cancelled()
+    finally:
+        browser._sync.close()
+        manager._manager._stop()
+
+
+def test_async_cancelled_launch_with_no_timeout_reaps_child_process(tmp_path: Path):
+    if os.name == "nt":
+        pytest.skip("executable launch cancellation probe uses a POSIX shell")
+
+    executable = tmp_path / "slow-chromium"
+    pid_path = tmp_path / "slow-chromium.pid"
+    executable.write_text(
+        "#!/bin/sh\n"
+        f"echo $$ > {shlex.quote(str(pid_path))}\n"
+        "sleep 60\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            launch_task = asyncio.create_task(
+                p.chromium.launch(executable_path=str(executable), headless=True, timeout=0)
+            )
+            deadline = time.monotonic() + 3
+            while not pid_path.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert pid_path.exists()
+            pid = int(pid_path.read_text(encoding="utf-8"))
+
+            launch_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await launch_task
+
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                pytest.fail("cancelled native launch left its child process running")
+
+    asyncio.run(run())
+
+
+def test_async_browser_new_page_cleans_default_context_cookie_and_permission_state(http_server):
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page1 = await browser.new_page()
+            await page1.goto(f"{http_server}/page")
+            await page1.evaluate("document.cookie = 'native_async_leak=page1; path=/'")
+            assert "native_async_leak=page1" in await page1.evaluate("document.cookie")
+            assert page1.context is not None
+            await page1.context.grant_permissions(["geolocation"], origin=http_server)
+            assert await page1.evaluate(
+                "async () => (await navigator.permissions.query({name: 'geolocation'})).state"
+            ) == "granted"
+            await page1.close()
+
+            page2 = await browser.new_page()
+            await page2.goto(f"{http_server}/page")
+            assert "native_async_leak=page1" not in await page2.evaluate("document.cookie")
+            assert await page2.evaluate(
+                "async () => (await navigator.permissions.query({name: 'geolocation'})).state"
+            ) != "granted"
+            await page2.close()
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_native_context_page_listener_adopts_window_open_popup():
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+            seen = []
+            context.on("page", seen.append)
+            page = await context.new_page()
+            assert seen == [page]
+
+            assert await page.evaluate(
+                """() => {
+                const popup = window.open('about:blank');
+                popup.document.write('<title>Native async popup</title>');
+                popup.document.close();
+                return true;
+                }"""
+            )
+            assert await wait_until_async(lambda: len(context.pages) == 2 and len(seen) == 2)
+            popup = next(candidate for candidate in context.pages if candidate is not page)
+            assert seen[-1] is popup
+            assert await popup.opener() is page
+            assert await popup.title() == "Native async popup"
+            await context.close()
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_cancelled_omit_background_screenshot_restores_page_background():
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_viewport_size({"width": 1200, "height": 900})
+            await page.set_content(
+                "<style>html,body{margin:0;width:100%;height:100%;background:white}</style>"
+            )
+
+            screenshot_task = asyncio.create_task(page.screenshot(omit_background=True))
+            deadline = time.monotonic() + 3
+            while not page._sync._core.background_override_active() and time.monotonic() < deadline:
+                await asyncio.sleep(0)
+            assert page._sync._core.background_override_active()
+            screenshot_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await screenshot_task
+
+            normal_screenshot = await page.screenshot()
+            assert not page._sync._core.background_override_active()
+            assert png_color_type(normal_screenshot) == 2
+            await browser.close()
 
     asyncio.run(run())
 
@@ -29962,6 +31251,37 @@ def test_async_context_pageload_and_pageclose_events(http_server):
     asyncio.run(run())
 
 
+def test_async_context_pageload_predicate_can_accept_second_delivery_of_same_page(http_server):
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
+            predicate_calls = 0
+
+            def accepts_second_load(loaded_page) -> bool:
+                nonlocal predicate_calls
+                assert loaded_page is page
+                predicate_calls += 1
+                return predicate_calls == 2
+
+            async with context.expect_event(
+                "pageload",
+                accepts_second_load,
+                timeout=5_000,
+            ) as load_info:
+                await page.goto(f"{http_server}/page")
+                await page.reload()
+
+            assert load_info.value is page
+            assert predicate_calls == 2
+            await browser.close()
+
+    asyncio.run(run())
+
+
 def test_async_context_pageload_and_pageclose_events_cover_new_pages_and_listener_removal(http_server):
     async def run() -> None:
         from playwright.async_api import async_playwright
@@ -30494,6 +31814,156 @@ def test_async_locator_strictness_and_page_selector_default():
                 await page.click("button", strict=True)
 
             await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_page_click_default_waits_for_receives_events(monkeypatch):
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+
+    async def run() -> None:
+        from playwright.async_api import TimeoutError, async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content(
+                """
+                <style>
+                #target { position:absolute; left:20px; top:20px; width:120px; height:40px; z-index:1; }
+                #overlay { position:absolute; inset:0; z-index:2; }
+                </style>
+                <button id="target" onclick="document.body.dataset.clicked = 'yes'">Target</button>
+                <div id="overlay"></div>
+                """
+            )
+
+            with pytest.raises(TimeoutError):
+                await page.click("#target", timeout=100)
+            assert await page.evaluate("document.body.dataset.clicked || null") is None
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_page_fill_default_rejects_readonly_input(monkeypatch):
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+
+    async def run() -> None:
+        from playwright.async_api import TimeoutError, async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content('<input id="x" readonly value="old">')
+
+            with pytest.raises(TimeoutError):
+                await page.fill("#x", "new", timeout=100)
+            assert await page.locator("#x").input_value() == "old"
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_page_click_and_fill_unsafe_dom_fastpath_stays_native(monkeypatch):
+    import rustwright.async_api as async_api
+
+    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
+
+    async def reject_sync_dispatch(*args, **kwargs):
+        raise AssertionError("unsafe optionless page click/fill should stay on the native path")
+
+    monkeypatch.setattr(async_api, "_run_sync_wait_sliced", reject_sync_dispatch)
+
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content(
+                """
+                <button id="target" onclick="document.body.dataset.clicked = String(event.isTrusted)">Target</button>
+                <input id="x" value="old">
+                """
+            )
+
+            await page.click("#target", timeout=1_000)
+            await page.fill("#x", "new", timeout=1_000)
+            assert await page.evaluate("document.body.dataset.clicked") == "false"
+            assert await page.locator("#x").input_value() == "new"
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monkeypatch):
+    import rustwright.async_api as async_api
+
+    class FakeCore:
+        def __init__(self):
+            self.calls = []
+
+        def click_async(self, *args):
+            async def run():
+                self.calls.append(("click", args))
+
+            return run()
+
+        def fill_async(self, *args):
+            async def run():
+                self.calls.append(("fill", args))
+
+            return run()
+
+    class FakeSyncPage:
+        def __init__(self):
+            self._active_page_cdp_event_contexts = 0
+            self._core = FakeCore()
+            self._default_timeout = 1_000.0
+
+        def click(self, *args, **kwargs):
+            raise AssertionError("the dispatch stub should intercept sync click")
+
+        def fill(self, *args, **kwargs):
+            raise AssertionError("the dispatch stub should intercept sync fill")
+
+    class FakeLocator:
+        _spec = {"kind": "css", "selector": "#target"}
+        _index = 0
+        _strict = False
+
+    sync_page = FakeSyncPage()
+    page = object.__new__(async_api.AsyncPage)
+    page._sync = sync_page
+    sync_calls = []
+
+    async def record_sync_dispatch(_owner, func, *args, **kwargs):
+        sync_calls.append((func.__name__, args, kwargs))
+
+    monkeypatch.setattr(async_api, "_native_page_hot_path_supported", lambda _page: True)
+    monkeypatch.setattr(async_api, "_native_locator", lambda *args, **kwargs: FakeLocator())
+    monkeypatch.setattr(async_api, "_run_sync_wait_sliced", record_sync_dispatch)
+
+    async def run() -> None:
+        monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+        await page.click("#target")
+        await page.fill("#target", "value")
+        assert [call[0] for call in sync_calls] == ["click", "fill"]
+        assert sync_page._core.calls == []
+
+        sync_calls.clear()
+        monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
+        await page.click("#target")
+        await page.fill("#target", "value")
+        assert [call[0] for call in sync_page._core.calls] == ["click", "fill"]
+        assert sync_calls == []
+
+        sync_page._active_page_cdp_event_contexts = 1
+        await page.click("#target")
+        await page.fill("#target", "value")
+        assert [call[0] for call in sync_calls] == ["click", "fill"]
+        assert [call[0] for call in sync_page._core.calls] == ["click", "fill"]
 
     asyncio.run(run())
 
