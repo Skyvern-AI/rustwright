@@ -180,6 +180,7 @@ See [`LIMITATIONS.md`](LIMITATIONS.md) for detail.
 ## Roadmap
 
 - [ ] **Language bindings** — one Rust engine, many languages: Go, Java, C#/.NET, Ruby, and PHP (plus a native Rust API)
+- [ ] **Rustwright MCP server** — expose browser automation as tools for MCP-compatible AI agents
 - [ ] CI / Testbox-backed benchmark evidence
 - [ ] Broaden the Node.js surface (contexts, routing, locators)
 - [ ] Close remaining OOPIF gaps
