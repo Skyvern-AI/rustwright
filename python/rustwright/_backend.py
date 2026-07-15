@@ -28,7 +28,7 @@ def _version() -> str:
     try:
         return metadata.version("rustwright")
     except metadata.PackageNotFoundError:
-        return "0.1.0+local"
+        return "0.1.1+local"
 
 
 def backend_marker(api_module: str | None = None) -> BackendMarker:

@@ -1,6 +1,6 @@
 [package]
 name = "rustwright-core"
-version = "0.1.0-alpha.4"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Rust CDP core for a Python Playwright-compatible automation API"

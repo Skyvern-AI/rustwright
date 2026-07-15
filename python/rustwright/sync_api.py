@@ -5625,7 +5625,7 @@ def _write_har(
             )
     log: dict[str, Any] = {
         "version": "1.2",
-        "creator": {"name": "Rustwright", "version": "0.1.0"},
+        "creator": {"name": "Rustwright", "version": "0.1.1"},
         "entries": entries,
     }
     if resolved_har_mode != "minimal":
@@ -11610,7 +11610,7 @@ class Tracing(_EventEmitter):
                 "type": "context-options",
                 "origin": "library",
                 "browserName": "chromium",
-                "playwrightVersion": "rustwright-0.1.0",
+                "playwrightVersion": "rustwright-0.1.1",
                 "options": _trace_option_payload(self._context),
                 "platform": sys.platform,
                 "wallTime": self._start_wall_time_ms,
