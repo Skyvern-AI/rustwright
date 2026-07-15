@@ -50,3 +50,8 @@ hashbrown = "=0.14.5"
 quote = "=1.0.37"
 proc-macro2 = "=1.0.86"
 unicode-ident = "=1.0.24"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
