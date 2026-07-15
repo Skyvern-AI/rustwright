@@ -9336,8 +9336,12 @@ class JSHandle(_EventEmitter):
         self._page = page
         self._payload = payload
         self._object_id = payload.get("objectId")
+        self._session_id = payload.get("__rustwright_session_id")
         self._owner_frame = owner_frame
         self._disposed = False
+
+    def _session_args(self) -> tuple[str, ...]:
+        return () if self._session_id is None else (str(self._session_id),)
 
     def _preview(self) -> str:
         if self._payload.get("subtype") == "node":
@@ -9374,7 +9378,14 @@ class JSHandle(_EventEmitter):
         self._ensure_not_disposed("json_value")
         if self._object_id:
             return _decode_json_result(
-                json.loads(_call(self._page._core.js_handle_json_value, self._object_id, self._page._default_timeout))
+                json.loads(
+                    _call(
+                        self._page._core.js_handle_json_value,
+                        self._object_id,
+                        self._page._default_timeout,
+                        *self._session_args(),
+                    )
+                )
             )
         if self._payload.get("type") == "undefined":
             return None
@@ -9395,6 +9406,7 @@ class JSHandle(_EventEmitter):
                 None,
                 True,
                 self._page._default_timeout if timeout_ms is None else timeout_ms,
+                *self._session_args(),
             )
             return bool(_decode_json_result(json.loads(result)))
         if self._payload.get("type") == "undefined" or self._payload.get("subtype") == "null":
@@ -9427,6 +9439,7 @@ class JSHandle(_EventEmitter):
                 self._object_id,
                 property_name,
                 self._page._default_timeout,
+                *self._session_args(),
             )
         )
         return JSHandle(self._page, payload, owner_frame=self._owner_frame)
@@ -9439,6 +9452,7 @@ class JSHandle(_EventEmitter):
                     self._page._core.js_handle_get_properties,
                     self._object_id,
                     None,
+                    *self._session_args(),
                 )
             )
             if isinstance(payload, dict):
@@ -9498,6 +9512,7 @@ class JSHandle(_EventEmitter):
                     json_module_dumps(prepared.cdp_arguments()),
                     True,
                     None,
+                    *self._session_args(),
                 )
                 return _decode_json_result(json.loads(result))
             finally:
@@ -9512,6 +9527,7 @@ class JSHandle(_EventEmitter):
             arg_json,
             True,
             None,
+            *self._session_args(),
         )
         return _decode_json_result(json.loads(result))
 
@@ -9547,6 +9563,7 @@ class JSHandle(_EventEmitter):
                         json_module_dumps(prepared.cdp_arguments()),
                         False,
                         None,
+                        *self._session_args(),
                     )
                 )
                 return JSHandle(self._page, payload, owner_frame=self._owner_frame)
@@ -9563,6 +9580,7 @@ class JSHandle(_EventEmitter):
                 arg_json,
                 False,
                 None,
+                *self._session_args(),
             )
         )
         return JSHandle(self._page, payload, owner_frame=self._owner_frame)
@@ -9575,7 +9593,12 @@ class JSHandle(_EventEmitter):
         if self._disposed:
             return
         if self._object_id:
-            _call(self._page._core.js_handle_dispose, self._object_id, None)
+            _call(
+                self._page._core.js_handle_dispose,
+                self._object_id,
+                None,
+                *self._session_args(),
+            )
         self._disposed = True
 
 
@@ -14624,21 +14647,23 @@ class Page:
         if not isinstance(root, dict):
             return []
 
-        def find(node: dict[str, Any]) -> Optional[dict[str, Any]]:
+        parent = None
+        pending = [root]
+        visited: set[str] = set()
+        while pending:
+            node = pending.pop()
             frame = node.get("frame")
             frame_id = frame.get("id") if isinstance(frame, dict) else None
+            visit_key = str(frame_id or id(node))
+            if visit_key in visited:
+                continue
+            visited.add(visit_key)
             if parent_frame_id is None or str(frame_id or "") == str(parent_frame_id):
-                return node
+                parent = node
+                break
             children = node.get("childFrames")
             if isinstance(children, list):
-                for child in children:
-                    if isinstance(child, dict):
-                        found = find(child)
-                        if found is not None:
-                            return found
-            return None
-
-        parent = find(root)
+                pending.extend(child for child in reversed(children) if isinstance(child, dict))
         children = parent.get("childFrames") if isinstance(parent, dict) else None
         if not isinstance(children, list):
             return []
@@ -14654,18 +14679,20 @@ class Page:
         if not isinstance(root, dict):
             return []
         entries: list[dict[str, Any]] = []
-
-        def visit(node: dict[str, Any]) -> None:
+        pending = [root]
+        visited: set[str] = set()
+        while pending:
+            node = pending.pop()
             frame = node.get("frame")
             if isinstance(frame, dict):
+                visit_key = str(frame.get("id") or id(node))
+                if visit_key in visited:
+                    continue
+                visited.add(visit_key)
                 entries.append(frame)
             children = node.get("childFrames")
             if isinstance(children, list):
-                for child in children:
-                    if isinstance(child, dict):
-                        visit(child)
-
-        visit(root)
+                pending.extend(child for child in reversed(children) if isinstance(child, dict))
         return entries
 
     def _cdp_frame_entry_for_id(self, frame_id: str) -> Optional[dict[str, Any]]:
@@ -14768,8 +14795,13 @@ class Page:
             self._main_frame._url = ""
         frames = [self._main_frame]
         pending = list(self._main_frame.child_frames)
+        visited = {str(self._main_frame._frame_id or id(self._main_frame))}
         while pending:
             frame = pending.pop(0)
+            visit_key = str(frame._frame_id or id(frame))
+            if visit_key in visited:
+                continue
+            visited.add(visit_key)
             frames.append(frame)
             pending.extend(frame.child_frames)
         return frames
@@ -15997,10 +16029,13 @@ class Page:
         params = payload.get("params", payload) if isinstance(payload, dict) else {}
         frame_id = None if not isinstance(params, dict) else params.get("frameId")
         frame_id = None if frame_id is None else str(frame_id)
-        child_frames = [frame for frame in self.frames if not frame._is_main]
-        frame = next(
-            (candidate for candidate in child_frames if frame_id and candidate._frame_id == frame_id),
-            child_frames[-1] if child_frames else Frame(self, frame_id=frame_id),
+        cached = self._frame_event_cache.get(frame_id) if frame_id is not None else None
+        entry = self._cdp_frame_entry_for_id(frame_id) if frame_id is not None else None
+        frame = cached or Frame(
+            self,
+            name=str((entry or {}).get("name") or ""),
+            url=str((entry or {}).get("url") or ""),
+            frame_id=frame_id,
         )
         snapshot = self._snapshot_frame(frame, frame_id=frame_id)
         if frame_id is not None:
@@ -22101,11 +22136,13 @@ return __rw_fn(matches, __rw_arg);
                 self._mouse_click_at_point(
                     point[0],
                     point[1],
+                    timeout=timeout,
                     modifiers=modifiers,
                     delay=delay,
                     button=button,
                     click_count=click_count,
                     steps=steps,
+                    position=position,
                 )
             run_post_action_locator_handlers()
             self._page._slow_mo()
@@ -22126,6 +22163,7 @@ return __rw_fn(matches, __rw_arg);
                 self._mouse_click_at_point(
                     point[0],
                     point[1],
+                    timeout=timeout,
                     modifiers=None,
                     delay=None,
                     button=None,
@@ -22155,6 +22193,7 @@ return __rw_fn(matches, __rw_arg);
                 self._mouse_click_at_point(
                     point[0],
                     point[1],
+                    timeout=timeout,
                     modifiers=None,
                     delay=None,
                     button=None,
@@ -22189,6 +22228,7 @@ return __rw_fn(matches, __rw_arg);
             self._mouse_click_at_point(
                 point[0],
                 point[1],
+                timeout=timeout,
                 modifiers=None,
                 delay=None,
                 button=None,
@@ -22419,11 +22459,13 @@ return {
         self._mouse_click_at_point(
             x,
             y,
+            timeout=timeout,
             modifiers=modifiers,
             delay=delay,
             button=button,
             click_count=click_count,
             steps=steps,
+            position=position,
         )
 
     def _mouse_click_at_point(
@@ -22431,22 +22473,98 @@ return {
         x: float,
         y: float,
         *,
+        timeout: Optional[float],
         modifiers: Optional[Iterable[str]],
         delay: Optional[float],
         button: Optional[str],
         click_count: Optional[int],
         steps: Optional[int],
+        position: Optional[dict[str, Any]] = None,
     ) -> None:
-        kwargs: dict[str, Any] = {}
-        if delay is not None:
-            kwargs["delay"] = delay
-        if button is not None:
-            kwargs["button"] = button
-        if click_count is not None:
-            kwargs["click_count"] = click_count
-        if steps is not None:
-            kwargs["steps"] = steps
-        self._with_mouse_modifiers(modifiers, lambda: self._page.mouse._click(x, y, **kwargs))
+        mouse = self._page.mouse
+        target_x, target_y = mouse._normalize_point("Locator.click", x, y)
+        normalized_button = mouse._normalize_button(button or "left", method="Locator.click")
+        normalized_click_count = mouse._normalize_click_count(click_count, method="Locator.click")
+        normalized_delay = mouse._normalize_delay(delay, method="Locator.click")
+        step_count = 1 if steps is None else max(
+            _normalize_integer_option(steps, method="Mouse.move", name="steps"),
+            1,
+        )
+        initial_buttons = mouse._buttons
+        button_mask = mouse._button_mask(normalized_button)
+
+        def dispatch() -> None:
+            self._dispatch_locator_pointer_action(
+                "click",
+                target_x,
+                target_y,
+                position=position,
+                timeout=timeout,
+                steps=step_count,
+                button=normalized_button,
+                button_mask=button_mask,
+                click_count=normalized_click_count,
+                delay_ms=normalized_delay,
+                initial_buttons=initial_buttons,
+            )
+
+        self._with_mouse_modifiers(modifiers, dispatch)
+        mouse._x = target_x
+        mouse._y = target_y
+        if normalized_click_count > 0:
+            mouse._buttons &= ~button_mask
+
+    def _dispatch_locator_pointer_action(
+        self,
+        kind: str,
+        target_x: float,
+        target_y: float,
+        *,
+        position: Optional[dict[str, Any]],
+        timeout: Optional[float],
+        steps: int = 1,
+        button: str = "none",
+        button_mask: int = 0,
+        click_count: int = 0,
+        delay_ms: Optional[float] = None,
+        initial_buttons: Optional[int] = None,
+        target: Optional["Locator"] = None,
+        target_position: Optional[dict[str, Any]] = None,
+    ) -> None:
+        mouse = self._page.mouse
+        action: dict[str, Any] = {
+            "kind": kind,
+            "startX": mouse._x,
+            "startY": mouse._y,
+            "targetX": target_x,
+            "targetY": target_y,
+            "steps": max(1, int(steps)),
+            "button": button,
+            "buttonMask": button_mask,
+            "clickCount": click_count,
+            "delayMs": delay_ms or 0.0,
+            "initialButtons": mouse._buttons if initial_buttons is None else initial_buttons,
+            "modifiers": self._page.keyboard._modifiers_mask(),
+        }
+        if position is not None:
+            action["position"] = {"x": float(position.get("x", 0)), "y": float(position.get("y", 0))}
+        if target is not None:
+            action.update(
+                targetLocator=_json(target._spec),
+                targetIndex=target._index,
+            )
+            if target_position is not None:
+                action["targetPosition"] = {
+                    "x": float(target_position.get("x", 0)),
+                    "y": float(target_position.get("y", 0)),
+                }
+        _call(
+            self._page._core.dispatch_locator_pointer_action,
+            _json(self._spec),
+            self._index,
+            json.dumps(action),
+            self._page._default_timeout if timeout is None else timeout,
+        )
 
     def _mouse_dblclick(
         self,
@@ -22459,14 +22577,17 @@ return {
         steps: Optional[int],
     ) -> None:
         x, y = self._mouse_point(position=position, timeout=timeout)
-        kwargs: dict[str, Any] = {}
-        if delay is not None:
-            kwargs["delay"] = delay
-        if button is not None:
-            kwargs["button"] = button
-        if steps is not None:
-            kwargs["steps"] = steps
-        self._with_mouse_modifiers(modifiers, lambda: self._page.mouse._dblclick(x, y, **kwargs))
+        self._mouse_click_at_point(
+            x,
+            y,
+            timeout=timeout,
+            modifiers=modifiers,
+            delay=delay,
+            button=button,
+            click_count=2,
+            steps=steps,
+            position=position,
+        )
 
     def _try_fast_simple_css_fill(
         self,
@@ -23661,7 +23782,18 @@ return {{ ok: true, info }};
         if trial and not forced:
             return
         x, y = self._mouse_point(position=position, timeout=timeout)
-        self._with_mouse_modifiers(modifiers, lambda: self._page.mouse.move(x, y))
+        self._with_mouse_modifiers(
+            modifiers,
+            lambda: self._dispatch_locator_pointer_action(
+                "hover",
+                x,
+                y,
+                position=position,
+                timeout=timeout,
+            ),
+        )
+        self._page.mouse._x = x
+        self._page.mouse._y = y
         self._page._slow_mo()
 
     def tap(
@@ -23723,9 +23855,11 @@ return {{ ok: true, info }};
             return
         self._with_mouse_modifiers(
             modifiers,
-            lambda: self._page.touchscreen._tap_at(
+            lambda: self._dispatch_locator_pointer_action(
+                "tap",
                 *self._mouse_point(position=position, timeout=timeout),
-                require_has_touch=False,
+                position=position,
+                timeout=timeout,
             ),
         )
         self._page._slow_mo()
@@ -23810,74 +23944,6 @@ return {{ ok: true, info }};
         self._native_drag_to(target, source_position=source_position, target_position=target_position, timeout=timeout, steps=steps)
         self._page._slow_mo()
 
-    def _setup_native_drag_interception(self, *, timeout: Optional[float]) -> None:
-        self.evaluate(
-            """
-(element) => {
-  const win = element.ownerDocument.defaultView || window;
-  let dragEvent = null;
-  let didStartDrag = Promise.resolve(false);
-  const dragListener = event => dragEvent = event;
-  const mouseListener = () => {
-    didStartDrag = new Promise(callback => {
-      win.addEventListener('dragstart', dragListener, { once: true, capture: true });
-      setTimeout(() => callback(dragEvent ? !dragEvent.defaultPrevented : false), 0);
-    });
-  };
-  win.addEventListener('mousemove', mouseListener, { once: true, capture: true });
-  win.__rustwrightCleanupDrag = async () => {
-    const value = await didStartDrag;
-    win.removeEventListener('mousemove', mouseListener, { capture: true });
-    win.removeEventListener('dragstart', dragListener, { capture: true });
-    delete win.__rustwrightCleanupDrag;
-    return value;
-  };
-}
-""",
-            timeout=timeout,
-        )
-
-    def _cleanup_native_drag_interception(self, *, timeout: Optional[float]) -> bool:
-        return bool(
-            self.evaluate(
-                """
-(element) => {
-  const win = element.ownerDocument.defaultView || window;
-  return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
-}
-""",
-                timeout=timeout,
-            )
-        )
-
-    def _native_drag_mouse_event(
-        self,
-        session: CDPSession,
-        event_type: str,
-        x: float,
-        y: float,
-        *,
-        button: str,
-        buttons: int,
-        click_count: int = 0,
-    ) -> None:
-        mouse = self._page.mouse
-        mouse._x = x
-        mouse._y = y
-        mouse._buttons = buttons
-        params: dict[str, Any] = {
-            "type": event_type,
-            "x": x,
-            "y": y,
-            "button": button,
-            "buttons": buttons,
-            "clickCount": click_count,
-            "modifiers": self._page.keyboard._modifiers_mask(),
-        }
-        if event_type in {"mouseMoved", "mousePressed"}:
-            params["force"] = 0.5 if buttons else 0
-        session.send("Input.dispatchMouseEvent", params)
-
     def _native_drag_to(
         self,
         target: "Locator",
@@ -23889,68 +23955,15 @@ return {{ ok: true, info }};
     ) -> None:
         source_x, source_y = self._mouse_point(position=source_position, timeout=timeout)
         target_x, target_y = target._mouse_point(position=target_position, timeout=timeout)
-        step_count = max(1, int(steps or 1))
-        path = [
-            (
-                source_x + ((target_x - source_x) * index / step_count),
-                source_y + ((target_y - source_y) * index / step_count),
-            )
-            for index in range(1, step_count + 1)
-        ]
-        session = CDPSession(_call(self._page._core.cdp_session))
-        left_mask = self._page.mouse._button_mask("left")
-        modifiers = self._page.keyboard._modifiers_mask()
-
-        self._native_drag_mouse_event(session, "mouseMoved", source_x, source_y, button="none", buttons=0)
-        self._native_drag_mouse_event(
-            session,
-            "mousePressed",
+        self._dispatch_locator_pointer_action(
+            "drag",
             source_x,
             source_y,
-            button="left",
-            buttons=left_mask,
-            click_count=1,
-        )
-
-        self._setup_native_drag_interception(timeout=timeout)
-        waiter = session._event_waiter("Input.dragIntercepted")
-        drag_data: Optional[dict[str, Any]] = None
-        try:
-            session.send("Input.setInterceptDrags", {"enabled": True})
-            first_x, first_y = path[0]
-            self._native_drag_mouse_event(session, "mouseMoved", first_x, first_y, button="left", buttons=left_mask)
-            if self._cleanup_native_drag_interception(timeout=timeout):
-                drag_payload = session._wait_for_event("Input.dragIntercepted", timeout=1_000.0, waiter=waiter)
-                data = drag_payload.get("data")
-                if isinstance(data, dict):
-                    drag_data = data
-        finally:
-            session.send("Input.setInterceptDrags", {"enabled": False})
-
-        if drag_data is None:
-            self._native_drag_mouse_event(
-                session,
-                "mouseReleased",
-                path[-1][0],
-                path[-1][1],
-                button="left",
-                buttons=0,
-                click_count=1,
-            )
-            return
-
-        session.send(
-            "Input.dispatchDragEvent",
-            {"type": "dragEnter", "x": path[0][0], "y": path[0][1], "data": drag_data, "modifiers": modifiers},
-        )
-        for x, y in path[1:]:
-            session.send(
-                "Input.dispatchDragEvent",
-                {"type": "dragOver", "x": x, "y": y, "data": drag_data, "modifiers": modifiers},
-            )
-        session.send(
-            "Input.dispatchDragEvent",
-            {"type": "drop", "x": target_x, "y": target_y, "data": drag_data, "modifiers": modifiers},
+            position=source_position,
+            timeout=timeout,
+            steps=max(1, int(steps or 1)),
+            target=target,
+            target_position=target_position,
         )
         self._page.mouse._x = target_x
         self._page.mouse._y = target_y
@@ -24075,11 +24088,13 @@ return true;
         self._mouse_click_at_point(
             point[0],
             point[1],
+            timeout=timeout,
             modifiers=None,
             delay=None,
             button=None,
             click_count=None,
             steps=None,
+            position=position,
         )
 
     def check(
