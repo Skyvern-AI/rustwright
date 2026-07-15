@@ -94,9 +94,22 @@ Already have a Chromium/Chrome binary? Point Rustwright at it with `RUSTWRIGHT_C
 
 ## Remote browsers (Skyvern)
 
-Rustwright removes the local driver process; [Skyvern Browser Sessions](https://www.skyvern.com/docs/developers/features/browser-sessions) (from the team behind Rustwright) address the other half — hosting the browser. A session is a persistent cloud browser whose login, cookie, and tab state carry across runs, with configurable timeouts from 5 minutes to 24 hours (60 by default), proxies in 21 countries, and a live view in the Skyvern Cloud UI; sessions bill while open. Creating one returns a `browser_address` CDP endpoint, and Rustwright connects to it like any remote Chromium.
+Rustwright drives browsers — but you still need somewhere to run them. Skyvern (the team behind Rustwright) offers hosted **[Browser Sessions](https://www.skyvern.com/docs/developers/features/browser-sessions)** as a paid service that funds this project.
 
-To get a `browser_address`: install the [Skyvern SDK](https://www.skyvern.com/docs/developers/getting-started/quickstart) (`pip install skyvern`) and copy an API key from [app.skyvern.com](https://app.skyvern.com) → Settings. Then:
+**Features:**
+
+- **Persistent cloud browsers** — logins, cookies, and tab state carry across runs
+- **Configurable timeouts** — 5 minutes to 24 hours (60 min default)
+- **Proxies in 21 countries**
+- **Live view** — watch and interact with the session in the Skyvern Cloud UI
+
+Each session returns a `browser_address` CDP endpoint that Rustwright connects to like any remote Chromium (sessions bill while open).
+
+**Get started:**
+
+1. Make an account at [app.skyvern.com](https://app.skyvern.com)
+2. Grab your API key from **Settings**
+3. `pip install skyvern`
 
 ```python
 import asyncio
@@ -114,7 +127,7 @@ async def main():
 asyncio.run(main())
 ```
 
-The sync API connects the same way: `p.chromium.connect_over_cdp(browser_address)`.
+> Remote sessions are Python-only for now — Rustwright's Node binding doesn't support `connect_over_cdp` yet (it's on the [Roadmap](#roadmap)).
 
 ## Automation detection
 
@@ -177,7 +190,7 @@ See [`LIMITATIONS.md`](LIMITATIONS.md) for detail.
 
 ## Roadmap
 
-- [ ] **Language bindings** — one Rust engine, many languages: Go, Java, C#/.NET, Ruby, and PHP (plus a native Rust API)
+- [ ] **Language bindings** — one Rust engine, many languages: Go, Java, Kotlin, C#/.NET, Ruby, and PHP (plus a native Rust API)
 - [ ] **Rustwright MCP server** — expose browser automation as tools for MCP-compatible AI agents
 - [ ] CI / Testbox-backed benchmark evidence
 - [ ] Broaden the Node.js surface (contexts, routing, locators)
