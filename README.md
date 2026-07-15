@@ -21,15 +21,9 @@
 Rustwright is a browser automation library for Python and Node.js that keeps the Playwright API you already know but drives Chromium from a **native Rust engine** speaking raw [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) — no driver subprocess in the path.
 
 ```text
-playwright-python:  your code ──pipe──► Node driver (separate process) ──CDP──► Chromium
-rustwright:         your code ────────────────── raw CDP ─────────────────────► Chromium
+playwright-python:  your code ──pipe──► Node driver ──CDP──► Chromium
+rustwright:         your code ────────── raw CDP ──────────► Chromium
 ```
-
-<div align="center">
-
-<img src="docs/assets/rustwright_vs_playwright.gif" alt="Rustwright vs playwright-python live demo" width="360" />
-
-</div>
 
 ## Quickstart
 
@@ -78,6 +72,12 @@ The Node binding drives an existing Chromium/Chrome — point Rustwright at it w
 Only a subset of the API surface is bridged — see [Limitations](#limitations).
 
 ## Why Rustwright?
+
+<div align="center">
+
+<img src="docs/assets/rustwright_vs_playwright.gif" alt="Rustwright vs playwright-python live demo" width="360" />
+
+</div>
 
 - **No Node driver subprocess.** `playwright-python` launches and pipes to a bundled Node driver. Rustwright's engine is native — the browser-control code runs in-process.
 - **Raw CDP, in Rust.** A from-scratch async CDP client — not a wrapper around another automation library.
