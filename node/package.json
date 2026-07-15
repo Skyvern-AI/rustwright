@@ -43,7 +43,7 @@
     "smoke": "node ./smoke.mjs"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.4"
+    "@napi-rs/cli": "^3.7.3"
   },
   "napi": {
     "name": "rustwright",
