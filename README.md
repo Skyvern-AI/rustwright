@@ -29,8 +29,6 @@ rustwright:         your code ────────────────�
 
 <img src="docs/assets/rustwright_vs_playwright.gif" alt="Rustwright vs playwright-python live demo" width="360" />
 
-<sub>Live demo · Rustwright vs playwright-python · <a href="docs/assets/rustwright_vs_playwright.mp4">watch the mp4</a></sub>
-
 </div>
 
 ## Quickstart
