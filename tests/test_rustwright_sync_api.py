@@ -937,6 +937,113 @@ def oopif_test_server():
                     """
                 )
                 return
+            if path == "/oopif-descendant-top":
+                self._send_html(
+                    f"""
+                    <!doctype html>
+                    <iframe id="child" src="{origin_localhost}/oopif-descendant-outer"
+                        style="position:absolute;left:140px;top:90px;width:560px;height:360px;border:0"></iframe>
+                    """
+                )
+                return
+            if path == "/oopif-descendant-outer":
+                self._send_html(
+                    """
+                    <!doctype html>
+                    <style>html,body { margin: 0 } button { width: 110px; height: 44px }</style>
+                    <button id="decoy" style="position:absolute;left:20px;top:20px"
+                        onclick="document.body.dataset.decoy = 'yes'">Decoy</button>
+                    <iframe id="leaf" src="/oopif-descendant-leaf"
+                        style="position:absolute;left:210px;top:130px;width:300px;height:180px;border:0"></iframe>
+                    """
+                )
+                return
+            if path == "/oopif-descendant-leaf":
+                self._send_html(
+                    """
+                    <!doctype html>
+                    <style>html,body { margin: 0 } button { width: 110px; height: 44px }</style>
+                    <button id="leaf-button" style="position:absolute;left:20px;top:20px"
+                        onclick="document.body.dataset.leaf = 'yes'; document.body.dataset.trusted = String(event.isTrusted)">Leaf</button>
+                    """
+                )
+                return
+            if path == "/oopif-navigation-top":
+                self._send_html(
+                    f"""
+                    <!doctype html>
+                    <iframe id="child" src="{origin_localhost}/oopif-navigation-child"
+                        style="width:420px;height:240px;border:0"></iframe>
+                    """
+                )
+                return
+            if path == "/oopif-navigation-child":
+                self._send_html(
+                    f"""
+                    <!doctype html>
+                    <button id="navigate" onclick="location.href='{origin_127}/oopif-navigation-arrived'">Navigate</button>
+                    """
+                )
+                return
+            if path == "/oopif-navigation-arrived":
+                self._send_html("<!doctype html><p id='arrived'>arrived</p>")
+                return
+            if path == "/oopif-rapid-top":
+                self._send_html(
+                    f"""
+                    <!doctype html>
+                    <iframe id="child" src="{origin_localhost}/oopif-rapid-child"
+                        style="width:420px;height:240px;border:0"></iframe>
+                    """
+                )
+                return
+            if path == "/oopif-rapid-child":
+                self._send_html(
+                    f"""
+                    <!doctype html>
+                    <script>location.replace('{origin_127}/oopif-rapid-arrived')</script>
+                    """
+                )
+                return
+            if path == "/oopif-rapid-arrived":
+                self._send_html(
+                    """
+                    <!doctype html>
+                    <p id="arrived">rapid arrived</p>
+                    <iframe id="leaf" src="/oopif-rapid-leaf"></iframe>
+                    """
+                )
+                return
+            if path == "/oopif-rapid-leaf":
+                self._send_html("<!doctype html><p id='leaf-value'>leaf ready</p>")
+                return
+            if path == "/oopif-pointer-top":
+                self._send_html(
+                    f"""
+                    <!doctype html>
+                    <iframe id="child" src="{origin_localhost}/oopif-pointer-child"
+                        style="position:absolute;left:120px;top:80px;width:520px;height:340px;border:0"></iframe>
+                    """
+                )
+                return
+            if path == "/oopif-pointer-child":
+                self._send_html(
+                    """
+                    <!doctype html>
+                    <style>
+                      #hover, #double, #tap { width:100px;height:40px;margin:8px }
+                      #source, #target { display:inline-block;width:100px;height:70px;margin:30px;padding:8px }
+                    </style>
+                    <button id="hover" onmouseenter="document.body.dataset.hover = String(event.isTrusted)">Hover</button>
+                    <button id="double" ondblclick="document.body.dataset.double = String(event.isTrusted)">Double</button>
+                    <button id="tap" ontouchend="document.body.dataset.tap = String(event.isTrusted)">Tap</button>
+                    <div id="source" draggable="true"
+                        ondragstart="document.body.dataset.dragstart = String(event.isTrusted)">Source</div>
+                    <div id="target" ondragover="event.preventDefault()"
+                        ondrop="event.preventDefault(); document.body.dataset.drop = String(event.isTrusted)">Target</div>
+                    """
+                )
+                return
             self.send_response(404, "Missing")
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -13559,6 +13666,95 @@ def test_forced_site_isolation_oopif_uses_iframe_target_session(playwright, oopi
         frame_locator.locator("#button").click()
         assert frame_locator.locator("#status").inner_text() == "clicked"
         assert any(frame.url.endswith("/oopif-child") for frame in page.frames)
+    finally:
+        browser.close()
+
+
+def test_forced_isolation_oopif_same_origin_descendant_uses_target_root_coordinates(
+    playwright, oopif_test_server
+):
+    browser = playwright.chromium.launch(headless=True, args=["--site-per-process"])
+    try:
+        page = browser.new_page()
+        page.goto(f"{oopif_test_server['top']}/oopif-descendant-top")
+        outer = page.frame_locator("#child")
+        leaf = outer.frame_locator("#leaf")
+
+        leaf.locator("#leaf-button").click()
+
+        assert leaf.locator("body").evaluate("body => body.dataset.leaf") == "yes"
+        assert leaf.locator("body").evaluate("body => body.dataset.trusted") == "true"
+        assert outer.locator("body").evaluate("body => body.dataset.decoy") is None
+    finally:
+        browser.close()
+
+
+def test_forced_isolation_oopif_navigation_detach_completes_pointer_barrier(
+    playwright, oopif_test_server
+):
+    browser = playwright.chromium.launch(headless=True, args=["--site-per-process"])
+    try:
+        page = browser.new_page()
+        page.goto(f"{oopif_test_server['top']}/oopif-navigation-top")
+        child = page.frame_locator("#child")
+
+        started = time.monotonic()
+        child.locator("#navigate").click(timeout=2_000)
+        elapsed_ms = (time.monotonic() - started) * 1_000
+
+        child.locator("#arrived").wait_for(state="attached", timeout=2_000)
+        assert child.locator("#arrived").inner_text() == "arrived"
+        assert elapsed_ms < 1_500
+    finally:
+        browser.close()
+
+
+def test_forced_isolation_detached_setup_cannot_poison_remapped_frame(
+    playwright, oopif_test_server
+):
+    browser = playwright.chromium.launch(headless=True, args=["--site-per-process"])
+    try:
+        page = browser.new_page()
+        page.goto(f"{oopif_test_server['top']}/oopif-rapid-top")
+        child = page.frame_locator("#child")
+        child.locator("#arrived").wait_for(state="attached", timeout=2_000)
+
+        # The detached setup task used to publish its five-second command timeout
+        # after this remapped frame was already usable.
+        page.wait_for_timeout(5_250)
+
+        assert child.locator("#arrived").inner_text(timeout=500) == "rapid arrived"
+        assert (
+            child.frame_locator("#leaf").locator("#leaf-value").inner_text(timeout=500)
+            == "leaf ready"
+        )
+    finally:
+        browser.close()
+
+
+def test_forced_isolation_oopif_locator_pointer_actions_wait_for_handlers(
+    playwright, oopif_test_server
+):
+    browser = playwright.chromium.launch(headless=True, args=["--site-per-process"])
+    try:
+        context = browser.new_context(has_touch=True)
+        page = context.new_page()
+        page.goto(f"{oopif_test_server['top']}/oopif-pointer-top")
+        child = page.frame_locator("#child")
+        body = child.locator("body")
+
+        child.locator("#hover").hover()
+        assert body.evaluate("body => body.dataset.hover") == "true"
+
+        child.locator("#double").dblclick()
+        assert body.evaluate("body => body.dataset.double") == "true"
+
+        child.locator("#tap").tap()
+        assert body.evaluate("body => body.dataset.tap") == "true"
+
+        child.locator("#source").drag_to(child.locator("#target"), steps=5)
+        assert body.evaluate("body => body.dataset.dragstart") == "true"
+        assert body.evaluate("body => body.dataset.drop") == "true"
     finally:
         browser.close()
 
