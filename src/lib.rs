@@ -184,6 +184,7 @@ impl Drop for SpawnedTaskAbortGuard {
 
 const CDP_EVENT_LOG_LIMIT: usize = 8192;
 const FRAME_UTILITY_WORLD_NAME: &str = "__utility_world__";
+const MAX_FRAME_TREE_DEPTH: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum RwError {
@@ -701,6 +702,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn nested_oopif_attachment_preserves_parent_session_root() {
+        let mut state = PageFrameState::new("session-main".to_string());
+        state.record_frame(
+            "main".to_string(),
+            None,
+            None,
+            None,
+            "session-main".to_string(),
+        );
+        state.record_session_for_frame("outer", "session-outer");
+        state.record_frame(
+            "outer".to_string(),
+            Some("main".to_string()),
+            None,
+            None,
+            "session-outer".to_string(),
+        );
+
+        state.record_frame(
+            "inner".to_string(),
+            Some("outer".to_string()),
+            None,
+            None,
+            "session-outer".to_string(),
+        );
+        assert_eq!(
+            state
+                .session_frames
+                .get("session-outer")
+                .map(String::as_str),
+            Some("outer")
+        );
+        assert_eq!(
+            state.frame_sessions.get("inner").map(String::as_str),
+            Some("session-outer")
+        );
+        assert!(state.frames.contains_key("outer"));
+
+        state.record_session_for_frame("inner", "session-inner");
+        assert_eq!(
+            state
+                .session_frames
+                .get("session-outer")
+                .map(String::as_str),
+            Some("outer")
+        );
+        assert_eq!(
+            state
+                .session_frames
+                .get("session-inner")
+                .map(String::as_str),
+            Some("inner")
+        );
+        assert_eq!(state.frames["inner"].parent_id.as_deref(), Some("outer"));
+
+        state.record_frame(
+            "leaf".to_string(),
+            Some("inner".to_string()),
+            None,
+            None,
+            "session-inner".to_string(),
+        );
+        state.detach_session("session-inner");
+        assert!(!state.session_frames.contains_key("session-inner"));
+        assert_eq!(
+            state.frame_sessions.get("inner").map(String::as_str),
+            Some("session-outer")
+        );
+        assert_eq!(
+            state.frame_sessions.get("leaf").map(String::as_str),
+            Some("session-outer")
+        );
+        assert_eq!(state.frames["inner"].session_id.as_str(), "session-outer");
+        assert_eq!(state.frames["leaf"].session_id.as_str(), "session-outer");
+        assert_eq!(
+            state
+                .session_frames
+                .get("session-outer")
+                .map(String::as_str),
+            Some("outer")
+        );
+    }
+
     fn request_target(endpoint: &str) -> String {
         let mut request = endpoint.into_client_request().unwrap();
         ensure_ws_request_path(&mut request);
@@ -1033,6 +1118,81 @@ mod tests {
         second.await.unwrap().unwrap();
         assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
         assert!(lifecycle.is_closed());
+    }
+
+    #[tokio::test]
+    async fn drag_interception_timeout_still_disables_and_releases_mouse() {
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(4);
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let (alive_tx, _) = watch::channel(true);
+        let client = CdpClient {
+            write_tx,
+            pending: Arc::clone(&pending),
+            events: events.clone(),
+            event_log: Arc::clone(&event_log),
+            next_id: AtomicU64::new(1),
+            sent_runtime_enable_count: AtomicU64::new(0),
+            sent_target_close_count: AtomicU64::new(0),
+            sent_context_dispose_count: AtomicU64::new(0),
+            alive: Arc::new(AtomicBool::new(true)),
+            alive_tx,
+        };
+        let mut drag_events = client.subscribe();
+        let respond_pending = Arc::clone(&pending);
+        let respond_events = events.clone();
+        let respond_event_log = Arc::clone(&event_log);
+
+        let (result, cleanup_commands) = tokio::join!(
+            run_drag_with_cleanup(
+                &client,
+                "root-session",
+                "pointer-session",
+                30.0,
+                40.0,
+                0,
+                async {
+                    wait_for_drag_intercepted(
+                        &mut drag_events,
+                        "pointer-session",
+                        OperationDeadline::new(Duration::from_millis(20)),
+                    )
+                    .await
+                    .map(Some)
+                },
+                |_| async { Ok(()) },
+            ),
+            async {
+                let mut commands = Vec::new();
+                for _ in 0..2 {
+                    let command = match write_rx.recv().await.unwrap() {
+                        CdpOutgoing::Text(payload) => {
+                            serde_json::from_str::<Value>(&payload).unwrap()
+                        }
+                        CdpOutgoing::Close => panic!("unexpected transport close"),
+                    };
+                    dispatch_cdp_payload(
+                        json!({ "id": command["id"], "result": {} }),
+                        Arc::clone(&respond_pending),
+                        respond_events.clone(),
+                        Arc::clone(&respond_event_log),
+                    );
+                    commands.push(command);
+                }
+                commands
+            },
+        );
+
+        assert!(matches!(result, Err(RwError::Timeout(20))));
+        assert_eq!(cleanup_commands[0]["method"], "Input.setInterceptDrags");
+        assert_eq!(cleanup_commands[0]["params"]["enabled"], false);
+        assert_eq!(cleanup_commands[0]["sessionId"], "root-session");
+        assert_eq!(cleanup_commands[1]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(cleanup_commands[1]["params"]["type"], "mouseReleased");
+        assert_eq!(cleanup_commands[1]["params"]["buttons"], 0);
+        assert_eq!(cleanup_commands[1]["sessionId"], "pointer-session");
+        assert!(write_rx.try_recv().is_err());
     }
 
     #[test]
@@ -3756,16 +3916,74 @@ struct PageFrameState {
     session_frames: HashMap<String, String>,
     frames: HashMap<String, PageFrameRecord>,
     child_order: HashMap<String, Vec<String>>,
+    frame_session_errors: HashMap<String, String>,
+    iframe_sessions_armed: HashSet<String>,
+    iframe_sessions_ready: HashSet<String>,
+    iframe_setup_started: HashSet<String>,
+    session_updates: watch::Sender<u64>,
 }
 
 impl PageFrameState {
     fn new(main_session_id: String) -> Self {
+        let (session_updates, _) = watch::channel(0);
         Self {
             main_session_id,
             frame_sessions: HashMap::new(),
             session_frames: HashMap::new(),
             frames: HashMap::new(),
             child_order: HashMap::new(),
+            frame_session_errors: HashMap::new(),
+            iframe_sessions_armed: HashSet::new(),
+            iframe_sessions_ready: HashSet::new(),
+            iframe_setup_started: HashSet::new(),
+            session_updates,
+        }
+    }
+
+    fn subscribe_session_updates(&self) -> watch::Receiver<u64> {
+        self.session_updates.subscribe()
+    }
+
+    fn notify_session_update(&self) {
+        self.session_updates
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    fn record_frame_session_error(&mut self, frame_id: &str, error: String) {
+        self.frame_session_errors
+            .insert(frame_id.to_string(), error);
+        self.notify_session_update();
+    }
+
+    fn session_still_owns_frame(&self, frame_id: &str, session_id: &str) -> bool {
+        self.session_frames.get(session_id).map(String::as_str) == Some(frame_id)
+            && self.frame_sessions.get(frame_id).map(String::as_str) == Some(session_id)
+    }
+
+    fn record_frame_session_error_if_current(
+        &mut self,
+        frame_id: &str,
+        session_id: &str,
+        error: String,
+    ) {
+        if self.session_still_owns_frame(frame_id, session_id) {
+            self.record_frame_session_error(frame_id, error);
+        }
+    }
+
+    fn mark_iframe_setup_started(&mut self, session_id: &str) -> bool {
+        self.iframe_setup_started.insert(session_id.to_string())
+    }
+
+    fn mark_iframe_session_armed(&mut self, session_id: &str) {
+        self.iframe_sessions_armed.insert(session_id.to_string());
+        self.notify_session_update();
+    }
+
+    fn mark_iframe_session_ready(&mut self, frame_id: &str, session_id: &str) {
+        if self.session_still_owns_frame(frame_id, session_id) {
+            self.iframe_sessions_ready.insert(session_id.to_string());
+            self.notify_session_update();
         }
     }
 
@@ -3784,13 +4002,69 @@ impl PageFrameState {
     }
 
     fn record_session_for_frame(&mut self, frame_id: &str, session_id: &str) {
-        self.frame_sessions
-            .insert(frame_id.to_string(), session_id.to_string());
-        self.session_frames
-            .insert(session_id.to_string(), frame_id.to_string());
+        self.frame_session_errors.remove(frame_id);
+        if let Some(previous_session_id) = self
+            .frame_sessions
+            .insert(frame_id.to_string(), session_id.to_string())
+        {
+            if previous_session_id != session_id
+                && self
+                    .session_frames
+                    .get(&previous_session_id)
+                    .map(String::as_str)
+                    == Some(frame_id)
+            {
+                self.session_frames.remove(&previous_session_id);
+            }
+        }
+        if let Some(previous_frame_id) = self
+            .session_frames
+            .insert(session_id.to_string(), frame_id.to_string())
+        {
+            if previous_frame_id != frame_id
+                && self
+                    .frame_sessions
+                    .get(&previous_frame_id)
+                    .map(String::as_str)
+                    == Some(session_id)
+            {
+                self.frame_sessions.remove(&previous_frame_id);
+            }
+        }
         if let Some(record) = self.frames.get_mut(frame_id) {
             record.session_id = session_id.to_string();
         }
+    }
+
+    fn detach_session(&mut self, detached_session_id: &str) {
+        let root_frame_id = self.session_frames.remove(detached_session_id);
+        let replacement_session_id = root_frame_id
+            .as_deref()
+            .and_then(|frame_id| self.frames.get(frame_id))
+            .and_then(|record| record.parent_id.as_deref())
+            .and_then(|parent_id| self.frame_sessions.get(parent_id))
+            .filter(|session_id| session_id.as_str() != detached_session_id)
+            .cloned()
+            .unwrap_or_else(|| self.main_session_id.clone());
+        let remapped_frame_ids = self
+            .frame_sessions
+            .iter()
+            .filter_map(|(frame_id, session_id)| {
+                (session_id == detached_session_id).then_some(frame_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for frame_id in remapped_frame_ids {
+            self.frame_sessions
+                .insert(frame_id.clone(), replacement_session_id.clone());
+            self.frame_session_errors.remove(&frame_id);
+            if let Some(record) = self.frames.get_mut(&frame_id) {
+                record.session_id = replacement_session_id.clone();
+            }
+        }
+        self.iframe_sessions_armed.remove(detached_session_id);
+        self.iframe_sessions_ready.remove(detached_session_id);
+        self.iframe_setup_started.remove(detached_session_id);
+        self.notify_session_update();
     }
 
     fn record_frame(
@@ -3801,25 +4075,11 @@ impl PageFrameState {
         url: Option<String>,
         event_session_id: String,
     ) {
-        if event_session_id != self.main_session_id {
-            if let Some(old_frame_id) = self
-                .session_frames
-                .insert(event_session_id.clone(), frame_id.clone())
-            {
-                if old_frame_id != frame_id {
-                    self.frame_sessions.remove(&old_frame_id);
-                    self.frames.remove(&old_frame_id);
-                    self.child_order.remove(&old_frame_id);
-                }
-            }
-            self.frame_sessions
-                .insert(frame_id.clone(), event_session_id.clone());
-        }
         let session_id = self
             .frame_sessions
-            .get(&frame_id)
-            .cloned()
-            .unwrap_or(event_session_id);
+            .entry(frame_id.clone())
+            .or_insert(event_session_id)
+            .clone();
         let entry = self
             .frames
             .entry(frame_id.clone())
@@ -3854,7 +4114,9 @@ impl PageFrameState {
         }
         self.frames.remove(frame_id);
         if let Some(session_id) = self.frame_sessions.remove(frame_id) {
-            self.session_frames.remove(&session_id);
+            if self.session_frames.get(&session_id).map(String::as_str) == Some(frame_id) {
+                self.session_frames.remove(&session_id);
+            }
         }
         for children in self.child_order.values_mut() {
             children.retain(|child| child != frame_id);
@@ -3947,6 +4209,19 @@ impl PageInner {
 }
 
 fn build_frame_tree_node(state: &PageFrameState, frame_id: &str) -> Option<Value> {
+    let mut visited = HashSet::new();
+    build_frame_tree_node_guarded(state, frame_id, &mut visited, 0)
+}
+
+fn build_frame_tree_node_guarded(
+    state: &PageFrameState,
+    frame_id: &str,
+    visited: &mut HashSet<String>,
+    depth: usize,
+) -> Option<Value> {
+    if depth >= MAX_FRAME_TREE_DEPTH || !visited.insert(frame_id.to_string()) {
+        return None;
+    }
     let record = state.frames.get(frame_id)?;
     let mut frame = json!({
         "id": record.id,
@@ -3959,7 +4234,7 @@ fn build_frame_tree_node(state: &PageFrameState, frame_id: &str) -> Option<Value
     let child_ids = state.child_order.get(frame_id).cloned().unwrap_or_default();
     let mut child_frames = Vec::new();
     for child_id in child_ids {
-        if let Some(child) = build_frame_tree_node(state, &child_id) {
+        if let Some(child) = build_frame_tree_node_guarded(state, &child_id, visited, depth + 1) {
             child_frames.push(child);
         }
     }
@@ -4864,6 +5139,412 @@ async fn evaluate_expression_for_page_async(
         .await
 }
 
+#[derive(Clone, Copy)]
+struct OperationDeadline {
+    at: tokio::time::Instant,
+    timeout: Duration,
+}
+
+impl OperationDeadline {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            at: tokio::time::Instant::now() + timeout,
+            timeout,
+        }
+    }
+
+    fn remaining(self) -> RwResult<Duration> {
+        let remaining = self
+            .at
+            .saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(RwError::Timeout(
+                self.timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            ));
+        }
+        Ok(remaining)
+    }
+
+    fn remaining_capped(self, cap: Duration) -> RwResult<Duration> {
+        self.remaining().map(|remaining| remaining.min(cap))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_mouse_click_sequence_in_session(
+    client: &CdpClient,
+    session_id: &str,
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+    step_count: u32,
+    button: &str,
+    button_mask: i64,
+    click_count: i64,
+    delay_ms: f64,
+    initial_buttons: i64,
+    modifiers: i64,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    let steps = step_count.max(1);
+    for index in 1..=steps {
+        let fraction = index as f64 / steps as f64;
+        let x = start_x + (target_x - start_x) * fraction;
+        let y = start_y + (target_y - start_y) * fraction;
+        client
+            .send(
+                "Input.dispatchMouseEvent",
+                mouse_event_payload("mouseMoved", x, y, "none", initial_buttons, 0, modifiers),
+                Some(session_id),
+                deadline.remaining()?,
+            )
+            .await?;
+    }
+
+    for count in 1..=click_count.max(0) {
+        client
+            .send(
+                "Input.dispatchMouseEvent",
+                mouse_event_payload(
+                    "mousePressed",
+                    target_x,
+                    target_y,
+                    button,
+                    initial_buttons | button_mask,
+                    count,
+                    modifiers,
+                ),
+                Some(session_id),
+                deadline.remaining()?,
+            )
+            .await?;
+        if delay_ms > 0.0 {
+            tokio::time::timeout(
+                deadline.remaining()?,
+                tokio::time::sleep(Duration::from_secs_f64(delay_ms / 1000.0)),
+            )
+            .await
+            .map_err(|_| {
+                RwError::Timeout(deadline.timeout.as_millis().min(u128::from(u64::MAX)) as u64)
+            })?;
+        }
+        client
+            .send(
+                "Input.dispatchMouseEvent",
+                mouse_event_payload(
+                    "mouseReleased",
+                    target_x,
+                    target_y,
+                    button,
+                    initial_buttons & !button_mask,
+                    count,
+                    modifiers,
+                ),
+                Some(session_id),
+                deadline.remaining()?,
+            )
+            .await?;
+        if count < click_count && delay_ms > 0.0 {
+            tokio::time::timeout(
+                deadline.remaining()?,
+                tokio::time::sleep(Duration::from_secs_f64(delay_ms / 1000.0)),
+            )
+            .await
+            .map_err(|_| {
+                RwError::Timeout(deadline.timeout.as_millis().min(u128::from(u64::MAX)) as u64)
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ResolvedLocatorPoint {
+    session_id: String,
+    frame_id: Option<String>,
+    locator_json: String,
+    index: usize,
+    x: f64,
+    y: f64,
+}
+
+async fn resolve_locator_point(
+    page: Arc<PageInner>,
+    locator_json: &str,
+    index: usize,
+    position_x: Option<f64>,
+    position_y: Option<f64>,
+    deadline: OperationDeadline,
+) -> RwResult<ResolvedLocatorPoint> {
+    let resolution = resolve_locator_session(Arc::clone(&page), locator_json, deadline).await?;
+    let expression = locator_script(
+        &resolution.locator_json,
+        index,
+        "if (!el) throw new Error('No element matches locator'); return el;",
+    );
+    let remote = if let Some(frame_id) = resolution.frame_id.as_deref() {
+        evaluate_handle_expression_in_frame_context(
+            &page.browser.client,
+            &resolution.session_id,
+            frame_id,
+            expression,
+            deadline,
+        )
+        .await?
+    } else {
+        evaluate_handle_expression_in_session(
+            &page.browser.client,
+            &resolution.session_id,
+            expression,
+            deadline,
+        )
+        .await?
+    };
+    let object_id = remote
+        .get("objectId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RwError::Message("locator did not resolve to an element".to_string()))?
+        .to_string();
+    let box_model = page
+        .browser
+        .client
+        .send(
+            "DOM.getBoxModel",
+            json!({ "objectId": object_id }),
+            Some(&resolution.session_id),
+            deadline.remaining()?,
+        )
+        .await;
+    if let Ok(remaining) = deadline.remaining_capped(Duration::from_secs(1)) {
+        let _ = page
+            .browser
+            .client
+            .send(
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+                Some(&resolution.session_id),
+                remaining,
+            )
+            .await;
+    }
+    let box_model = box_model?;
+    let quad = box_model
+        .pointer("/model/border")
+        .and_then(Value::as_array)
+        .filter(|quad| quad.len() >= 8)
+        .ok_or_else(|| RwError::Message("locator element has no layout box".to_string()))?;
+    let xs = [0, 2, 4, 6]
+        .into_iter()
+        .map(|index| quad[index].as_f64())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| RwError::Message("locator element has an invalid layout box".to_string()))?;
+    let ys = [1, 3, 5, 7]
+        .into_iter()
+        .map(|index| quad[index].as_f64())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| RwError::Message("locator element has an invalid layout box".to_string()))?;
+    let min_x = xs.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_x = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let min_y = ys.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_y = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let x = position_x.map_or((min_x + max_x) / 2.0, |offset| min_x + offset);
+    let y = position_y.map_or((min_y + max_y) / 2.0, |offset| min_y + offset);
+    Ok(ResolvedLocatorPoint {
+        session_id: resolution.session_id,
+        frame_id: resolution.frame_id,
+        locator_json: resolution.locator_json,
+        index,
+        x,
+        y,
+    })
+}
+
+async fn evaluate_resolved_locator_body(
+    page: &Arc<PageInner>,
+    resolved: &ResolvedLocatorPoint,
+    body: &str,
+    deadline: OperationDeadline,
+) -> RwResult<Value> {
+    let expression = locator_script(&resolved.locator_json, resolved.index, body);
+    let json = if let Some(frame_id) = resolved.frame_id.as_deref() {
+        evaluate_expression_in_frame_context(
+            &page.browser.client,
+            &resolved.session_id,
+            frame_id,
+            expression,
+            deadline,
+        )
+        .await?
+    } else {
+        evaluate_expression_in_session_before(
+            &page.browser.client,
+            &resolved.session_id,
+            expression,
+            deadline,
+        )
+        .await?
+    };
+    Ok(serde_json::from_str(&json)?)
+}
+
+async fn wait_for_drag_intercepted(
+    events: &mut broadcast::Receiver<Value>,
+    session_id: &str,
+    deadline: OperationDeadline,
+) -> RwResult<Value> {
+    loop {
+        match tokio::time::timeout(deadline.remaining()?, events.recv()).await {
+            Ok(Ok(event)) => {
+                if event.get("method").and_then(Value::as_str) == Some("Input.dragIntercepted") {
+                    return event.pointer("/params/data").cloned().ok_or_else(|| {
+                        RwError::Message("drag interception did not include data".to_string())
+                    });
+                }
+                if event.get("method").and_then(Value::as_str) == Some("Target.detachedFromTarget")
+                    && event.pointer("/params/sessionId").and_then(Value::as_str)
+                        == Some(session_id)
+                {
+                    return Err(RwError::Message(
+                        "CDP target detached while starting drag".to_string(),
+                    ));
+                }
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => {
+                return Err(RwError::Message("CDP event stream closed".to_string()));
+            }
+            Err(_) => return Err(RwError::Timeout(deadline.timeout.as_millis() as u64)),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_drag_with_cleanup<Start, Complete, Completion>(
+    client: &CdpClient,
+    interception_session_id: &str,
+    pointer_session_id: &str,
+    release_x: f64,
+    release_y: f64,
+    modifiers: i64,
+    start: Start,
+    complete: Complete,
+) -> RwResult<()>
+where
+    Start: Future<Output = RwResult<Option<Value>>>,
+    Complete: FnOnce(Option<Value>) -> Completion,
+    Completion: Future<Output = RwResult<()>>,
+{
+    const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+
+    let start_result = start.await;
+    let _ = client
+        .send(
+            "Input.setInterceptDrags",
+            json!({ "enabled": false }),
+            Some(interception_session_id),
+            CLEANUP_TIMEOUT,
+        )
+        .await;
+    let result = match start_result {
+        Ok(drag_data) => complete(drag_data).await,
+        Err(error) => Err(error),
+    };
+    if result.is_err() {
+        let _ = client
+            .send(
+                "Input.dispatchMouseEvent",
+                mouse_event_payload(
+                    "mouseReleased",
+                    release_x,
+                    release_y,
+                    "left",
+                    0,
+                    1,
+                    modifiers,
+                ),
+                Some(pointer_session_id),
+                CLEANUP_TIMEOUT,
+            )
+            .await;
+    }
+    result
+}
+
+async fn dispatch_mouse_move_sequence_in_session(
+    client: &CdpClient,
+    session_id: &str,
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+    step_count: u32,
+    buttons: i64,
+    modifiers: i64,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    let steps = step_count.max(1);
+    for index in 1..=steps {
+        let fraction = index as f64 / steps as f64;
+        let x = start_x + (target_x - start_x) * fraction;
+        let y = start_y + (target_y - start_y) * fraction;
+        let move_button = if buttons == 0 { "none" } else { "left" };
+        let mut payload =
+            mouse_event_payload("mouseMoved", x, y, move_button, buttons, 0, modifiers);
+        if buttons != 0 {
+            payload["force"] = json!(0.5);
+        }
+        client
+            .send(
+                "Input.dispatchMouseEvent",
+                payload,
+                Some(session_id),
+                deadline.remaining()?,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn pointer_action_ordering_barrier(
+    client: &CdpClient,
+    session_id: &str,
+    mut events: broadcast::Receiver<Value>,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    let barrier = client.send(
+        "Runtime.evaluate",
+        json!({
+            "expression": "void 0",
+            "awaitPromise": true,
+            "returnByValue": true,
+            "userGesture": true,
+        }),
+        Some(session_id),
+        deadline.remaining()?,
+    );
+    tokio::pin!(barrier);
+    loop {
+        tokio::select! {
+            biased;
+            event = events.recv() => match event {
+                Ok(event) => {
+                    if event.get("method").and_then(Value::as_str) == Some("Target.detachedFromTarget")
+                        && event.pointer("/params/sessionId").and_then(Value::as_str) == Some(session_id)
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err(RwError::Message("CDP event stream closed".to_string()));
+                }
+            },
+            result = &mut barrier => return result.map(|_| ()),
+        }
+    }
+}
+
 fn evaluate_expression_for_frame(
     page: Arc<PageInner>,
     frame_id: String,
@@ -4916,6 +5597,21 @@ async fn evaluate_expression_in_session(
     expression: String,
     timeout: Duration,
 ) -> RwResult<String> {
+    evaluate_expression_in_session_before(
+        client,
+        session_id,
+        expression,
+        OperationDeadline::new(timeout),
+    )
+    .await
+}
+
+async fn evaluate_expression_in_session_before(
+    client: &CdpClient,
+    session_id: &str,
+    expression: String,
+    deadline: OperationDeadline,
+) -> RwResult<String> {
     let result = client
         .send(
             "Runtime.evaluate",
@@ -4926,17 +5622,17 @@ async fn evaluate_expression_in_session(
                 "userGesture": true,
             }),
             Some(session_id),
-            timeout,
+            deadline.remaining()?,
         )
         .await?;
-    runtime_result_to_json_with_serializer(client, session_id, &result, timeout).await
+    runtime_result_to_json_with_serializer(client, session_id, &result, deadline.remaining()?).await
 }
 
 async fn evaluate_handle_expression_in_session(
     client: &CdpClient,
     session_id: &str,
     expression: String,
-    timeout: Duration,
+    deadline: OperationDeadline,
 ) -> RwResult<Value> {
     let result = client
         .send(
@@ -4948,7 +5644,7 @@ async fn evaluate_handle_expression_in_session(
                 "userGesture": true,
             }),
             Some(session_id),
-            timeout,
+            deadline.remaining()?,
         )
         .await?;
     let remote_json = runtime_result_to_remote_object(&result)?;
@@ -4960,9 +5656,11 @@ async fn evaluate_expression_in_frame_context(
     session_id: &str,
     frame_id: &str,
     expression: String,
-    timeout: Duration,
+    deadline: OperationDeadline,
 ) -> RwResult<String> {
-    let context_id = create_isolated_world_for_frame(client, session_id, frame_id, timeout).await?;
+    let context_id =
+        create_isolated_world_for_frame(client, session_id, frame_id, deadline.remaining()?)
+            .await?;
     let result = client
         .send(
             "Runtime.evaluate",
@@ -4974,10 +5672,10 @@ async fn evaluate_expression_in_frame_context(
                 "userGesture": true,
             }),
             Some(session_id),
-            timeout,
+            deadline.remaining()?,
         )
         .await?;
-    runtime_result_to_json_with_serializer(client, session_id, &result, timeout).await
+    runtime_result_to_json_with_serializer(client, session_id, &result, deadline.remaining()?).await
 }
 
 async fn evaluate_handle_expression_in_frame_context(
@@ -4985,9 +5683,11 @@ async fn evaluate_handle_expression_in_frame_context(
     session_id: &str,
     frame_id: &str,
     expression: String,
-    timeout: Duration,
+    deadline: OperationDeadline,
 ) -> RwResult<Value> {
-    let context_id = create_isolated_world_for_frame(client, session_id, frame_id, timeout).await?;
+    let context_id =
+        create_isolated_world_for_frame(client, session_id, frame_id, deadline.remaining()?)
+            .await?;
     let result = client
         .send(
             "Runtime.evaluate",
@@ -4999,7 +5699,7 @@ async fn evaluate_handle_expression_in_frame_context(
                 "userGesture": true,
             }),
             Some(session_id),
-            timeout,
+            deadline.remaining()?,
         )
         .await?;
     let remote_json = runtime_result_to_remote_object(&result)?;
@@ -5037,7 +5737,6 @@ struct LocatorSessionResolution {
 
 struct FrameOwnerResolution {
     frame_id: Option<String>,
-    url: Option<String>,
     same_origin_accessible: bool,
 }
 
@@ -5048,7 +5747,8 @@ async fn evaluate_locator_for_page(
     body: String,
     timeout: Duration,
 ) -> RwResult<String> {
-    let resolution = resolve_locator_session(Arc::clone(&page), &locator_json, timeout).await?;
+    let deadline = OperationDeadline::new(timeout);
+    let resolution = resolve_locator_session(Arc::clone(&page), &locator_json, deadline).await?;
     let expression = locator_script(&resolution.locator_json, index, &body);
     if let Some(frame_id) = resolution.frame_id {
         evaluate_expression_in_frame_context(
@@ -5056,15 +5756,15 @@ async fn evaluate_locator_for_page(
             &resolution.session_id,
             &frame_id,
             expression,
-            timeout,
+            deadline,
         )
         .await
     } else {
-        evaluate_expression_in_session(
+        evaluate_expression_in_session_before(
             &page.browser.client,
             &resolution.session_id,
             expression,
-            timeout,
+            deadline,
         )
         .await
     }
@@ -5077,7 +5777,8 @@ async fn evaluate_locator_handle_for_page(
     body: String,
     timeout: Duration,
 ) -> RwResult<String> {
-    let resolution = resolve_locator_session(Arc::clone(&page), &locator_json, timeout).await?;
+    let deadline = OperationDeadline::new(timeout);
+    let resolution = resolve_locator_session(Arc::clone(&page), &locator_json, deadline).await?;
     let expression = locator_script(&resolution.locator_json, index, &body);
     let mut remote = if let Some(frame_id) = resolution.frame_id {
         evaluate_handle_expression_in_frame_context(
@@ -5085,7 +5786,7 @@ async fn evaluate_locator_handle_for_page(
             &resolution.session_id,
             &frame_id,
             expression,
-            timeout,
+            deadline,
         )
         .await?
     } else {
@@ -5093,7 +5794,7 @@ async fn evaluate_locator_handle_for_page(
             &page.browser.client,
             &resolution.session_id,
             expression,
-            timeout,
+            deadline,
         )
         .await?
     };
@@ -5109,10 +5810,14 @@ async fn evaluate_locator_handle_for_page(
 async fn resolve_locator_session(
     page: Arc<PageInner>,
     locator_json: &str,
-    timeout: Duration,
+    deadline: OperationDeadline,
 ) -> RwResult<LocatorSessionResolution> {
     let original_spec: Value = serde_json::from_str(locator_json)?;
-    let _ = refresh_page_frame_tree(&page, Duration::from_millis(250)).await;
+    let _ = refresh_page_frame_tree(
+        &page,
+        deadline.remaining_capped(Duration::from_millis(250))?,
+    )
+    .await;
     let mut session_id = page.session_id.clone();
     let mut frame_id = None;
     let mut spec = original_spec.clone();
@@ -5129,7 +5834,7 @@ async fn resolve_locator_session(
             &session_id,
             frame_id.as_deref(),
             &candidate_spec,
-            timeout,
+            deadline,
         )
         .await?
         else {
@@ -5175,7 +5880,7 @@ async fn resolve_next_oopif_frame(
     current_session_id: &str,
     current_frame_id: Option<&str>,
     spec: &Value,
-    timeout: Duration,
+    deadline: OperationDeadline,
 ) -> RwResult<Option<(String, (Option<String>, Value))>> {
     let frame_chain = leading_frame_chain(spec);
     if frame_chain.is_empty() {
@@ -5204,7 +5909,7 @@ async fn resolve_next_oopif_frame(
             frame_index,
             frame_strict,
             selector_label,
-            timeout,
+            deadline,
         )
         .await?
         else {
@@ -5218,105 +5923,90 @@ async fn resolve_next_oopif_frame(
                 "cross-origin iframe did not expose a CDP frame id".to_string(),
             ));
         };
-        let mapped_session = wait_for_frame_session(&page, &frame_id, timeout).await;
-        if let Some(mapped_session) = mapped_session {
-            if mapped_session != current_session_id {
-                let remaining = frame_chain[index]
-                    .get("inner")
-                    .cloned()
-                    .unwrap_or_else(|| json!({ "kind": "css", "selector": "*" }));
-                return Ok(Some((mapped_session, (None, remaining))));
-            }
+        let remaining = frame_chain[index]
+            .get("inner")
+            .cloned()
+            .unwrap_or_else(|| json!({ "kind": "css", "selector": "*" }));
+        if let Some(mapped_session) =
+            frame_session_for_frame(&page, &frame_id, Some(current_session_id))?
+        {
+            return Ok(Some((mapped_session, (None, remaining))));
+        }
+        if owner.same_origin_accessible {
             continue;
         }
-        if let Some(parent_frame_id) =
-            current_context_frame_id(&page, current_session_id, current_frame_id)
-        {
-            if let Some(attached_session_id) = attach_iframe_target_for_frame(
-                Arc::clone(&page),
-                &frame_id,
-                &parent_frame_id,
-                owner.url.as_deref(),
-                timeout,
-            )
-            .await?
+
+        let target_info = iframe_target_info_for_frame(&page, &frame_id, deadline).await?;
+        if let Some(target_info) = target_info {
+            if !target_info
+                .get("attached")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
             {
-                let remaining = frame_chain[index]
-                    .get("inner")
-                    .cloned()
-                    .unwrap_or_else(|| json!({ "kind": "css", "selector": "*" }));
+                if let Some(attached_session_id) = attach_iframe_target_for_frame(
+                    Arc::clone(&page),
+                    &frame_id,
+                    &target_info,
+                    deadline,
+                )
+                .await?
+                {
+                    return Ok(Some((attached_session_id, (None, remaining))));
+                }
+            }
+            if let Some(attached_session_id) =
+                wait_for_frame_session(&page, &frame_id, Some(current_session_id), deadline).await?
+            {
                 return Ok(Some((attached_session_id, (None, remaining))));
             }
+            return Err(RwError::Message(
+                "iframe target attachment ended without a frame session".to_string(),
+            ));
         }
-        if !owner.same_origin_accessible {
-            let remaining = frame_chain[index]
-                .get("inner")
-                .cloned()
-                .unwrap_or_else(|| json!({ "kind": "css", "selector": "*" }));
+
+        if session_owns_frame(
+            &page.browser.client,
+            current_session_id,
+            &frame_id,
+            deadline,
+        )
+        .await?
+        {
             return Ok(Some((
                 current_session_id.to_string(),
                 (Some(frame_id), remaining),
             )));
         }
+        if let Some(attached_session_id) =
+            wait_for_frame_session(&page, &frame_id, Some(current_session_id), deadline).await?
+        {
+            return Ok(Some((attached_session_id, (None, remaining))));
+        }
+        return Err(RwError::Message(
+            "cross-origin iframe did not acquire an execution session".to_string(),
+        ));
     }
 
     Ok(None)
 }
 
-fn current_context_frame_id(
-    page: &Arc<PageInner>,
-    current_session_id: &str,
-    current_frame_id: Option<&str>,
-) -> Option<String> {
-    if let Some(frame_id) = current_frame_id {
-        return Some(frame_id.to_string());
-    }
-    if current_session_id == page.session_id {
-        return page.main_frame_id.lock().unwrap().clone();
-    }
-    page.frame_state
-        .lock()
-        .unwrap()
-        .session_frames
-        .get(current_session_id)
-        .cloned()
-}
-
 async fn attach_iframe_target_for_frame(
     page: Arc<PageInner>,
     frame_id: &str,
-    parent_frame_id: &str,
-    frame_url: Option<&str>,
-    timeout: Duration,
+    target_info: &Value,
+    deadline: OperationDeadline,
 ) -> RwResult<Option<String>> {
-    let targets = page
-        .browser
-        .client
-        .send("Target.getTargets", json!({}), None, timeout)
-        .await?;
-    let Some(targets) = targets.get("targetInfos").and_then(Value::as_array) else {
+    let Some(target_id) = target_info
+        .get("targetId")
+        .and_then(Value::as_str)
+        .filter(|target_id| *target_id == frame_id)
+    else {
         return Ok(None);
     };
-    let target_id = targets.iter().find_map(|info| {
-        if info.get("type").and_then(Value::as_str) != Some("iframe") {
-            return None;
-        }
-        if info.get("parentFrameId").and_then(Value::as_str) != Some(parent_frame_id) {
-            return None;
-        }
-        if let Some(frame_url) = frame_url {
-            let target_url = info.get("url").and_then(Value::as_str).unwrap_or("");
-            if !frame_url.is_empty() && target_url != frame_url {
-                return None;
-            }
-        }
-        info.get("targetId")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-    });
-    let Some(target_id) = target_id else {
-        return Ok(None);
-    };
+    let parent_frame_id = target_info
+        .get("parentFrameId")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
     let attached = page
         .browser
         .client
@@ -5324,16 +6014,44 @@ async fn attach_iframe_target_for_frame(
             "Target.attachToTarget",
             json!({ "targetId": target_id, "flatten": true }),
             None,
-            timeout,
+            deadline.remaining()?,
         )
         .await?;
     let Some(session_id) = attached.get("sessionId").and_then(Value::as_str) else {
         return Ok(None);
     };
     let session_id = session_id.to_string();
-    initialize_attached_iframe_session(Arc::clone(&page), frame_id.to_string(), session_id.clone())
-        .await;
+    register_attached_iframe_session(
+        Arc::clone(&page),
+        frame_id.to_string(),
+        parent_frame_id,
+        session_id.clone(),
+        deadline.remaining()?,
+    )
+    .await?;
     Ok(Some(session_id))
+}
+
+async fn iframe_target_info_for_frame(
+    page: &Arc<PageInner>,
+    frame_id: &str,
+    deadline: OperationDeadline,
+) -> RwResult<Option<Value>> {
+    let targets = page
+        .browser
+        .client
+        .send("Target.getTargets", json!({}), None, deadline.remaining()?)
+        .await?;
+    Ok(targets
+        .get("targetInfos")
+        .and_then(Value::as_array)
+        .and_then(|targets| {
+            targets.iter().find(|info| {
+                info.get("type").and_then(Value::as_str) == Some("iframe")
+                    && info.get("targetId").and_then(Value::as_str) == Some(frame_id)
+            })
+        })
+        .cloned())
 }
 
 fn leading_frame_chain(spec: &Value) -> Vec<Value> {
@@ -5385,7 +6103,7 @@ async fn describe_frame_owner(
     frame_index: i64,
     _frame_strict: bool,
     _selector_label: &str,
-    timeout: Duration,
+    deadline: OperationDeadline,
 ) -> RwResult<Option<FrameOwnerResolution>> {
     let body = format!(
         r#"
@@ -5406,38 +6124,36 @@ return frame;
             session_id,
             current_frame_id,
             expression,
-            timeout,
+            deadline,
         )
         .await?
     } else {
-        evaluate_handle_expression_in_session(client, session_id, expression, timeout).await?
+        evaluate_handle_expression_in_session(client, session_id, expression, deadline).await?
     };
     let Some(object_id) = remote.get("objectId").and_then(Value::as_str) else {
         return Ok(None);
     };
-    let same_origin_accessible = frame_owner_same_origin(client, session_id, object_id, timeout)
+    let same_origin_accessible = frame_owner_same_origin(client, session_id, object_id, deadline)
         .await
         .unwrap_or(false);
-    let frame_url = frame_owner_url(client, session_id, object_id, timeout)
-        .await
-        .ok()
-        .filter(|url| !url.is_empty());
     let described = client
         .send(
             "DOM.describeNode",
             json!({ "objectId": object_id, "depth": 0 }),
             Some(session_id),
-            timeout,
+            deadline.remaining()?,
         )
         .await;
-    let _ = client
-        .send(
-            "Runtime.releaseObject",
-            json!({ "objectId": object_id }),
-            Some(session_id),
-            Duration::from_secs(1),
-        )
-        .await;
+    if let Ok(remaining) = deadline.remaining_capped(Duration::from_secs(1)) {
+        let _ = client
+            .send(
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+                Some(session_id),
+                remaining,
+            )
+            .await;
+    }
     let described = described?;
     let frame_id = described
         .pointer("/node/frameId")
@@ -5445,7 +6161,6 @@ return frame;
         .map(ToString::to_string);
     Ok(Some(FrameOwnerResolution {
         frame_id,
-        url: frame_url,
         same_origin_accessible,
     }))
 }
@@ -5454,7 +6169,7 @@ async fn frame_owner_same_origin(
     client: &CdpClient,
     session_id: &str,
     object_id: &str,
-    timeout: Duration,
+    deadline: OperationDeadline,
 ) -> RwResult<bool> {
     let result = client
         .send(
@@ -5467,7 +6182,7 @@ async fn frame_owner_same_origin(
                 "userGesture": true,
             }),
             Some(session_id),
-            timeout,
+            deadline.remaining()?,
         )
         .await?;
     Ok(
@@ -5477,56 +6192,64 @@ async fn frame_owner_same_origin(
     )
 }
 
-async fn frame_owner_url(
+async fn session_owns_frame(
     client: &CdpClient,
     session_id: &str,
-    object_id: &str,
-    timeout: Duration,
-) -> RwResult<String> {
-    let result = client
-        .send(
-            "Runtime.callFunctionOn",
-            json!({
-                "objectId": object_id,
-                "functionDeclaration": "function() { return String(this.src || this.getAttribute('src') || ''); }",
-                "awaitPromise": true,
-                "returnByValue": true,
-                "userGesture": true,
-            }),
-            Some(session_id),
-            timeout,
-        )
-        .await?;
-    Ok(
-        serde_json::from_str::<Value>(&runtime_result_to_json(&result)?)?
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
-    )
+    frame_id: &str,
+    deadline: OperationDeadline,
+) -> RwResult<bool> {
+    match create_isolated_world_for_frame(client, session_id, frame_id, deadline.remaining()?).await
+    {
+        Ok(_) => Ok(true),
+        Err(RwError::Cdp { method, message })
+            if method == "Page.createIsolatedWorld"
+                && message.to_ascii_lowercase().contains("no frame") =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn frame_session_for_frame(
+    page: &Arc<PageInner>,
+    frame_id: &str,
+    different_from_session_id: Option<&str>,
+) -> RwResult<Option<String>> {
+    let state = page.frame_state.lock().unwrap();
+    if let Some(error) = state.frame_session_errors.get(frame_id) {
+        return Err(RwError::Message(error.clone()));
+    }
+    Ok(state.frame_sessions.get(frame_id).and_then(|session_id| {
+        let session_is_ready = session_id == &state.main_session_id
+            || state.iframe_sessions_ready.contains(session_id);
+        (session_is_ready && different_from_session_id != Some(session_id.as_str()))
+            .then(|| session_id.clone())
+    }))
 }
 
 async fn wait_for_frame_session(
     page: &Arc<PageInner>,
     frame_id: &str,
-    timeout: Duration,
-) -> Option<String> {
-    let deadline = tokio::time::Instant::now() + timeout.min(Duration::from_millis(1_000));
+    different_from_session_id: Option<&str>,
+    deadline: OperationDeadline,
+) -> RwResult<Option<String>> {
+    let mut updates = page.frame_state.lock().unwrap().subscribe_session_updates();
     loop {
-        if let Some(session_id) = page
-            .frame_state
-            .lock()
-            .unwrap()
-            .frame_sessions
-            .get(frame_id)
-            .cloned()
+        if let Some(session_id) =
+            frame_session_for_frame(page, frame_id, different_from_session_id)?
         {
-            return Some(session_id);
+            return Ok(Some(session_id));
         }
-        if tokio::time::Instant::now() >= deadline {
-            return None;
+        let remaining = deadline.remaining()?;
+        match tokio::time::timeout(remaining, updates.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Ok(None),
+            Err(_) => {
+                deadline.remaining()?;
+                return Ok(None);
+            }
         }
-        let _ = refresh_page_frame_tree(page, Duration::from_millis(100)).await;
-        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -6424,6 +7147,345 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                     }
                 }
                 Ok(())
+            })
+        })
+        .map_err(py_err)
+    }
+
+    #[pyo3(signature = (locator_json, locator_index, action_json, timeout_ms=None))]
+    fn dispatch_locator_pointer_action(
+        &self,
+        py: Python<'_>,
+        locator_json: &str,
+        locator_index: usize,
+        action_json: &str,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<()> {
+        let action = serde_json::from_str::<Value>(action_json)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let client = Arc::clone(&browser.client);
+        let locator_json = locator_json.to_string();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+
+        py.detach(move || {
+            browser.block_on(async move {
+                let deadline = OperationDeadline::new(timeout);
+                let kind = action
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RwError::Message("pointer action is missing kind".to_string()))?;
+                let number = |name: &str| {
+                    action.get(name).and_then(Value::as_f64).ok_or_else(|| {
+                        RwError::Message(format!("pointer action is missing {name}"))
+                    })
+                };
+                let integer = |name: &str, default: i64| {
+                    action.get(name).and_then(Value::as_i64).unwrap_or(default)
+                };
+                let position = action.get("position").and_then(Value::as_object);
+                let resolved = resolve_locator_point(
+                    Arc::clone(&page),
+                    &locator_json,
+                    locator_index,
+                    position.and_then(|value| value.get("x")).and_then(Value::as_f64),
+                    position.and_then(|value| value.get("y")).and_then(Value::as_f64),
+                    deadline,
+                )
+                .await?;
+                let top_x = number("targetX")?;
+                let top_y = number("targetY")?;
+                let start_x = number("startX")? - (top_x - resolved.x);
+                let start_y = number("startY")? - (top_y - resolved.y);
+                let steps = integer("steps", 1).max(1) as u32;
+                let initial_buttons = integer("initialButtons", 0);
+                let modifiers = integer("modifiers", 0);
+                let detach_events = client.subscribe();
+
+                match kind {
+                    "click" => {
+                        let button = action
+                            .get("button")
+                            .and_then(Value::as_str)
+                            .unwrap_or("left");
+                        dispatch_mouse_click_sequence_in_session(
+                            &client,
+                            &resolved.session_id,
+                            start_x,
+                            start_y,
+                            resolved.x,
+                            resolved.y,
+                            steps,
+                            button,
+                            integer("buttonMask", 1),
+                            integer("clickCount", 1),
+                            action.get("delayMs").and_then(Value::as_f64).unwrap_or(0.0).max(0.0),
+                            initial_buttons,
+                            modifiers,
+                            deadline,
+                        )
+                        .await?;
+                    }
+                    "hover" => {
+                        dispatch_mouse_move_sequence_in_session(
+                            &client,
+                            &resolved.session_id,
+                            start_x,
+                            start_y,
+                            resolved.x,
+                            resolved.y,
+                            steps,
+                            initial_buttons,
+                            modifiers,
+                            deadline,
+                        )
+                        .await?;
+                    }
+                    "tap" => {
+                        client
+                            .send(
+                                "Input.dispatchTouchEvent",
+                                json!({
+                                    "type": "touchStart",
+                                    "touchPoints": [{
+                                        "x": resolved.x,
+                                        "y": resolved.y,
+                                        "id": 0,
+                                        "radiusX": 1,
+                                        "radiusY": 1,
+                                        "force": 1,
+                                    }],
+                                    "modifiers": modifiers,
+                                }),
+                                Some(&resolved.session_id),
+                                deadline.remaining()?,
+                            )
+                            .await?;
+                        client
+                            .send(
+                                "Input.dispatchTouchEvent",
+                                json!({
+                                    "type": "touchEnd",
+                                    "touchPoints": [],
+                                    "modifiers": modifiers,
+                                }),
+                                Some(&resolved.session_id),
+                                deadline.remaining()?,
+                            )
+                            .await?;
+                    }
+                    "drag" => {
+                        let target_locator_json = action
+                            .get("targetLocator")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| RwError::Message("drag action is missing target locator".to_string()))?;
+                        let target_position = action.get("targetPosition").and_then(Value::as_object);
+                        let target = resolve_locator_point(
+                            Arc::clone(&page),
+                            target_locator_json,
+                            integer("targetIndex", 0).max(0) as usize,
+                            target_position.and_then(|value| value.get("x")).and_then(Value::as_f64),
+                            target_position.and_then(|value| value.get("y")).and_then(Value::as_f64),
+                            deadline,
+                        )
+                        .await?;
+                        if target.session_id != resolved.session_id {
+                            return Err(RwError::Message(
+                                "drag source and target must belong to the same CDP target".to_string(),
+                            ));
+                        }
+                        dispatch_mouse_move_sequence_in_session(
+                            &client,
+                            &resolved.session_id,
+                            start_x,
+                            start_y,
+                            resolved.x,
+                            resolved.y,
+                            1,
+                            initial_buttons,
+                            modifiers,
+                            deadline,
+                        )
+                        .await?;
+                        let mut press = mouse_event_payload(
+                            "mousePressed",
+                            resolved.x,
+                            resolved.y,
+                            "left",
+                            1,
+                            1,
+                            modifiers,
+                        );
+                        press["force"] = json!(0.5);
+                        client
+                            .send(
+                                "Input.dispatchMouseEvent",
+                                press,
+                                Some(&resolved.session_id),
+                                deadline.remaining()?,
+                            )
+                            .await?;
+                        run_drag_with_cleanup(
+                            &client,
+                            &page.session_id,
+                            &resolved.session_id,
+                            target.x,
+                            target.y,
+                            modifiers,
+                            async {
+                                evaluate_resolved_locator_body(
+                                    &page,
+                                    &resolved,
+                                    r#"
+if (!el) throw new Error('No element matches locator');
+const win = el.ownerDocument.defaultView || window;
+let dragEvent = null;
+let didStartDrag = Promise.resolve(false);
+const dragListener = event => dragEvent = event;
+const mouseListener = () => {
+  didStartDrag = new Promise(callback => {
+    win.addEventListener('dragstart', dragListener, { once: true, capture: true });
+    setTimeout(() => callback(dragEvent ? !dragEvent.defaultPrevented : false), 0);
+  });
+};
+win.addEventListener('mousemove', mouseListener, { once: true, capture: true });
+win.__rustwrightCleanupDrag = async () => {
+  const value = await didStartDrag;
+  win.removeEventListener('mousemove', mouseListener, { capture: true });
+  win.removeEventListener('dragstart', dragListener, { capture: true });
+  delete win.__rustwrightCleanupDrag;
+  return value;
+};
+return true;
+"#,
+                                    deadline,
+                                )
+                                .await?;
+                                let mut drag_events = client.subscribe();
+                                client
+                                    .send(
+                                        "Input.setInterceptDrags",
+                                        json!({ "enabled": true }),
+                                        Some(&page.session_id),
+                                        deadline.remaining()?,
+                                    )
+                                    .await?;
+                                let first_fraction = 1.0 / f64::from(steps);
+                                let first_x =
+                                    resolved.x + (target.x - resolved.x) * first_fraction;
+                                let first_y =
+                                    resolved.y + (target.y - resolved.y) * first_fraction;
+                                dispatch_mouse_move_sequence_in_session(
+                                    &client,
+                                    &resolved.session_id,
+                                    resolved.x,
+                                    resolved.y,
+                                    first_x,
+                                    first_y,
+                                    1,
+                                    1,
+                                    modifiers,
+                                    deadline,
+                                )
+                                .await?;
+                                let started = evaluate_resolved_locator_body(
+                                    &page,
+                                    &resolved,
+                                    r#"
+if (!el) return false;
+const win = el.ownerDocument.defaultView || window;
+return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
+"#,
+                                    deadline,
+                                )
+                                .await?
+                                .as_bool()
+                                .unwrap_or(false);
+                                if started {
+                                    wait_for_drag_intercepted(
+                                        &mut drag_events,
+                                        &resolved.session_id,
+                                        deadline,
+                                    )
+                                    .await
+                                    .map(Some)
+                                } else {
+                                    Ok(None)
+                                }
+                            },
+                            |drag_data| async {
+                                if let Some(drag_data) = drag_data {
+                                    for index in 1..=steps {
+                                        let fraction = f64::from(index) / f64::from(steps);
+                                        let x = resolved.x + (target.x - resolved.x) * fraction;
+                                        let y = resolved.y + (target.y - resolved.y) * fraction;
+                                        client
+                                            .send(
+                                                "Input.dispatchDragEvent",
+                                                json!({
+                                                    "type": if index == 1 { "dragEnter" } else { "dragOver" },
+                                                    "x": x,
+                                                    "y": y,
+                                                    "data": drag_data,
+                                                    "modifiers": modifiers,
+                                                }),
+                                                Some(&resolved.session_id),
+                                                deadline.remaining()?,
+                                            )
+                                            .await?;
+                                    }
+                                    client
+                                        .send(
+                                            "Input.dispatchDragEvent",
+                                            json!({
+                                                "type": "drop",
+                                                "x": target.x,
+                                                "y": target.y,
+                                                "data": drag_data,
+                                                "modifiers": modifiers,
+                                            }),
+                                            Some(&resolved.session_id),
+                                            deadline.remaining()?,
+                                        )
+                                        .await?;
+                                } else {
+                                    client
+                                        .send(
+                                            "Input.dispatchMouseEvent",
+                                            mouse_event_payload(
+                                                "mouseReleased",
+                                                target.x,
+                                                target.y,
+                                                "left",
+                                                0,
+                                                1,
+                                                modifiers,
+                                            ),
+                                            Some(&resolved.session_id),
+                                            deadline.remaining()?,
+                                        )
+                                        .await?;
+                                }
+                                Ok(())
+                            },
+                        )
+                        .await?;
+                    }
+                    _ => {
+                        return Err(RwError::Message(format!(
+                            "unsupported locator pointer action: {kind}"
+                        )));
+                    }
+                }
+
+                pointer_action_ordering_barrier(
+                    &client,
+                    &resolved.session_id,
+                    detach_events,
+                    deadline,
+                )
+                .await
             })
         })
         .map_err(py_err)
@@ -7389,29 +8451,37 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
             Some(arguments),
             return_by_value,
             timeout_ms,
+            None,
         );
-        let _ = self.js_handle_dispose(object_id, timeout_ms);
+        let _ = self.js_handle_dispose(object_id, timeout_ms, None);
         result.map_err(py_err)
     }
 
-    #[pyo3(signature = (object_id, timeout_ms=None))]
-    fn js_handle_json_value(&self, object_id: &str, timeout_ms: Option<f64>) -> PyResult<String> {
+    #[pyo3(signature = (object_id, timeout_ms=None, session_id=None))]
+    fn js_handle_json_value(
+        &self,
+        object_id: &str,
+        timeout_ms: Option<f64>,
+        session_id: Option<&str>,
+    ) -> PyResult<String> {
         self.call_function_on_handle(
             object_id,
             "function() { return this; }",
             None,
             true,
             timeout_ms,
+            session_id,
         )
         .map_err(py_err)
     }
 
-    #[pyo3(signature = (object_id, name, timeout_ms=None))]
+    #[pyo3(signature = (object_id, name, timeout_ms=None, session_id=None))]
     fn js_handle_get_property(
         &self,
         object_id: &str,
         name: &str,
         timeout_ms: Option<f64>,
+        session_id: Option<&str>,
     ) -> PyResult<String> {
         let args = json!([{ "value": name }]);
         self.call_function_on_handle(
@@ -7420,22 +8490,26 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
             Some(args),
             false,
             timeout_ms,
+            session_id,
         )
         .map_err(py_err)
     }
 
-    #[pyo3(signature = (object_id, timeout_ms=None))]
+    #[pyo3(signature = (object_id, timeout_ms=None, session_id=None))]
     fn js_handle_get_properties(
         &self,
         object_id: &str,
         timeout_ms: Option<f64>,
+        session_id: Option<&str>,
     ) -> PyResult<String> {
         let page = Arc::clone(&self.inner);
         let object_id = object_id.to_string();
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
         let client = Arc::clone(&browser.client);
-        let session_id = page.session_id.clone();
+        let session_id = session_id
+            .map(ToString::to_string)
+            .unwrap_or_else(|| page.session_id.clone());
         browser
             .block_on(async move {
                 let result = client
@@ -7466,7 +8540,14 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                         let Some(value) = item.get("value") else {
                             continue;
                         };
-                        properties.insert(name.to_string(), value.clone());
+                        let mut value = value.clone();
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert(
+                                "__rustwright_session_id".to_string(),
+                                Value::String(session_id.clone()),
+                            );
+                        }
+                        properties.insert(name.to_string(), value);
                     }
                 }
                 Ok(Value::Object(properties).to_string())
@@ -7474,7 +8555,7 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
             .map_err(py_err)
     }
 
-    #[pyo3(signature = (object_id, expression, arg_json=None, return_by_value=true, timeout_ms=None))]
+    #[pyo3(signature = (object_id, expression, arg_json=None, return_by_value=true, timeout_ms=None, session_id=None))]
     fn js_handle_evaluate(
         &self,
         object_id: &str,
@@ -7482,6 +8563,7 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
         arg_json: Option<&str>,
         return_by_value: bool,
         timeout_ms: Option<f64>,
+        session_id: Option<&str>,
     ) -> PyResult<String> {
         let trimmed = expression.trim();
         let function = if arg_json.is_some() {
@@ -7497,11 +8579,18 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
             })
             .transpose()
             .map_err(py_err)?;
-        self.call_function_on_handle(object_id, &function, args, return_by_value, timeout_ms)
-            .map_err(py_err)
+        self.call_function_on_handle(
+            object_id,
+            &function,
+            args,
+            return_by_value,
+            timeout_ms,
+            session_id,
+        )
+        .map_err(py_err)
     }
 
-    #[pyo3(signature = (object_id, function_declaration, arguments_json, return_by_value=true, timeout_ms=None))]
+    #[pyo3(signature = (object_id, function_declaration, arguments_json, return_by_value=true, timeout_ms=None, session_id=None))]
     fn js_handle_evaluate_with_call_arguments(
         &self,
         object_id: &str,
@@ -7509,6 +8598,7 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
         arguments_json: &str,
         return_by_value: bool,
         timeout_ms: Option<f64>,
+        session_id: Option<&str>,
     ) -> PyResult<String> {
         let arguments = serde_json::from_str::<Value>(arguments_json)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -7518,18 +8608,26 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
             Some(arguments),
             return_by_value,
             timeout_ms,
+            session_id,
         )
         .map_err(py_err)
     }
 
-    #[pyo3(signature = (object_id, timeout_ms=None))]
-    fn js_handle_dispose(&self, object_id: &str, timeout_ms: Option<f64>) -> PyResult<()> {
+    #[pyo3(signature = (object_id, timeout_ms=None, session_id=None))]
+    fn js_handle_dispose(
+        &self,
+        object_id: &str,
+        timeout_ms: Option<f64>,
+        session_id: Option<&str>,
+    ) -> PyResult<()> {
         let page = Arc::clone(&self.inner);
         let object_id = object_id.to_string();
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
         let client = Arc::clone(&browser.client);
-        let session_id = page.session_id.clone();
+        let session_id = session_id
+            .map(ToString::to_string)
+            .unwrap_or_else(|| page.session_id.clone());
         browser
             .block_on(async move {
                 client
@@ -9775,7 +10873,7 @@ impl PyPage {
                     timeout,
                 )
                 .await?;
-            runtime_result_to_remote_object(&result)
+            runtime_result_to_remote_object_with_session(&result, &session_id)
         })
     }
 
@@ -9786,6 +10884,7 @@ impl PyPage {
         arguments: Option<Value>,
         return_by_value: bool,
         timeout_ms: Option<f64>,
+        session_id: Option<&str>,
     ) -> RwResult<String> {
         let page = Arc::clone(&self.inner);
         let object_id = object_id.to_string();
@@ -9793,7 +10892,9 @@ impl PyPage {
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
         let client = Arc::clone(&browser.client);
-        let session_id = page.session_id.clone();
+        let session_id = session_id
+            .map(ToString::to_string)
+            .unwrap_or_else(|| page.session_id.clone());
         browser.block_on(async move {
             let mut params = json!({
                 "objectId": object_id,
@@ -9811,7 +10912,7 @@ impl PyPage {
             if return_by_value {
                 runtime_result_to_json_with_serializer(&client, &session_id, &result, timeout).await
             } else {
-                runtime_result_to_remote_object(&result)
+                runtime_result_to_remote_object_with_session(&result, &session_id)
             }
         })
     }
@@ -10492,7 +11593,7 @@ async fn attach_existing_page_unregistered(
     )
     .await?;
     install_stealth_defaults(&browser, &session_id).await?;
-    enable_page_iframe_auto_attach(&browser.client, &session_id).await?;
+    enable_page_iframe_auto_attach(&browser.client, &session_id, Duration::from_secs(5)).await?;
     let page_inner = Arc::new(PageInner {
         browser: Arc::clone(&browser),
         target_id,
@@ -10548,7 +11649,11 @@ async fn attach_existing_worker(
     })
 }
 
-async fn enable_page_iframe_auto_attach(client: &CdpClient, session_id: &str) -> RwResult<()> {
+async fn enable_page_iframe_auto_attach(
+    client: &CdpClient,
+    session_id: &str,
+    timeout: Duration,
+) -> RwResult<()> {
     client
         .send(
             "Target.setAutoAttach",
@@ -10562,24 +11667,85 @@ async fn enable_page_iframe_auto_attach(client: &CdpClient, session_id: &str) ->
                 ],
             }),
             Some(session_id),
-            Duration::from_secs(5),
+            timeout,
         )
         .await?;
     Ok(())
 }
 
-async fn initialize_attached_iframe_session(
+async fn register_attached_iframe_session(
     page: Arc<PageInner>,
     frame_id: String,
+    parent_frame_id: Option<String>,
     child_session_id: String,
-) {
+    timeout: Duration,
+) -> RwResult<()> {
     let client = Arc::clone(&page.browser.client);
     {
         let mut state = page.frame_state.lock().unwrap();
         state.record_session_for_frame(&frame_id, &child_session_id);
-        state.record_frame(frame_id.clone(), None, None, None, child_session_id.clone());
+        state.record_frame(
+            frame_id.clone(),
+            parent_frame_id,
+            None,
+            None,
+            child_session_id.clone(),
+        );
     }
-    let _ = try_join_all(
+    if let Err(error) = enable_page_iframe_auto_attach(&client, &child_session_id, timeout).await {
+        page.frame_state
+            .lock()
+            .unwrap()
+            .record_frame_session_error_if_current(&frame_id, &child_session_id, error.to_string());
+        return Err(error);
+    }
+    page.frame_state
+        .lock()
+        .unwrap()
+        .mark_iframe_session_armed(&child_session_id);
+    spawn_attached_iframe_session_setup(page, frame_id, child_session_id);
+    Ok(())
+}
+
+fn spawn_attached_iframe_session_setup(
+    page: Arc<PageInner>,
+    frame_id: String,
+    child_session_id: String,
+) {
+    let should_start = page
+        .frame_state
+        .lock()
+        .unwrap()
+        .mark_iframe_setup_started(&child_session_id);
+    if !should_start {
+        return;
+    }
+    tokio::spawn(async move {
+        match setup_attached_iframe_session(Arc::clone(&page), child_session_id.clone()).await {
+            Ok(()) => page
+                .frame_state
+                .lock()
+                .unwrap()
+                .mark_iframe_session_ready(&frame_id, &child_session_id),
+            Err(error) => page
+                .frame_state
+                .lock()
+                .unwrap()
+                .record_frame_session_error_if_current(
+                    &frame_id,
+                    &child_session_id,
+                    error.to_string(),
+                ),
+        }
+    });
+}
+
+async fn setup_attached_iframe_session(
+    page: Arc<PageInner>,
+    child_session_id: String,
+) -> RwResult<()> {
+    let client = Arc::clone(&page.browser.client);
+    try_join_all(
         ["Page.enable", "DOM.enable", "Network.enable"]
             .into_iter()
             .map(|method| {
@@ -10591,10 +11757,9 @@ async fn initialize_attached_iframe_session(
                 )
             }),
     )
-    .await;
-    let _ = install_stealth_defaults(&page.browser, &child_session_id).await;
-    let _ = enable_page_iframe_auto_attach(&client, &child_session_id).await;
-    let _ = refresh_page_frame_tree(&page, Duration::from_secs(5)).await;
+    .await?;
+    install_stealth_defaults(&page.browser, &child_session_id).await?;
+    refresh_page_frame_tree(&page, Duration::from_secs(5)).await
 }
 
 fn spawn_page_oopif_event_listener(page: Weak<PageInner>) {
@@ -10656,10 +11821,16 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
         let Some(frame_id) = target_info.get("targetId").and_then(Value::as_str) else {
             return;
         };
-        initialize_attached_iframe_session(
+        let parent_frame_id = target_info
+            .get("parentFrameId")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let _ = register_attached_iframe_session(
             Arc::clone(&page),
             frame_id.to_string(),
+            parent_frame_id,
             child_session_id.to_string(),
+            Duration::from_secs(5),
         )
         .await;
         return;
@@ -10670,14 +11841,10 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
         else {
             return;
         };
-        let mut state = page.frame_state.lock().unwrap();
-        if let Some(frame_id) = state.session_frames.remove(detached_session_id) {
-            state.frame_sessions.remove(&frame_id);
-            let main_session_id = state.main_session_id.clone();
-            if let Some(record) = state.frames.get_mut(&frame_id) {
-                record.session_id = main_session_id;
-            }
-        }
+        page.frame_state
+            .lock()
+            .unwrap()
+            .detach_session(detached_session_id);
         return;
     }
 
@@ -10755,8 +11922,11 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
             );
         }
         "Page.frameDetached" => {
-            if let Some(frame_id) = params.get("frameId").and_then(Value::as_str) {
-                page.frame_state.lock().unwrap().remove_frame(frame_id);
+            let reason = params.get("reason").and_then(Value::as_str).unwrap_or("");
+            if reason != "swap" {
+                if let Some(frame_id) = params.get("frameId").and_then(Value::as_str) {
+                    page.frame_state.lock().unwrap().remove_frame(frame_id);
+                }
             }
         }
         _ => {}
@@ -10764,28 +11934,42 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
 }
 
 async fn refresh_page_frame_tree(page: &Arc<PageInner>, timeout: Duration) -> RwResult<()> {
+    let deadline = OperationDeadline::new(timeout);
     let sessions = page.frame_state.lock().unwrap().session_ids();
     for session_id in sessions {
+        let Ok(remaining) = deadline.remaining() else {
+            break;
+        };
         let result = page
             .browser
             .client
-            .send("Page.getFrameTree", json!({}), Some(&session_id), timeout)
+            .send("Page.getFrameTree", json!({}), Some(&session_id), remaining)
             .await;
         let Ok(tree) = result else {
             continue;
         };
         if let Some(root) = tree.get("frameTree") {
-            ingest_frame_tree_node(page, root, &session_id);
+            let mut visited = HashSet::new();
+            ingest_frame_tree_node(page, root, &session_id, &mut visited, 0);
         }
     }
     Ok(())
 }
 
-fn ingest_frame_tree_node(page: &Arc<PageInner>, node: &Value, session_id: &str) {
+fn ingest_frame_tree_node(
+    page: &Arc<PageInner>,
+    node: &Value,
+    session_id: &str,
+    visited: &mut HashSet<String>,
+    depth: usize,
+) {
     let frame = node.get("frame").unwrap_or(&Value::Null);
     let Some(frame_id) = frame.get("id").and_then(Value::as_str) else {
         return;
     };
+    if depth >= MAX_FRAME_TREE_DEPTH || !visited.insert(frame_id.to_string()) {
+        return;
+    }
     let parent_id = frame
         .get("parentId")
         .and_then(Value::as_str)
@@ -10810,7 +11994,7 @@ fn ingest_frame_tree_node(page: &Arc<PageInner>, node: &Value, session_id: &str)
     );
     if let Some(children) = node.get("childFrames").and_then(Value::as_array) {
         for child in children {
-            ingest_frame_tree_node(page, child, session_id);
+            ingest_frame_tree_node(page, child, session_id, visited, depth + 1);
         }
     }
 }
@@ -15209,6 +16393,23 @@ fn runtime_result_to_remote_object(result: &Value) -> RwResult<String> {
         .cloned()
         .unwrap_or(Value::Null)
         .to_string())
+}
+
+fn runtime_result_to_remote_object_with_session(
+    result: &Value,
+    session_id: &str,
+) -> RwResult<String> {
+    if let Some(exception) = result.get("exceptionDetails") {
+        return Err(RwError::Message(runtime_exception_message(exception)));
+    }
+    let mut remote = result.get("result").cloned().unwrap_or(Value::Null);
+    if let Some(object) = remote.as_object_mut() {
+        object.insert(
+            "__rustwright_session_id".to_string(),
+            Value::String(session_id.to_string()),
+        );
+    }
+    Ok(remote.to_string())
 }
 
 fn simple_css_locator_spec(value: &Value) -> bool {
