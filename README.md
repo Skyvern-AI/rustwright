@@ -25,6 +25,14 @@ playwright-python:  your code ──pipe──► Node driver (separate process)
 rustwright:         your code ────────────────── raw CDP ─────────────────────► Chromium
 ```
 
+<div align="center">
+
+<img src="docs/assets/rustwright_vs_playwright.gif" alt="Rustwright vs playwright-python live demo" width="360" />
+
+<sub>Live demo · Rustwright vs playwright-python · <a href="docs/assets/rustwright_vs_playwright.mp4">watch the mp4</a></sub>
+
+</div>
+
 ## Quickstart
 
 Rustwright is interoperable with Playwright — install it, change one import, and your existing code runs on the Rust engine.
