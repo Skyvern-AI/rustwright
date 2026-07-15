@@ -1,0 +1,12 @@
+[
+  {
+    "id": "the_internet_sample_download",
+    "category": "download",
+    "url": "https://the-internet.herokuapp.com/download",
+    "download_trigger": {
+      "op": "click",
+      "selector": "a[href=\"download/some-file.txt\"]"
+    },
+    "expect_download": true
+  }
+]

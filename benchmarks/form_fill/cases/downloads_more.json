@@ -1,0 +1,22 @@
+[
+  {
+    "id": "samplelib_empty_pdf_download",
+    "category": "download",
+    "url": "https://samplelib.com/sample-pdf.html",
+    "download_trigger": {
+      "op": "click",
+      "selector": "a[href=\"/pdf/sample-empty.pdf\"]"
+    },
+    "expect_download": true
+  },
+  {
+    "id": "samplelib_one_page_pdf_download",
+    "category": "download",
+    "url": "https://samplelib.com/sample-pdf.html",
+    "download_trigger": {
+      "op": "click",
+      "selector": "a[href=\"/pdf/sample1.pdf\"]"
+    },
+    "expect_download": true
+  }
+]

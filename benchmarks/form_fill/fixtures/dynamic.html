@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Controlled dynamic wait fixture</title>
+</head>
+<body>
+  <main>
+    <h1>Controlled dynamic wait fixture</h1>
+    <button id="start" type="button">Start fixed wait</button>
+    <div id="done" hidden>Done</div>
+  </main>
+  <script>
+    "use strict";
+    document.querySelector("#start").addEventListener("click", (event) => {
+      event.currentTarget.disabled = true;
+      window.setTimeout(() => {
+        document.querySelector("#done").hidden = false;
+      }, 300);
+    }, {once: true});
+  </script>
+</body>
+</html>

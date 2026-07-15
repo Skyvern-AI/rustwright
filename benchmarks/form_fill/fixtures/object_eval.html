@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Controlled object evaluation fixture</title>
+</head>
+<body>
+  <main id="ready">Object evaluation fixture ready.</main>
+  <script>
+    "use strict";
+    window.buildNestedObject = (depth, breadth) => {
+      if (!Number.isInteger(depth) || depth < 0) {
+        throw new TypeError("depth must be a non-negative integer");
+      }
+      if (!Number.isInteger(breadth) || breadth < 1) {
+        throw new TypeError("breadth must be a positive integer");
+      }
+
+      const buildLevel = (level) => {
+        if (level === depth) {
+          return {level, value: "leaf"};
+        }
+        const node = {level};
+        for (let index = 0; index < breadth; index += 1) {
+          node[`child-${index}`] = buildLevel(level + 1);
+        }
+        return node;
+      };
+
+      return {depth, breadth, root: buildLevel(0)};
+    };
+  </script>
+</body>
+</html>

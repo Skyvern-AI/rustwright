@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Controlled deep DOM fixture</title>
+</head>
+<body>
+  <main id="deep-root">
+    <h1>Controlled deep DOM fixture</h1>
+  </main>
+  <script>
+    "use strict";
+    let parent = document.querySelector("#deep-root");
+    for (let depth = 1; depth <= 50; depth += 1) {
+      const child = document.createElement("div");
+      child.id = `depth-${depth}`;
+      child.dataset.depth = String(depth);
+      parent.appendChild(child);
+      parent = child;
+    }
+    parent.textContent = "Depth 50";
+  </script>
+</body>
+</html>

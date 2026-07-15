@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Controlled form fixture</title>
+</head>
+<body>
+  <main>
+    <h1>Controlled form fixture</h1>
+    <form id="fixture-form" onsubmit="return false">
+      <label for="field-0">First name</label>
+      <input id="field-0" name="first_name" type="text">
+      <label for="field-1">Last name</label>
+      <input id="field-1" name="last_name" type="text">
+      <label for="field-2">Email</label>
+      <input id="field-2" name="email" type="text">
+      <label for="field-3">Company</label>
+      <input id="field-3" name="company" type="text">
+      <label for="field-4">City</label>
+      <input id="field-4" name="city" type="text">
+      <label for="field-5">Notes</label>
+      <input id="field-5" name="notes" type="text">
+
+      <label for="field-6">Email updates</label>
+      <input id="field-6" name="email_updates" type="checkbox">
+      <label for="field-7">Product updates</label>
+      <input id="field-7" name="product_updates" type="checkbox">
+      <label for="field-8">Research updates</label>
+      <input id="field-8" name="research_updates" type="checkbox">
+
+      <label for="field-9">Region</label>
+      <select id="field-9" name="region">
+        <option value="north">North</option>
+        <option value="south">South</option>
+      </select>
+      <label for="field-10">Plan</label>
+      <select id="field-10" name="plan">
+        <option value="basic">Basic</option>
+        <option value="pro">Pro</option>
+      </select>
+      <label for="field-11">Team size</label>
+      <select id="field-11" name="team_size">
+        <option value="small">Small</option>
+        <option value="large">Large</option>
+      </select>
+
+      <button id="submit" type="submit" disabled>Submit disabled</button>
+    </form>
+  </main>
+</body>
+</html>

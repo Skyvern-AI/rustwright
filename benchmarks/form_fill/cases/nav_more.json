@@ -1,0 +1,175 @@
+[
+  {
+    "id": "internet_tables_read_sorted_last_names",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/tables",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/tables"
+      },
+      {
+        "op": "wait",
+        "selector": "#table1 tbody tr"
+      },
+      {
+        "op": "eval",
+        "expression": "Array.from(document.querySelectorAll('#table1 tbody .last-name'), (cell) => cell.textContent.trim()).sort((left, right) => left.localeCompare(right))"
+      }
+    ]
+  },
+  {
+    "id": "internet_jquery_menu_reveal_download_labels",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/jqueryui/menu",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/jqueryui/menu"
+      },
+      {
+        "op": "wait",
+        "selector": "#ui-id-3"
+      },
+      {
+        "op": "click",
+        "selector": "#ui-id-3"
+      },
+      {
+        "op": "click",
+        "selector": "#ui-id-4"
+      },
+      {
+        "op": "wait",
+        "selector": "#ui-id-5"
+      },
+      {
+        "op": "eval",
+        "expression": "Array.from(document.querySelectorAll(\"#menu a[href^='/download/jqueryui/menu/']\"), (link) => link.textContent.trim())"
+      }
+    ]
+  },
+  {
+    "id": "internet_add_four_elements",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/add_remove_elements/",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/add_remove_elements/"
+      },
+      {
+        "op": "wait",
+        "selector": ".example button[onclick='addElement()']"
+      },
+      {
+        "op": "click",
+        "selector": ".example button[onclick='addElement()']"
+      },
+      {
+        "op": "click",
+        "selector": ".example button[onclick='addElement()']"
+      },
+      {
+        "op": "click",
+        "selector": ".example button[onclick='addElement()']"
+      },
+      {
+        "op": "click",
+        "selector": ".example button[onclick='addElement()']"
+      },
+      {
+        "op": "wait",
+        "selector": "#elements .added-manually"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#elements .added-manually').length"
+      }
+    ]
+  },
+  {
+    "id": "internet_notification_message_refresh",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/notification_message",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/notification_message"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/notification_message']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/notification_message']"
+      },
+      {
+        "op": "wait",
+        "selector": "#flash"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#flash').textContent.trim()"
+      }
+    ]
+  },
+  {
+    "id": "internet_shifting_menu_read_links",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/shifting_content/menu",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/shifting_content/menu"
+      },
+      {
+        "op": "wait",
+        "selector": ".example li a[href='/']"
+      },
+      {
+        "op": "eval",
+        "expression": "Array.from(document.querySelectorAll('.example li a'), (link) => ({ text: link.textContent.trim(), href: link.getAttribute('href') }))"
+      }
+    ]
+  },
+  {
+    "id": "internet_typos_read_copy",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/typos",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/typos"
+      },
+      {
+        "op": "wait",
+        "selector": ".example p"
+      },
+      {
+        "op": "eval",
+        "expression": "Array.from(document.querySelectorAll('.example p'), (paragraph) => paragraph.textContent.trim())"
+      }
+    ]
+  },
+  {
+    "id": "internet_disappearing_elements_read_links",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/disappearing_elements",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/disappearing_elements"
+      },
+      {
+        "op": "wait",
+        "selector": ".example li a[href='/']"
+      },
+      {
+        "op": "eval",
+        "expression": "Array.from(document.querySelectorAll('.example li a'), (link) => ({ text: link.textContent.trim(), href: link.getAttribute('href') }))"
+      }
+    ]
+  }
+]

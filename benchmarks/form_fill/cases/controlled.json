@@ -1,0 +1,1602 @@
+[
+  {
+    "id": "controlled_click_20_buttons",
+    "category": "navigation",
+    "fixture": "click.html",
+    "controlled_operation": "click",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGNsaWNrIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluPgogICAgPGgxPkNvbnRyb2xsZWQgY2xpY2sgZml4dHVyZTwvaDE+CiAgICA8YnV0dG9uIGlkPSJidG4tMCIgdHlwZT0iYnV0dG9uIiBkYXRhLWFjdGl2ZT0iZmFsc2UiPkJ1dHRvbiAwPC9idXR0b24+CiAgICA8YnV0dG9uIGlkPSJidG4tMSIgdHlwZT0iYnV0dG9uIiBkYXRhLWFjdGl2ZT0iZmFsc2UiPkJ1dHRvbiAxPC9idXR0b24+CiAgICA8YnV0dG9uIGlkPSJidG4tMiIgdHlwZT0iYnV0dG9uIiBkYXRhLWFjdGl2ZT0iZmFsc2UiPkJ1dHRvbiAyPC9idXR0b24+CiAgICA8YnV0dG9uIGlkPSJidG4tMyIgdHlwZT0iYnV0dG9uIiBkYXRhLWFjdGl2ZT0iZmFsc2UiPkJ1dHRvbiAzPC9idXR0b24+CiAgICA8YnV0dG9uIGlkPSJidG4tNCIgdHlwZT0iYnV0dG9uIiBkYXRhLWFjdGl2ZT0iZmFsc2UiPkJ1dHRvbiA0PC9idXR0b24+CiAgICA8YnV0dG9uIGlkPSJidG4tNSIgdHlwZT0iYnV0dG9uIiBkYXRhLWFjdGl2ZT0iZmFsc2UiPkJ1dHRvbiA1PC9idXR0b24+CiAgICA8YnV0dG9uIGlkPSJidG4tNiIgdHlwZT0iYnV0dG9uIiBkYXRhLWFjdGl2ZT0iZmFsc2UiPkJ1dHRvbiA2PC9idXR0b24+CiAgICA8YnV0dG9uIGlkPSJidG4tNyIgdHlwZT0iYnV0dG9uIiBkYXRhLWFjdGl2ZT0iZmFsc2UiPkJ1dHRvbiA3PC9idXR0b24+CiAgICA8YnV0dG9uIGlkPSJidG4tOCIgdHlwZT0iYnV0dG9uIiBkYXRhLWFjdGl2ZT0iZmFsc2UiPkJ1dHRvbiA4PC9idXR0b24+CiAgICA8YnV0dG9uIGlkPSJidG4tOSIgdHlwZT0iYnV0dG9uIiBkYXRhLWFjdGl2ZT0iZmFsc2UiPkJ1dHRvbiA5PC9idXR0b24+CiAgICA8YnV0dG9uIGlkPSJidG4tMTAiIHR5cGU9ImJ1dHRvbiIgZGF0YS1hY3RpdmU9ImZhbHNlIj5CdXR0b24gMTA8L2J1dHRvbj4KICAgIDxidXR0b24gaWQ9ImJ0bi0xMSIgdHlwZT0iYnV0dG9uIiBkYXRhLWFjdGl2ZT0iZmFsc2UiPkJ1dHRvbiAxMTwvYnV0dG9uPgogICAgPGJ1dHRvbiBpZD0iYnRuLTEyIiB0eXBlPSJidXR0b24iIGRhdGEtYWN0aXZlPSJmYWxzZSI+QnV0dG9uIDEyPC9idXR0b24+CiAgICA8YnV0dG9uIGlkPSJidG4tMTMiIHR5cGU9ImJ1dHRvbiIgZGF0YS1hY3RpdmU9ImZhbHNlIj5CdXR0b24gMTM8L2J1dHRvbj4KICAgIDxidXR0b24gaWQ9ImJ0bi0xNCIgdHlwZT0iYnV0dG9uIiBkYXRhLWFjdGl2ZT0iZmFsc2UiPkJ1dHRvbiAxNDwvYnV0dG9uPgogICAgPGJ1dHRvbiBpZD0iYnRuLTE1IiB0eXBlPSJidXR0b24iIGRhdGEtYWN0aXZlPSJmYWxzZSI+QnV0dG9uIDE1PC9idXR0b24+CiAgICA8YnV0dG9uIGlkPSJidG4tMTYiIHR5cGU9ImJ1dHRvbiIgZGF0YS1hY3RpdmU9ImZhbHNlIj5CdXR0b24gMTY8L2J1dHRvbj4KICAgIDxidXR0b24gaWQ9ImJ0bi0xNyIgdHlwZT0iYnV0dG9uIiBkYXRhLWFjdGl2ZT0iZmFsc2UiPkJ1dHRvbiAxNzwvYnV0dG9uPgogICAgPGJ1dHRvbiBpZD0iYnRuLTE4IiB0eXBlPSJidXR0b24iIGRhdGEtYWN0aXZlPSJmYWxzZSI+QnV0dG9uIDE4PC9idXR0b24+CiAgICA8YnV0dG9uIGlkPSJidG4tMTkiIHR5cGU9ImJ1dHRvbiIgZGF0YS1hY3RpdmU9ImZhbHNlIj5CdXR0b24gMTk8L2J1dHRvbj4KICA8L21haW4+CiAgPHNjcmlwdD4KICAgICJ1c2Ugc3RyaWN0IjsKICAgIGZvciAoY29uc3QgYnV0dG9uIG9mIGRvY3VtZW50LnF1ZXJ5U2VsZWN0b3JBbGwoImJ1dHRvbiIpKSB7CiAgICAgIGJ1dHRvbi5hZGRFdmVudExpc3RlbmVyKCJjbGljayIsICgpID0+IHsKICAgICAgICBidXR0b24uZGF0YXNldC5hY3RpdmUgPSBTdHJpbmcoYnV0dG9uLmRhdGFzZXQuYWN0aXZlICE9PSAidHJ1ZSIpOwogICAgICB9KTsKICAgIH0KICA8L3NjcmlwdD4KPC9ib2R5Pgo8L2h0bWw+Cg=="
+      },
+      {
+        "op": "click",
+        "selector": "#btn-0"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-1"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-2"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-3"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-4"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-5"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-6"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-7"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-8"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-9"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-10"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-11"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-12"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-13"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-14"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-15"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-16"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-17"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-18"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-19"
+      }
+    ]
+  },
+  {
+    "id": "controlled_evaluate_rtt_100",
+    "category": "navigation",
+    "fixture": "evaluate.html",
+    "controlled_operation": "eval",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      },
+      {
+        "op": "eval",
+        "expression": "1 + 1"
+      }
+    ]
+  },
+  {
+    "id": "controlled_object_eval_small_25",
+    "category": "navigation",
+    "fixture": "object_eval.html",
+    "controlled_operation": "eval",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIG9iamVjdCBldmFsdWF0aW9uIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+T2JqZWN0IGV2YWx1YXRpb24gZml4dHVyZSByZWFkeS48L21haW4+CiAgPHNjcmlwdD4KICAgICJ1c2Ugc3RyaWN0IjsKICAgIHdpbmRvdy5idWlsZE5lc3RlZE9iamVjdCA9IChkZXB0aCwgYnJlYWR0aCkgPT4gewogICAgICBpZiAoIU51bWJlci5pc0ludGVnZXIoZGVwdGgpIHx8IGRlcHRoIDwgMCkgewogICAgICAgIHRocm93IG5ldyBUeXBlRXJyb3IoImRlcHRoIG11c3QgYmUgYSBub24tbmVnYXRpdmUgaW50ZWdlciIpOwogICAgICB9CiAgICAgIGlmICghTnVtYmVyLmlzSW50ZWdlcihicmVhZHRoKSB8fCBicmVhZHRoIDwgMSkgewogICAgICAgIHRocm93IG5ldyBUeXBlRXJyb3IoImJyZWFkdGggbXVzdCBiZSBhIHBvc2l0aXZlIGludGVnZXIiKTsKICAgICAgfQoKICAgICAgY29uc3QgYnVpbGRMZXZlbCA9IChsZXZlbCkgPT4gewogICAgICAgIGlmIChsZXZlbCA9PT0gZGVwdGgpIHsKICAgICAgICAgIHJldHVybiB7bGV2ZWwsIHZhbHVlOiAibGVhZiJ9OwogICAgICAgIH0KICAgICAgICBjb25zdCBub2RlID0ge2xldmVsfTsKICAgICAgICBmb3IgKGxldCBpbmRleCA9IDA7IGluZGV4IDwgYnJlYWR0aDsgaW5kZXggKz0gMSkgewogICAgICAgICAgbm9kZVtgY2hpbGQtJHtpbmRleH1gXSA9IGJ1aWxkTGV2ZWwobGV2ZWwgKyAxKTsKICAgICAgICB9CiAgICAgICAgcmV0dXJuIG5vZGU7CiAgICAgIH07CgogICAgICByZXR1cm4ge2RlcHRoLCBicmVhZHRoLCByb290OiBidWlsZExldmVsKDApfTsKICAgIH07CiAgPC9zY3JpcHQ+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(3, 4)"
+      }
+    ]
+  },
+  {
+    "id": "controlled_object_eval_large_10",
+    "category": "navigation",
+    "fixture": "object_eval.html",
+    "controlled_operation": "eval",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIG9iamVjdCBldmFsdWF0aW9uIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+T2JqZWN0IGV2YWx1YXRpb24gZml4dHVyZSByZWFkeS48L21haW4+CiAgPHNjcmlwdD4KICAgICJ1c2Ugc3RyaWN0IjsKICAgIHdpbmRvdy5idWlsZE5lc3RlZE9iamVjdCA9IChkZXB0aCwgYnJlYWR0aCkgPT4gewogICAgICBpZiAoIU51bWJlci5pc0ludGVnZXIoZGVwdGgpIHx8IGRlcHRoIDwgMCkgewogICAgICAgIHRocm93IG5ldyBUeXBlRXJyb3IoImRlcHRoIG11c3QgYmUgYSBub24tbmVnYXRpdmUgaW50ZWdlciIpOwogICAgICB9CiAgICAgIGlmICghTnVtYmVyLmlzSW50ZWdlcihicmVhZHRoKSB8fCBicmVhZHRoIDwgMSkgewogICAgICAgIHRocm93IG5ldyBUeXBlRXJyb3IoImJyZWFkdGggbXVzdCBiZSBhIHBvc2l0aXZlIGludGVnZXIiKTsKICAgICAgfQoKICAgICAgY29uc3QgYnVpbGRMZXZlbCA9IChsZXZlbCkgPT4gewogICAgICAgIGlmIChsZXZlbCA9PT0gZGVwdGgpIHsKICAgICAgICAgIHJldHVybiB7bGV2ZWwsIHZhbHVlOiAibGVhZiJ9OwogICAgICAgIH0KICAgICAgICBjb25zdCBub2RlID0ge2xldmVsfTsKICAgICAgICBmb3IgKGxldCBpbmRleCA9IDA7IGluZGV4IDwgYnJlYWR0aDsgaW5kZXggKz0gMSkgewogICAgICAgICAgbm9kZVtgY2hpbGQtJHtpbmRleH1gXSA9IGJ1aWxkTGV2ZWwobGV2ZWwgKyAxKTsKICAgICAgICB9CiAgICAgICAgcmV0dXJuIG5vZGU7CiAgICAgIH07CgogICAgICByZXR1cm4ge2RlcHRoLCBicmVhZHRoLCByb290OiBidWlsZExldmVsKDApfTsKICAgIH07CiAgPC9zY3JpcHQ+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(5, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(5, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(5, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(5, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(5, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(5, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(5, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(5, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(5, 4)"
+      },
+      {
+        "op": "eval",
+        "expression": "buildNestedObject(5, 4)"
+      }
+    ]
+  },
+  {
+    "id": "controlled_large_dom_all_cells_20",
+    "category": "navigation",
+    "fixture": "large_dom.html",
+    "controlled_operation": "eval",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGxhcmdlIERPTSBmaXh0dXJlPC90aXRsZT4KPC9oZWFkPgo8Ym9keT4KICA8bWFpbj4KICAgIDxoMT5Db250cm9sbGVkIGxhcmdlIERPTSBmaXh0dXJlPC9oMT4KICAgIDx0YWJsZSBpZD0ibGFyZ2UtdGFibGUiPgogICAgICA8dGJvZHkgaWQ9ImxhcmdlLXRhYmxlLWJvZHkiPjwvdGJvZHk+CiAgICA8L3RhYmxlPgogIDwvbWFpbj4KICA8c2NyaXB0PgogICAgInVzZSBzdHJpY3QiOwogICAgY29uc3QgYm9keSA9IGRvY3VtZW50LnF1ZXJ5U2VsZWN0b3IoIiNsYXJnZS10YWJsZS1ib2R5Iik7CiAgICBjb25zdCByb3dzID0gZG9jdW1lbnQuY3JlYXRlRG9jdW1lbnRGcmFnbWVudCgpOwogICAgZm9yIChsZXQgcm93SW5kZXggPSAwOyByb3dJbmRleCA8IDIwMDA7IHJvd0luZGV4ICs9IDEpIHsKICAgICAgY29uc3Qgcm93ID0gZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgidHIiKTsKICAgICAgcm93LmlkID0gYHJvdy0ke3Jvd0luZGV4fWA7CiAgICAgIGZvciAobGV0IGNvbHVtbkluZGV4ID0gMDsgY29sdW1uSW5kZXggPCAxMDsgY29sdW1uSW5kZXggKz0gMSkgewogICAgICAgIGNvbnN0IGNlbGwgPSBkb2N1bWVudC5jcmVhdGVFbGVtZW50KCJ0ZCIpOwogICAgICAgIGNlbGwuaWQgPSBgY2VsbC0ke3Jvd0luZGV4fS0ke2NvbHVtbkluZGV4fWA7CiAgICAgICAgY2VsbC50ZXh0Q29udGVudCA9IGAke3Jvd0luZGV4fToke2NvbHVtbkluZGV4fWA7CiAgICAgICAgcm93LmFwcGVuZENoaWxkKGNlbGwpOwogICAgICB9CiAgICAgIHJvd3MuYXBwZW5kQ2hpbGQocm93KTsKICAgIH0KICAgIGJvZHkuYXBwZW5kQ2hpbGQocm93cyk7CiAgPC9zY3JpcHQ+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#large-table td').length"
+      }
+    ]
+  },
+  {
+    "id": "controlled_large_dom_id_lookup_100",
+    "category": "navigation",
+    "fixture": "large_dom.html",
+    "controlled_operation": "eval",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGxhcmdlIERPTSBmaXh0dXJlPC90aXRsZT4KPC9oZWFkPgo8Ym9keT4KICA8bWFpbj4KICAgIDxoMT5Db250cm9sbGVkIGxhcmdlIERPTSBmaXh0dXJlPC9oMT4KICAgIDx0YWJsZSBpZD0ibGFyZ2UtdGFibGUiPgogICAgICA8dGJvZHkgaWQ9ImxhcmdlLXRhYmxlLWJvZHkiPjwvdGJvZHk+CiAgICA8L3RhYmxlPgogIDwvbWFpbj4KICA8c2NyaXB0PgogICAgInVzZSBzdHJpY3QiOwogICAgY29uc3QgYm9keSA9IGRvY3VtZW50LnF1ZXJ5U2VsZWN0b3IoIiNsYXJnZS10YWJsZS1ib2R5Iik7CiAgICBjb25zdCByb3dzID0gZG9jdW1lbnQuY3JlYXRlRG9jdW1lbnRGcmFnbWVudCgpOwogICAgZm9yIChsZXQgcm93SW5kZXggPSAwOyByb3dJbmRleCA8IDIwMDA7IHJvd0luZGV4ICs9IDEpIHsKICAgICAgY29uc3Qgcm93ID0gZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgidHIiKTsKICAgICAgcm93LmlkID0gYHJvdy0ke3Jvd0luZGV4fWA7CiAgICAgIGZvciAobGV0IGNvbHVtbkluZGV4ID0gMDsgY29sdW1uSW5kZXggPCAxMDsgY29sdW1uSW5kZXggKz0gMSkgewogICAgICAgIGNvbnN0IGNlbGwgPSBkb2N1bWVudC5jcmVhdGVFbGVtZW50KCJ0ZCIpOwogICAgICAgIGNlbGwuaWQgPSBgY2VsbC0ke3Jvd0luZGV4fS0ke2NvbHVtbkluZGV4fWA7CiAgICAgICAgY2VsbC50ZXh0Q29udGVudCA9IGAke3Jvd0luZGV4fToke2NvbHVtbkluZGV4fWA7CiAgICAgICAgcm93LmFwcGVuZENoaWxkKGNlbGwpOwogICAgICB9CiAgICAgIHJvd3MuYXBwZW5kQ2hpbGQocm93KTsKICAgIH0KICAgIGJvZHkuYXBwZW5kQ2hpbGQocm93cyk7CiAgPC9zY3JpcHQ+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      },
+      {
+        "op": "eval",
+        "expression": "document.getElementById('cell-1999-9').textContent"
+      }
+    ]
+  },
+  {
+    "id": "controlled_deep_dom_query_50",
+    "category": "navigation",
+    "fixture": "deep_dom.html",
+    "controlled_operation": "eval",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGRlZXAgRE9NIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJkZWVwLXJvb3QiPgogICAgPGgxPkNvbnRyb2xsZWQgZGVlcCBET00gZml4dHVyZTwvaDE+CiAgPC9tYWluPgogIDxzY3JpcHQ+CiAgICAidXNlIHN0cmljdCI7CiAgICBsZXQgcGFyZW50ID0gZG9jdW1lbnQucXVlcnlTZWxlY3RvcigiI2RlZXAtcm9vdCIpOwogICAgZm9yIChsZXQgZGVwdGggPSAxOyBkZXB0aCA8PSA1MDsgZGVwdGggKz0gMSkgewogICAgICBjb25zdCBjaGlsZCA9IGRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImRpdiIpOwogICAgICBjaGlsZC5pZCA9IGBkZXB0aC0ke2RlcHRofWA7CiAgICAgIGNoaWxkLmRhdGFzZXQuZGVwdGggPSBTdHJpbmcoZGVwdGgpOwogICAgICBwYXJlbnQuYXBwZW5kQ2hpbGQoY2hpbGQpOwogICAgICBwYXJlbnQgPSBjaGlsZDsKICAgIH0KICAgIHBhcmVudC50ZXh0Q29udGVudCA9ICJEZXB0aCA1MCI7CiAgPC9zY3JpcHQ+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#depth-50').dataset.depth"
+      }
+    ]
+  },
+  {
+    "id": "controlled_form_checkbox_click_24",
+    "category": "navigation",
+    "fixture": "form.html",
+    "controlled_operation": "click",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGZvcm0gZml4dHVyZTwvdGl0bGU+CjwvaGVhZD4KPGJvZHk+CiAgPG1haW4+CiAgICA8aDE+Q29udHJvbGxlZCBmb3JtIGZpeHR1cmU8L2gxPgogICAgPGZvcm0gaWQ9ImZpeHR1cmUtZm9ybSIgb25zdWJtaXQ9InJldHVybiBmYWxzZSI+CiAgICAgIDxsYWJlbCBmb3I9ImZpZWxkLTAiPkZpcnN0IG5hbWU8L2xhYmVsPgogICAgICA8aW5wdXQgaWQ9ImZpZWxkLTAiIG5hbWU9ImZpcnN0X25hbWUiIHR5cGU9InRleHQiPgogICAgICA8bGFiZWwgZm9yPSJmaWVsZC0xIj5MYXN0IG5hbWU8L2xhYmVsPgogICAgICA8aW5wdXQgaWQ9ImZpZWxkLTEiIG5hbWU9Imxhc3RfbmFtZSIgdHlwZT0idGV4dCI+CiAgICAgIDxsYWJlbCBmb3I9ImZpZWxkLTIiPkVtYWlsPC9sYWJlbD4KICAgICAgPGlucHV0IGlkPSJmaWVsZC0yIiBuYW1lPSJlbWFpbCIgdHlwZT0idGV4dCI+CiAgICAgIDxsYWJlbCBmb3I9ImZpZWxkLTMiPkNvbXBhbnk8L2xhYmVsPgogICAgICA8aW5wdXQgaWQ9ImZpZWxkLTMiIG5hbWU9ImNvbXBhbnkiIHR5cGU9InRleHQiPgogICAgICA8bGFiZWwgZm9yPSJmaWVsZC00Ij5DaXR5PC9sYWJlbD4KICAgICAgPGlucHV0IGlkPSJmaWVsZC00IiBuYW1lPSJjaXR5IiB0eXBlPSJ0ZXh0Ij4KICAgICAgPGxhYmVsIGZvcj0iZmllbGQtNSI+Tm90ZXM8L2xhYmVsPgogICAgICA8aW5wdXQgaWQ9ImZpZWxkLTUiIG5hbWU9Im5vdGVzIiB0eXBlPSJ0ZXh0Ij4KCiAgICAgIDxsYWJlbCBmb3I9ImZpZWxkLTYiPkVtYWlsIHVwZGF0ZXM8L2xhYmVsPgogICAgICA8aW5wdXQgaWQ9ImZpZWxkLTYiIG5hbWU9ImVtYWlsX3VwZGF0ZXMiIHR5cGU9ImNoZWNrYm94Ij4KICAgICAgPGxhYmVsIGZvcj0iZmllbGQtNyI+UHJvZHVjdCB1cGRhdGVzPC9sYWJlbD4KICAgICAgPGlucHV0IGlkPSJmaWVsZC03IiBuYW1lPSJwcm9kdWN0X3VwZGF0ZXMiIHR5cGU9ImNoZWNrYm94Ij4KICAgICAgPGxhYmVsIGZvcj0iZmllbGQtOCI+UmVzZWFyY2ggdXBkYXRlczwvbGFiZWw+CiAgICAgIDxpbnB1dCBpZD0iZmllbGQtOCIgbmFtZT0icmVzZWFyY2hfdXBkYXRlcyIgdHlwZT0iY2hlY2tib3giPgoKICAgICAgPGxhYmVsIGZvcj0iZmllbGQtOSI+UmVnaW9uPC9sYWJlbD4KICAgICAgPHNlbGVjdCBpZD0iZmllbGQtOSIgbmFtZT0icmVnaW9uIj4KICAgICAgICA8b3B0aW9uIHZhbHVlPSJub3J0aCI+Tm9ydGg8L29wdGlvbj4KICAgICAgICA8b3B0aW9uIHZhbHVlPSJzb3V0aCI+U291dGg8L29wdGlvbj4KICAgICAgPC9zZWxlY3Q+CiAgICAgIDxsYWJlbCBmb3I9ImZpZWxkLTEwIj5QbGFuPC9sYWJlbD4KICAgICAgPHNlbGVjdCBpZD0iZmllbGQtMTAiIG5hbWU9InBsYW4iPgogICAgICAgIDxvcHRpb24gdmFsdWU9ImJhc2ljIj5CYXNpYzwvb3B0aW9uPgogICAgICAgIDxvcHRpb24gdmFsdWU9InBybyI+UHJvPC9vcHRpb24+CiAgICAgIDwvc2VsZWN0PgogICAgICA8bGFiZWwgZm9yPSJmaWVsZC0xMSI+VGVhbSBzaXplPC9sYWJlbD4KICAgICAgPHNlbGVjdCBpZD0iZmllbGQtMTEiIG5hbWU9InRlYW1fc2l6ZSI+CiAgICAgICAgPG9wdGlvbiB2YWx1ZT0ic21hbGwiPlNtYWxsPC9vcHRpb24+CiAgICAgICAgPG9wdGlvbiB2YWx1ZT0ibGFyZ2UiPkxhcmdlPC9vcHRpb24+CiAgICAgIDwvc2VsZWN0PgoKICAgICAgPGJ1dHRvbiBpZD0ic3VibWl0IiB0eXBlPSJzdWJtaXQiIGRpc2FibGVkPlN1Ym1pdCBkaXNhYmxlZDwvYnV0dG9uPgogICAgPC9mb3JtPgogIDwvbWFpbj4KPC9ib2R5Pgo8L2h0bWw+Cg=="
+      },
+      {
+        "op": "click",
+        "selector": "#field-6"
+      },
+      {
+        "op": "click",
+        "selector": "#field-7"
+      },
+      {
+        "op": "click",
+        "selector": "#field-8"
+      },
+      {
+        "op": "click",
+        "selector": "#field-6"
+      },
+      {
+        "op": "click",
+        "selector": "#field-7"
+      },
+      {
+        "op": "click",
+        "selector": "#field-8"
+      },
+      {
+        "op": "click",
+        "selector": "#field-6"
+      },
+      {
+        "op": "click",
+        "selector": "#field-7"
+      },
+      {
+        "op": "click",
+        "selector": "#field-8"
+      },
+      {
+        "op": "click",
+        "selector": "#field-6"
+      },
+      {
+        "op": "click",
+        "selector": "#field-7"
+      },
+      {
+        "op": "click",
+        "selector": "#field-8"
+      },
+      {
+        "op": "click",
+        "selector": "#field-6"
+      },
+      {
+        "op": "click",
+        "selector": "#field-7"
+      },
+      {
+        "op": "click",
+        "selector": "#field-8"
+      },
+      {
+        "op": "click",
+        "selector": "#field-6"
+      },
+      {
+        "op": "click",
+        "selector": "#field-7"
+      },
+      {
+        "op": "click",
+        "selector": "#field-8"
+      },
+      {
+        "op": "click",
+        "selector": "#field-6"
+      },
+      {
+        "op": "click",
+        "selector": "#field-7"
+      },
+      {
+        "op": "click",
+        "selector": "#field-8"
+      },
+      {
+        "op": "click",
+        "selector": "#field-6"
+      },
+      {
+        "op": "click",
+        "selector": "#field-7"
+      },
+      {
+        "op": "click",
+        "selector": "#field-8"
+      }
+    ]
+  },
+  {
+    "id": "controlled_dynamic_wait_300ms",
+    "category": "navigation",
+    "fixture": "dynamic.html",
+    "controlled_operation": "wait",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGR5bmFtaWMgd2FpdCBmaXh0dXJlPC90aXRsZT4KPC9oZWFkPgo8Ym9keT4KICA8bWFpbj4KICAgIDxoMT5Db250cm9sbGVkIGR5bmFtaWMgd2FpdCBmaXh0dXJlPC9oMT4KICAgIDxidXR0b24gaWQ9InN0YXJ0IiB0eXBlPSJidXR0b24iPlN0YXJ0IGZpeGVkIHdhaXQ8L2J1dHRvbj4KICAgIDxkaXYgaWQ9ImRvbmUiIGhpZGRlbj5Eb25lPC9kaXY+CiAgPC9tYWluPgogIDxzY3JpcHQ+CiAgICAidXNlIHN0cmljdCI7CiAgICBkb2N1bWVudC5xdWVyeVNlbGVjdG9yKCIjc3RhcnQiKS5hZGRFdmVudExpc3RlbmVyKCJjbGljayIsIChldmVudCkgPT4gewogICAgICBldmVudC5jdXJyZW50VGFyZ2V0LmRpc2FibGVkID0gdHJ1ZTsKICAgICAgd2luZG93LnNldFRpbWVvdXQoKCkgPT4gewogICAgICAgIGRvY3VtZW50LnF1ZXJ5U2VsZWN0b3IoIiNkb25lIikuaGlkZGVuID0gZmFsc2U7CiAgICAgIH0sIDMwMCk7CiAgICB9LCB7b25jZTogdHJ1ZX0pOwogIDwvc2NyaXB0Pgo8L2JvZHk+CjwvaHRtbD4K"
+      },
+      {
+        "op": "click",
+        "selector": "#start"
+      },
+      {
+        "op": "wait",
+        "selector": "#done"
+      }
+    ]
+  },
+  {
+    "id": "controlled_goto_data_url_20",
+    "category": "navigation",
+    "fixture": "evaluate.html",
+    "controlled_operation": "goto",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      },
+      {
+        "op": "goto",
+        "url": "data:text/html;base64,PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0idXRmLTgiPgogIDx0aXRsZT5Db250cm9sbGVkIGV2YWx1YXRlIGZpeHR1cmU8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5PgogIDxtYWluIGlkPSJyZWFkeSI+RXZhbHVhdGUgZml4dHVyZSByZWFkeS48L21haW4+CjwvYm9keT4KPC9odG1sPgo="
+      }
+    ]
+  }
+]

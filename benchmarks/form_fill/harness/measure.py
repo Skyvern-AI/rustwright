@@ -199,8 +199,13 @@ def main() -> int:
                 time.sleep(1)
 
             epochs["workload_start"] = time.time()
+            workload_name = os.environ.get("BENCH_WORKLOAD") or (
+                "fill_form_remote.py"
+                if os.environ.get("SKYVERN_SESSION") == "1"
+                else "fill_form.py"
+            )
             workload = start_process(
-                [sys.executable, str(SUITE_DIR / "fill_form.py")],
+                [sys.executable, str(SUITE_DIR / workload_name)],
                 log,
                 env=workload_environment,
             )

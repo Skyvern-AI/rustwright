@@ -1,0 +1,378 @@
+[
+  {
+    "id": "internet_add_element_once",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/add_remove_elements/",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/add_remove_elements/"
+      },
+      {
+        "op": "click",
+        "selector": ".example button"
+      },
+      {
+        "op": "wait",
+        "selector": ".added-manually"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('.added-manually').length"
+      }
+    ]
+  },
+  {
+    "id": "internet_add_three_elements",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/add_remove_elements/",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/add_remove_elements/"
+      },
+      {
+        "op": "click",
+        "selector": ".example button"
+      },
+      {
+        "op": "click",
+        "selector": ".example button"
+      },
+      {
+        "op": "click",
+        "selector": ".example button"
+      },
+      {
+        "op": "wait",
+        "selector": ".added-manually"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('.added-manually').length"
+      }
+    ]
+  },
+  {
+    "id": "internet_toggle_first_checkbox",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/checkboxes",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/checkboxes"
+      },
+      {
+        "op": "wait",
+        "selector": "#checkboxes"
+      },
+      {
+        "op": "click",
+        "selector": "#checkboxes input:first-of-type"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#checkboxes input').checked"
+      }
+    ]
+  },
+  {
+    "id": "internet_count_dropdown_options",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/dropdown",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/dropdown"
+      },
+      {
+        "op": "wait",
+        "selector": "#dropdown"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#dropdown option').length"
+      }
+    ]
+  },
+  {
+    "id": "internet_dynamic_loading_hidden_element",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/dynamic_loading/1",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/dynamic_loading/1"
+      },
+      {
+        "op": "click",
+        "selector": "#start button"
+      },
+      {
+        "op": "wait",
+        "selector": "#finish"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#finish h4').textContent"
+      }
+    ]
+  },
+  {
+    "id": "internet_dynamic_loading_rendered_element",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/dynamic_loading/2",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/dynamic_loading/2"
+      },
+      {
+        "op": "click",
+        "selector": "#start button"
+      },
+      {
+        "op": "wait",
+        "selector": "#finish"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#finish h4').textContent"
+      }
+    ]
+  },
+  {
+    "id": "internet_dynamic_controls_remove_checkbox",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/dynamic_controls",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/dynamic_controls"
+      },
+      {
+        "op": "wait",
+        "selector": "#checkbox-example"
+      },
+      {
+        "op": "click",
+        "selector": "#checkbox-example button"
+      },
+      {
+        "op": "eval",
+        "expression": "!!document.querySelector('#checkbox-example #loading')"
+      }
+    ]
+  },
+  {
+    "id": "internet_login_controls_present",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/login",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/login"
+      },
+      {
+        "op": "wait",
+        "selector": "#username"
+      },
+      {
+        "op": "eval",
+        "expression": "!!document.querySelector('#login')"
+      }
+    ]
+  },
+  {
+    "id": "internet_table_row_count",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/tables",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/tables"
+      },
+      {
+        "op": "wait",
+        "selector": "#table1"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#table1 tbody tr').length"
+      }
+    ]
+  },
+  {
+    "id": "internet_challenging_dom_row_count",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/challenging_dom",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/challenging_dom"
+      },
+      {
+        "op": "wait",
+        "selector": ".large-10"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('table tbody tr').length"
+      }
+    ]
+  },
+  {
+    "id": "internet_jquery_menu_navigation",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/jqueryui/menu",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/jqueryui/menu"
+      },
+      {
+        "op": "wait",
+        "selector": "#menu"
+      },
+      {
+        "op": "click",
+        "selector": "#ui-id-3"
+      }
+    ]
+  },
+  {
+    "id": "internet_ab_test_heading",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/abtest",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/abtest"
+      },
+      {
+        "op": "wait",
+        "selector": "#content h3"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#content h3').textContent"
+      }
+    ]
+  },
+  {
+    "id": "internet_home_to_ab_test_and_back",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/"
+      },
+      {
+        "op": "wait",
+        "selector": "#content"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/abtest']"
+      },
+      {
+        "op": "wait",
+        "selector": "#content h3"
+      },
+      {
+        "op": "back"
+      }
+    ]
+  },
+  {
+    "id": "internet_key_presses_initial_result",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/key_presses",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/key_presses"
+      },
+      {
+        "op": "wait",
+        "selector": "#target"
+      },
+      {
+        "op": "click",
+        "selector": "#target"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#result').textContent"
+      }
+    ]
+  },
+  {
+    "id": "internet_infinite_scroll_position",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/infinite_scroll",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/infinite_scroll"
+      },
+      {
+        "op": "wait",
+        "selector": ".jscroll-added, #content"
+      },
+      {
+        "op": "eval",
+        "expression": "window.scrollTo(0, document.body.scrollHeight)"
+      },
+      {
+        "op": "eval",
+        "expression": "window.scrollY"
+      }
+    ]
+  },
+  {
+    "id": "internet_status_code_navigation_history",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/status_codes",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/status_codes"
+      },
+      {
+        "op": "wait",
+        "selector": "#content"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='status_codes/200']"
+      },
+      {
+        "op": "back"
+      },
+      {
+        "op": "forward"
+      }
+    ]
+  },
+  {
+    "id": "internet_redirector_link_present",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/redirector",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/redirector"
+      },
+      {
+        "op": "wait",
+        "selector": "#redirect"
+      },
+      {
+        "op": "eval",
+        "expression": "!!document.querySelector('#redirect')"
+      }
+    ]
+  }
+]

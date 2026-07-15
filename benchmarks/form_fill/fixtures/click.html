@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Controlled click fixture</title>
+</head>
+<body>
+  <main>
+    <h1>Controlled click fixture</h1>
+    <button id="btn-0" type="button" data-active="false">Button 0</button>
+    <button id="btn-1" type="button" data-active="false">Button 1</button>
+    <button id="btn-2" type="button" data-active="false">Button 2</button>
+    <button id="btn-3" type="button" data-active="false">Button 3</button>
+    <button id="btn-4" type="button" data-active="false">Button 4</button>
+    <button id="btn-5" type="button" data-active="false">Button 5</button>
+    <button id="btn-6" type="button" data-active="false">Button 6</button>
+    <button id="btn-7" type="button" data-active="false">Button 7</button>
+    <button id="btn-8" type="button" data-active="false">Button 8</button>
+    <button id="btn-9" type="button" data-active="false">Button 9</button>
+    <button id="btn-10" type="button" data-active="false">Button 10</button>
+    <button id="btn-11" type="button" data-active="false">Button 11</button>
+    <button id="btn-12" type="button" data-active="false">Button 12</button>
+    <button id="btn-13" type="button" data-active="false">Button 13</button>
+    <button id="btn-14" type="button" data-active="false">Button 14</button>
+    <button id="btn-15" type="button" data-active="false">Button 15</button>
+    <button id="btn-16" type="button" data-active="false">Button 16</button>
+    <button id="btn-17" type="button" data-active="false">Button 17</button>
+    <button id="btn-18" type="button" data-active="false">Button 18</button>
+    <button id="btn-19" type="button" data-active="false">Button 19</button>
+  </main>
+  <script>
+    "use strict";
+    for (const button of document.querySelectorAll("button")) {
+      button.addEventListener("click", () => {
+        button.dataset.active = String(button.dataset.active !== "true");
+      });
+    }
+  </script>
+</body>
+</html>

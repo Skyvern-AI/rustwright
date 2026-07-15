@@ -1,0 +1,1365 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Rustwright vs Playwright — Cloud CDP Benchmark</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ground: #F7F8FA;
+      --surface: #FFFFFF;
+      --surface-subtle: #F0F2F5;
+      --surface-raised: #FFFFFF;
+      --ink: #17202A;
+      --ink-muted: #52606D;
+      --ink-faint: #74808C;
+      --line: #D9DEE5;
+      --line-strong: #B8C0CA;
+      --shadow: 0 1px 2px rgb(15 23 42 / 5%), 0 8px 24px rgb(15 23 42 / 4%);
+      --accent: #C2410C;
+      --green: #15803D;
+      --green-ink: #15803D;
+      --green-wash: #EAF6ED;
+      --amber: #B45309;
+      --amber-ink: #92400E;
+      --amber-wash: #FFF5E6;
+      --red: #B91C1C;
+      --red-ink: #B91C1C;
+      --red-wash: #FCECEC;
+      --track: #E2E6EB;
+      --focus: #C2410C;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --ground: #0E1216;
+        --surface: #151B21;
+        --surface-subtle: #1A222A;
+        --surface-raised: #182028;
+        --ink: #E7EBEF;
+        --ink-muted: #A7B1BC;
+        --ink-faint: #7F8B97;
+        --line: #2B3540;
+        --line-strong: #46525E;
+        --shadow: 0 1px 2px rgb(0 0 0 / 24%), 0 10px 28px rgb(0 0 0 / 16%);
+        --green-ink: #62D28A;
+        --green-wash: #13291C;
+        --amber-ink: #F0B45E;
+        --amber-wash: #2C2114;
+        --red-ink: #F47A7A;
+        --red-wash: #30191A;
+        --track: #26313A;
+      }
+    }
+
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --ground: #0E1216;
+      --surface: #151B21;
+      --surface-subtle: #1A222A;
+      --surface-raised: #182028;
+      --ink: #E7EBEF;
+      --ink-muted: #A7B1BC;
+      --ink-faint: #7F8B97;
+      --line: #2B3540;
+      --line-strong: #46525E;
+      --shadow: 0 1px 2px rgb(0 0 0 / 24%), 0 10px 28px rgb(0 0 0 / 16%);
+      --green-ink: #62D28A;
+      --green-wash: #13291C;
+      --amber-ink: #F0B45E;
+      --amber-wash: #2C2114;
+      --red-ink: #F47A7A;
+      --red-wash: #30191A;
+      --track: #26313A;
+    }
+
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --ground: #F7F8FA;
+      --surface: #FFFFFF;
+      --surface-subtle: #F0F2F5;
+      --surface-raised: #FFFFFF;
+      --ink: #17202A;
+      --ink-muted: #52606D;
+      --ink-faint: #74808C;
+      --line: #D9DEE5;
+      --line-strong: #B8C0CA;
+      --shadow: 0 1px 2px rgb(15 23 42 / 5%), 0 8px 24px rgb(15 23 42 / 4%);
+      --green-ink: #15803D;
+      --green-wash: #EAF6ED;
+      --amber-ink: #92400E;
+      --amber-wash: #FFF5E6;
+      --red-ink: #B91C1C;
+      --red-wash: #FCECEC;
+      --track: #E2E6EB;
+    }
+
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      min-width: 0;
+      overflow-x: hidden;
+      background: var(--ground);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.58;
+      text-rendering: optimizeLegibility;
+    }
+
+    button,
+    a {
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    a {
+      color: inherit;
+      text-decoration-color: var(--line-strong);
+      text-underline-offset: 0.18em;
+    }
+
+    a:hover {
+      text-decoration-color: var(--accent);
+    }
+
+    :focus-visible {
+      outline: 3px solid var(--focus);
+      outline-offset: 3px;
+    }
+
+    .mono,
+    .num,
+    code,
+    table,
+    .metric-value,
+    .bar-value,
+    .severity,
+    .section-index {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-variant-numeric: tabular-nums lining-nums;
+    }
+
+    .page-shell {
+      width: min(1180px, calc(100% - 40px));
+      margin: 0 auto;
+    }
+
+    .site-header {
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+    }
+
+    .header-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 18px 0;
+    }
+
+    .brand-mark {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--ink-muted);
+      font-size: 0.76rem;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+    }
+
+    .brand-mark::before {
+      width: 9px;
+      height: 9px;
+      border: 2px solid var(--accent);
+      border-radius: 2px;
+      content: "";
+    }
+
+    .theme-toggle {
+      display: inline-flex;
+      min-height: 38px;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 11px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: var(--surface-subtle);
+      color: var(--ink-muted);
+      font: inherit;
+      font-size: 0.8rem;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    .theme-toggle:hover {
+      border-color: var(--line-strong);
+      color: var(--ink);
+    }
+
+    .theme-toggle-dot {
+      width: 11px;
+      height: 11px;
+      border: 1px solid var(--line-strong);
+      border-radius: 50%;
+      background: var(--ink);
+      box-shadow: inset 5px 0 0 var(--surface-subtle);
+    }
+
+    .hero {
+      padding: 72px 0 44px;
+    }
+
+    .eyebrow {
+      margin: 0 0 14px;
+      color: var(--accent);
+      font-size: 0.76rem;
+      font-weight: 800;
+      letter-spacing: 0.105em;
+      text-transform: uppercase;
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      overflow-wrap: anywhere;
+    }
+
+    h1 {
+      max-width: 920px;
+      margin: 0;
+      font-size: clamp(2.05rem, 5vw, 4.15rem);
+      font-weight: 720;
+      letter-spacing: -0.052em;
+      line-height: 1.02;
+    }
+
+    .subtitle {
+      margin: 22px 0 0;
+      color: var(--ink-muted);
+      font-size: clamp(1.02rem, 2vw, 1.28rem);
+      font-weight: 520;
+      letter-spacing: -0.012em;
+    }
+
+    .smoke-note {
+      display: flex;
+      max-width: 900px;
+      align-items: flex-start;
+      gap: 10px;
+      margin: 24px 0 0;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+      color: var(--ink-muted);
+      font-size: 0.9rem;
+    }
+
+    .smoke-note::before {
+      flex: 0 0 auto;
+      width: 7px;
+      height: 7px;
+      margin-top: 0.48rem;
+      border-radius: 50%;
+      background: var(--amber);
+      content: "";
+    }
+
+    main {
+      padding-bottom: 60px;
+    }
+
+    section {
+      padding: 52px 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .summary {
+      padding-top: 16px;
+      border-top: 0;
+    }
+
+    .section-heading {
+      display: grid;
+      grid-template-columns: 46px minmax(0, 1fr);
+      gap: 14px;
+      margin-bottom: 28px;
+    }
+
+    .section-index {
+      padding-top: 5px;
+      color: var(--accent);
+      font-size: 0.74rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: clamp(1.42rem, 3vw, 2rem);
+      font-weight: 710;
+      letter-spacing: -0.03em;
+      line-height: 1.2;
+    }
+
+    .section-intro {
+      max-width: 780px;
+      margin: 8px 0 0;
+      color: var(--ink-muted);
+      font-size: 0.95rem;
+    }
+
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .stat-card {
+      grid-column: span 4;
+      min-width: 0;
+      padding: 21px 21px 20px;
+      border: 1px solid var(--line);
+      border-top: 3px solid var(--line-strong);
+      border-radius: 8px;
+      background: var(--surface-raised);
+      box-shadow: var(--shadow);
+    }
+
+    .stat-card:nth-child(-n + 2) {
+      grid-column: span 6;
+    }
+
+    .stat-card.win-card {
+      border-top-color: var(--green);
+    }
+
+    .stat-card.loss-card {
+      border-top-color: var(--red);
+    }
+
+    .stat-card.caveat-card {
+      box-shadow: inset 3px 0 0 var(--amber), var(--shadow);
+    }
+
+    .stat-kicker {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 26px;
+      color: var(--ink-muted);
+      font-size: 0.69rem;
+      font-weight: 800;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+    }
+
+    .status-mark {
+      display: inline-block;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--line-strong);
+    }
+
+    .win-card .status-mark {
+      background: var(--green);
+    }
+
+    .loss-card .status-mark {
+      background: var(--red);
+    }
+
+    .metric-value {
+      margin: 0;
+      font-size: clamp(1.42rem, 2.8vw, 2.12rem);
+      font-weight: 760;
+      letter-spacing: -0.045em;
+      line-height: 1.12;
+    }
+
+    .win-card .metric-value {
+      color: var(--green-ink);
+    }
+
+    .loss-card .metric-value {
+      color: var(--red-ink);
+    }
+
+    .metric-context {
+      margin: 13px 0 0;
+      color: var(--ink-muted);
+      font-size: 0.84rem;
+    }
+
+    .caveat-tag {
+      color: var(--amber-ink);
+      font-size: 0.7rem;
+      font-weight: 750;
+    }
+
+    .method-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .method-item {
+      min-width: 0;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .method-label {
+      margin: 0 0 8px;
+      color: var(--ink-faint);
+      font-size: 0.71rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .method-item p:last-child {
+      margin: 0;
+      color: var(--ink-muted);
+      font-size: 0.92rem;
+    }
+
+    .table-block + .table-block {
+      margin-top: 32px;
+    }
+
+    .table-title-row {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 12px;
+    }
+
+    h3 {
+      margin: 0;
+      font-size: 1.01rem;
+      font-weight: 720;
+      letter-spacing: -0.012em;
+    }
+
+    .unit-note {
+      flex: 0 0 auto;
+      margin: 0;
+      color: var(--ink-faint);
+      font-size: 0.72rem;
+    }
+
+    .table-scroll {
+      max-width: 100%;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      overscroll-behavior-inline: contain;
+    }
+
+    table {
+      width: 100%;
+      min-width: 690px;
+      border-collapse: collapse;
+      font-size: 0.84rem;
+      line-height: 1.45;
+    }
+
+    th,
+    td {
+      padding: 15px 18px;
+      border-bottom: 1px solid var(--line);
+      text-align: right;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+
+    th:first-child,
+    td:first-child {
+      text-align: left;
+    }
+
+    th:last-child,
+    td:last-child {
+      white-space: normal;
+    }
+
+    thead th {
+      background: var(--surface-subtle);
+      color: var(--ink-muted);
+      font-size: 0.7rem;
+      font-weight: 800;
+      letter-spacing: 0.055em;
+      text-transform: uppercase;
+    }
+
+    tbody tr:last-child td {
+      border-bottom: 0;
+    }
+
+    tbody tr:hover {
+      background: var(--surface-subtle);
+    }
+
+    td.metric-name {
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-weight: 660;
+    }
+
+    .win {
+      color: var(--green-ink);
+      font-weight: 800;
+    }
+
+    .loss {
+      color: var(--red-ink);
+      font-weight: 800;
+    }
+
+    .note-cell {
+      color: var(--ink-muted);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 0.8rem;
+      text-align: left;
+    }
+
+    .bars-panel {
+      margin-top: 32px;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .bars-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 22px;
+    }
+
+    .bars-heading p {
+      margin: 0;
+      color: var(--ink-faint);
+      font-size: 0.73rem;
+    }
+
+    .bar-group + .bar-group {
+      margin-top: 22px;
+      padding-top: 20px;
+      border-top: 1px solid var(--line);
+    }
+
+    .bar-metric {
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 10px;
+      color: var(--ink-muted);
+      font-size: 0.79rem;
+      font-weight: 700;
+    }
+
+    .bar-scale {
+      display: grid;
+      grid-template-columns: 90px minmax(120px, 1fr) 96px;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .bar-scale + .bar-scale {
+      margin-top: 8px;
+    }
+
+    .bar-series {
+      color: var(--ink-muted);
+      font-size: 0.74rem;
+      font-weight: 650;
+    }
+
+    .bar-track {
+      height: 10px;
+      overflow: hidden;
+      border-radius: 2px;
+      background: var(--track);
+    }
+
+    .bar-fill {
+      height: 100%;
+      min-width: 3px;
+      border-radius: 2px;
+      background: var(--line-strong);
+    }
+
+    .bar-fill.good {
+      background: var(--green);
+    }
+
+    .bar-fill.bad {
+      background: var(--red);
+    }
+
+    .bar-value {
+      color: var(--ink);
+      font-size: 0.73rem;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .weakness-list {
+      display: grid;
+      gap: 14px;
+    }
+
+    .weakness {
+      display: grid;
+      grid-template-columns: 116px minmax(0, 1fr);
+      gap: 20px;
+      padding: 23px;
+      border: 1px solid var(--line);
+      border-left: 3px solid var(--red);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .weakness.high {
+      border-left-color: var(--amber);
+    }
+
+    .severity-block {
+      display: flex;
+      align-items: flex-start;
+      gap: 9px;
+    }
+
+    .weakness-id {
+      padding-top: 3px;
+      color: var(--ink-faint);
+      font-size: 0.72rem;
+      font-weight: 800;
+    }
+
+    .severity {
+      display: inline-flex;
+      min-height: 25px;
+      align-items: center;
+      padding: 3px 7px;
+      border: 1px solid var(--red);
+      border-radius: 4px;
+      background: var(--red-wash);
+      color: var(--red-ink);
+      font-size: 0.62rem;
+      font-weight: 850;
+      letter-spacing: 0.04em;
+    }
+
+    .high .severity {
+      border-color: var(--amber);
+      background: var(--amber-wash);
+      color: var(--amber-ink);
+    }
+
+    .weakness-copy h3 {
+      margin-bottom: 8px;
+    }
+
+    .weakness-copy p {
+      margin: 7px 0 0;
+      color: var(--ink-muted);
+      font-size: 0.9rem;
+    }
+
+    .weakness-copy .mechanism {
+      color: var(--ink);
+    }
+
+    .action-note {
+      margin: 18px 0 0;
+      padding: 15px 18px;
+      border: 1px solid var(--line);
+      border-left: 3px solid var(--accent);
+      border-radius: 6px;
+      background: var(--surface-subtle);
+      color: var(--ink-muted);
+      font-size: 0.88rem;
+    }
+
+    .evidence-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .evidence-grid.two-column {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .evidence-card {
+      min-width: 0;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .evidence-card h3 {
+      margin-bottom: 10px;
+    }
+
+    .evidence-card p {
+      margin: 0;
+      color: var(--ink-muted);
+      font-size: 0.9rem;
+    }
+
+    .evidence-card .evidence-value {
+      margin-bottom: 12px;
+      color: var(--green-ink);
+      font-size: 1.45rem;
+      font-weight: 800;
+      letter-spacing: -0.035em;
+      line-height: 1.1;
+    }
+
+    .caveat-panel {
+      padding: 24px;
+      border: 1px solid var(--amber);
+      border-left-width: 4px;
+      border-radius: 8px;
+      background: var(--amber-wash);
+    }
+
+    .caveat-panel ul {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 13px 34px;
+      margin: 0;
+      padding-left: 19px;
+    }
+
+    .caveat-panel li {
+      padding-left: 4px;
+      color: var(--ink-muted);
+      font-size: 0.9rem;
+    }
+
+    .caveat-panel li::marker {
+      color: var(--amber);
+    }
+
+    .site-footer {
+      border-top: 1px solid var(--line);
+      background: var(--surface);
+    }
+
+    .footer-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      min-height: 92px;
+      padding: 20px 0;
+      color: var(--ink-faint);
+      font-size: 0.76rem;
+    }
+
+    .footer-inner p {
+      margin: 0;
+    }
+
+    code {
+      padding: 0.12em 0.34em;
+      border: 1px solid var(--line);
+      border-radius: 3px;
+      background: var(--surface-subtle);
+      color: var(--ink-muted);
+      font-size: 0.92em;
+    }
+
+    @media (max-width: 820px) {
+      .page-shell {
+        width: min(100% - 28px, 1180px);
+      }
+
+      .hero {
+        padding: 54px 0 36px;
+      }
+
+      .stat-card,
+      .stat-card:nth-child(-n + 2) {
+        grid-column: span 12;
+      }
+
+      .method-grid,
+      .evidence-grid,
+      .evidence-grid.two-column,
+      .caveat-panel ul {
+        grid-template-columns: 1fr;
+      }
+
+      .weakness {
+        grid-template-columns: 1fr;
+        gap: 13px;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .header-bar {
+        padding: 13px 0;
+      }
+
+      .brand-mark {
+        font-size: 0.66rem;
+        letter-spacing: 0.065em;
+      }
+
+      .theme-toggle-text {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        clip-path: inset(50%);
+        white-space: nowrap;
+      }
+
+      .theme-toggle {
+        padding: 7px 10px;
+      }
+
+      section {
+        padding: 42px 0;
+      }
+
+      .section-heading {
+        grid-template-columns: 34px minmax(0, 1fr);
+        gap: 8px;
+      }
+
+      .stat-card,
+      .method-item,
+      .bars-panel,
+      .weakness,
+      .evidence-card,
+      .caveat-panel {
+        padding: 18px;
+      }
+
+      .bars-heading,
+      .table-title-row,
+      .footer-inner {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .bar-scale {
+        grid-template-columns: 72px minmax(80px, 1fr) 82px;
+        gap: 8px;
+      }
+
+      .footer-inner {
+        justify-content: center;
+        gap: 6px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html {
+        scroll-behavior: auto;
+      }
+
+      *,
+      *::before,
+      *::after {
+        scroll-behavior: auto !important;
+        transition-duration: 0.01ms !important;
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+      }
+    }
+
+    @media print {
+      :root,
+      :root[data-theme="dark"] {
+        color-scheme: light;
+        --ground: #FFFFFF;
+        --surface: #FFFFFF;
+        --surface-subtle: #F0F2F5;
+        --surface-raised: #FFFFFF;
+        --ink: #17202A;
+        --ink-muted: #52606D;
+        --ink-faint: #74808C;
+        --line: #D9DEE5;
+        --line-strong: #B8C0CA;
+        --green-ink: #15803D;
+        --green-wash: #EAF6ED;
+        --amber-ink: #92400E;
+        --amber-wash: #FFF5E6;
+        --red-ink: #B91C1C;
+        --red-wash: #FCECEC;
+        --track: #E2E6EB;
+      }
+
+      .theme-toggle {
+        display: none;
+      }
+
+      .page-shell {
+        width: 100%;
+      }
+
+      .stat-card,
+      .method-item,
+      .table-scroll,
+      .bars-panel,
+      .weakness,
+      .evidence-card,
+      .caveat-panel {
+        break-inside: avoid;
+        box-shadow: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="site-header">
+    <div class="page-shell header-bar">
+      <div class="brand-mark">Benchmark instrument / smoke stage</div>
+      <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch color theme">
+        <span class="theme-toggle-dot" aria-hidden="true"></span>
+        <span class="theme-toggle-text">Theme</span>
+      </button>
+    </div>
+  </header>
+
+  <div class="page-shell">
+    <div class="hero">
+      <p class="eyebrow">Remote CDP · reference Playwright 1.59</p>
+      <h1>Rustwright vs Playwright — Cloud CDP Benchmark</h1>
+      <p class="subtitle">Smoke-stage findings · remote Skyvern browsers · library-isolated metrics</p>
+      <p class="smoke-note">Smoke-stage evidence only: repetition counts are low, and memory is macOS process-tree RSS rather than proportional set size (PSS).</p>
+    </div>
+  </div>
+
+  <main class="page-shell">
+    <section class="summary" aria-labelledby="summary-title">
+      <div class="section-heading">
+        <div class="section-index">00</div>
+        <div>
+          <h2 id="summary-title">Executive readout</h2>
+          <p class="section-intro">Rustwright is a Rust CDP engine implementing Playwright’s Python API. Its client architecture shows a clear memory advantage and wins the controlled click workload, while three concentrated latency regressions remain.</p>
+        </div>
+      </div>
+
+      <div class="stat-grid">
+        <article class="stat-card win-card">
+          <div class="stat-kicker"><span>Memory</span><span class="status-mark" aria-hidden="true"></span></div>
+          <p class="metric-value">2.8x smaller — 45 MB vs 126 MB</p>
+          <p class="metric-context">Client process-tree RSS; browser runs remotely and is not included.</p>
+        </article>
+
+        <article class="stat-card win-card">
+          <div class="stat-kicker"><span>Controlled latency</span><span class="status-mark" aria-hidden="true"></span></div>
+          <p class="metric-value">1.35x faster — 7.9s vs 10.7s</p>
+          <p class="metric-context"><span class="num">20</span> identical clicks on a controlled fixture with <code>page_wait=0</code>.</p>
+        </article>
+
+        <article class="stat-card loss-card">
+          <div class="stat-kicker"><span>Weakness</span><span class="status-mark" aria-hidden="true"></span></div>
+          <p class="metric-value">query_selector_all ~300x slower — ~270 ms/element vs ~1 ms</p>
+          <p class="metric-context">Handle materialization scales linearly because it is not batched.</p>
+        </article>
+
+        <article class="stat-card loss-card">
+          <div class="stat-kicker"><span>Weakness</span><span class="status-mark" aria-hidden="true"></span></div>
+          <p class="metric-value">object-evaluate ~2.5x slower</p>
+          <p class="metric-context">Small object return: <span class="num">138 ms</span> vs <span class="num">55 ms</span>.</p>
+        </article>
+
+        <article class="stat-card loss-card caveat-card">
+          <div class="stat-kicker"><span>Weakness</span><span class="caveat-tag">variance-sensitive</span></div>
+          <p class="metric-value">connect ~3x slower — 1336 vs 449 ms</p>
+          <p class="metric-context">Current smoke result; higher-repetition confirmation is still required.</p>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="method-title">
+      <div class="section-heading">
+        <div class="section-index">01</div>
+        <div>
+          <h2 id="method-title">Methodology</h2>
+          <p class="section-intro">The harness separates client-library work from browser hosting and excludes page-load time from the latency comparisons.</p>
+        </div>
+      </div>
+
+      <div class="method-grid">
+        <article class="method-item">
+          <p class="method-label">Remote execution</p>
+          <p>Both clients drive remote Skyvern cloud browsers over CDP. Browser memory is off-box, so the memory result isolates the local client process tree.</p>
+        </article>
+        <article class="method-item">
+          <p class="method-label">Navigation exclusion</p>
+          <p>Website and network time are excluded as a navigation band rather than attributed to either library.</p>
+        </article>
+        <article class="method-item">
+          <p class="method-label">Two evidence lanes</p>
+          <p>Controlled <code>data:</code> URL fixtures provide byte-identical work and zero render; live automation-sandbox cases exercise real navigation and interaction.</p>
+        </article>
+        <article class="method-item">
+          <p class="method-label">Library probes</p>
+          <p>Page-wait-free probes isolate CDP and library pipelines. Controlled click cases set <code>page_wait=0</code>.</p>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="results-title">
+      <div class="section-heading">
+        <div class="section-index">02</div>
+        <div>
+          <h2 id="results-title">Latency results</h2>
+          <p class="section-intro">Lower is better. Color identifies the faster and slower side of each direct comparison; it does not imply statistical confidence.</p>
+        </div>
+      </div>
+
+      <div class="table-block">
+        <div class="table-title-row">
+          <h3>Clean library latency (page-render-free)</h3>
+          <p class="unit-note mono">milliseconds</p>
+        </div>
+        <div class="table-scroll" role="region" aria-label="Clean library latency results" tabindex="0">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Operation</th>
+                <th scope="col">Rustwright</th>
+                <th scope="col">Playwright 1.59</th>
+                <th scope="col">Finding</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="metric-name">evaluate RTT</td>
+                <td class="win">41.6 ms</td>
+                <td class="loss">42.8 ms</td>
+                <td class="note-cell">Parity; network-bound</td>
+              </tr>
+              <tr>
+                <td class="metric-name">property read</td>
+                <td class="win">37.7 ms</td>
+                <td class="loss">43.9 ms</td>
+                <td class="note-cell">Rustwright lower</td>
+              </tr>
+              <tr>
+                <td class="metric-name">stable-element click pipeline</td>
+                <td class="win">270.7 ms</td>
+                <td class="loss">473.7 ms</td>
+                <td class="note-cell">Rustwright <span class="num">1.75x</span> faster</td>
+              </tr>
+              <tr>
+                <td class="metric-name">connect</td>
+                <td class="loss">1336 ms</td>
+                <td class="win">449 ms</td>
+                <td class="note-cell">Rustwright <span class="num">~3x</span> slower</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="table-block">
+        <div class="table-title-row">
+          <h3>Controlled fixture (20 clicks, identical work, page_wait=0)</h3>
+          <p class="unit-note mono">milliseconds</p>
+        </div>
+        <div class="table-scroll" role="region" aria-label="Controlled fixture latency results" tabindex="0">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Measure</th>
+                <th scope="col">Rustwright</th>
+                <th scope="col">Playwright 1.59</th>
+                <th scope="col">Finding</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="metric-name">library latency</td>
+                <td class="win">7890 ms</td>
+                <td class="loss">10674 ms</td>
+                <td class="note-cell">Rustwright <span class="num">1.35x</span> faster</td>
+              </tr>
+              <tr>
+                <td class="metric-name">per-click latency</td>
+                <td class="win">294 ms</td>
+                <td class="loss">461 ms</td>
+                <td class="note-cell">Rustwright lower</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="bars-panel" aria-labelledby="bars-title">
+        <div class="bars-heading">
+          <h3 id="bars-title">Headline comparison</h3>
+          <p>Bar length encodes observed magnitude · lower is better</p>
+        </div>
+
+        <div class="bar-group">
+          <div class="bar-metric"><span>Client process-tree RSS</span><span class="mono">max 126 MB</span></div>
+          <div class="bar-scale">
+            <div class="bar-series">Rustwright</div>
+            <div class="bar-track"><div class="bar-fill good" style="width: 35.7%"></div></div>
+            <div class="bar-value win">45 MB</div>
+          </div>
+          <div class="bar-scale">
+            <div class="bar-series">Playwright</div>
+            <div class="bar-track"><div class="bar-fill bad" style="width: 100%"></div></div>
+            <div class="bar-value loss">126 MB</div>
+          </div>
+        </div>
+
+        <div class="bar-group">
+          <div class="bar-metric"><span>Controlled fixture · 20 clicks</span><span class="mono">max 10674 ms</span></div>
+          <div class="bar-scale">
+            <div class="bar-series">Rustwright</div>
+            <div class="bar-track"><div class="bar-fill good" style="width: 73.9%"></div></div>
+            <div class="bar-value win">7890 ms</div>
+          </div>
+          <div class="bar-scale">
+            <div class="bar-series">Playwright</div>
+            <div class="bar-track"><div class="bar-fill bad" style="width: 100%"></div></div>
+            <div class="bar-value loss">10674 ms</div>
+          </div>
+        </div>
+
+        <div class="bar-group">
+          <div class="bar-metric"><span>Stable-element click pipeline</span><span class="mono">max 473.7 ms</span></div>
+          <div class="bar-scale">
+            <div class="bar-series">Rustwright</div>
+            <div class="bar-track"><div class="bar-fill good" style="width: 57.1%"></div></div>
+            <div class="bar-value win">270.7 ms</div>
+          </div>
+          <div class="bar-scale">
+            <div class="bar-series">Playwright</div>
+            <div class="bar-track"><div class="bar-fill bad" style="width: 100%"></div></div>
+            <div class="bar-value loss">473.7 ms</div>
+          </div>
+        </div>
+
+        <div class="bar-group">
+          <div class="bar-metric"><span>Connect</span><span class="mono">max 1336 ms</span></div>
+          <div class="bar-scale">
+            <div class="bar-series">Rustwright</div>
+            <div class="bar-track"><div class="bar-fill bad" style="width: 100%"></div></div>
+            <div class="bar-value loss">1336 ms</div>
+          </div>
+          <div class="bar-scale">
+            <div class="bar-series">Playwright</div>
+            <div class="bar-track"><div class="bar-fill good" style="width: 33.6%"></div></div>
+            <div class="bar-value win">449 ms</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="weaknesses-title">
+      <div class="section-heading">
+        <div class="section-index">03</div>
+        <div>
+          <h2 id="weaknesses-title">Concentrated weaknesses</h2>
+          <p class="section-intro">The smoke suite exposes specific implementation paths, not a general across-the-board slowdown.</p>
+        </div>
+      </div>
+
+      <div class="weakness-list">
+        <article class="weakness">
+          <div class="severity-block">
+            <span class="weakness-id mono">W1</span>
+            <span class="severity">CRITICAL</span>
+          </div>
+          <div class="weakness-copy">
+            <h3><code>query_selector_all</code> handle-returning path</h3>
+            <p><span class="num">~270 ms/element</span>: <span class="num">N=10 → 2.8s</span>, <span class="num">N=50 → 13.5s</span>, and <span class="num">N=100 → 27s</span>. Playwright is <span class="num">~1 ms/element</span>, including <span class="num">N=1000 → 875 ms</span>.</p>
+            <p><code>locator.count()</code> is fine and remains flat at <span class="num">~150 ms</span>, localizing the regression to the handle-returning path.</p>
+            <p class="mechanism"><strong>Cause:</strong> one CDP round-trip per <code>ElementHandle</code>, with no batching. <strong>Fix:</strong> batch handle materialization.</p>
+          </div>
+        </article>
+
+        <article class="weakness high">
+          <div class="severity-block">
+            <span class="weakness-id mono">W2</span>
+            <span class="severity">HIGH</span>
+          </div>
+          <div class="weakness-copy">
+            <h3>Object-evaluate return path</h3>
+            <p>Small-object evaluation is <span class="num">~2.5x</span> slower: Rustwright <span class="num">138 ms</span> vs Playwright <span class="num">55 ms</span>.</p>
+            <p class="mechanism"><strong>Target:</strong> profile serialization and remote-object conversion on the object-return path.</p>
+          </div>
+        </article>
+
+        <article class="weakness high">
+          <div class="severity-block">
+            <span class="weakness-id mono">W3</span>
+            <span class="severity">HIGH</span>
+          </div>
+          <div class="weakness-copy">
+            <h3>Initial CDP connection</h3>
+            <p>Connect is <span class="num">~3x</span> slower in the corrected smoke result: Rustwright <span class="num">1336 ms</span> vs Playwright <span class="num">449 ms</span>.</p>
+            <p class="mechanism"><strong>Likely mechanism:</strong> eager target attach plus Tokio and event-stream setup. Confirm with higher-repetition instrumentation before optimizing.</p>
+          </div>
+        </article>
+      </div>
+
+      <p class="action-note">These are actionable optimization targets for the team: batch handle creation first, then profile object conversion and connection initialization.</p>
+    </section>
+
+    <section aria-labelledby="memory-title">
+      <div class="section-heading">
+        <div class="section-index">04</div>
+        <div>
+          <h2 id="memory-title">Memory</h2>
+          <p class="section-intro">The strongest architectural finding is the local client footprint. Remote browser memory remains off-box and outside this measurement.</p>
+        </div>
+      </div>
+
+      <div class="evidence-grid two-column">
+        <article class="evidence-card">
+          <h3>Client memory</h3>
+          <p class="evidence-value mono">45 vs 126 MB</p>
+          <p>Client process-tree RSS with the browser remote: Rustwright uses <span class="num">~2.8x</span> less, or <span class="num">65%</span> less memory.</p>
+        </article>
+        <article class="evidence-card">
+          <h3>Architectural basis</h3>
+          <p class="evidence-value mono">in-process Rust</p>
+          <p>The result is consistent with an in-process Rust client versus Python plus a Node driver, and matches the repository’s known <span class="num">66%</span>-less-memory claim.</p>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="coverage-title">
+      <div class="section-heading">
+        <div class="section-index">05</div>
+        <div>
+          <h2 id="coverage-title">Coverage</h2>
+          <p class="section-intro">Functional coverage is useful smoke evidence, with controlled fixtures carrying more weight than the flaky live lane.</p>
+        </div>
+      </div>
+
+      <div class="evidence-grid">
+        <article class="evidence-card">
+          <h3>Validated coverage</h3>
+          <p class="evidence-value mono">39 cases</p>
+          <p><span class="num">10</span> controlled fixtures + <span class="num">26</span> live navigation/interaction cases + <span class="num">3</span> downloads.</p>
+        </article>
+        <article class="evidence-card">
+          <h3>Live-lane stability</h3>
+          <p class="evidence-value mono">44% culled</p>
+          <p>One live batch was heavily flaky, so the controlled fixtures remain the defensible core of the latency evidence.</p>
+        </article>
+        <article class="evidence-card">
+          <h3>Adversarial review</h3>
+          <p class="evidence-value mono">30 findings</p>
+          <p>A <code>WEAKNESSES.md</code> adversarial self-review records limitations and optimization targets.</p>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="caveats-title">
+      <div class="section-heading">
+        <div class="section-index">06</div>
+        <div>
+          <h2 id="caveats-title">Caveats and next evidence</h2>
+          <p class="section-intro">Read the direction of the controlled results, but do not treat this smoke stage as a publication-grade confidence interval.</p>
+        </div>
+      </div>
+
+      <div class="caveat-panel">
+        <ul>
+          <li>Memory is macOS process-tree RSS, not proportional set size (PSS).</li>
+          <li>Repetition counts are low; variance and tail latency are not characterized.</li>
+          <li>Single-sample connect variance was corrected during testing: an earlier “faster connect” result was a fluke.</li>
+          <li>The two clients were compared in separate remote browser sessions, not one shared session.</li>
+          <li>Precise PSS, high-repetition statistics, and complete provenance require the Blacksmith run.</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="page-shell footer-inner">
+      <p>Generated from <code>bench/skyvern-cloud-suite</code></p>
+      <p>Methodology per <code>WEAKNESSES.md</code></p>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var root = document.documentElement;
+      var button = document.getElementById("theme-toggle");
+      var media = window.matchMedia("(prefers-color-scheme: dark)");
+
+      try {
+        var storedTheme = window.localStorage.getItem("benchmark-theme");
+        if (storedTheme === "dark" || storedTheme === "light") {
+          root.setAttribute("data-theme", storedTheme);
+        }
+      } catch (error) {
+        // Storage can be unavailable in hardened or local-file contexts.
+      }
+
+      function effectiveTheme() {
+        return root.getAttribute("data-theme") || (media.matches ? "dark" : "light");
+      }
+
+      function updateButton() {
+        var current = effectiveTheme();
+        var next = current === "dark" ? "light" : "dark";
+        button.setAttribute("aria-label", "Switch to " + next + " theme");
+        button.setAttribute("title", "Switch to " + next + " theme");
+      }
+
+      button.addEventListener("click", function () {
+        var next = effectiveTheme() === "dark" ? "light" : "dark";
+        root.setAttribute("data-theme", next);
+        try {
+          window.localStorage.setItem("benchmark-theme", next);
+        } catch (error) {
+          // The explicit data-theme attribute still applies for this page view.
+        }
+        updateButton();
+      });
+
+      if (typeof media.addEventListener === "function") {
+        media.addEventListener("change", updateButton);
+      }
+
+      updateButton();
+    }());
+  </script>
+</body>
+</html>

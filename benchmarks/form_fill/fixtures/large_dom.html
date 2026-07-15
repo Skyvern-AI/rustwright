@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Controlled large DOM fixture</title>
+</head>
+<body>
+  <main>
+    <h1>Controlled large DOM fixture</h1>
+    <table id="large-table">
+      <tbody id="large-table-body"></tbody>
+    </table>
+  </main>
+  <script>
+    "use strict";
+    const body = document.querySelector("#large-table-body");
+    const rows = document.createDocumentFragment();
+    for (let rowIndex = 0; rowIndex < 2000; rowIndex += 1) {
+      const row = document.createElement("tr");
+      row.id = `row-${rowIndex}`;
+      for (let columnIndex = 0; columnIndex < 10; columnIndex += 1) {
+        const cell = document.createElement("td");
+        cell.id = `cell-${rowIndex}-${columnIndex}`;
+        cell.textContent = `${rowIndex}:${columnIndex}`;
+        row.appendChild(cell);
+      }
+      rows.appendChild(row);
+    }
+    body.appendChild(rows);
+  </script>
+</body>
+</html>

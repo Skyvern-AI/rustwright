@@ -1,0 +1,26 @@
+[
+  {
+    "id": "the_internet_abtest_nav",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/",
+    "nav_steps": [
+      {"op": "goto", "url": "https://the-internet.herokuapp.com/"},
+      {"op": "wait", "selector": "h1.heading"},
+      {"op": "click", "selector": "a[href='/abtest']"},
+      {"op": "wait", "selector": "#content h3"},
+      {"op": "back"}
+    ]
+  },
+  {
+    "id": "example_domain_iana_nav",
+    "category": "navigation",
+    "url": "https://example.com/",
+    "nav_steps": [
+      {"op": "goto", "url": "https://example.com/"},
+      {"op": "wait", "selector": "h1"},
+      {"op": "click", "selector": "a[href='https://iana.org/domains/example']"},
+      {"op": "wait", "selector": "#example-domains"},
+      {"op": "back"}
+    ]
+  }
+]

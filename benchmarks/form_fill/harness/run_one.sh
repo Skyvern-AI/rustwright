@@ -46,11 +46,25 @@ docker_args=(
   --entrypoint python
 )
 
-for variable in CDP_URL BENCH_PAUSE_SCALE BENCH_SKIP_UPLOADS; do
+for variable in \
+  CDP_URL \
+  CDP_CONNECT_HEADERS \
+  SKYVERN_SESSION \
+  BENCH_PAUSE_SCALE \
+  BENCH_SKIP_UPLOADS
+do
   if [[ -n "${!variable:-}" ]]; then
     docker_args+=(--env "$variable")
   fi
 done
+
+if [[ "${SKYVERN_SESSION:-0}" == "1" && -z "${CDP_URL:-}" ]]; then
+  for variable in SKYVERN_CLOUD_API_KEY SKYVERN_BASE_URL; do
+    if [[ -n "${!variable:-}" ]]; then
+      docker_args+=(--env "$variable")
+    fi
+  done
+fi
 
 if [[ -n "${BENCH_FIELD_CONFIG_HOST:-}" ]]; then
   config_dir="$(cd "$(dirname "$BENCH_FIELD_CONFIG_HOST")" && pwd -P)"

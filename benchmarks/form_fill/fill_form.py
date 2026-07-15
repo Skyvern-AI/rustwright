@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from harness.library_probe import run_library_probes
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = SCRIPT_DIR / "field_map.example.json"
@@ -129,6 +131,24 @@ def required_environment(name: str) -> str:
     if not value:
         raise ValueError(f"{name} is required")
     return value
+
+
+def parse_cdp_connect_headers(raw_headers: str) -> dict[str, str] | None:
+    """Parse optional CDP headers without ever including their values in errors."""
+    if not raw_headers.strip():
+        return None
+    try:
+        payload = json.loads(raw_headers)
+    except json.JSONDecodeError:
+        raise ValueError("CDP_CONNECT_HEADERS must be valid JSON") from None
+    if not isinstance(payload, dict) or not all(
+        isinstance(name, str)
+        and bool(name.strip())
+        and isinstance(value, str)
+        for name, value in payload.items()
+    ):
+        raise ValueError("CDP_CONNECT_HEADERS must be a JSON object of string headers")
+    return payload
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -305,6 +325,7 @@ def main() -> None:
     scripted_pause_ms = 0.0
     per_field: list[dict[str, Any]] = []
     screenshot_count = 0
+    probe = None
 
     def finish_interval(label: str, kind: str, end_s: float | None = None) -> None:
         nonlocal timeline_cursor_s
@@ -325,7 +346,21 @@ def main() -> None:
     with sync_playwright() as playwright:
         cdp_url = os.environ.get("CDP_URL", "").strip()
         if cdp_url:
-            browser = playwright.chromium.connect_over_cdp(cdp_url, timeout=120_000)
+            connect_options: dict[str, Any] = {"timeout": 120_000}
+            cdp_headers = parse_cdp_connect_headers(
+                os.environ.get("CDP_CONNECT_HEADERS", "")
+            )
+            if cdp_headers is not None:
+                connect_options["headers"] = cdp_headers
+            try:
+                browser = playwright.chromium.connect_over_cdp(
+                    cdp_url, **connect_options
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Remote CDP connection failed; endpoint details were omitted "
+                    f"({type(exc).__name__})"
+                ) from None
             context = make_remote_context(browser)
             context_mode = "remote_isolated_context"
             launch_label = "library startup and remote CDP connect"
@@ -420,6 +455,13 @@ def main() -> None:
                     )
             if screenshot_count != len(fields) or len(per_field) != len(fields):
                 raise AssertionError("A field action or screenshot did not complete")
+
+            try:
+                probe = run_library_probes(
+                    page, reps=int(os.environ.get("BENCH_PROBE_REPS", "20"))
+                )
+            except Exception:
+                probe = None
         finally:
             context.close()
             browser.close()
@@ -427,6 +469,7 @@ def main() -> None:
     total_end_s = time.monotonic() - total_start
     finish_interval("validation and teardown", "action", total_end_s)
     total_ms = total_end_s * 1000.0
+    action_ms = round(total_ms - scripted_pause_ms, 3)
     result = {
         "launch_ms": round(launch_ms, 3),
         "navigation_ms": round(navigation_ms, 3),
@@ -434,7 +477,9 @@ def main() -> None:
         "per_field": per_field,
         "total_ms": round(total_ms, 3),
         "scripted_pause_ms": round(scripted_pause_ms, 3),
-        "action_ms": round(total_ms - scripted_pause_ms, 3),
+        "action_ms": action_ms,
+        "library_latency_ms": action_ms,
+        "page_wait_ms": 0,
         "fields_filled": len(per_field),
         "skipped_fields": skipped_fields,
         "screenshots": screenshot_count,
@@ -448,6 +493,7 @@ def main() -> None:
         "blocked_persistent_transport_attempts": guard[
             "blockedPersistentTransports"
         ],
+        "library_probe": probe,
     }
     timeline_payload = {
         "script_start_epoch": script_start_epoch,
