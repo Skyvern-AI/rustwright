@@ -30,7 +30,13 @@ async def _run_session(checks, env_overrides=None) -> None:
 
     command = _server_command()
     env = dict(os.environ)
-    env.pop("RUSTWRIGHT_MCP_ALLOW_EVAL", None)
+    for name in (
+        "RUSTWRIGHT_MCP_ALLOW_EVAL",
+        "RUSTWRIGHT_MCP_CDP_ENDPOINT",
+        "RUSTWRIGHT_MCP_CDP_HEADERS",
+        "RUSTWRIGHT_MCP_CDP_TIMEOUT_MS",
+    ):
+        env.pop(name, None)
     if env_overrides:
         env.update(env_overrides)
     params = StdioServerParameters(
