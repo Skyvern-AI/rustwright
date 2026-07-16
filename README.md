@@ -92,6 +92,67 @@ One Rust core — an async CDP client built on Tokio (WebSocket, with opt-in Uni
 
 Already have a Chromium/Chrome binary? Point Rustwright at it with `RUSTWRIGHT_CHROMIUM`, `CHROME`, or `CHROMIUM`.
 
+## Browser automation for AI agents
+
+Two agent-facing surfaces drive Chromium from a compact accessibility snapshot
+with stable element refs (`e1`, `e2`, …) instead of raw HTML or screenshots:
+take a snapshot, then act on an element by its ref. Refs are session-scoped and
+never reused; resolution is best-effort for cooperative pages (not a security
+boundary), and snapshots reflect page values with password fields masked.
+
+### CLI — `rustwright-agent`
+
+Ships with the `rustwright` package (pure Python, no extra runtime dependency).
+Named sessions keep one browser alive across commands:
+
+```bash
+pip install rustwright
+python -m rustwright install chromium   # one-time browser download
+
+rustwright-agent open example.com       # launch + navigate; prints a snapshot
+rustwright-agent snapshot               # accessibility tree with refs (e1, e2, …)
+rustwright-agent click e3               # act on an element by its ref
+rustwright-agent fill e2 "hi@example.com"
+rustwright-agent --json snapshot        # one JSON object, for scripting
+rustwright-agent close
+```
+
+Full verbs, flags, session model, and threat model:
+[docs/agent-interfaces.md](docs/agent-interfaces.md).
+
+### MCP server — `rustwright-mcp`
+
+A [Model Context Protocol](https://modelcontextprotocol.io) server (a separate,
+opt-in package under [`mcp/`](mcp/)) exposing browser tools — `browser_navigate`,
+`browser_snapshot`, `browser_click`, `browser_type`, … — over stdio, so
+MCP-compatible agents (Claude Code, Claude Desktop, and others) can browse with
+Rustwright. Register it with Claude Code, no clone required:
+
+```bash
+claude mcp add rustwright \
+  --env RUSTWRIGHT_MCP_CHANNEL=chrome \
+  -- uvx --from 'git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp' rustwright-mcp
+```
+
+…or point any MCP client at it:
+
+```json
+{
+  "mcpServers": {
+    "rustwright": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp", "rustwright-mcp"],
+      "env": { "RUSTWRIGHT_MCP_CHANNEL": "chrome" }
+    }
+  }
+}
+```
+
+Key environment variables: `RUSTWRIGHT_MCP_HEADLESS` (`0` runs headed),
+`RUSTWRIGHT_MCP_CHANNEL` (Chromium channel, e.g. `chrome`), and
+`RUSTWRIGHT_MCP_ALLOW_EVAL` (`1` exposes the `browser_evaluate` tool, off by
+default). Full setup, tool list, and configuration: [mcp/README.md](mcp/README.md).
+
 ## Remote browsers (Skyvern)
 
 Rustwright drives browsers — but you still need somewhere to run them. Skyvern (the team behind Rustwright) offers hosted **[Browser Sessions](https://www.skyvern.com/docs/developers/features/browser-sessions)** as a paid service that funds this project.
@@ -192,7 +253,7 @@ See [`LIMITATIONS.md`](LIMITATIONS.md) for detail.
 
 - [ ] **Kotlin binding** — idiomatic Kotlin wrapper (Kotlin/JVM can already consume the Java FFM binding)
 - [ ] Grow the new language bindings beyond the alpha subset (contexts, routing, locators)
-- [x] **Rustwright MCP server** — expose browser automation as tools for MCP-compatible AI agents ([mcp/](mcp/))
+- [ ] **Rustwright MCP server** — expose browser automation as tools for MCP-compatible AI agents
 - [ ] CI / Testbox-backed benchmark evidence
 - [ ] Broaden the Node.js surface (contexts, routing, locators)
 - [ ] Close remaining OOPIF gaps
