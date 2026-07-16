@@ -19980,10 +19980,11 @@ return true;
         *,
         timeout: Optional[float],
         method: str,
+        wait_probe: bool = False,
     ) -> Any:
         result = _call_with_method_prefix(
             method,
-            self._page._core.evaluate,
+            self._page._core.evaluate_wait_probe if wait_probe else self._page._core.evaluate,
             expression,
             json_module_dumps(payload),
             self._page._default_timeout if timeout is None else timeout,
@@ -21311,6 +21312,7 @@ try {
             payload,
             timeout=timeout,
             method=method,
+            wait_probe=True,
         )
         if isinstance(result, dict) and result.get("ok"):
             return True if result.get("satisfied") else _MISSING
