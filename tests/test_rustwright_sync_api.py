@@ -358,6 +358,51 @@ def http_server():
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            navigation_wait_pages = {
+                "/wait-for-navigation-visible-a": """
+                    <script>
+                    setTimeout(function() { location.href = '/wait-for-navigation-visible-b'; }, 200);
+                    </script>
+                    <main>Waiting for navigation</main>
+                """,
+                "/wait-for-navigation-visible-b": "<div id='target'>hello</div>",
+                "/wait-for-navigation-absence-a": """
+                    <script>
+                    setTimeout(function() { location.href = '/wait-for-navigation-absence-b'; }, 200);
+                    </script>
+                    <div id='target'>present before navigation</div>
+                """,
+                "/wait-for-navigation-absence-b": "<main>target removed by navigation</main>",
+                "/wait-for-navigation-multi-a": """
+                    <script>
+                    setTimeout(function() { location.href = '/wait-for-navigation-multi-b'; }, 150);
+                    </script>
+                    <main>First document</main>
+                """,
+                "/wait-for-navigation-multi-b": """
+                    <script>
+                    setTimeout(function() { location.href = '/wait-for-navigation-multi-c'; }, 150);
+                    </script>
+                    <main>Second document</main>
+                """,
+                "/wait-for-navigation-multi-c": "<div id='target'>final document</div>",
+                "/wait-for-navigation-timeout-a": """
+                    <script>
+                    setTimeout(function() { location.href = '/wait-for-navigation-timeout-b'; }, 200);
+                    </script>
+                    <main>Missing target before navigation</main>
+                """,
+                "/wait-for-navigation-timeout-b": "<main>Missing target after navigation</main>",
+            }
+            if self.path in navigation_wait_pages:
+                body = navigation_wait_pages[self.path].encode("utf-8")
+                self.send_response(200, "OK")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path == "/json":
                 body = json.dumps({"ok": True, "path": self.path}).encode("utf-8")
                 self.send_response(201, "Created")
@@ -19157,6 +19202,95 @@ def test_wait_for_selector(page):
         root.wait_for_selector("#hidden", state="enabled", timeout=500)
     with pytest.raises(Error, match="Frame\\.wait_for_selector: state: expected one of"):
         frame.wait_for_selector("#frame-hidden", state="enabled", timeout=500)
+
+
+def test_locator_wait_for_survives_navigation_mid_wait(page, http_server):
+    page.goto(f"{http_server}/wait-for-navigation-visible-a")
+    target = page.locator("#target")
+
+    assert target.wait_for(state="visible", timeout=10_000) is None
+    assert target.inner_text() == "hello"
+    assert page.url == f"{http_server}/wait-for-navigation-visible-b"
+
+
+def test_page_wait_for_selector_survives_navigation_mid_wait(page, http_server):
+    page.goto(f"{http_server}/wait-for-navigation-visible-a")
+
+    target = page.wait_for_selector("#target", state="visible", timeout=10_000)
+
+    assert target is not None
+    assert target.text_content() == "hello"
+    assert page.url == f"{http_server}/wait-for-navigation-visible-b"
+
+
+@pytest.mark.parametrize("state", ["hidden", "detached"])
+def test_locator_wait_for_absence_state_resolves_on_navigation(page, http_server, state):
+    page.goto(f"{http_server}/wait-for-navigation-absence-a")
+    target = page.locator("#target")
+
+    assert target.wait_for(state=state, timeout=10_000) is None
+    assert page.url == f"{http_server}/wait-for-navigation-absence-b"
+
+
+def test_locator_wait_for_survives_multiple_navigations(page, http_server):
+    page.goto(f"{http_server}/wait-for-navigation-multi-a")
+    target = page.locator("#target")
+
+    assert target.wait_for(state="visible", timeout=10_000) is None
+    assert target.inner_text() == "final document"
+    assert page.url == f"{http_server}/wait-for-navigation-multi-c"
+
+
+def test_async_locator_wait_for_survives_navigation_mid_wait(http_server):
+    async def run() -> None:
+        from rustwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(f"{http_server}/wait-for-navigation-visible-a")
+            target = page.locator("#target")
+
+            assert await target.wait_for(state="visible", timeout=10_000) is None
+            assert await target.inner_text() == "hello"
+            assert page.url == f"{http_server}/wait-for-navigation-visible-b"
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_locator_wait_for_navigation_preserves_timeout_budget(page, http_server):
+    page.goto(f"{http_server}/wait-for-navigation-timeout-a")
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError, match=r"Locator\.wait_for: Timeout 2000ms exceeded\."):
+        page.locator("#target").wait_for(state="visible", timeout=2_000)
+
+    assert time.monotonic() - started < 4.5
+
+
+def test_locator_wait_for_fails_fast_when_page_closes(http_server):
+    # The sync API serializes commands on the calling thread, so a concurrent
+    # close must come from the async API to reach the browser mid-wait.
+    async def run() -> None:
+        from rustwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content("<main>Waiting for target</main>")
+            waiter = asyncio.create_task(
+                page.locator("#target").wait_for(state="visible", timeout=10_000)
+            )
+            await asyncio.sleep(0.2)
+            started = time.monotonic()
+            await page.close()
+            with pytest.raises(Exception, match=r"(?i)closed"):
+                await waiter
+            assert time.monotonic() - started < 5
+            await browser.close()
+
+    asyncio.run(run())
 
 
 def test_wait_for_selector_timeout_messages_match_playwright(page):
