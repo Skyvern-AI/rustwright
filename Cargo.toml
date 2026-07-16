@@ -12,7 +12,7 @@ keywords = ["browser", "automation", "cdp", "playwright", "chromium"]
 categories = ["web-programming"]
 
 [workspace]
-members = ["node"]
+members = ["node", "capi", "rust-native"]
 resolver = "2"
 
 [features]
