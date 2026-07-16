@@ -659,6 +659,39 @@ mod tests {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     #[test]
+    fn locator_wait_context_loss_classification_is_narrow() {
+        for message in [
+            "Inspected target navigated or closed",
+            "Execution context was destroyed.",
+            "Cannot find context with specified id",
+            "Session with given id not found.",
+            "CDP session is detached",
+            "No frame for given id found",
+        ] {
+            assert!(is_locator_wait_context_loss(&RwError::Cdp {
+                method: "Runtime.evaluate".to_string(),
+                message: message.to_string(),
+            }));
+        }
+
+        for message in [
+            "Target closed",
+            "Session closed",
+            "CDP websocket is closed",
+            "Invalid selector",
+        ] {
+            assert!(!is_locator_wait_context_loss(&RwError::Cdp {
+                method: "Runtime.evaluate".to_string(),
+                message: message.to_string(),
+            }));
+        }
+        assert!(!is_locator_wait_context_loss(&RwError::Message(
+            "Execution context was destroyed.".to_string()
+        )));
+        assert!(!is_locator_wait_context_loss(&RwError::Timeout(100)));
+    }
+
+    #[test]
     fn cached_main_frame_url_prefers_last_navigated_url() {
         let mut state = PageFrameState::new("session-main".to_string());
 
@@ -1403,6 +1436,8 @@ mod tests {
                 background_override_active: Arc::new(AtomicBool::new(false)),
                 screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
                 lifecycle: Arc::new(CloseLifecycle::new()),
+                target_closed: AtomicBool::new(false),
+                crashed: AtomicBool::new(false),
                 close_target_on_drop: AtomicBool::new(false),
             })
         };
@@ -3522,6 +3557,8 @@ struct PageInner {
     background_override_active: Arc<AtomicBool>,
     screenshot_lock: Arc<tokio::sync::Mutex<()>>,
     lifecycle: Arc<CloseLifecycle>,
+    target_closed: AtomicBool,
+    crashed: AtomicBool,
     close_target_on_drop: AtomicBool,
 }
 
@@ -5130,6 +5167,32 @@ fn evaluate_expression_for_page_raw(
     ))
 }
 
+fn evaluate_locator_wait_probe_for_page(
+    page: Arc<PageInner>,
+    expression: String,
+    timeout_ms: Option<f64>,
+) -> RwResult<String> {
+    let timeout = BrowserInner::command_timeout(timeout_ms);
+    let browser = Arc::clone(&page.browser);
+    browser.block_on(async move {
+        let attempt_page = Arc::clone(&page);
+        run_locator_wait_retry(page, timeout, move |deadline| {
+            let page = Arc::clone(&attempt_page);
+            let expression = expression.clone();
+            async move {
+                evaluate_expression_in_session_before(
+                    &page.browser.client,
+                    &page.session_id,
+                    expression,
+                    deadline,
+                )
+                .await
+            }
+        })
+        .await
+    })
+}
+
 async fn evaluate_expression_for_page_async(
     page: Arc<PageInner>,
     expression: String,
@@ -5661,6 +5724,17 @@ async fn evaluate_expression_in_frame_context(
     let context_id =
         create_isolated_world_for_frame(client, session_id, frame_id, deadline.remaining()?)
             .await?;
+    evaluate_expression_in_context_before(client, session_id, context_id, expression, deadline)
+        .await
+}
+
+async fn evaluate_expression_in_context_before(
+    client: &CdpClient,
+    session_id: &str,
+    context_id: Value,
+    expression: String,
+    deadline: OperationDeadline,
+) -> RwResult<String> {
     let result = client
         .send(
             "Runtime.evaluate",
@@ -5740,6 +5814,51 @@ struct FrameOwnerResolution {
     same_origin_accessible: bool,
 }
 
+async fn evaluate_locator_resolution(
+    page: &PageInner,
+    resolution: &LocatorSessionResolution,
+    expression: String,
+    setup_deadline: OperationDeadline,
+    transport_slack: Duration,
+) -> RwResult<String> {
+    let context_id = if let Some(frame_id) = &resolution.frame_id {
+        Some(
+            create_isolated_world_for_frame(
+                &page.browser.client,
+                &resolution.session_id,
+                frame_id,
+                setup_deadline.remaining()?,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let transport_deadline = if transport_slack.is_zero() {
+        setup_deadline
+    } else {
+        OperationDeadline::new(setup_deadline.remaining()?.saturating_add(transport_slack))
+    };
+    if let Some(context_id) = context_id {
+        evaluate_expression_in_context_before(
+            &page.browser.client,
+            &resolution.session_id,
+            context_id,
+            expression,
+            transport_deadline,
+        )
+        .await
+    } else {
+        evaluate_expression_in_session_before(
+            &page.browser.client,
+            &resolution.session_id,
+            expression,
+            transport_deadline,
+        )
+        .await
+    }
+}
+
 async fn evaluate_locator_for_page(
     page: Arc<PageInner>,
     locator_json: String,
@@ -5750,24 +5869,7 @@ async fn evaluate_locator_for_page(
     let deadline = OperationDeadline::new(timeout);
     let resolution = resolve_locator_session(Arc::clone(&page), &locator_json, deadline).await?;
     let expression = locator_script(&resolution.locator_json, index, &body);
-    if let Some(frame_id) = resolution.frame_id {
-        evaluate_expression_in_frame_context(
-            &page.browser.client,
-            &resolution.session_id,
-            &frame_id,
-            expression,
-            deadline,
-        )
-        .await
-    } else {
-        evaluate_expression_in_session_before(
-            &page.browser.client,
-            &resolution.session_id,
-            expression,
-            deadline,
-        )
-        .await
-    }
+    evaluate_locator_resolution(&page, &resolution, expression, deadline, Duration::ZERO).await
 }
 
 async fn evaluate_locator_handle_for_page(
@@ -6401,6 +6503,51 @@ async fn page_goto_async(
         .to_string())
 }
 
+fn is_locator_wait_context_loss(error: &RwError) -> bool {
+    let message = match error {
+        RwError::Cdp { message, .. } => message.to_ascii_lowercase(),
+        _ => return false,
+    };
+    // Only retry when the resolved execution environment disappeared; page terminal state is
+    // checked separately so an ambiguous navigation-or-close error never masks a closed target.
+    [
+        "inspected target navigated or closed",
+        "execution context was destroyed",
+        "cannot find context with specified id",
+        "cannot find context with id",
+        "session with given id not found",
+        "no session with given id",
+        "session is detached",
+        "session detached",
+        "frame with the given id was not found",
+        "no frame for given id",
+        "no frame with given id",
+        "cannot find frame with id",
+        "frame was detached",
+    ]
+    .iter()
+    .any(|fragment| message.contains(fragment))
+}
+
+fn locator_wait_terminal_error(page: &PageInner) -> Option<RwError> {
+    if page.crashed.load(Ordering::SeqCst) {
+        return Some(RwError::Message("Page crashed".to_string()));
+    }
+    if page.lifecycle.is_closing_or_closed()
+        || page.target_closed.load(Ordering::SeqCst)
+        || !page.browser.client.is_connected()
+    {
+        return Some(RwError::Message(
+            "Target page, context or browser has been closed".to_string(),
+        ));
+    }
+    None
+}
+
+fn locator_wait_timeout(timeout: Duration) -> RwError {
+    RwError::Timeout(timeout.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
 fn wait_for_selector_body(state: &str, strict: bool, timeout: Duration) -> String {
     let state_json = serde_json::to_string(state).unwrap_or_else(|_| "\"visible\"".to_string());
     let strict_json = if strict { "true" } else { "false" };
@@ -6455,6 +6602,108 @@ return new Promise(resolve => {{
     )
 }
 
+async fn evaluate_wait_for_selector_attempt(
+    page: &Arc<PageInner>,
+    locator_json: &str,
+    index: usize,
+    state: &str,
+    strict: bool,
+    deadline: OperationDeadline,
+) -> RwResult<String> {
+    let resolution = resolve_locator_session(Arc::clone(page), locator_json, deadline).await?;
+    let body = wait_for_selector_body(state, strict, deadline.remaining()?);
+    let expression = locator_script(&resolution.locator_json, index, &body);
+    evaluate_locator_resolution(
+        page,
+        &resolution,
+        expression,
+        deadline,
+        Duration::from_secs(1),
+    )
+    .await
+}
+
+async fn verify_locator_wait_target_liveness(
+    page: &PageInner,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    if let Some(error) = locator_wait_terminal_error(page) {
+        return Err(error);
+    }
+    let timeout = deadline.remaining_capped(Duration::from_millis(250))?;
+    match page
+        .browser
+        .client
+        .send(
+            "Target.getTargetInfo",
+            json!({ "targetId": page.target_id }),
+            None,
+            timeout,
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        // Only a protocol rejection proves the target is gone; a probe timeout on a
+        // slow or remote connection is inconclusive and must not abort the wait.
+        Err(RwError::Cdp { .. }) => Err(RwError::Message(
+            "Target page, context or browser has been closed".to_string(),
+        )),
+        Err(_) => Ok(()),
+    }
+}
+
+async fn wait_before_rearming_locator_wait(
+    page: &PageInner,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    if let Some(error) = locator_wait_terminal_error(page) {
+        return Err(error);
+    }
+    tokio::time::sleep(deadline.remaining_capped(Duration::from_millis(25))?).await;
+    if let Some(error) = locator_wait_terminal_error(page) {
+        return Err(error);
+    }
+    deadline.remaining().map(|_| ())
+}
+
+async fn run_locator_wait_retry<T, Attempt, AttemptFuture>(
+    page: Arc<PageInner>,
+    timeout: Duration,
+    mut attempt: Attempt,
+) -> RwResult<T>
+where
+    Attempt: FnMut(OperationDeadline) -> AttemptFuture,
+    AttemptFuture: Future<Output = RwResult<T>>,
+{
+    let deadline = OperationDeadline::new(timeout);
+    loop {
+        if let Some(error) = locator_wait_terminal_error(&page) {
+            return Err(error);
+        }
+        let attempt = attempt(deadline);
+        tokio::pin!(attempt);
+        let result = loop {
+            tokio::select! {
+                result = &mut attempt => break result,
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    if let Some(error) = locator_wait_terminal_error(&page) {
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) if is_locator_wait_context_loss(&error) => {
+                verify_locator_wait_target_liveness(&page, deadline).await?;
+                wait_before_rearming_locator_wait(&page, deadline).await?;
+            }
+            Err(RwError::Timeout(_)) => return Err(locator_wait_timeout(timeout)),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 async fn page_wait_for_selector_async(
     page: Arc<PageInner>,
     locator_json: String,
@@ -6463,12 +6712,27 @@ async fn page_wait_for_selector_async(
     timeout: Duration,
     strict: bool,
 ) -> RwResult<bool> {
-    let body = wait_for_selector_body(&state, strict, timeout);
-    let eval_timeout = Duration::from_millis(timeout.as_millis().saturating_add(1_000) as u64);
-    let json = evaluate_locator_for_page(page, locator_json, index, body, eval_timeout).await?;
+    let attempt_page = Arc::clone(&page);
+    let json = run_locator_wait_retry(page, timeout, move |deadline| {
+        let page = Arc::clone(&attempt_page);
+        let locator_json = locator_json.clone();
+        let state = state.clone();
+        async move {
+            evaluate_wait_for_selector_attempt(
+                &page,
+                &locator_json,
+                index,
+                &state,
+                strict,
+                deadline,
+            )
+            .await
+        }
+    })
+    .await?;
     let value = serde_json::from_str::<Value>(&json).unwrap_or(Value::Null);
     if value.as_str() == Some("__rustwright_timeout__") {
-        return Err(RwError::Timeout(timeout.as_millis() as u64));
+        return Err(locator_wait_timeout(timeout));
     }
     if let Some(count) = value
         .as_str()
@@ -8380,6 +8644,20 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
             .map_err(py_err)
     }
 
+    #[pyo3(signature = (expression, arg_json=None, timeout_ms=None))]
+    fn evaluate_wait_probe(
+        &self,
+        py: Python<'_>,
+        expression: &str,
+        arg_json: Option<&str>,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<String> {
+        let expression = make_evaluate_expression(expression, arg_json);
+        let page = Arc::clone(&self.inner);
+        py.detach(move || evaluate_locator_wait_probe_for_page(page, expression, timeout_ms))
+            .map_err(py_err)
+    }
+
     #[pyo3(signature = (frame_id, expression, arg_json=None, timeout_ms=None))]
     fn evaluate_frame(
         &self,
@@ -8934,79 +9212,21 @@ return true;
         timeout_ms: Option<f64>,
         strict: Option<bool>,
     ) -> PyResult<bool> {
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let locator_json = locator_json.to_string();
         let state = state.unwrap_or("visible").to_string();
-        let strict = strict.unwrap_or(false);
         let timeout = BrowserInner::command_timeout(timeout_ms);
-        let state_json =
-            serde_json::to_string(&state).unwrap_or_else(|_| "\"visible\"".to_string());
-        let strict_json = if strict { "true" } else { "false" };
-        let timeout_millis = timeout.as_millis().max(1);
-        let eval_timeout = timeout_millis.saturating_add(1_000) as f64;
-        let body = format!(
-            r#"
-const targetState = {state_json};
-const strict = {strict_json};
-const timeoutMs = {timeout_millis};
-const snapshot = () => {{
-  const matches = all(spec);
-  if (strict && matches.length > 1) return {{ strict: true, count: matches.length }};
-  const current = matches[index] || null;
-  const attached = !!current;
-  const isVisible = !!current && visible(current);
-  const matched = targetState === 'attached'
-    ? attached
-    : targetState === 'detached'
-      ? !attached
-      : targetState === 'hidden'
-        ? (!attached || !isVisible)
-        : isVisible;
-  return {{ attached, matched }};
-}};
-const first = snapshot();
-if (first.strict) return `__rustwright_strict_violation__:${{first.count}}`;
-if (first.matched) return first.attached;
-return new Promise(resolve => {{
-  let settled = false;
-  let observer = null;
-  let interval = null;
-  let timer = null;
-  const finish = value => {{
-    if (settled) return;
-    settled = true;
-    if (observer) observer.disconnect();
-    if (interval) clearInterval(interval);
-    if (timer) clearTimeout(timer);
-    resolve(value);
-  }};
-  const check = () => {{
-    const next = snapshot();
-    if (next.strict) finish(`__rustwright_strict_violation__:${{next.count}}`);
-    if (next.matched) finish(next.attached);
-  }};
-  observer = new MutationObserver(check);
-  observer.observe(document, {{ subtree: true, childList: true, attributes: true, characterData: true }});
-  interval = setInterval(check, 5);
-  timer = setTimeout(() => finish('__rustwright_timeout__'), timeoutMs);
-}});
-"#
-        );
-        let json = self
-            .evaluate_locator(locator_json, index, &body, Some(eval_timeout))
-            .map_err(py_err)?;
-        let value = serde_json::from_str::<Value>(&json).unwrap_or(Value::Null);
-        if value.as_str() == Some("__rustwright_timeout__") {
-            return Err(py_err(RwError::Timeout(timeout.as_millis() as u64)));
-        }
-        if let Some(count) = value
-            .as_str()
-            .and_then(|text| text.strip_prefix("__rustwright_strict_violation__:"))
-            .and_then(|text| text.parse::<u64>().ok())
-        {
-            return Err(py_err(RwError::Message(format!(
-                "strict mode violation: locator resolved to {count} elements while trying to wait_for_selector"
-            ))));
-        }
-        Ok(value.as_bool().unwrap_or(false))
+        browser
+            .block_on(page_wait_for_selector_async(
+                page,
+                locator_json,
+                index,
+                state,
+                timeout,
+                strict.unwrap_or(false),
+            ))
+            .map_err(py_err)
     }
 
     #[pyo3(signature = (path=None, full_page=None, clip_json=None, timeout_ms=None, image_type=None, quality=None, omit_background=None))]
@@ -11609,6 +11829,8 @@ async fn attach_existing_page_unregistered(
         background_override_active: Arc::new(AtomicBool::new(false)),
         screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
         lifecycle: Arc::new(CloseLifecycle::new()),
+        target_closed: AtomicBool::new(false),
+        crashed: AtomicBool::new(false),
         close_target_on_drop: AtomicBool::new(false),
     });
     let _ = refresh_page_frame_tree(&page_inner, Duration::from_secs(5)).await;
@@ -11788,6 +12010,35 @@ fn spawn_page_oopif_event_listener(page: Weak<PageInner>) {
 
 async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
     let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+    if method == "Target.targetCrashed"
+        && event.pointer("/params/targetId").and_then(Value::as_str)
+            == Some(page.target_id.as_str())
+    {
+        page.crashed.store(true, Ordering::SeqCst);
+        return;
+    }
+    if method == "Inspector.targetCrashed"
+        && event.get("sessionId").and_then(Value::as_str) == Some(page.session_id.as_str())
+    {
+        page.crashed.store(true, Ordering::SeqCst);
+        return;
+    }
+    if method == "Target.targetDestroyed"
+        && event.pointer("/params/targetId").and_then(Value::as_str)
+            == Some(page.target_id.as_str())
+    {
+        page.target_closed.store(true, Ordering::SeqCst);
+        return;
+    }
+    if (method == "Inspector.detached"
+        && event.get("sessionId").and_then(Value::as_str) == Some(page.session_id.as_str()))
+        || (method == "Target.detachedFromTarget"
+            && event.pointer("/params/sessionId").and_then(Value::as_str)
+                == Some(page.session_id.as_str()))
+    {
+        page.target_closed.store(true, Ordering::SeqCst);
+        return;
+    }
     if method == "Target.attachedToTarget" {
         let parent_session_id = event.get("sessionId").and_then(Value::as_str);
         if !parent_session_id
@@ -11896,6 +12147,7 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
                 .map(ToString::to_string);
             if parent_id.is_none() && event_session_id == page.session_id {
                 *page.main_frame_id.lock().unwrap() = Some(frame_id.to_string());
+                page.crashed.store(false, Ordering::SeqCst);
             }
             page.frame_state.lock().unwrap().record_frame(
                 frame_id.to_string(),
