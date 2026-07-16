@@ -8,12 +8,19 @@ Environment variables:
     RUSTWRIGHT_MCP_HEADLESS    "0" to show the browser window (default headless)
     RUSTWRIGHT_MCP_CHANNEL     chromium channel, e.g. "chrome" (default: bundled chromium)
     RUSTWRIGHT_MCP_EXECUTABLE  explicit browser executable path (overrides channel)
+    RUSTWRIGHT_MCP_CDP_ENDPOINT remote browser CDP endpoint (uses remote mode when set)
+    RUSTWRIGHT_MCP_CDP_HEADERS optional JSON object of CDP connection headers
+    RUSTWRIGHT_MCP_CDP_TIMEOUT_MS remote connection timeout in milliseconds (default: 60000)
     RUSTWRIGHT_MCP_ALLOW_EVAL  "1", "true", or "yes" to expose browser_evaluate
+
+When RUSTWRIGHT_MCP_CDP_ENDPOINT is set, the local headless, channel, and
+executable options are ignored.
 """
 
 from __future__ import annotations
 
 import functools
+import json
 import os
 import tempfile
 import threading
@@ -67,15 +74,98 @@ def _register_dialog_handler(page) -> None:
 
 
 def _page():
+    """Return the active page, launching locally or attaching over remote CDP.
+
+    In remote CDP mode, local launch options (headless, channel, and executable)
+    are ignored.
+    """
     if "page" in _session:
         try:
             # The user may have closed a headed window; detect a dead
             # session and relaunch instead of failing every call.
             _session["page"].evaluate("() => 1")
         except Exception:
+            if _session.get("remote"):
+                _teardown()
+                raise RuntimeError(
+                    "Remote CDP session is no longer reachable — "
+                    "reconnect/restart the MCP server."
+                ) from None
             _teardown()
     if "page" not in _session:
         from rustwright.sync_api import sync_playwright
+
+        endpoint = os.environ.get("RUSTWRIGHT_MCP_CDP_ENDPOINT")
+        if endpoint:
+            raw_headers = os.environ.get("RUSTWRIGHT_MCP_CDP_HEADERS", "")
+            headers: dict[str, str] = {}
+            if raw_headers:
+                try:
+                    parsed_headers = json.loads(raw_headers)
+                except json.JSONDecodeError:
+                    raise ValueError(
+                        "RUSTWRIGHT_MCP_CDP_HEADERS must contain a valid JSON object"
+                    ) from None
+                if not isinstance(parsed_headers, dict) or not all(
+                    isinstance(name, str) and isinstance(value, str)
+                    for name, value in parsed_headers.items()
+                ):
+                    raise ValueError(
+                        "RUSTWRIGHT_MCP_CDP_HEADERS must be a JSON object with "
+                        "string keys and values"
+                    )
+                headers = parsed_headers
+
+            try:
+                timeout_ms = int(
+                    os.environ.get("RUSTWRIGHT_MCP_CDP_TIMEOUT_MS", "60000")
+                )
+            except ValueError:
+                raise ValueError(
+                    "RUSTWRIGHT_MCP_CDP_TIMEOUT_MS must be a non-negative integer"
+                ) from None
+            if timeout_ms < 0:
+                raise ValueError(
+                    "RUSTWRIGHT_MCP_CDP_TIMEOUT_MS must be a non-negative integer"
+                )
+
+            pw = None
+            browser = None
+            try:
+                pw = sync_playwright().start()
+                browser = pw.chromium.connect_over_cdp(
+                    endpoint,
+                    headers=headers,
+                    timeout=timeout_ms,
+                )
+                context = browser.contexts[0]
+                pages = context.pages
+                page = pages[0] if pages else context.new_page()
+                _session.update(
+                    pw=pw,
+                    browser=browser,
+                    page=page,
+                    remote=True,
+                    snapshot_taken=False,
+                    next_ref=1,
+                    dialog_pages=[],
+                )
+                _register_dialog_handler(page)
+            except Exception:
+                for close in (
+                    lambda: browser.close() if browser is not None else None,
+                    lambda: pw.stop() if pw is not None else None,
+                ):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                _session.clear()
+                raise RuntimeError(
+                    "Remote CDP browser is unreachable; check the connection "
+                    "settings and try again."
+                ) from None
+            return _session["page"]
 
         headless = os.environ.get("RUSTWRIGHT_MCP_HEADLESS", "1") != "0"
         launch_kwargs: dict = {"headless": headless}
@@ -92,6 +182,7 @@ def _page():
             pw=pw,
             browser=browser,
             page=page,
+            remote=False,
             snapshot_taken=False,
             next_ref=1,
             dialog_pages=[],
@@ -118,6 +209,8 @@ def _snapshot(page) -> str:
 
 
 def _teardown() -> None:
+    # For remote sessions, closing the connected Browser detaches this client;
+    # Rustwright leaves the remotely owned browser running.
     for close in (
         lambda: _session["browser"].close(),
         lambda: _session["pw"].stop(),

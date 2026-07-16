@@ -137,7 +137,35 @@ Example Domains
 | `RUSTWRIGHT_MCP_HEADLESS` | `0` shows the browser window (default headless) |
 | `RUSTWRIGHT_MCP_CHANNEL` | Chromium channel, e.g. `chrome`, `chrome-beta` |
 | `RUSTWRIGHT_MCP_EXECUTABLE` | Explicit browser binary path (overrides channel) |
+| `RUSTWRIGHT_MCP_CDP_ENDPOINT` | Remote browser CDP endpoint; enables remote mode when set |
+| `RUSTWRIGHT_MCP_CDP_HEADERS` | Optional JSON object of extra CDP connection headers |
+| `RUSTWRIGHT_MCP_CDP_TIMEOUT_MS` | Remote connection timeout in milliseconds (default `60000`) |
 | `RUSTWRIGHT_MCP_ALLOW_EVAL` | `1`, `true`, or `yes` exposes `browser_evaluate` (default off) |
+
+### Remote browsers over CDP
+
+Set `RUSTWRIGHT_MCP_CDP_ENDPOINT` to attach to an existing Chromium browser
+over CDP. `RUSTWRIGHT_MCP_CDP_HEADERS` accepts a JSON object of extra connection
+headers, and `RUSTWRIGHT_MCP_CDP_TIMEOUT_MS` controls the connection timeout.
+The server adopts the remote browser's default context and an existing page,
+creating a page only when the context has none.
+
+```bash
+RUSTWRIGHT_MCP_CDP_ENDPOINT='wss://browser.example.com/devtools/browser/<session-id>' \
+RUSTWRIGHT_MCP_CDP_HEADERS='{"Authorization":"Bearer <token>"}' \
+RUSTWRIGHT_MCP_CDP_TIMEOUT_MS=60000 \
+rustwright-mcp
+```
+
+In CDP mode, `RUSTWRIGHT_MCP_HEADLESS`, `RUSTWRIGHT_MCP_CHANNEL`, and
+`RUSTWRIGHT_MCP_EXECUTABLE` are ignored. If the initial connection fails or a
+remote session stops responding, the tool fails loudly; it never silently
+launches a local browser. `browser_close` detaches from the remote browser
+without terminating the remotely owned process.
+
+For example, a hosted browser provider such as Skyvern Browser Sessions exposes
+a CDP address plus an `x-api-key` header; configure the header with
+`RUSTWRIGHT_MCP_CDP_HEADERS='{"x-api-key":"<key>"}'`.
 
 ### Headless vs headed
 
@@ -166,12 +194,12 @@ restart the session).
   are masked in snapshot output; other field values are included as-is.
 - Snapshot refs are best-effort handles for cooperative pages, not a security
   boundary. Refs increase for the browser session and stale refs fail fast.
-- Each server process controls a single local browser session, which may have
-  multiple tabs.
+- Each server process controls a single local or remote browser session, which
+  may have multiple tabs.
 
 ## Limitations
 
-- Single local browser session per server process.
+- Single browser session per server process.
 - Snapshot refs are regenerated on every snapshot; after a page mutation,
   take a new snapshot before acting on refs. Stale refs fail fast with a
   message asking for a fresh snapshot.
