@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+
+    <PackageId>Rustwright</PackageId>
+    <Version>0.1.1</Version>
+    <Authors>Skyvern</Authors>
+    <Description>A synchronous .NET binding for Rustwright's Rust-powered Chromium CDP engine.</Description>
+    <PackageTags>browser;automation;cdp;chromium;playwright</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/Skyvern-AI/rustwright</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/Skyvern-AI/rustwright</PackageProjectUrl>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Update="README.md" Pack="true" PackagePath="/" />
+
+    <!-- Generated release artifacts are staged here before packing. -->
+    <None Update="runtimes/osx-arm64/native/librustwright_capi.dylib"
+          Pack="true"
+          PackagePath="runtimes/osx-arm64/native/librustwright_capi.dylib"
+          Condition="Exists('runtimes/osx-arm64/native/librustwright_capi.dylib')" />
+    <None Update="runtimes/osx-x64/native/librustwright_capi.dylib"
+          Pack="true"
+          PackagePath="runtimes/osx-x64/native/librustwright_capi.dylib"
+          Condition="Exists('runtimes/osx-x64/native/librustwright_capi.dylib')" />
+    <None Update="runtimes/linux-arm64/native/librustwright_capi.so"
+          Pack="true"
+          PackagePath="runtimes/linux-arm64/native/librustwright_capi.so"
+          Condition="Exists('runtimes/linux-arm64/native/librustwright_capi.so')" />
+    <None Update="runtimes/linux-x64/native/librustwright_capi.so"
+          Pack="true"
+          PackagePath="runtimes/linux-x64/native/librustwright_capi.so"
+          Condition="Exists('runtimes/linux-x64/native/librustwright_capi.so')" />
+    <None Update="runtimes/win-x64/native/rustwright_capi.dll"
+          Pack="true"
+          PackagePath="runtimes/win-x64/native/rustwright_capi.dll"
+          Condition="Exists('runtimes/win-x64/native/rustwright_capi.dll')" />
+  </ItemGroup>
+</Project>
