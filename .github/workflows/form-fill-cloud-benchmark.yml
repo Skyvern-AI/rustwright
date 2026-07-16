@@ -40,7 +40,11 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The job never pushes; do not leave the job token in git config
+          # for later steps that execute repository build code.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -55,8 +59,10 @@ jobs:
       - name: Build rustwright in its benchmark environment
         run: |
           python -m venv .venv-rw
-          # Exact pins: this step runs before the secret-bearing benchmark
-          # step, so nothing mutable is installed on the way there.
+          # Exact pins keep the third-party dependency chain deterministic.
+          # The repository's own Rust build code necessarily executes here;
+          # that code is what this workflow exists to benchmark and is
+          # reviewed through normal PR review.
           .venv-rw/bin/pip install maturin==1.14.1 psutil==7.2.2
           # maturin locates the target venv via VIRTUAL_ENV; invoking its binary
           # from .venv-rw/bin does not set it, and the venv is not named ".venv".
@@ -79,6 +85,12 @@ jobs:
           REPS: ${{ inputs.reps }}
           CONCURRENCY: ${{ inputs.concurrency }}
         run: |
+          # Constrain BACKENDS before it is word-split below: env routing
+          # already prevents shell injection, and this rejects CLI-option
+          # smuggling (e.g. "rustwright --weakness") through the split.
+          case "$BACKENDS" in
+            (*[!a-z\ ]*) echo "invalid backends: must be space-separated lowercase words"; exit 1 ;;
+          esac
           # shellcheck disable=SC2086  # BACKENDS is an intentional space-separated list
           PYTHONPATH="$PWD/benchmarks/form_fill" \
             .venv-rw/bin/python benchmarks/form_fill/harness/run_suite.py \
@@ -91,12 +103,18 @@ jobs:
 
       - name: Print benchmark summary
         if: always()
-        run: cat out/suite/suite_summary.txt
+        run: |
+          if [ -f out/suite/suite_summary.txt ]; then
+            cat out/suite/suite_summary.txt
+          else
+            echo "No summary produced (benchmark aborted before writing output)."
+          fi
 
       - name: Upload benchmark results
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: form-fill-cloud-benchmark
           path: out/suite/
-          if-no-files-found: warn
+          if-no-files-found: error
+          retention-days: 30

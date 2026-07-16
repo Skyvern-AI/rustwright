@@ -1,0 +1,23 @@
+case | category | backend | lib_latency_ms(median) | lib_latency_ms(p95) | probe_ms(median) | probe_ms(p95) | page_wait_ms(median) | page_wait_ms(p95) | pss_peak_mb(median) | equivalent_work | soft_failures | ok/total
+controlled_click_20_buttons | navigation | rustwright | 15569.581 | 15626.219 | 798.880 | 801.144 | 0.000 | 0.000 | 68.811 | 3/3 | True | 0
+controlled_click_20_buttons | navigation | playwright | 12601.079 | 12683.525 | 680.115 | 681.084 | 0.000 | 0.000 | 108.275 | 3/3 | True | 0
+controlled_evaluate_rtt_100 | navigation | rustwright | 7571.825 | 7685.961 | 784.601 | 787.036 | 0.000 | 0.000 | 27.820 | 3/3 | True | 0
+controlled_evaluate_rtt_100 | navigation | playwright | 6694.005 | 7097.335 | 678.368 | 680.272 | 0.000 | 0.000 | 110.573 | 3/3 | True | 0
+controlled_object_eval_small_25 | navigation | rustwright | 6427.869 | 6480.061 | 795.360 | 802.214 | 0.000 | 0.000 | 28.006 | 3/3 | True | 0
+controlled_object_eval_small_25 | navigation | playwright | 2487.416 | 2548.611 | 679.342 | 679.388 | 0.000 | 0.000 | 107.886 | 3/3 | True | 0
+controlled_object_eval_large_10 | navigation | rustwright | 4088.890 | 4089.708 | 791.189 | 795.377 | 0.000 | 0.000 | 32.431 | 3/3 | True | 0
+controlled_object_eval_large_10 | navigation | playwright | 1978.495 | 1978.634 | 679.985 | 681.349 | 0.000 | 0.000 | 135.155 | 3/3 | True | 0
+controlled_large_dom_all_cells_20 | navigation | rustwright | 3338.706 | 3389.377 | 814.569 | 814.751 | 0.000 | 0.000 | 28.418 | 3/3 | True | 0
+controlled_large_dom_all_cells_20 | navigation | playwright | 2410.628 | 2816.916 | 696.976 | 697.510 | 0.000 | 0.000 | 106.928 | 3/3 | True | 0
+controlled_large_dom_id_lookup_100 | navigation | rustwright | 7805.036 | 7812.593 | 808.629 | 815.189 | 0.000 | 0.000 | 25.679 | 3/3 | True | 0
+controlled_large_dom_id_lookup_100 | navigation | playwright | 6740.478 | 7255.837 | 696.905 | 696.997 | 0.000 | 0.000 | 109.879 | 3/3 | True | 0
+controlled_deep_dom_query_50 | navigation | rustwright | 4994.083 | 5007.310 | 793.279 | 800.374 | 0.000 | 0.000 | 28.011 | 3/3 | True | 0
+controlled_deep_dom_query_50 | navigation | playwright | 3872.319 | 3880.775 | 678.993 | 679.385 | 0.000 | 0.000 | 110.082 | 3/3 | True | 0
+controlled_form_checkbox_click_24 | navigation | rustwright | 17993.157 | 18196.151 | 792.982 | 798.214 | 0.000 | 0.000 | 25.632 | 3/3 | True | 0
+controlled_form_checkbox_click_24 | navigation | playwright | 14834.215 | 14919.633 | 680.483 | 681.919 | 0.000 | 0.000 | 110.699 | 3/3 | True | 0
+controlled_dynamic_wait_300ms | navigation | rustwright | 2971.748 | 2991.704 | 803.601 | 805.952 | 583.675 | 585.423 | 25.564 | 3/3 | True | 0
+controlled_dynamic_wait_300ms | navigation | playwright | 1778.620 | 1791.025 | 677.244 | 679.827 | 522.037 | 526.168 | 110.040 | 3/3 | True | 0
+controlled_goto_data_url_20 | navigation | rustwright | 2126.415 | 2149.254 | 799.962 | 805.358 | 0.000 | 0.000 | 28.812 | 3/3 | True | 0
+controlled_goto_data_url_20 | navigation | playwright | 935.680 | 1008.955 | 679.361 | 679.683 | 0.000 | 0.000 | 109.892 | 3/3 | True | 0
+
+Note: library_latency_ms excludes page_wait.

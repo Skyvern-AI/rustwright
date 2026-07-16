@@ -1,0 +1,21 @@
+case | category | backend | lib_latency_ms(median) | lib_latency_ms(p95) | probe_ms(median) | probe_ms(p95) | page_wait_ms(median) | page_wait_ms(p95) | pss_peak_mb(median) | equivalent_work | soft_failures | ok/total
+controlled_more_click_50_sequential | navigation | rustwright | 35635.644 | 35652.119 | 798.744 | 801.157 | 0.000 | 0.000 | 25.190 | 3/3 | True | 0
+controlled_more_click_50_sequential | navigation | playwright | 29780.547 | 30397.555 | 680.241 | 697.764 | 0.000 | 0.000 | 85.833 | 3/3 | True | 0
+controlled_more_evaluate_rtt_40 | navigation | rustwright | 4491.104 | 4848.561 | 820.018 | 877.617 | 0.000 | 0.000 | 24.672 | 3/3 | True | 0
+controlled_more_evaluate_rtt_40 | navigation | playwright | 3337.414 | 3381.774 | 681.913 | 696.057 | 0.000 | 0.000 | 111.231 | 3/3 | True | 0
+controlled_more_object_eval_increasing | navigation | rustwright | 3506.973 | 3519.711 | 806.168 | 811.204 | 0.000 | 0.000 | 39.576 | 3/3 | True | 0
+controlled_more_object_eval_increasing | navigation | playwright | 1596.362 | 1654.766 | 701.489 | 702.563 | 0.000 | 0.000 | 151.989 | 3/3 | True | 0
+controlled_more_property_reads_80 | navigation | rustwright | 6780.811 | 6916.337 | 823.363 | 823.618 | 0.000 | 0.000 | 26.503 | 3/3 | True | 0
+controlled_more_property_reads_80 | navigation | playwright | 5726.902 | 5761.216 | 684.325 | 705.629 | 0.000 | 0.000 | 110.600 | 3/3 | True | 0
+controlled_more_dynamic_page_wait_300ms | navigation | rustwright | 2918.287 | 2965.411 | 793.958 | 797.488 | 582.014 | 594.698 | 27.376 | 3/3 | True | 0
+controlled_more_dynamic_page_wait_300ms | navigation | playwright | 1774.968 | 1825.610 | 696.866 | 699.111 | 543.585 | 549.508 | 111.415 | 3/3 | True | 0
+controlled_more_form_field_reads_60 | navigation | rustwright | 5576.342 | 5597.729 | 812.735 | 816.699 | 0.000 | 0.000 | 26.602 | 3/3 | True | 0
+controlled_more_form_field_reads_60 | navigation | playwright | 4565.665 | 4615.664 | 699.828 | 717.413 | 0.000 | 0.000 | 110.828 | 3/3 | True | 0
+controlled_more_goto_tiny_data_url_30 | navigation | rustwright | 2169.678 | 2209.961 | 804.962 | 823.344 | 0.000 | 0.000 | 26.396 | 3/3 | True | 0
+controlled_more_goto_tiny_data_url_30 | navigation | playwright | 948.226 | 987.633 | 688.093 | 697.628 | 0.000 | 0.000 | 110.522 | 3/3 | True | 0
+controlled_more_mixed_click_eval_25 | navigation | rustwright | 20173.970 | 20283.177 | 791.574 | 793.417 | 0.000 | 0.000 | 24.898 | 3/3 | True | 0
+controlled_more_mixed_click_eval_25 | navigation | playwright | 17150.527 | 17188.154 | 683.334 | 696.458 | 0.000 | 0.000 | 111.776 | 3/3 | True | 0
+controlled_more_large_dom_row_count_40 | navigation | rustwright | 4559.210 | 4597.982 | 829.811 | 836.164 | 0.000 | 0.000 | 27.537 | 3/3 | True | 0
+controlled_more_large_dom_row_count_40 | navigation | playwright | 3545.620 | 3606.297 | 715.854 | 768.458 | 0.000 | 0.000 | 114.575 | 3/3 | True | 0
+
+Note: library_latency_ms excludes page_wait.
