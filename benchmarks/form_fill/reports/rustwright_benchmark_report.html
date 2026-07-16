@@ -958,7 +958,7 @@
       <p class="eyebrow">Remote CDP · reference Playwright 1.59 · Blacksmith 8-vCPU Linux</p>
       <h1>Rustwright vs Playwright — Cloud CDP Benchmark</h1>
       <p class="subtitle">Real Linux PSS · remote Skyvern browsers · library-isolated metrics</p>
-      <p class="smoke-note">Blacksmith CI run <code>29465108042</code> (commit <code>e63087b</code>), <code>cases/controlled.json</code>, 3 reps × 10 fixtures × 2 backends = <strong>60/60 sessions, 0 failures</strong>. Memory is real Linux proportional set size (PSS); page-load and navigation time are excluded from latency.</p>
+      <p class="smoke-note">Three green Blacksmith CI runs (<code>29465108042</code>, <code>29476022036</code>, <code>29476022706</code>): 10 + 9 controlled fixtures and 17 live-site cases, two backends each — <strong>182/182 sessions, 0 failures</strong>. Memory is real Linux proportional set size (PSS); page-load and navigation time are excluded from latency, and the live lane confirms both backends wait comparably (<span class="num">0.94x</span>), so the exclusion is fair.</p>
     </div>
   </div>
 
@@ -968,7 +968,7 @@
         <div class="section-index">00</div>
         <div>
           <h2 id="summary-title">Executive readout</h2>
-          <p class="section-intro">Rustwright is a Rust CDP engine implementing Playwright’s Python API. It delivers a decisive <span class="num">~4x</span> memory reduction, but currently trades that for higher per-operation latency — <span class="num">1.1–2.6x</span> slower across every controlled case. Raw CDP round-trips are at parity, so the deficit is concentrated in connection setup and object/DOM-heavy operations, not the wire.</p>
+          <p class="section-intro">Rustwright is a Rust CDP engine implementing Playwright’s Python API. It delivers a decisive <span class="num">~4x</span> memory reduction — replicated across three independent runs and 36 cases (controlled fixtures and live sites) — but currently trades that for higher per-operation latency: <span class="num">1.1–2.6x</span> slower on every case measured. Raw CDP round-trips are at parity, so the deficit is concentrated in connection setup and object/DOM-heavy operations, not the wire.</p>
         </div>
       </div>
 
@@ -982,7 +982,7 @@
         <article class="stat-card loss-card">
           <div class="stat-kicker"><span>Latency</span><span class="status-mark" aria-hidden="true"></span></div>
           <p class="metric-value">1.1–2.6x slower — median ~1.8x</p>
-          <p class="metric-context">Library latency with <code>page_wait=0</code>; rustwright is slower on all <span class="num">10</span> controlled cases.</p>
+          <p class="metric-context">Library latency (page waits excluded); rustwright is slower on all <span class="num">36</span> cases across three runs.</p>
         </article>
 
         <article class="stat-card">
@@ -1108,6 +1108,49 @@
               <tr><td class="metric-name">large-DOM all cells ×20</td><td class="loss">3339 ms</td><td class="win">2411 ms</td><td class="note-cell"><span class="num">1.38x</span> slower</td></tr>
               <tr><td class="metric-name">dynamic wait 300 ms</td><td class="loss">2972 ms</td><td class="win">1779 ms</td><td class="note-cell"><span class="num">1.67x</span> slower</td></tr>
               <tr><td class="metric-name">goto data: URL ×20</td><td class="loss">2126 ms</td><td class="win">936 ms</td><td class="note-cell"><span class="num">2.27x</span> slower</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="table-block">
+        <div class="table-title-row">
+          <h3>Replication — three independent Blacksmith runs</h3>
+          <p class="unit-note mono">per-lane medians</p>
+        </div>
+        <div class="table-scroll" role="region" aria-label="Replication across benchmark lanes" tabindex="0">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Lane (run)</th>
+                <th scope="col">Sessions</th>
+                <th scope="col">PSS rw ÷ pw</th>
+                <th scope="col">Latency rw ÷ pw</th>
+                <th scope="col">Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="metric-name">controlled ×10 (<span class="mono">29465108042</span>)</td>
+                <td>60/60</td>
+                <td class="win">0.25x</td>
+                <td class="loss">1.80x</td>
+                <td class="note-cell">reps=3 · data: fixtures, page_wait=0</td>
+              </tr>
+              <tr>
+                <td class="metric-name">controlled_more ×9 (<span class="mono">29476022036</span>)</td>
+                <td>54/54</td>
+                <td class="win">0.24x</td>
+                <td class="loss">1.29x</td>
+                <td class="note-cell">reps=3 · different op mix, replicates goto <span class="num">2.29x</span> and object-eval <span class="num">2.20x</span></td>
+              </tr>
+              <tr>
+                <td class="metric-name">live sites ×17 (<span class="mono">29476022706</span>)</td>
+                <td>68/68</td>
+                <td class="win">0.27x</td>
+                <td class="loss">1.79x</td>
+                <td class="note-cell">reps=2 · the-internet sandbox; page_wait comparable across backends (<span class="num">0.94x</span>) — exclusion is fair</td>
+              </tr>
             </tbody>
           </table>
         </div>
@@ -1241,7 +1284,7 @@
         <article class="evidence-card">
           <h3>Client memory</h3>
           <p class="evidence-value mono">28 vs 110 MB PSS</p>
-          <p>Peak client PSS with the browser remote (median of 10 cases): Rustwright uses <span class="num">~4x</span> less, or <span class="num">75%</span> less memory. Per-case range: <span class="num">26–69 MB</span> vs <span class="num">107–135 MB</span> — smaller in every case, all 30 sessions per backend.</p>
+          <p>Peak client PSS with the browser remote: Rustwright uses <span class="num">~4x</span> less (<span class="num">0.24–0.27x</span> per-lane medians, <span class="num">75%</span> less). Per-case range across all 36 cases: <span class="num">25–69 MB</span> vs <span class="num">86–152 MB</span> — smaller in every case, 91 sessions per backend.</p>
         </article>
         <article class="evidence-card">
           <h3>Architectural basis</h3>
@@ -1262,14 +1305,14 @@
 
       <div class="evidence-grid">
         <article class="evidence-card">
-          <h3>Validated coverage</h3>
-          <p class="evidence-value mono">39 cases</p>
-          <p><span class="num">10</span> controlled fixtures + <span class="num">26</span> live navigation/interaction cases + <span class="num">3</span> downloads.</p>
+          <h3>Linux-measured coverage</h3>
+          <p class="evidence-value mono">36 cases · 182/182</p>
+          <p><span class="num">19</span> controlled fixtures + <span class="num">17</span> live-site cases ran green on Blacksmith with zero session failures; the catalog holds <span class="num">48</span> validated cases in total.</p>
         </article>
         <article class="evidence-card">
           <h3>Live-lane stability</h3>
-          <p class="evidence-value mono">44% culled</p>
-          <p>One live batch was heavily flaky, so the controlled fixtures remain the defensible core of the latency evidence.</p>
+          <p class="evidence-value mono">68/68 on Linux</p>
+          <p>The curated live lane (flaky cases culled during validation) ran without a single failure, and both backends completed identical step counts on every rep.</p>
         </article>
         <article class="evidence-card">
           <h3>Adversarial review</h3>
@@ -1290,12 +1333,12 @@
 
       <div class="caveat-panel">
         <ul>
-          <li>Latency reps are still modest (3 per case/backend); p95 tracks the median closely, but tails are not deeply characterized.</li>
+          <li>Latency reps are modest (2–3 per case/backend); p95 tracks the median closely, but tails are not deeply characterized.</li>
           <li>The smoke stage’s “1.35x faster on controlled clicks” did <strong>not</strong> reproduce — Blacksmith shows clicks <span class="num">1.24x</span> slower. The Blacksmith numbers supersede all smoke latency claims.</li>
           <li>The <code>query_selector_all</code> ~300x finding is from the smoke weakness lane and has not yet been re-measured on Linux.</li>
           <li>The two clients ran in separate remote browser sessions (by design, for parallelism); sessions come from the same Skyvern pool but are not the same instance.</li>
           <li>Remote CDP latency to Skyvern amplifies per-round-trip costs; local-browser gaps will be smaller in absolute terms.</li>
-          <li>Provenance: run <code>29465108042</code>, branch <code>bench/fix-maturin-venv</code> (commit <code>e63087b</code>), Blacksmith 8-vCPU Ubuntu 24.04, <code>controlled.json</code>, reps=3, concurrency=6, 60/60 sessions OK.</li>
+          <li>Provenance: Blacksmith 8-vCPU Ubuntu 24.04, concurrency=6. Runs <code>29465108042</code> (<code>controlled.json</code>, reps=3, commit <code>e63087b</code>), <code>29476022036</code> (<code>controlled_more.json</code>, reps=3, main) and <code>29476022706</code> (<code>nav_the_internet.json</code>, reps=2, main) — 182/182 sessions OK.</li>
         </ul>
       </div>
     </section>
@@ -1303,7 +1346,7 @@
 
   <footer class="site-footer">
     <div class="page-shell footer-inner">
-      <p>Generated from <code>Skyvern-AI/rustwright-cloud</code> · <code>benchmarks/form_fill</code> · Blacksmith run <code>29465108042</code></p>
+      <p>Generated from <code>Skyvern-AI/rustwright-cloud</code> · <code>benchmarks/form_fill</code> · Blacksmith runs <code>29465108042</code> · <code>29476022036</code> · <code>29476022706</code></p>
       <p>Methodology per <code>WEAKNESSES.md</code></p>
     </div>
   </footer>
