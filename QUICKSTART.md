@@ -95,6 +95,23 @@ imports is inconvenient, call `rustwright.enable_playwright_compat()` before
 importing `playwright`; this compatibility mode is opt-in and may evolve before
 beta.
 
+### 5. Drive a browser from an agent (CLI)
+
+Installing Rustwright also installs `rustwright-agent`, a CLI that keeps one
+browser alive across commands:
+
+```bash
+rustwright-agent open example.com    # launch + navigate; prints an accessibility snapshot
+rustwright-agent snapshot            # accessibility tree with refs (e1, e2, …)
+rustwright-agent click e3            # act on an element by its ref
+rustwright-agent --json snapshot     # one JSON object, for scripting
+rustwright-agent close               # shut the session down
+```
+
+See [docs/agent-interfaces.md](docs/agent-interfaces.md) for the CLI verbs,
+configuration, threat model, and current scope. An MCP server for Rustwright is
+available as a separate, opt-in package (`rustwright-mcp`).
+
 ## Node.js (experimental)
 
 The Node.js binding is published to npm. It
