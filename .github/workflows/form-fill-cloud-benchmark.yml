@@ -1,0 +1,97 @@
+# Dispatch-only; requires the repository secret SKYVERN_CLOUD_API_KEY; browsers run in remote Skyvern cloud sessions (no local browser); runs never submit forms.
+name: Form-fill cloud benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      cases_file:
+        description: Benchmark cases file
+        type: string
+        default: benchmarks/form_fill/cases/smoke_nav.json
+      backends:
+        description: Space-separated backends to benchmark
+        type: string
+        default: rustwright playwright
+      reps:
+        description: Repetitions per case and backend
+        type: string
+        default: "2"
+      concurrency:
+        description: Maximum concurrent benchmark cases
+        type: string
+        default: "4"
+      runner_label:
+        description: Runner label
+        type: choice
+        default: blacksmith-8vcpu-ubuntu-2404
+        options:
+          - blacksmith-8vcpu-ubuntu-2404
+          - blacksmith-4vcpu-ubuntu-2404
+          - ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Rustwright and Playwright cloud benchmark
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 120
+
+    steps:
+      # NOTE: Pin this action to a full commit SHA before merge.
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # NOTE: Pin this action to a full commit SHA before merge.
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - name: Build rustwright in its benchmark environment
+        run: |
+          python -m venv .venv-rw
+          .venv-rw/bin/pip install -U pip maturin
+          .venv-rw/bin/pip install psutil
+          # maturin locates the target venv via VIRTUAL_ENV; invoking its binary
+          # from .venv-rw/bin does not set it, and the venv is not named ".venv".
+          VIRTUAL_ENV="$PWD/.venv-rw" .venv-rw/bin/maturin develop --release
+
+      - name: Install reference Playwright in its benchmark environment
+        run: |
+          python -m venv .venv-pw
+          .venv-pw/bin/pip install "playwright==1.59.0"
+          .venv-pw/bin/pip install psutil
+
+      - name: Run form-fill cloud benchmark suite
+        env:
+          SKYVERN_CLOUD_API_KEY: ${{ secrets.SKYVERN_CLOUD_API_KEY }}
+          SKYVERN_BASE_URL: https://api.skyvern.com
+        run: >-
+          PYTHONPATH=$PWD/benchmarks/form_fill
+          .venv-rw/bin/python benchmarks/form_fill/harness/run_suite.py
+          --cases "${{ inputs.cases_file }}"
+          --backends ${{ inputs.backends }}
+          --reps ${{ inputs.reps }}
+          --concurrency ${{ inputs.concurrency }}
+          --python rustwright=$PWD/.venv-rw/bin/python playwright=$PWD/.venv-pw/bin/python
+          --output out/suite
+
+      - name: Print benchmark summary
+        if: always()
+        run: cat out/suite/suite_summary.txt
+
+      # NOTE: Pin this action to a full commit SHA before merge.
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: form-fill-cloud-benchmark
+          path: out/suite/
+          if-no-files-found: warn
