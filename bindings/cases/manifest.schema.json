@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rustwright.dev/schemas/benchmark-manifest-v1.json",
+  "title": "Rustwright cross-language benchmark manifest",
+  "description": "Language-neutral, ordered Rustwright alpha API cases.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "cases"],
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Manifest contract version. Version 1 is the only supported value."
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/case" }
+    }
+  },
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "steps"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/nonEmptyString",
+          "description": "Stable, manifest-unique case identifier used by --cases and result records."
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable intent; runners do not interpret this field."
+        },
+        "html": {
+          "type": "string",
+          "description": "Inline document used by a goto step with useCaseHtml:true. Runners percent-encode its UTF-8 bytes into a hermetic data URL."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri-reference",
+          "description": "Optional case-level source metadata. Version 1 navigation is still controlled by each goto step's url or useCaseHtml field."
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/step" }
+        }
+      }
+    },
+    "step": {
+      "oneOf": [
+        { "$ref": "#/$defs/goto" },
+        { "$ref": "#/$defs/click" },
+        { "$ref": "#/$defs/fill" },
+        { "$ref": "#/$defs/title" },
+        { "$ref": "#/$defs/textContent" },
+        { "$ref": "#/$defs/evaluate" },
+        { "$ref": "#/$defs/screenshot" },
+        { "$ref": "#/$defs/assertTitle" },
+        { "$ref": "#/$defs/assertText" },
+        { "$ref": "#/$defs/assertEval" }
+      ]
+    },
+    "goto": {
+      "description": "Navigate to a literal URL or to the current case's inline HTML. Exactly one source is required.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op"],
+      "properties": {
+        "op": { "const": "goto" },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Literal navigation target."
+        },
+        "useCaseHtml": {
+          "const": true,
+          "description": "Build a data:text/html;charset=utf-8 URL from the current case's html field."
+        },
+        "waitUntil": {
+          "enum": ["load", "domcontentloaded", "networkidle", "commit"],
+          "description": "Optional navigation readiness state; the core default is load."
+        }
+      },
+      "oneOf": [
+        { "required": ["url"], "not": { "required": ["useCaseHtml"] } },
+        { "required": ["useCaseHtml"], "not": { "required": ["url"] } }
+      ]
+    },
+    "click": {
+      "description": "Click the first element matching selector.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "selector"],
+      "properties": {
+        "op": { "const": "click" },
+        "selector": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "fill": {
+      "description": "Fill the first matching element and dispatch input and change events.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "selector", "value"],
+      "properties": {
+        "op": { "const": "fill" },
+        "selector": { "$ref": "#/$defs/nonEmptyString" },
+        "value": { "type": "string" }
+      }
+    },
+    "title": {
+      "description": "Read document.title and store the string in captures[capture].",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "capture"],
+      "properties": {
+        "op": { "const": "title" },
+        "capture": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "textContent": {
+      "description": "Read the first matching element's textContent and store a string or null in captures[capture].",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "selector", "capture"],
+      "properties": {
+        "op": { "const": "textContent" },
+        "selector": { "$ref": "#/$defs/nonEmptyString" },
+        "capture": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "evaluate": {
+      "description": "Evaluate JavaScript, optionally with one JSON argument, decode the Rustwright wire value, and store it in captures[capture].",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "expression", "capture"],
+      "properties": {
+        "op": { "const": "evaluate" },
+        "expression": { "$ref": "#/$defs/nonEmptyString" },
+        "arg": { "description": "Any JSON value passed as the evaluate argument." },
+        "capture": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "screenshot": {
+      "description": "Capture a default PNG screenshot and store its byte length as a non-negative integer in captures[capture].",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "capture"],
+      "properties": {
+        "op": { "const": "screenshot" },
+        "capture": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "assertTitle": {
+      "description": "Read document.title and require exactly one equality or substring condition.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op"],
+      "properties": {
+        "op": { "const": "assertTitle" },
+        "equals": { "type": "string" },
+        "contains": { "type": "string" }
+      },
+      "oneOf": [
+        { "required": ["equals"], "not": { "required": ["contains"] } },
+        { "required": ["contains"], "not": { "required": ["equals"] } }
+      ]
+    },
+    "assertText": {
+      "description": "Read textContent for selector and require exactly one equality or substring condition. A null textContent fails.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "selector"],
+      "properties": {
+        "op": { "const": "assertText" },
+        "selector": { "$ref": "#/$defs/nonEmptyString" },
+        "equals": { "type": "string" },
+        "contains": { "type": "string" }
+      },
+      "oneOf": [
+        { "required": ["equals"], "not": { "required": ["contains"] } },
+        { "required": ["contains"], "not": { "required": ["equals"] } }
+      ]
+    },
+    "assertEval": {
+      "description": "Evaluate JavaScript without an argument, decode the wire value, and compare it to equals using structural JSON equality.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "expression", "equals"],
+      "properties": {
+        "op": { "const": "assertEval" },
+        "expression": { "$ref": "#/$defs/nonEmptyString" },
+        "equals": { "description": "Any JSON value used for exact structural comparison." }
+      }
+    }
+  }
+}

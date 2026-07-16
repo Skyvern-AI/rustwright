@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "title-basic",
+      "description": "Navigate to inline HTML, capture the title, and assert exact title equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Smoke Title</title></head><body><h1>Hello</h1></body></html>",
+      "steps": [
+        { "op": "goto", "useCaseHtml": true },
+        { "op": "title", "capture": "title" },
+        { "op": "assertTitle", "equals": "Rustwright Smoke Title" }
+      ]
+    },
+    {
+      "id": "form-interaction",
+      "description": "Exercise textContent, fill, click, and a DOM mutation assertion.",
+      "html": "<!doctype html><html><head><title>Form</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        { "op": "goto", "useCaseHtml": true, "waitUntil": "load" },
+        { "op": "textContent", "selector": "#message", "capture": "before" },
+        { "op": "fill", "selector": "#name", "value": "filled from manifest" },
+        { "op": "click", "selector": "#go" },
+        { "op": "textContent", "selector": "#message", "capture": "after" },
+        { "op": "assertText", "selector": "#message", "equals": "filled from manifest" }
+      ]
+    },
+    {
+      "id": "text-content",
+      "description": "Capture and assert element text using contains semantics.",
+      "html": "<!doctype html><html><head><title>Text</title></head><body><article id=\"content\">alpha beta gamma</article></body></html>",
+      "steps": [
+        { "op": "goto", "useCaseHtml": true },
+        { "op": "textContent", "selector": "#content", "capture": "content" },
+        { "op": "assertText", "selector": "#content", "contains": "beta" },
+        { "op": "assertTitle", "contains": "Tex" }
+      ]
+    },
+    {
+      "id": "evaluate-json",
+      "description": "Pass a JSON argument, capture a decoded object, and assert a primitive evaluation.",
+      "html": "<!doctype html><html><head><title>Evaluate</title></head><body></body></html>",
+      "steps": [
+        { "op": "goto", "useCaseHtml": true },
+        {
+          "op": "evaluate",
+          "expression": "value => ({ doubled: value.n * 2, label: value.label })",
+          "arg": { "n": 21, "label": "answer" },
+          "capture": "computed"
+        },
+        { "op": "assertEval", "expression": "6 * 7", "equals": 42 }
+      ]
+    },
+    {
+      "id": "screenshot-png",
+      "description": "Record the default PNG screenshot byte length.",
+      "html": "<!doctype html><html><head><title>Screenshot</title><style>body{margin:0;background:#2457d6;color:white;font:32px sans-serif}main{padding:48px}</style></head><body><main>Rustwright screenshot smoke</main></body></html>",
+      "steps": [
+        { "op": "goto", "useCaseHtml": true },
+        { "op": "screenshot", "capture": "pngBytes" },
+        { "op": "evaluate", "expression": "document.body.textContent.trim()", "capture": "bodyText" },
+        { "op": "assertTitle", "equals": "Screenshot" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,2850 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "title-00",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 00</title></head><body><h1>heading 0</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 00"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 00"
+        }
+      ]
+    },
+    {
+      "id": "title-01",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 01</title></head><body><h1>heading 1</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 01"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 01"
+        }
+      ]
+    },
+    {
+      "id": "title-02",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 02</title></head><body><h1>heading 2</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 02"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 02"
+        }
+      ]
+    },
+    {
+      "id": "title-03",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 03</title></head><body><h1>heading 3</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 03"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 03"
+        }
+      ]
+    },
+    {
+      "id": "title-04",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 04</title></head><body><h1>heading 4</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 04"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 04"
+        }
+      ]
+    },
+    {
+      "id": "title-05",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 05</title></head><body><h1>heading 5</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 05"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 05"
+        }
+      ]
+    },
+    {
+      "id": "title-06",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 06</title></head><body><h1>heading 6</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 06"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 06"
+        }
+      ]
+    },
+    {
+      "id": "title-07",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 07</title></head><body><h1>heading 7</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 07"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 07"
+        }
+      ]
+    },
+    {
+      "id": "title-08",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 08</title></head><body><h1>heading 8</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 08"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 08"
+        }
+      ]
+    },
+    {
+      "id": "title-09",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 09</title></head><body><h1>heading 9</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 09"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 09"
+        }
+      ]
+    },
+    {
+      "id": "title-10",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 10</title></head><body><h1>heading 10</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 10"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 10"
+        }
+      ]
+    },
+    {
+      "id": "title-11",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 11</title></head><body><h1>heading 11</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 11"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 11"
+        }
+      ]
+    },
+    {
+      "id": "title-12",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 12</title></head><body><h1>heading 12</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 12"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 12"
+        }
+      ]
+    },
+    {
+      "id": "title-13",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 13</title></head><body><h1>heading 13</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 13"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 13"
+        }
+      ]
+    },
+    {
+      "id": "title-14",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 14</title></head><body><h1>heading 14</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 14"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 14"
+        }
+      ]
+    },
+    {
+      "id": "title-15",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 15</title></head><body><h1>heading 15</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 15"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 15"
+        }
+      ]
+    },
+    {
+      "id": "title-16",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 16</title></head><body><h1>heading 16</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 16"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 16"
+        }
+      ]
+    },
+    {
+      "id": "title-17",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 17</title></head><body><h1>heading 17</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 17"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 17"
+        }
+      ]
+    },
+    {
+      "id": "title-18",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 18</title></head><body><h1>heading 18</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 18"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 18"
+        }
+      ]
+    },
+    {
+      "id": "title-19",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 19</title></head><body><h1>heading 19</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 19"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 19"
+        }
+      ]
+    },
+    {
+      "id": "title-20",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 20</title></head><body><h1>heading 20</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 20"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 20"
+        }
+      ]
+    },
+    {
+      "id": "title-21",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 21</title></head><body><h1>heading 21</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 21"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 21"
+        }
+      ]
+    },
+    {
+      "id": "title-22",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 22</title></head><body><h1>heading 22</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 22"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 22"
+        }
+      ]
+    },
+    {
+      "id": "title-23",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 23</title></head><body><h1>heading 23</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 23"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 23"
+        }
+      ]
+    },
+    {
+      "id": "title-24",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 24</title></head><body><h1>heading 24</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 24"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 24"
+        }
+      ]
+    },
+    {
+      "id": "title-25",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 25</title></head><body><h1>heading 25</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 25"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 25"
+        }
+      ]
+    },
+    {
+      "id": "title-26",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 26</title></head><body><h1>heading 26</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 26"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 26"
+        }
+      ]
+    },
+    {
+      "id": "title-27",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 27</title></head><body><h1>heading 27</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 27"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 27"
+        }
+      ]
+    },
+    {
+      "id": "title-28",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 28</title></head><body><h1>heading 28</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 28"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 28"
+        }
+      ]
+    },
+    {
+      "id": "title-29",
+      "description": "Capture the document title and assert exact + substring equality.",
+      "html": "<!doctype html><html><head><title>Rustwright Case 29</title></head><body><h1>heading 29</h1></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "title",
+          "capture": "title"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Rustwright Case 29"
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Case 29"
+        }
+      ]
+    },
+    {
+      "id": "form-00",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 00</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-000"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-000"
+        }
+      ]
+    },
+    {
+      "id": "form-01",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 01</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-001"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-001"
+        }
+      ]
+    },
+    {
+      "id": "form-02",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 02</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-002"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-002"
+        }
+      ]
+    },
+    {
+      "id": "form-03",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 03</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-003"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-003"
+        }
+      ]
+    },
+    {
+      "id": "form-04",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 04</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-004"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-004"
+        }
+      ]
+    },
+    {
+      "id": "form-05",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 05</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-005"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-005"
+        }
+      ]
+    },
+    {
+      "id": "form-06",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 06</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-006"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-006"
+        }
+      ]
+    },
+    {
+      "id": "form-07",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 07</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-007"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-007"
+        }
+      ]
+    },
+    {
+      "id": "form-08",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 08</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-008"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-008"
+        }
+      ]
+    },
+    {
+      "id": "form-09",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 09</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-009"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-009"
+        }
+      ]
+    },
+    {
+      "id": "form-10",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 10</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-010"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-010"
+        }
+      ]
+    },
+    {
+      "id": "form-11",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 11</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-011"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-011"
+        }
+      ]
+    },
+    {
+      "id": "form-12",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 12</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-012"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-012"
+        }
+      ]
+    },
+    {
+      "id": "form-13",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 13</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-013"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-013"
+        }
+      ]
+    },
+    {
+      "id": "form-14",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 14</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-014"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-014"
+        }
+      ]
+    },
+    {
+      "id": "form-15",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 15</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-015"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-015"
+        }
+      ]
+    },
+    {
+      "id": "form-16",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 16</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-016"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-016"
+        }
+      ]
+    },
+    {
+      "id": "form-17",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 17</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-017"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-017"
+        }
+      ]
+    },
+    {
+      "id": "form-18",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 18</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-018"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-018"
+        }
+      ]
+    },
+    {
+      "id": "form-19",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 19</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-019"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-019"
+        }
+      ]
+    },
+    {
+      "id": "form-20",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 20</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-020"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-020"
+        }
+      ]
+    },
+    {
+      "id": "form-21",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 21</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-021"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-021"
+        }
+      ]
+    },
+    {
+      "id": "form-22",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 22</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-022"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-022"
+        }
+      ]
+    },
+    {
+      "id": "form-23",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 23</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-023"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-023"
+        }
+      ]
+    },
+    {
+      "id": "form-24",
+      "description": "Read initial text, fill an input, click, and assert the mutated text.",
+      "html": "<!doctype html><html><head><title>Form 24</title></head><body><p id=\"message\">ready</p><input id=\"name\"><button id=\"go\" onclick=\"document.querySelector('#message').textContent=document.querySelector('#name').value\">Go</button></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true,
+          "waitUntil": "load"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "before"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "ready"
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "value-024"
+        },
+        {
+          "op": "click",
+          "selector": "#go"
+        },
+        {
+          "op": "textContent",
+          "selector": "#message",
+          "capture": "after"
+        },
+        {
+          "op": "assertText",
+          "selector": "#message",
+          "equals": "value-024"
+        }
+      ]
+    },
+    {
+      "id": "eval-00",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 00</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 0,
+            "tag": "t-00"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "0 + 0",
+          "equals": 0
+        }
+      ]
+    },
+    {
+      "id": "eval-01",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 01</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 1,
+            "tag": "t-01"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "1 + 1",
+          "equals": 2
+        }
+      ]
+    },
+    {
+      "id": "eval-02",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 02</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 2,
+            "tag": "t-02"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "2 + 2",
+          "equals": 4
+        }
+      ]
+    },
+    {
+      "id": "eval-03",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 03</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 3,
+            "tag": "t-03"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "3 + 3",
+          "equals": 6
+        }
+      ]
+    },
+    {
+      "id": "eval-04",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 04</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 4,
+            "tag": "t-04"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "4 + 4",
+          "equals": 8
+        }
+      ]
+    },
+    {
+      "id": "eval-05",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 05</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 5,
+            "tag": "t-05"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "5 + 5",
+          "equals": 10
+        }
+      ]
+    },
+    {
+      "id": "eval-06",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 06</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 6,
+            "tag": "t-06"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "6 + 6",
+          "equals": 12
+        }
+      ]
+    },
+    {
+      "id": "eval-07",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 07</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 7,
+            "tag": "t-07"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "7 + 7",
+          "equals": 14
+        }
+      ]
+    },
+    {
+      "id": "eval-08",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 08</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 8,
+            "tag": "t-08"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "8 + 8",
+          "equals": 16
+        }
+      ]
+    },
+    {
+      "id": "eval-09",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 09</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 9,
+            "tag": "t-09"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "9 + 9",
+          "equals": 18
+        }
+      ]
+    },
+    {
+      "id": "eval-10",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 10</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 10,
+            "tag": "t-10"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "10 + 10",
+          "equals": 20
+        }
+      ]
+    },
+    {
+      "id": "eval-11",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 11</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 11,
+            "tag": "t-11"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "11 + 11",
+          "equals": 22
+        }
+      ]
+    },
+    {
+      "id": "eval-12",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 12</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 12,
+            "tag": "t-12"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "12 + 12",
+          "equals": 24
+        }
+      ]
+    },
+    {
+      "id": "eval-13",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 13</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 13,
+            "tag": "t-13"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "13 + 13",
+          "equals": 26
+        }
+      ]
+    },
+    {
+      "id": "eval-14",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 14</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 14,
+            "tag": "t-14"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "14 + 14",
+          "equals": 28
+        }
+      ]
+    },
+    {
+      "id": "eval-15",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 15</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 15,
+            "tag": "t-15"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "15 + 15",
+          "equals": 30
+        }
+      ]
+    },
+    {
+      "id": "eval-16",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 16</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 16,
+            "tag": "t-16"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "16 + 16",
+          "equals": 32
+        }
+      ]
+    },
+    {
+      "id": "eval-17",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 17</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 17,
+            "tag": "t-17"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "17 + 17",
+          "equals": 34
+        }
+      ]
+    },
+    {
+      "id": "eval-18",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 18</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 18,
+            "tag": "t-18"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "18 + 18",
+          "equals": 36
+        }
+      ]
+    },
+    {
+      "id": "eval-19",
+      "description": "Pass a JSON argument, capture a decoded object, assert a primitive result.",
+      "html": "<!doctype html><html><head><title>Evaluate 19</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ n: v.n, doubled: v.n * 2, tag: v.tag, items: [v.n, v.n + 1] })",
+          "arg": {
+            "n": 19,
+            "tag": "t-19"
+          },
+          "capture": "computed"
+        },
+        {
+          "op": "assertEval",
+          "expression": "19 + 19",
+          "equals": 38
+        }
+      ]
+    },
+    {
+      "id": "text-00",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 00</title></head><body><article id=\"content\">lorem 00 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "00"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 00 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "text-01",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 01</title></head><body><article id=\"content\">lorem 01 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "01"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 01 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "text-02",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 02</title></head><body><article id=\"content\">lorem 02 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "02"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 02 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "text-03",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 03</title></head><body><article id=\"content\">lorem 03 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "03"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 03 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "text-04",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 04</title></head><body><article id=\"content\">lorem 04 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "04"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 04 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "text-05",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 05</title></head><body><article id=\"content\">lorem 05 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "05"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 05 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "text-06",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 06</title></head><body><article id=\"content\">lorem 06 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "06"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 06 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "text-07",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 07</title></head><body><article id=\"content\">lorem 07 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "07"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 07 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "text-08",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 08</title></head><body><article id=\"content\">lorem 08 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "08"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 08 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "text-09",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 09</title></head><body><article id=\"content\">lorem 09 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "09"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 09 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "text-10",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 10</title></head><body><article id=\"content\">lorem 10 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "10"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 10 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "text-11",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 11</title></head><body><article id=\"content\">lorem 11 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "11"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 11 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "text-12",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 12</title></head><body><article id=\"content\">lorem 12 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "12"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 12 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "text-13",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 13</title></head><body><article id=\"content\">lorem 13 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "13"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 13 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "text-14",
+      "description": "Capture element text and assert contains + exact semantics.",
+      "html": "<!doctype html><html><head><title>Text 14</title></head><body><article id=\"content\">lorem 14 ipsum dolor</article></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#content",
+          "capture": "content"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "contains": "14"
+        },
+        {
+          "op": "assertText",
+          "selector": "#content",
+          "equals": "lorem 14 ipsum dolor"
+        }
+      ]
+    },
+    {
+      "id": "shot-00",
+      "description": "Record the default PNG screenshot byte length for a deterministic render.",
+      "html": "<!doctype html><html><head><title>Shot 00</title><style>body{margin:0;background:#2457d6;color:#fff;font:32px sans-serif}main{padding:48px}</style></head><body><main>Rustwright shot 00</main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.body.textContent.trim()",
+          "capture": "bodyText"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Shot 00"
+        }
+      ]
+    },
+    {
+      "id": "shot-01",
+      "description": "Record the default PNG screenshot byte length for a deterministic render.",
+      "html": "<!doctype html><html><head><title>Shot 01</title><style>body{margin:0;background:#0b7d3e;color:#fff;font:32px sans-serif}main{padding:48px}</style></head><body><main>Rustwright shot 01</main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.body.textContent.trim()",
+          "capture": "bodyText"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Shot 01"
+        }
+      ]
+    },
+    {
+      "id": "shot-02",
+      "description": "Record the default PNG screenshot byte length for a deterministic render.",
+      "html": "<!doctype html><html><head><title>Shot 02</title><style>body{margin:0;background:#8a1f5c;color:#fff;font:32px sans-serif}main{padding:48px}</style></head><body><main>Rustwright shot 02</main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.body.textContent.trim()",
+          "capture": "bodyText"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Shot 02"
+        }
+      ]
+    },
+    {
+      "id": "shot-03",
+      "description": "Record the default PNG screenshot byte length for a deterministic render.",
+      "html": "<!doctype html><html><head><title>Shot 03</title><style>body{margin:0;background:#b45309;color:#fff;font:32px sans-serif}main{padding:48px}</style></head><body><main>Rustwright shot 03</main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.body.textContent.trim()",
+          "capture": "bodyText"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Shot 03"
+        }
+      ]
+    },
+    {
+      "id": "shot-04",
+      "description": "Record the default PNG screenshot byte length for a deterministic render.",
+      "html": "<!doctype html><html><head><title>Shot 04</title><style>body{margin:0;background:#334155;color:#fff;font:32px sans-serif}main{padding:48px}</style></head><body><main>Rustwright shot 04</main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.body.textContent.trim()",
+          "capture": "bodyText"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Shot 04"
+        }
+      ]
+    },
+    {
+      "id": "shot-05",
+      "description": "Record the default PNG screenshot byte length for a deterministic render.",
+      "html": "<!doctype html><html><head><title>Shot 05</title><style>body{margin:0;background:#7c3aed;color:#fff;font:32px sans-serif}main{padding:48px}</style></head><body><main>Rustwright shot 05</main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.body.textContent.trim()",
+          "capture": "bodyText"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Shot 05"
+        }
+      ]
+    },
+    {
+      "id": "shot-06",
+      "description": "Record the default PNG screenshot byte length for a deterministic render.",
+      "html": "<!doctype html><html><head><title>Shot 06</title><style>body{margin:0;background:#0e7490;color:#fff;font:32px sans-serif}main{padding:48px}</style></head><body><main>Rustwright shot 06</main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.body.textContent.trim()",
+          "capture": "bodyText"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Shot 06"
+        }
+      ]
+    },
+    {
+      "id": "shot-07",
+      "description": "Record the default PNG screenshot byte length for a deterministic render.",
+      "html": "<!doctype html><html><head><title>Shot 07</title><style>body{margin:0;background:#be123c;color:#fff;font:32px sans-serif}main{padding:48px}</style></head><body><main>Rustwright shot 07</main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.body.textContent.trim()",
+          "capture": "bodyText"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Shot 07"
+        }
+      ]
+    },
+    {
+      "id": "shot-08",
+      "description": "Record the default PNG screenshot byte length for a deterministic render.",
+      "html": "<!doctype html><html><head><title>Shot 08</title><style>body{margin:0;background:#15803d;color:#fff;font:32px sans-serif}main{padding:48px}</style></head><body><main>Rustwright shot 08</main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.body.textContent.trim()",
+          "capture": "bodyText"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Shot 08"
+        }
+      ]
+    },
+    {
+      "id": "shot-09",
+      "description": "Record the default PNG screenshot byte length for a deterministic render.",
+      "html": "<!doctype html><html><head><title>Shot 09</title><style>body{margin:0;background:#a16207;color:#fff;font:32px sans-serif}main{padding:48px}</style></head><body><main>Rustwright shot 09</main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.body.textContent.trim()",
+          "capture": "bodyText"
+        },
+        {
+          "op": "assertTitle",
+          "equals": "Shot 09"
+        }
+      ]
+    }
+  ]
+}
