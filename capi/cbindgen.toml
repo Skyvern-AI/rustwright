@@ -1,0 +1,9 @@
+language = "C"
+include_guard = "RUSTWRIGHT_H"
+cpp_compat = true
+usize_is_size_t = true
+
+# capi/include/rustwright.h is the reviewed source of truth. This file only
+# supplies sensible defaults for maintainers who use cbindgen as a comparison.
+[parse]
+parse_deps = false
