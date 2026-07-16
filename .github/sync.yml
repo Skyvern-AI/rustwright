@@ -1,7 +1,13 @@
 # Shared Rustwright files mirrored from rustwright to rustwright-cloud.
-# Repository-specific GitHub workflows and metadata are intentionally excluded.
+# Repository-specific GitHub workflows and metadata are intentionally excluded,
+# with one deliberate exception: the form-fill cloud benchmark workflow is part
+# of the shared benchmark suite and is mirrored so hardening fixes stay in
+# lockstep. Note: syncing it requires RUSTWRIGHT_SYNC_GH_PAT to carry the
+# `workflow` scope; while the two copies are identical the entry is inert.
 # Cloud-only additions must live outside the mirrored paths below.
 Skyvern-AI/rustwright-cloud:
+  - source: .github/workflows/form-fill-cloud-benchmark.yml
+    dest: .github/workflows/form-fill-cloud-benchmark.yml
   - source: benchmarks/
     dest: benchmarks/
     deleteOrphaned: true
