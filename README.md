@@ -190,7 +190,8 @@ See [`LIMITATIONS.md`](LIMITATIONS.md) for detail.
 
 ## Roadmap
 
-- [ ] **Language bindings** — one Rust engine, many languages: Go, Java, Kotlin, C#/.NET, Ruby, and PHP (plus a native Rust API)
+- [ ] **Kotlin binding** — idiomatic Kotlin wrapper (Kotlin/JVM can already consume the Java FFM binding)
+- [ ] Grow the new language bindings beyond the alpha subset (contexts, routing, locators)
 - [ ] **Rustwright MCP server** — expose browser automation as tools for MCP-compatible AI agents
 - [ ] CI / Testbox-backed benchmark evidence
 - [ ] Broaden the Node.js surface (contexts, routing, locators)
@@ -198,6 +199,7 @@ See [`LIMITATIONS.md`](LIMITATIONS.md) for detail.
 
 Recently shipped:
 
+- [x] **Language bindings (alpha)** — Go, Java, C#/.NET, Ruby, and PHP over a shared C ABI, plus a native Rust API ([`bindings/CONTRACT.md`](bindings/CONTRACT.md)); cross-language equivalence gated in CI
 - [x] Python package published to PyPI
 - [x] Node.js binding published to npm
 - [x] Native async engine over the Tokio CDP core
