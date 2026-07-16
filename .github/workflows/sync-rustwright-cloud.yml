@@ -37,7 +37,9 @@ jobs:
           PR_LABELS: sync
           BRANCH_NAME: repo-sync/rustwright-${{ github.event.pull_request.number || github.run_id }}
           PR_BODY: ${{ github.event.pull_request.html_url || 'Manual sync from rustwright' }}
-          PR_TITLE: "Sync rustwright changes to rustwright-cloud (#${{ github.event.pull_request.number || github.run_id }})"
+          # The sync PR title (and its squash commit on the target main) should
+          # carry the originating change's title; dispatch runs have no PR context.
+          PR_TITLE: ${{ github.event.pull_request.title || format('Sync rustwright changes to rustwright-cloud (run {0})', github.run_id) }}
 
       - name: Link the rustwright-cloud PR
         if: github.event_name == 'pull_request_target' && steps.file-sync.outputs.pull_request_urls
