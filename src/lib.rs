@@ -185,6 +185,7 @@ impl Drop for SpawnedTaskAbortGuard {
 const CDP_EVENT_LOG_LIMIT: usize = 8192;
 const FRAME_UTILITY_WORLD_NAME: &str = "__utility_world__";
 const MAX_FRAME_TREE_DEPTH: usize = 256;
+const NAVIGATION_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Error)]
 pub enum RwError {
@@ -202,6 +203,20 @@ pub enum RwError {
     Reqwest(#[from] reqwest::Error),
     #[error(transparent)]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+}
+
+/// True for the CDP errors Chromium reports when the execution context an
+/// evaluation was running in goes away because the frame navigated. Callers that
+/// poll the page can re-resolve the frame and retry instead of failing.
+fn is_execution_context_destroyed_error(error: &RwError) -> bool {
+    let RwError::Cdp { message, .. } = error else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    message.contains("inspected target navigated or closed")
+        || message.contains("execution context was destroyed")
+        || message.contains("cannot find context with specified id")
+        || message.contains("execution context with given id not found")
 }
 
 #[cfg(feature = "python")]
@@ -908,6 +923,37 @@ mod tests {
         assert!(
             remote_debugging_port_from_args(&["--remote-debugging-port=bad".to_string()]).is_err()
         );
+    }
+
+    #[test]
+    fn execution_context_destroyed_errors_are_detected_for_navigation_retry() {
+        for message in [
+            "Inspected target navigated or closed",
+            "Execution context was destroyed.",
+            "Cannot find context with specified id",
+            "Execution context with given id not found",
+        ] {
+            let error = RwError::Cdp {
+                method: "Runtime.evaluate".to_string(),
+                message: message.to_string(),
+            };
+            assert!(
+                is_execution_context_destroyed_error(&error),
+                "expected {message:?} to be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_errors_are_not_treated_as_execution_context_destroyed() {
+        assert!(!is_execution_context_destroyed_error(&RwError::Cdp {
+            method: "Runtime.evaluate".to_string(),
+            message: "Uncaught ReferenceError: spec is not defined".to_string(),
+        }));
+        assert!(!is_execution_context_destroyed_error(&RwError::Timeout(120)));
+        assert!(!is_execution_context_destroyed_error(&RwError::Message(
+            "Inspected target navigated or closed".to_string()
+        )));
     }
 
     #[test]
@@ -6463,23 +6509,52 @@ async fn page_wait_for_selector_async(
     timeout: Duration,
     strict: bool,
 ) -> RwResult<bool> {
-    let body = wait_for_selector_body(&state, strict, timeout);
-    let eval_timeout = Duration::from_millis(timeout.as_millis().saturating_add(1_000) as u64);
-    let json = evaluate_locator_for_page(page, locator_json, index, body, eval_timeout).await?;
-    let value = serde_json::from_str::<Value>(&json).unwrap_or(Value::Null);
-    if value.as_str() == Some("__rustwright_timeout__") {
-        return Err(RwError::Timeout(timeout.as_millis() as u64));
+    let reported_timeout = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+    let deadline = OperationDeadline::new(timeout);
+    loop {
+        // The poll runs inside the page, so a navigation destroys it along with
+        // its execution context. Re-arm it against whatever document is live now
+        // and keep waiting, budgeting each attempt to the time the caller has
+        // left so retries cannot extend the overall wait.
+        let Ok(remaining) = deadline.remaining() else {
+            return Err(RwError::Timeout(reported_timeout));
+        };
+        let body = wait_for_selector_body(&state, strict, remaining);
+        let eval_timeout = remaining.saturating_add(Duration::from_secs(1));
+        let json = match evaluate_locator_for_page(
+            Arc::clone(&page),
+            locator_json.clone(),
+            index,
+            body,
+            eval_timeout,
+        )
+        .await
+        {
+            Ok(json) => json,
+            Err(error) if is_execution_context_destroyed_error(&error) => {
+                let Ok(remaining) = deadline.remaining() else {
+                    return Err(RwError::Timeout(reported_timeout));
+                };
+                tokio::time::sleep(remaining.min(NAVIGATION_RETRY_INTERVAL)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let value = serde_json::from_str::<Value>(&json).unwrap_or(Value::Null);
+        if value.as_str() == Some("__rustwright_timeout__") {
+            return Err(RwError::Timeout(reported_timeout));
+        }
+        if let Some(count) = value
+            .as_str()
+            .and_then(|text| text.strip_prefix("__rustwright_strict_violation__:"))
+            .and_then(|text| text.parse::<u64>().ok())
+        {
+            return Err(RwError::Message(format!(
+                "strict mode violation: locator resolved to {count} elements while trying to wait_for_selector"
+            )));
+        }
+        return Ok(value.as_bool().unwrap_or(false));
     }
-    if let Some(count) = value
-        .as_str()
-        .and_then(|text| text.strip_prefix("__rustwright_strict_violation__:"))
-        .and_then(|text| text.parse::<u64>().ok())
-    {
-        return Err(RwError::Message(format!(
-            "strict mode violation: locator resolved to {count} elements while trying to wait_for_selector"
-        )));
-    }
-    Ok(value.as_bool().unwrap_or(false))
 }
 
 fn locator_action_body(action: &str, strict: bool, timeout: Duration) -> String {
@@ -8937,76 +9012,14 @@ return true;
         let state = state.unwrap_or("visible").to_string();
         let strict = strict.unwrap_or(false);
         let timeout = BrowserInner::command_timeout(timeout_ms);
-        let state_json =
-            serde_json::to_string(&state).unwrap_or_else(|_| "\"visible\"".to_string());
-        let strict_json = if strict { "true" } else { "false" };
-        let timeout_millis = timeout.as_millis().max(1);
-        let eval_timeout = timeout_millis.saturating_add(1_000) as f64;
-        let body = format!(
-            r#"
-const targetState = {state_json};
-const strict = {strict_json};
-const timeoutMs = {timeout_millis};
-const snapshot = () => {{
-  const matches = all(spec);
-  if (strict && matches.length > 1) return {{ strict: true, count: matches.length }};
-  const current = matches[index] || null;
-  const attached = !!current;
-  const isVisible = !!current && visible(current);
-  const matched = targetState === 'attached'
-    ? attached
-    : targetState === 'detached'
-      ? !attached
-      : targetState === 'hidden'
-        ? (!attached || !isVisible)
-        : isVisible;
-  return {{ attached, matched }};
-}};
-const first = snapshot();
-if (first.strict) return `__rustwright_strict_violation__:${{first.count}}`;
-if (first.matched) return first.attached;
-return new Promise(resolve => {{
-  let settled = false;
-  let observer = null;
-  let interval = null;
-  let timer = null;
-  const finish = value => {{
-    if (settled) return;
-    settled = true;
-    if (observer) observer.disconnect();
-    if (interval) clearInterval(interval);
-    if (timer) clearTimeout(timer);
-    resolve(value);
-  }};
-  const check = () => {{
-    const next = snapshot();
-    if (next.strict) finish(`__rustwright_strict_violation__:${{next.count}}`);
-    if (next.matched) finish(next.attached);
-  }};
-  observer = new MutationObserver(check);
-  observer.observe(document, {{ subtree: true, childList: true, attributes: true, characterData: true }});
-  interval = setInterval(check, 5);
-  timer = setTimeout(() => finish('__rustwright_timeout__'), timeoutMs);
-}});
-"#
-        );
-        let json = self
-            .evaluate_locator(locator_json, index, &body, Some(eval_timeout))
-            .map_err(py_err)?;
-        let value = serde_json::from_str::<Value>(&json).unwrap_or(Value::Null);
-        if value.as_str() == Some("__rustwright_timeout__") {
-            return Err(py_err(RwError::Timeout(timeout.as_millis() as u64)));
-        }
-        if let Some(count) = value
-            .as_str()
-            .and_then(|text| text.strip_prefix("__rustwright_strict_violation__:"))
-            .and_then(|text| text.parse::<u64>().ok())
-        {
-            return Err(py_err(RwError::Message(format!(
-                "strict mode violation: locator resolved to {count} elements while trying to wait_for_selector"
-            ))));
-        }
-        Ok(value.as_bool().unwrap_or(false))
+        let page = Arc::clone(&self.inner);
+        let locator_json = locator_json.to_string();
+        let browser = Arc::clone(&page.browser);
+        browser
+            .block_on(async move {
+                page_wait_for_selector_async(page, locator_json, index, state, timeout, strict).await
+            })
+            .map_err(py_err)
     }
 
     #[pyo3(signature = (path=None, full_page=None, clip_json=None, timeout_ms=None, image_type=None, quality=None, omit_background=None))]

@@ -740,6 +740,26 @@ def http_server():
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if self.path == "/navigate-away-mid-wait":
+                body = (
+                    b"<!doctype html>"
+                    b"<script>setTimeout(function(){location.href='/navigate-away-target'},200)</script>"
+                    b"<div id='before-navigation'>A</div>"
+                )
+                self.send_response(200, "OK")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/navigate-away-target":
+                body = b"<!doctype html><div id='after-navigation'>Loaded</div>"
+                self.send_response(200, "OK")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             body = b"missing"
             self.send_response(404, "Missing")
             self.send_header("Content-Length", str(len(body)))
@@ -19157,6 +19177,40 @@ def test_wait_for_selector(page):
         root.wait_for_selector("#hidden", state="enabled", timeout=500)
     with pytest.raises(Error, match="Frame\\.wait_for_selector: state: expected one of"):
         frame.wait_for_selector("#frame-hidden", state="enabled", timeout=500)
+
+
+def test_wait_for_selector_survives_navigation_committed_mid_wait(page, http_server):
+    # The target only exists in the document we redirect to, so the wait has to
+    # poll across the navigation before it can ever match. Playwright keeps
+    # polling in the new document instead of surfacing the CDP error raised when
+    # the original execution context is torn down.
+    page.goto(f"{http_server}/navigate-away-mid-wait")
+
+    handle = page.wait_for_selector("#after-navigation", timeout=10_000)
+
+    assert handle is not None
+    assert handle.text_content() == "Loaded"
+    assert page.url == f"{http_server}/navigate-away-target"
+
+
+def test_locator_wait_for_survives_navigation_committed_mid_wait(page, http_server):
+    page.goto(f"{http_server}/navigate-away-mid-wait")
+
+    assert page.locator("#after-navigation").wait_for(state="visible", timeout=10_000) is None
+    assert page.locator("#after-navigation").text_content() == "Loaded"
+
+
+def test_wait_for_selector_still_times_out_when_navigation_never_reveals_element(page, http_server):
+    # The navigation retry must not extend the caller's deadline.
+    page.goto(f"{http_server}/navigate-away-mid-wait")
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError) as exc_info:
+        page.wait_for_selector("#never-appears", timeout=1_000)
+    elapsed_ms = (time.monotonic() - started) * 1000
+
+    assert str(exc_info.value).splitlines()[0] == "Page.wait_for_selector: Timeout 1000ms exceeded."
+    assert elapsed_ms < 5_000
 
 
 def test_wait_for_selector_timeout_messages_match_playwright(page):
