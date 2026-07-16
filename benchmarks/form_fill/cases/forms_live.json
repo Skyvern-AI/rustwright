@@ -1,0 +1,621 @@
+[
+  {
+    "id": "internet_login_success",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/login",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/login"
+      },
+      {
+        "op": "wait",
+        "selector": "#username"
+      },
+      {
+        "op": "fill",
+        "selector": "#username",
+        "value": "tomsmith"
+      },
+      {
+        "op": "fill",
+        "selector": "#password",
+        "value": "SuperSecretPassword!"
+      },
+      {
+        "op": "hover",
+        "selector": "#login button[type='submit']"
+      },
+      {
+        "op": "click",
+        "selector": "#login button[type='submit']"
+      },
+      {
+        "op": "wait",
+        "selector": "#flash"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#flash').textContent.trim()"
+      }
+    ]
+  },
+  {
+    "id": "internet_checkbox_state_cycle",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/checkboxes",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/checkboxes"
+      },
+      {
+        "op": "wait",
+        "selector": "#checkboxes input[type='checkbox']"
+      },
+      {
+        "op": "uncheck",
+        "selector": "#checkboxes input:nth-of-type(2)"
+      },
+      {
+        "op": "check",
+        "selector": "#checkboxes input:nth-of-type(1)"
+      },
+      {
+        "op": "uncheck",
+        "selector": "#checkboxes input:nth-of-type(1)"
+      },
+      {
+        "op": "check",
+        "selector": "#checkboxes input:nth-of-type(2)"
+      },
+      {
+        "op": "hover",
+        "selector": "#checkboxes input:nth-of-type(1)"
+      },
+      {
+        "op": "eval",
+        "expression": "Array.from(document.querySelectorAll(\"#checkboxes input[type='checkbox']\")).map(input => input.checked)"
+      }
+    ]
+  },
+  {
+    "id": "internet_dropdown_keyboard_and_select",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/dropdown",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/dropdown"
+      },
+      {
+        "op": "wait",
+        "selector": "#dropdown"
+      },
+      {
+        "op": "select",
+        "selector": "#dropdown",
+        "value": "1"
+      },
+      {
+        "op": "select",
+        "selector": "#dropdown",
+        "value": "2"
+      },
+      {
+        "op": "press",
+        "selector": "#dropdown",
+        "key": "ArrowUp"
+      },
+      {
+        "op": "press",
+        "selector": "#dropdown",
+        "key": "ArrowDown"
+      },
+      {
+        "op": "hover",
+        "selector": "#dropdown"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#dropdown').value"
+      }
+    ]
+  },
+  {
+    "id": "internet_number_input_adjust",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/inputs",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/inputs"
+      },
+      {
+        "op": "wait",
+        "selector": "input[type='number']"
+      },
+      {
+        "op": "fill",
+        "selector": "input[type='number']",
+        "value": "41"
+      },
+      {
+        "op": "press",
+        "selector": "input[type='number']",
+        "key": "ArrowUp"
+      },
+      {
+        "op": "press",
+        "selector": "input[type='number']",
+        "key": "ArrowDown"
+      },
+      {
+        "op": "fill",
+        "selector": "input[type='number']",
+        "value": "-12"
+      },
+      {
+        "op": "type",
+        "selector": "input[type='number']",
+        "text": "5"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector(\"input[type='number']\").value"
+      }
+    ]
+  },
+  {
+    "id": "internet_horizontal_slider_keys",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/horizontal_slider",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/horizontal_slider"
+      },
+      {
+        "op": "wait",
+        "selector": "input[type='range']"
+      },
+      {
+        "op": "click",
+        "selector": "input[type='range']"
+      },
+      {
+        "op": "press",
+        "selector": "input[type='range']",
+        "key": "ArrowRight"
+      },
+      {
+        "op": "press",
+        "selector": "input[type='range']",
+        "key": "ArrowRight"
+      },
+      {
+        "op": "press",
+        "selector": "input[type='range']",
+        "key": "ArrowRight"
+      },
+      {
+        "op": "press",
+        "selector": "input[type='range']",
+        "key": "ArrowLeft"
+      },
+      {
+        "op": "hover",
+        "selector": "input[type='range']"
+      },
+      {
+        "op": "eval",
+        "expression": "({value: document.querySelector(\"input[type='range']\").value, displayed: document.querySelector('#range').textContent})"
+      }
+    ]
+  },
+  {
+    "id": "internet_dynamic_controls_modify",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/dynamic_controls",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/dynamic_controls"
+      },
+      {
+        "op": "wait",
+        "selector": "#checkbox-example input[type='checkbox']"
+      },
+      {
+        "op": "check",
+        "selector": "#checkbox-example input[type='checkbox']"
+      },
+      {
+        "op": "uncheck",
+        "selector": "#checkbox-example input[type='checkbox']"
+      },
+      {
+        "op": "check",
+        "selector": "#checkbox-example input[type='checkbox']"
+      },
+      {
+        "op": "click",
+        "selector": "#checkbox-example button"
+      },
+      {
+        "op": "wait",
+        "selector": "#checkbox-example #message"
+      },
+      {
+        "op": "click",
+        "selector": "#input-example button"
+      },
+      {
+        "op": "wait",
+        "selector": "#input-example input:enabled"
+      },
+      {
+        "op": "fill",
+        "selector": "#input-example input",
+        "value": "enabled"
+      },
+      {
+        "op": "type",
+        "selector": "#input-example input",
+        "text": " control"
+      },
+      {
+        "op": "eval",
+        "expression": "({removed: !document.querySelector(\"#checkbox-example input[type='checkbox']\"), value: document.querySelector('#input-example input').value})"
+      }
+    ]
+  },
+  {
+    "id": "internet_key_presses_sequence",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/key_presses",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/key_presses"
+      },
+      {
+        "op": "wait",
+        "selector": "#target"
+      },
+      {
+        "op": "click",
+        "selector": "#target"
+      },
+      {
+        "op": "type",
+        "selector": "#target",
+        "text": "ab"
+      },
+      {
+        "op": "press",
+        "selector": "#target",
+        "key": "Escape"
+      },
+      {
+        "op": "press",
+        "selector": "#target",
+        "key": "Enter"
+      },
+      {
+        "op": "hover",
+        "selector": "#target"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#result').textContent"
+      }
+    ]
+  },
+  {
+    "id": "expandtesting_login_success",
+    "category": "navigation",
+    "url": "https://practice.expandtesting.com/login",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://practice.expandtesting.com/login"
+      },
+      {
+        "op": "wait",
+        "selector": "#username"
+      },
+      {
+        "op": "fill",
+        "selector": "#username",
+        "value": "practice"
+      },
+      {
+        "op": "fill",
+        "selector": "#password",
+        "value": "SuperSecretPassword!"
+      },
+      {
+        "op": "hover",
+        "selector": "#submit-login"
+      },
+      {
+        "op": "click",
+        "selector": "#submit-login"
+      },
+      {
+        "op": "wait",
+        "selector": "#flash"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#flash').textContent.trim()"
+      }
+    ]
+  },
+  {
+    "id": "expandtesting_register_fields",
+    "category": "navigation",
+    "url": "https://practice.expandtesting.com/register",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://practice.expandtesting.com/register"
+      },
+      {
+        "op": "wait",
+        "selector": "#username"
+      },
+      {
+        "op": "fill",
+        "selector": "#username",
+        "value": "benchmark_user_2048"
+      },
+      {
+        "op": "fill",
+        "selector": "#password",
+        "value": "SandboxPass123!"
+      },
+      {
+        "op": "type",
+        "selector": "#confirmPassword",
+        "text": "SandboxPass123!"
+      },
+      {
+        "op": "press",
+        "selector": "#confirmPassword",
+        "key": "Tab"
+      },
+      {
+        "op": "hover",
+        "selector": "#register button[type='submit']"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#password').value === document.querySelector('#confirmPassword').value"
+      }
+    ]
+  },
+  {
+    "id": "expandtesting_inputs_display",
+    "category": "navigation",
+    "url": "https://practice.expandtesting.com/inputs",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://practice.expandtesting.com/inputs"
+      },
+      {
+        "op": "wait",
+        "selector": "#input-number"
+      },
+      {
+        "op": "fill",
+        "selector": "#input-number",
+        "value": "2026"
+      },
+      {
+        "op": "fill",
+        "selector": "#input-text",
+        "value": "benchmark text"
+      },
+      {
+        "op": "type",
+        "selector": "#input-password",
+        "text": "sandbox-pass"
+      },
+      {
+        "op": "fill",
+        "selector": "#input-date",
+        "value": "2026-07-16"
+      },
+      {
+        "op": "hover",
+        "selector": "#btn-display-inputs"
+      },
+      {
+        "op": "click",
+        "selector": "#btn-display-inputs"
+      },
+      {
+        "op": "wait",
+        "selector": "#output-number"
+      },
+      {
+        "op": "eval",
+        "expression": "({number: document.querySelector('#output-number').textContent, text: document.querySelector('#output-text').textContent})"
+      }
+    ]
+  },
+  {
+    "id": "expandtesting_form_validation_fields",
+    "category": "navigation",
+    "url": "https://practice.expandtesting.com/form-validation",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://practice.expandtesting.com/form-validation"
+      },
+      {
+        "op": "wait",
+        "selector": "input[name='ContactName']"
+      },
+      {
+        "op": "fill",
+        "selector": "input[name='ContactName']",
+        "value": "Test User"
+      },
+      {
+        "op": "fill",
+        "selector": "input[name='contactnumber']",
+        "value": "5550102048"
+      },
+      {
+        "op": "fill",
+        "selector": "input[name='pickupdate']",
+        "value": "2026-07-20"
+      },
+      {
+        "op": "select",
+        "selector": "select[name='payment']",
+        "value": "card"
+      },
+      {
+        "op": "hover",
+        "selector": "form.needs-validation button[type='submit']"
+      },
+      {
+        "op": "eval",
+        "expression": "({name: document.querySelector(\"input[name='ContactName']\").value, payment: document.querySelector(\"select[name='payment']\").value})"
+      }
+    ]
+  },
+  {
+    "id": "expandtesting_multiple_dropdowns",
+    "category": "navigation",
+    "url": "https://practice.expandtesting.com/dropdown",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://practice.expandtesting.com/dropdown"
+      },
+      {
+        "op": "wait",
+        "selector": "#dropdown"
+      },
+      {
+        "op": "select",
+        "selector": "#dropdown",
+        "value": "1"
+      },
+      {
+        "op": "select",
+        "selector": "#elementsPerPageSelect",
+        "value": "20"
+      },
+      {
+        "op": "select",
+        "selector": "#country",
+        "value": "CA"
+      },
+      {
+        "op": "hover",
+        "selector": "#country"
+      },
+      {
+        "op": "select",
+        "selector": "#dropdown",
+        "value": "2"
+      },
+      {
+        "op": "eval",
+        "expression": "({option: document.querySelector('#dropdown').value, perPage: document.querySelector('#elementsPerPageSelect').value, country: document.querySelector('#country').value})"
+      }
+    ]
+  },
+  {
+    "id": "expandtesting_checkbox_state_cycle",
+    "category": "navigation",
+    "url": "https://practice.expandtesting.com/checkboxes",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://practice.expandtesting.com/checkboxes"
+      },
+      {
+        "op": "wait",
+        "selector": "#checkbox1"
+      },
+      {
+        "op": "click",
+        "selector": "#checkbox2"
+      },
+      {
+        "op": "check",
+        "selector": "#checkbox1"
+      },
+      {
+        "op": "click",
+        "selector": "#checkbox1"
+      },
+      {
+        "op": "check",
+        "selector": "#checkbox2"
+      },
+      {
+        "op": "hover",
+        "selector": "#checkbox1"
+      },
+      {
+        "op": "eval",
+        "expression": "[document.querySelector('#checkbox1').checked, document.querySelector('#checkbox2').checked]"
+      }
+    ]
+  },
+  {
+    "id": "quotes_login_form_fill",
+    "category": "navigation",
+    "url": "https://quotes.toscrape.com/login",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://quotes.toscrape.com/login"
+      },
+      {
+        "op": "wait",
+        "selector": "#username"
+      },
+      {
+        "op": "fill",
+        "selector": "#username",
+        "value": "benchmark_user"
+      },
+      {
+        "op": "fill",
+        "selector": "#password",
+        "value": "dummy_password"
+      },
+      {
+        "op": "press",
+        "selector": "#password",
+        "key": "Tab"
+      },
+      {
+        "op": "hover",
+        "selector": "input[type='submit']"
+      },
+      {
+        "op": "click",
+        "selector": "input[type='submit']"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href=\"/logout\"]"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('.quote').length"
+      }
+    ]
+  }
+]

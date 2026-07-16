@@ -1,0 +1,510 @@
+[
+  {
+    "id": "quotes_love_pager_author_history",
+    "category": "navigation",
+    "url": "https://quotes.toscrape.com/",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://quotes.toscrape.com/"
+      },
+      {
+        "op": "wait",
+        "selector": ".quote .tag[href='/tag/love/page/1/']"
+      },
+      {
+        "op": "click",
+        "selector": ".quote .tag[href='/tag/love/page/1/']"
+      },
+      {
+        "op": "wait",
+        "selector": "li.next a"
+      },
+      {
+        "op": "click",
+        "selector": "li.next a"
+      },
+      {
+        "op": "wait",
+        "selector": ".quote span a[href^='/author/']"
+      },
+      {
+        "op": "click",
+        "selector": ".quote span a[href^='/author/']"
+      },
+      {
+        "op": "wait",
+        "selector": ".author-title"
+      },
+      {
+        "op": "back"
+      },
+      {
+        "op": "forward"
+      },
+      {
+        "op": "wait",
+        "selector": ".author-title"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('.author-description').textContent.length"
+      }
+    ]
+  },
+  {
+    "id": "quotes_page_tag_author_round_trip",
+    "category": "navigation",
+    "url": "https://quotes.toscrape.com/",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://quotes.toscrape.com/"
+      },
+      {
+        "op": "wait",
+        "selector": "li.next a"
+      },
+      {
+        "op": "click",
+        "selector": "li.next a"
+      },
+      {
+        "op": "wait",
+        "selector": ".quote .tag[href='/tag/navigation/page/1/']"
+      },
+      {
+        "op": "click",
+        "selector": ".quote .tag[href='/tag/navigation/page/1/']"
+      },
+      {
+        "op": "wait",
+        "selector": ".quote span a[href^='/author/']"
+      },
+      {
+        "op": "click",
+        "selector": ".quote span a[href^='/author/']"
+      },
+      {
+        "op": "wait",
+        "selector": ".author-title"
+      },
+      {
+        "op": "back"
+      },
+      {
+        "op": "wait",
+        "selector": ".quote"
+      },
+      {
+        "op": "forward"
+      },
+      {
+        "op": "wait",
+        "selector": ".author-title"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('.author-title').textContent.trim()"
+      }
+    ]
+  },
+  {
+    "id": "quotes_login_history",
+    "category": "navigation",
+    "url": "https://quotes.toscrape.com/",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://quotes.toscrape.com/"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/login']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/login']"
+      },
+      {
+        "op": "wait",
+        "selector": "form"
+      },
+      {
+        "op": "back"
+      },
+      {
+        "op": "wait",
+        "selector": ".quote"
+      },
+      {
+        "op": "forward"
+      },
+      {
+        "op": "wait",
+        "selector": "form"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('form input').length"
+      }
+    ]
+  },
+  {
+    "id": "quotes_tag_author_home_page_tag",
+    "category": "navigation",
+    "url": "https://quotes.toscrape.com/",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://quotes.toscrape.com/"
+      },
+      {
+        "op": "wait",
+        "selector": ".quote .tag[href='/tag/inspirational/page/1/']"
+      },
+      {
+        "op": "click",
+        "selector": ".quote .tag[href='/tag/inspirational/page/1/']"
+      },
+      {
+        "op": "wait",
+        "selector": ".quote span a[href^='/author/']"
+      },
+      {
+        "op": "click",
+        "selector": ".quote span a[href^='/author/']"
+      },
+      {
+        "op": "wait",
+        "selector": ".author-title"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/']"
+      },
+      {
+        "op": "wait",
+        "selector": "li.next a"
+      },
+      {
+        "op": "click",
+        "selector": "li.next a"
+      },
+      {
+        "op": "wait",
+        "selector": ".quote .tag[href='/tag/life/page/1/']"
+      },
+      {
+        "op": "click",
+        "selector": ".quote .tag[href='/tag/life/page/1/']"
+      },
+      {
+        "op": "wait",
+        "selector": ".quote"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('.quote').length"
+      }
+    ]
+  },
+  {
+    "id": "internet_shifting_menu_query_history",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/shifting_content",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/shifting_content"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/shifting_content/menu']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/shifting_content/menu']"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/shifting_content/menu?mode=random']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/shifting_content/menu?mode=random']"
+      },
+      {
+        "op": "wait",
+        "selector": ".example"
+      },
+      {
+        "op": "back"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/shifting_content/menu?mode=random']"
+      },
+      {
+        "op": "forward"
+      },
+      {
+        "op": "wait",
+        "selector": ".example"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('.example a').length"
+      }
+    ]
+  },
+  {
+    "id": "internet_floating_menu_anchor_hop",
+    "category": "navigation",
+    "url": "https://the-internet.herokuapp.com/floating_menu",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://the-internet.herokuapp.com/floating_menu"
+      },
+      {
+        "op": "wait",
+        "selector": "#menu a[href='#news']"
+      },
+      {
+        "op": "click",
+        "selector": "#menu a[href='#news']"
+      },
+      {
+        "op": "click",
+        "selector": "#menu a[href='#contact']"
+      },
+      {
+        "op": "click",
+        "selector": "#menu a[href='#about']"
+      },
+      {
+        "op": "eval",
+        "expression": "window.location.hash"
+      }
+    ]
+  },
+  {
+    "id": "expand_home_dynamic_tables_history",
+    "category": "navigation",
+    "url": "https://practice.expandtesting.com/",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://practice.expandtesting.com/"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/dynamic-table']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/dynamic-table']"
+      },
+      {
+        "op": "wait",
+        "selector": "table.table.table-striped"
+      },
+      {
+        "op": "back"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/tables']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/tables']"
+      },
+      {
+        "op": "wait",
+        "selector": "#table1"
+      },
+      {
+        "op": "back"
+      },
+      {
+        "op": "forward"
+      },
+      {
+        "op": "wait",
+        "selector": "#table1"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('#table1 tbody tr').length"
+      }
+    ]
+  },
+  {
+    "id": "expand_tables_fragment_hop",
+    "category": "navigation",
+    "url": "https://practice.expandtesting.com/tables",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://practice.expandtesting.com/tables"
+      },
+      {
+        "op": "wait",
+        "selector": "#table1"
+      },
+      {
+        "op": "click",
+        "selector": "#table1 a[href='#edit']"
+      },
+      {
+        "op": "click",
+        "selector": "#table1 a[href='#delete']"
+      },
+      {
+        "op": "wait",
+        "selector": "#table1"
+      },
+      {
+        "op": "eval",
+        "expression": "window.location.hash"
+      }
+    ]
+  },
+  {
+    "id": "expand_redirector_history",
+    "category": "navigation",
+    "url": "https://practice.expandtesting.com/redirector",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://practice.expandtesting.com/redirector"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='redirect']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='redirect']"
+      },
+      {
+        "op": "wait",
+        "selector": "h1"
+      },
+      {
+        "op": "back"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='redirect']"
+      },
+      {
+        "op": "forward"
+      },
+      {
+        "op": "wait",
+        "selector": "h1"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('a').length"
+      }
+    ]
+  },
+  {
+    "id": "httpbin_links_forward_history",
+    "category": "navigation",
+    "url": "https://httpbin.org/links/10/0",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://httpbin.org/links/10/0"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/links/10/1']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/links/10/1']"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/links/10/2']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/links/10/2']"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/links/10/3']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/links/10/3']"
+      },
+      {
+        "op": "back"
+      },
+      {
+        "op": "forward"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('a').length"
+      }
+    ]
+  },
+  {
+    "id": "httpbin_links_reverse_history",
+    "category": "navigation",
+    "url": "https://httpbin.org/links/10/9",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://httpbin.org/links/10/9"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/links/10/8']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/links/10/8']"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/links/10/7']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/links/10/7']"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/links/10/6']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/links/10/6']"
+      },
+      {
+        "op": "back"
+      },
+      {
+        "op": "forward"
+      },
+      {
+        "op": "wait",
+        "selector": "a"
+      },
+      {
+        "op": "eval",
+        "expression": "document.body.textContent.trim().length"
+      }
+    ]
+  }
+]

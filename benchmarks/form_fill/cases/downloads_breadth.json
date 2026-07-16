@@ -1,0 +1,62 @@
+[
+  {
+    "id": "the_internet_random_data_txt_download",
+    "category": "download",
+    "url": "https://the-internet.herokuapp.com/download",
+    "download_trigger": {
+      "op": "click",
+      "selector": "a[href=\"download/random_data.txt\"]"
+    },
+    "expect_download": true
+  },
+  {
+    "id": "the_internet_background_jpg_download",
+    "category": "download",
+    "url": "https://the-internet.herokuapp.com/download",
+    "download_trigger": {
+      "op": "click",
+      "selector": "a[href=\"download/background.jpg\"]"
+    },
+    "expect_download": true
+  },
+  {
+    "id": "the_internet_spectrum_logo_png_download",
+    "category": "download",
+    "url": "https://the-internet.herokuapp.com/download",
+    "download_trigger": {
+      "op": "click",
+      "selector": "a[href=\"download/spectrum-logo.png\"]"
+    },
+    "expect_download": true
+  },
+  {
+    "id": "the_internet_pdf_1mb_download",
+    "category": "download",
+    "url": "https://the-internet.herokuapp.com/download",
+    "download_trigger": {
+      "op": "click",
+      "selector": "a[href=\"download/pdf-1mb.pdf\"]"
+    },
+    "expect_download": true
+  },
+  {
+    "id": "expandtesting_cdct_jpg_download",
+    "category": "download",
+    "url": "https://practice.expandtesting.com/download",
+    "download_trigger": {
+      "op": "click",
+      "selector": "a[href=\"download/cdct.jpg\"]"
+    },
+    "expect_download": true
+  },
+  {
+    "id": "expandtesting_wdio_png_download",
+    "category": "download",
+    "url": "https://practice.expandtesting.com/download",
+    "download_trigger": {
+      "op": "click",
+      "selector": "a[href=\"download/wdio.png\"]"
+    },
+    "expect_download": true
+  }
+]

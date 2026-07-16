@@ -1,0 +1,312 @@
+[
+  {
+    "id": "parity_uncheck_selenium_web_form_all_controls",
+    "category": "navigation",
+    "url": "https://www.selenium.dev/selenium/web/web-form.html",
+    "known_failure": {
+      "backend": "rustwright",
+      "error": "Page.uncheck diverges from Playwright on this element",
+      "discovered": "2026-07-16 breadth validation"
+    },
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://www.selenium.dev/selenium/web/web-form.html"
+      },
+      {
+        "op": "wait",
+        "selector": "#my-check-1"
+      },
+      {
+        "op": "check",
+        "selector": "#my-check-1"
+      },
+      {
+        "op": "uncheck",
+        "selector": "#my-check-1"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('input:checked').length"
+      }
+    ]
+  },
+  {
+    "id": "parity_uncheck_expandtesting_checkbox_state_cycle",
+    "category": "navigation",
+    "url": "https://practice.expandtesting.com/checkboxes",
+    "known_failure": {
+      "backend": "rustwright",
+      "error": "Page.uncheck diverges from Playwright on this element",
+      "discovered": "2026-07-16 breadth validation"
+    },
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://practice.expandtesting.com/checkboxes"
+      },
+      {
+        "op": "wait",
+        "selector": "#checkbox2"
+      },
+      {
+        "op": "check",
+        "selector": "#checkbox2"
+      },
+      {
+        "op": "uncheck",
+        "selector": "#checkbox2"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('input:checked').length"
+      }
+    ]
+  },
+  {
+    "id": "parity_click_receives_events_books_sidebar",
+    "category": "navigation",
+    "url": "https://books.toscrape.com/",
+    "known_failure": {
+      "backend": "rustwright",
+      "error": "actionability wait times out with receives_events=false on a plainly clickable sidebar link (count=1, visible, stable); Playwright clicks it",
+      "discovered": "2026-07-16 breadth validation (persisted across unique-selector fix)"
+    },
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://books.toscrape.com/"
+      },
+      {
+        "op": "wait",
+        "selector": ".side_categories a[href='catalogue/category/books/travel_2/index.html']"
+      },
+      {
+        "op": "click",
+        "selector": ".side_categories a[href='catalogue/category/books/travel_2/index.html']"
+      },
+      {
+        "op": "eval",
+        "expression": "location.pathname"
+      }
+    ]
+  },
+  {
+    "id": "expand_dynamic_home_redirect_chain",
+    "category": "navigation",
+    "url": "https://practice.expandtesting.com/",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://practice.expandtesting.com/"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/dynamic-table']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/dynamic-table']"
+      },
+      {
+        "op": "wait",
+        "selector": "table.table.table-striped"
+      },
+      {
+        "op": "click",
+        "selector": "a.navbar-brand"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='/redirector']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='/redirector']"
+      },
+      {
+        "op": "wait",
+        "selector": "a[href='redirect']"
+      },
+      {
+        "op": "click",
+        "selector": "a[href='redirect']"
+      },
+      {
+        "op": "wait",
+        "selector": "h1"
+      },
+      {
+        "op": "back"
+      },
+      {
+        "op": "forward"
+      },
+      {
+        "op": "wait",
+        "selector": "h1"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('h1').textContent.trim()"
+      }
+    ],
+    "known_failure": {
+      "backend": "rustwright",
+      "error": "wait_for_selector times out mid multi-hop redirect journey; Playwright completes all 14 steps",
+      "discovered": "2026-07-16 breadth validation (reproduced twice)"
+    }
+  },
+  {
+    "id": "expandtesting_some_file_json_download",
+    "category": "download",
+    "url": "https://practice.expandtesting.com/download",
+    "download_trigger": {
+      "op": "click",
+      "selector": "a[href=\"download/some-file.json\"]"
+    },
+    "expect_download": true,
+    "known_failure": {
+      "backend": "rustwright",
+      "error": "download event never fires for a .json link (60s timeout, reproduced twice); Playwright receives the download",
+      "discovered": "2026-07-16 breadth validation"
+    }
+  },
+  {
+    "id": "selenium_web_form_all_controls",
+    "category": "navigation",
+    "url": "https://www.selenium.dev/selenium/web/web-form.html",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://www.selenium.dev/selenium/web/web-form.html"
+      },
+      {
+        "op": "wait",
+        "selector": "#my-text-id"
+      },
+      {
+        "op": "fill",
+        "selector": "#my-text-id",
+        "value": "Automation benchmark"
+      },
+      {
+        "op": "fill",
+        "selector": "input[name='my-password']",
+        "value": "sandbox-password"
+      },
+      {
+        "op": "fill",
+        "selector": "textarea[name='my-textarea']",
+        "value": "Line one"
+      },
+      {
+        "op": "type",
+        "selector": "textarea[name='my-textarea']",
+        "text": " and line two"
+      },
+      {
+        "op": "fill",
+        "selector": "input[name='my-datalist']",
+        "value": "Seattle"
+      },
+      {
+        "op": "select",
+        "selector": "select[name='my-select']",
+        "value": "2"
+      },
+      {
+        "op": "click",
+        "selector": "#my-check-1"
+      },
+      {
+        "op": "check",
+        "selector": "#my-check-2"
+      },
+      {
+        "op": "check",
+        "selector": "#my-radio-2"
+      },
+      {
+        "op": "press",
+        "selector": "input[name='my-range']",
+        "key": "ArrowRight"
+      },
+      {
+        "op": "hover",
+        "selector": "button[type='submit']"
+      },
+      {
+        "op": "eval",
+        "expression": "({text: document.querySelector('#my-text-id').value, selected: document.querySelector(\"select[name='my-select']\").value, range: document.querySelector(\"input[name='my-range']\").value})"
+      }
+    ],
+    "known_failure": {
+      "backend": "rustwright",
+      "error": "multi-symptom form-control divergence: uncheck 'Not a checkbox or radio button' (run 1); check 'no element matched' (run 2); Playwright completes all 14 steps",
+      "discovered": "2026-07-16 breadth validation"
+    }
+  },
+  {
+    "id": "selenium_click_bubbling_and_history",
+    "category": "navigation",
+    "url": "https://www.selenium.dev/selenium/web/clicks.html",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://www.selenium.dev/selenium/web/clicks.html"
+      },
+      {
+        "op": "wait",
+        "selector": "#bubblesFrom"
+      },
+      {
+        "op": "hover",
+        "selector": "#bubblesFrom"
+      },
+      {
+        "op": "click",
+        "selector": "#bubblesFrom"
+      },
+      {
+        "op": "eval",
+        "expression": "window.bubbledClick === true"
+      },
+      {
+        "op": "hover",
+        "selector": "#anchor"
+      },
+      {
+        "op": "click",
+        "selector": "#anchor"
+      },
+      {
+        "op": "eval",
+        "expression": "location.hash"
+      },
+      {
+        "op": "back"
+      },
+      {
+        "op": "wait",
+        "selector": "#anchor"
+      },
+      {
+        "op": "forward"
+      },
+      {
+        "op": "wait",
+        "selector": "#anchor"
+      },
+      {
+        "op": "eval",
+        "expression": "location.hash"
+      }
+    ],
+    "known_failure": {
+      "backend": "rustwright",
+      "error": "Page.go_back: Timeout 30000ms (reproduced twice); Playwright completes the journey",
+      "discovered": "2026-07-16 breadth validation"
+    }
+  }
+]

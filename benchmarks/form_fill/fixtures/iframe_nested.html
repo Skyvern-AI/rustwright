@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Controlled nested iframe fixture</title>
+</head>
+<body>
+  <main>
+    <h1>Controlled nested iframe fixture</h1>
+    <div id="fallback-buttons">
+      <button id="fallback-0" type="button">Fallback 0</button>
+      <button id="fallback-1" type="button">Fallback 1</button>
+      <button id="fallback-2" type="button">Fallback 2</button>
+      <button id="fallback-3" type="button">Fallback 3</button>
+      <button id="fallback-4" type="button">Fallback 4</button>
+      <button id="fallback-5" type="button">Fallback 5</button>
+      <button id="fallback-6" type="button">Fallback 6</button>
+      <button id="fallback-7" type="button">Fallback 7</button>
+      <button id="fallback-8" type="button">Fallback 8</button>
+      <button id="fallback-9" type="button">Fallback 9</button>
+    </div>
+    <iframe
+      id="frame0"
+      title="Button frame 0"
+      srcdoc="<!doctype html><html lang='en'><body><button id='if0_b0' type='button'>Frame 0 button 0</button><button id='if0_b1' type='button'>Frame 0 button 1</button><button id='if0_b2' type='button'>Frame 0 button 2</button><button id='if0_b3' type='button'>Frame 0 button 3</button><button id='if0_b4' type='button'>Frame 0 button 4</button><button id='if0_b5' type='button'>Frame 0 button 5</button><button id='if0_b6' type='button'>Frame 0 button 6</button><button id='if0_b7' type='button'>Frame 0 button 7</button><button id='if0_b8' type='button'>Frame 0 button 8</button><button id='if0_b9' type='button'>Frame 0 button 9</button></body></html>"
+    ></iframe>
+    <iframe
+      id="frame1"
+      title="Button frame 1"
+      srcdoc="<!doctype html><html lang='en'><body><button id='if1_b0' type='button'>Frame 1 button 0</button><button id='if1_b1' type='button'>Frame 1 button 1</button><button id='if1_b2' type='button'>Frame 1 button 2</button><button id='if1_b3' type='button'>Frame 1 button 3</button><button id='if1_b4' type='button'>Frame 1 button 4</button><button id='if1_b5' type='button'>Frame 1 button 5</button><button id='if1_b6' type='button'>Frame 1 button 6</button><button id='if1_b7' type='button'>Frame 1 button 7</button><button id='if1_b8' type='button'>Frame 1 button 8</button><button id='if1_b9' type='button'>Frame 1 button 9</button></body></html>"
+    ></iframe>
+  </main>
+</body>
+</html>

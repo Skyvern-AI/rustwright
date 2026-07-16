@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Controlled shadow DOM fixture</title>
+</head>
+<body>
+  <main>
+    <h1>Controlled shadow DOM fixture</h1>
+    <div id="h0"></div>
+    <div id="h1"></div>
+    <div id="h2"></div>
+    <div id="h3"></div>
+    <div id="h4"></div>
+    <div id="h5"></div>
+    <div id="h6"></div>
+    <div id="h7"></div>
+    <div id="h8"></div>
+    <div id="h9"></div>
+  </main>
+  <script>
+    "use strict";
+    window.__clicked = 0;
+    for (let index = 0; index < 10; index += 1) {
+      const host = document.querySelector(`#h${index}`);
+      const root = host.attachShadow({mode: "open"});
+      const button = document.createElement("button");
+      button.id = "sbtn";
+      button.type = "button";
+      button.textContent = `Shadow button ${index}`;
+      button.addEventListener("click", () => {
+        window.__clicked += 1;
+      });
+      root.append(button);
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,517 @@
+[
+  {
+    "id": "selenium_form_page_controls",
+    "category": "navigation",
+    "url": "https://www.selenium.dev/selenium/web/formPage.html",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://www.selenium.dev/selenium/web/formPage.html"
+      },
+      {
+        "op": "wait",
+        "selector": "#email"
+      },
+      {
+        "op": "fill",
+        "selector": "#email",
+        "value": "benchmark@example.test"
+      },
+      {
+        "op": "fill",
+        "selector": "#age",
+        "value": "42"
+      },
+      {
+        "op": "fill",
+        "selector": "#working",
+        "value": "Selenium"
+      },
+      {
+        "op": "type",
+        "selector": "#working",
+        "text": " fixture"
+      },
+      {
+        "op": "check",
+        "selector": "#checky"
+      },
+      {
+        "op": "click",
+        "selector": "#checkedchecky"
+      },
+      {
+        "op": "select",
+        "selector": "select[name='selectomatic']",
+        "value": "four"
+      },
+      {
+        "op": "select",
+        "selector": "#multi",
+        "value": "ham"
+      },
+      {
+        "op": "check",
+        "selector": "#peas"
+      },
+      {
+        "op": "press",
+        "selector": "#working",
+        "key": "End"
+      },
+      {
+        "op": "hover",
+        "selector": "#submitButton"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#email').value + '|' + document.querySelector('#working').value + '|' + document.querySelector(\"select[name='selectomatic']\").value"
+      }
+    ]
+  },
+  {
+    "id": "selenium_drag_fixture_hover_positions",
+    "category": "navigation",
+    "url": "https://www.selenium.dev/selenium/web/dragAndDropTest.html",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://www.selenium.dev/selenium/web/dragAndDropTest.html"
+      },
+      {
+        "op": "wait",
+        "selector": "#test1"
+      },
+      {
+        "op": "hover",
+        "selector": "#test1"
+      },
+      {
+        "op": "hover",
+        "selector": "#test2"
+      },
+      {
+        "op": "hover",
+        "selector": "#test3"
+      },
+      {
+        "op": "eval",
+        "expression": "Math.round(document.querySelector('#test3').getBoundingClientRect().left)"
+      },
+      {
+        "op": "hover",
+        "selector": "#test4"
+      },
+      {
+        "op": "eval",
+        "expression": "Math.round(document.querySelector('#test4').getBoundingClientRect().top)"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('.dragme').length"
+      }
+    ]
+  },
+  {
+    "id": "selenium_javascript_keyboard_events",
+    "category": "navigation",
+    "url": "https://www.selenium.dev/selenium/web/javascriptPage.html",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://www.selenium.dev/selenium/web/javascriptPage.html"
+      },
+      {
+        "op": "wait",
+        "selector": "#keyUp"
+      },
+      {
+        "op": "type",
+        "selector": "#keyUp",
+        "text": "alpha"
+      },
+      {
+        "op": "press",
+        "selector": "#keyReporter",
+        "key": "A"
+      },
+      {
+        "op": "fill",
+        "selector": "#theworks",
+        "value": "event"
+      },
+      {
+        "op": "type",
+        "selector": "#theworks",
+        "text": " sequence"
+      },
+      {
+        "op": "press",
+        "selector": "#theworks",
+        "key": "Tab"
+      },
+      {
+        "op": "hover",
+        "selector": "#plainButton"
+      },
+      {
+        "op": "click",
+        "selector": "#plainButton"
+      },
+      {
+        "op": "click",
+        "selector": "#labeledCheckbox"
+      },
+      {
+        "op": "click",
+        "selector": "#labeledCheckbox"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#resultParagraph').textContent.trim()"
+      }
+    ]
+  },
+  {
+    "id": "selenium_static_tables_inspection",
+    "category": "navigation",
+    "url": "https://www.selenium.dev/selenium/web/tables.html",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://www.selenium.dev/selenium/web/tables.html"
+      },
+      {
+        "op": "wait",
+        "selector": "#base"
+      },
+      {
+        "op": "hover",
+        "selector": "#base"
+      },
+      {
+        "op": "hover",
+        "selector": "#th1"
+      },
+      {
+        "op": "hover",
+        "selector": "#td1"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#td2').textContent.trim()"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#base').rows[0].cells.length"
+      }
+    ]
+  },
+  {
+    "id": "selenium_color_formats_hover",
+    "category": "navigation",
+    "url": "https://www.selenium.dev/selenium/web/colorPage.html",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://www.selenium.dev/selenium/web/colorPage.html"
+      },
+      {
+        "op": "wait",
+        "selector": "#namedColor"
+      },
+      {
+        "op": "hover",
+        "selector": "#rgb"
+      },
+      {
+        "op": "hover",
+        "selector": "#hex"
+      },
+      {
+        "op": "hover",
+        "selector": "#hsla"
+      },
+      {
+        "op": "eval",
+        "expression": "getComputedStyle(document.querySelector('#rgb')).backgroundColor"
+      },
+      {
+        "op": "eval",
+        "expression": "getComputedStyle(document.querySelector('#rgba')).backgroundColor"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('body > div').length"
+      }
+    ]
+  },
+  {
+    "id": "selenium_dynamic_reveal_and_boxes",
+    "category": "navigation",
+    "url": "https://www.selenium.dev/selenium/web/dynamic.html",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://www.selenium.dev/selenium/web/dynamic.html"
+      },
+      {
+        "op": "wait",
+        "selector": "#adder"
+      },
+      {
+        "op": "click",
+        "selector": "#adder"
+      },
+      {
+        "op": "click",
+        "selector": "#adder"
+      },
+      {
+        "op": "wait",
+        "selector": "#box1"
+      },
+      {
+        "op": "hover",
+        "selector": "#box0"
+      },
+      {
+        "op": "click",
+        "selector": "#reveal"
+      },
+      {
+        "op": "wait",
+        "selector": "#revealed"
+      },
+      {
+        "op": "fill",
+        "selector": "#revealed",
+        "value": "visible"
+      },
+      {
+        "op": "type",
+        "selector": "#revealed",
+        "text": " input"
+      },
+      {
+        "op": "press",
+        "selector": "#revealed",
+        "key": "End"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#revealed').value"
+      }
+    ]
+  },
+  {
+    "id": "selenium_frameset_top_level_inspection",
+    "category": "navigation",
+    "url": "https://www.selenium.dev/selenium/web/frameset.html",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://www.selenium.dev/selenium/web/frameset.html"
+      },
+      {
+        "op": "wait",
+        "selector": "frame#fifth"
+      },
+      {
+        "op": "hover",
+        "selector": "frame#fifth"
+      },
+      {
+        "op": "hover",
+        "selector": "frame[name='third']"
+      },
+      {
+        "op": "eval",
+        "expression": "document.title"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelectorAll('frame').length"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector(\"frame[name='second']\").getAttribute('src')"
+      }
+    ]
+  },
+  {
+    "id": "selenium_input_types_editing",
+    "category": "navigation",
+    "url": "https://www.selenium.dev/selenium/web/inputs.html",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://www.selenium.dev/selenium/web/inputs.html"
+      },
+      {
+        "op": "wait",
+        "selector": "input[name='number_input']"
+      },
+      {
+        "op": "fill",
+        "selector": "input[name='number_input']",
+        "value": "7"
+      },
+      {
+        "op": "press",
+        "selector": "input[name='number_input']",
+        "key": "ArrowUp"
+      },
+      {
+        "op": "fill",
+        "selector": "input[name='email_input']",
+        "value": "bench@example.test"
+      },
+      {
+        "op": "type",
+        "selector": "input[name='email_input']",
+        "text": ".invalid"
+      },
+      {
+        "op": "fill",
+        "selector": "input[name='search_input']",
+        "value": "selenium"
+      },
+      {
+        "op": "type",
+        "selector": "input[name='search_input']",
+        "text": " fixtures"
+      },
+      {
+        "op": "click",
+        "selector": "input[name='checkbox_input']"
+      },
+      {
+        "op": "click",
+        "selector": "input[name='radio_input'][value='radio2']"
+      },
+      {
+        "op": "fill",
+        "selector": "input[name='date_input']",
+        "value": "2024-02-29"
+      },
+      {
+        "op": "hover",
+        "selector": "input[name='color_input']"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector(\"input[name='number_input']\").value + '|' + document.querySelector(\"input[name='search_input']\").value"
+      }
+    ]
+  },
+  {
+    "id": "selenium_select_variants",
+    "category": "navigation",
+    "url": "https://www.selenium.dev/selenium/web/selectPage.html",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://www.selenium.dev/selenium/web/selectPage.html"
+      },
+      {
+        "op": "wait",
+        "selector": "#selectWithoutMultiple"
+      },
+      {
+        "op": "select",
+        "selector": "#selectWithoutMultiple",
+        "value": "two"
+      },
+      {
+        "op": "press",
+        "selector": "#selectWithoutMultiple",
+        "key": "ArrowUp"
+      },
+      {
+        "op": "select",
+        "selector": "#selectWithMultipleEqualsMultiple",
+        "value": "Roquefort"
+      },
+      {
+        "op": "select",
+        "selector": "#selectWithEmptyStringMultiple",
+        "value": "two"
+      },
+      {
+        "op": "select",
+        "selector": "#selectWithMultipleWithoutValue",
+        "value": "two"
+      },
+      {
+        "op": "select",
+        "selector": "#selectWithRandomMultipleValue",
+        "value": "two"
+      },
+      {
+        "op": "select",
+        "selector": "#narrow",
+        "value": "cheddar"
+      },
+      {
+        "op": "hover",
+        "selector": "#visibility"
+      },
+      {
+        "op": "press",
+        "selector": "#selectWithoutMultiple",
+        "key": "ArrowDown"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#selectWithoutMultiple').value + '|' + document.querySelector('#narrow').value"
+      }
+    ]
+  },
+  {
+    "id": "selenium_form_page_fill_and_toggle",
+    "category": "navigation",
+    "url": "https://www.selenium.dev/selenium/web/formPage.html",
+    "nav_steps": [
+      {
+        "op": "goto",
+        "url": "https://www.selenium.dev/selenium/web/formPage.html"
+      },
+      {
+        "op": "wait",
+        "selector": "#working"
+      },
+      {
+        "op": "fill",
+        "selector": "#working",
+        "value": "breadth case"
+      },
+      {
+        "op": "type",
+        "selector": "#working",
+        "text": " extra"
+      },
+      {
+        "op": "press",
+        "selector": "#working",
+        "key": "Home"
+      },
+      {
+        "op": "click",
+        "selector": "#checky"
+      },
+      {
+        "op": "click",
+        "selector": "#checky"
+      },
+      {
+        "op": "hover",
+        "selector": "#working"
+      },
+      {
+        "op": "eval",
+        "expression": "document.querySelector('#working').value.length"
+      }
+    ]
+  }
+]

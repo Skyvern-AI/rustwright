@@ -88,6 +88,27 @@ def main():
                 elif op == "click":
                     kind = "library"
                     page.click(step["selector"], timeout=30000)
+                elif op == "fill":
+                    kind = "library"
+                    page.fill(step["selector"], step["value"], timeout=30000)
+                elif op == "type":
+                    kind = "library"
+                    page.type(step["selector"], step["text"], timeout=30000)
+                elif op == "press":
+                    kind = "library"
+                    page.press(step["selector"], step["key"], timeout=30000)
+                elif op == "check":
+                    kind = "library"
+                    page.check(step["selector"], timeout=30000)
+                elif op == "uncheck":
+                    kind = "library"
+                    page.uncheck(step["selector"], timeout=30000)
+                elif op == "select":
+                    kind = "library"
+                    page.select_option(step["selector"], step["value"], timeout=30000)
+                elif op == "hover":
+                    kind = "library"
+                    page.hover(step["selector"], timeout=30000)
                 elif op == "back":
                     kind = "navigation"
                     page.go_back(wait_until="commit")
