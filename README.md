@@ -253,7 +253,7 @@ See [`LIMITATIONS.md`](LIMITATIONS.md) for detail.
 
 - [ ] **Kotlin binding** — idiomatic Kotlin wrapper (Kotlin/JVM can already consume the Java FFM binding)
 - [ ] Grow the new language bindings beyond the alpha subset (contexts, routing, locators)
-- [ ] **Rustwright MCP server** — expose browser automation as tools for MCP-compatible AI agents
+- [x] **Rustwright MCP server** — expose browser automation as tools for MCP-compatible AI agents ([mcp/](mcp/))
 - [ ] CI / Testbox-backed benchmark evidence
 - [ ] Broaden the Node.js surface (contexts, routing, locators)
 - [ ] Close remaining OOPIF gaps
