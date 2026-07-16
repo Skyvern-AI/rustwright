@@ -1,0 +1,5 @@
+# Compiled binaries from `go build`
+/smoke
+/runner
+cmd/smoke/smoke
+cmd/runner/runner
