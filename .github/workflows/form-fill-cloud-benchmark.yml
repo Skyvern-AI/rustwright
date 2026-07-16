@@ -39,13 +39,11 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      # NOTE: Pin this action to a full commit SHA before merge.
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      # NOTE: Pin this action to a full commit SHA before merge.
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
 
@@ -57,8 +55,9 @@ jobs:
       - name: Build rustwright in its benchmark environment
         run: |
           python -m venv .venv-rw
-          .venv-rw/bin/pip install -U pip maturin
-          .venv-rw/bin/pip install psutil
+          # Exact pins: this step runs before the secret-bearing benchmark
+          # step, so nothing mutable is installed on the way there.
+          .venv-rw/bin/pip install maturin==1.14.1 psutil==7.2.2
           # maturin locates the target venv via VIRTUAL_ENV; invoking its binary
           # from .venv-rw/bin does not set it, and the venv is not named ".venv".
           VIRTUAL_ENV="$PWD/.venv-rw" .venv-rw/bin/maturin develop --release
@@ -66,31 +65,37 @@ jobs:
       - name: Install reference Playwright in its benchmark environment
         run: |
           python -m venv .venv-pw
-          .venv-pw/bin/pip install "playwright==1.59.0"
-          .venv-pw/bin/pip install psutil
+          .venv-pw/bin/pip install playwright==1.59.0 psutil==7.2.2
 
       - name: Run form-fill cloud benchmark suite
         env:
           SKYVERN_CLOUD_API_KEY: ${{ secrets.SKYVERN_CLOUD_API_KEY }}
           SKYVERN_BASE_URL: https://api.skyvern.com
-        run: >-
-          PYTHONPATH=$PWD/benchmarks/form_fill
-          .venv-rw/bin/python benchmarks/form_fill/harness/run_suite.py
-          --cases "${{ inputs.cases_file }}"
-          --backends ${{ inputs.backends }}
-          --reps ${{ inputs.reps }}
-          --concurrency ${{ inputs.concurrency }}
-          --python rustwright=$PWD/.venv-rw/bin/python playwright=$PWD/.venv-pw/bin/python
-          --output out/suite
+          # Dispatch inputs are passed via env, never interpolated into the
+          # shell, so input text cannot inject commands. run_suite.py further
+          # constrains --backends to {rustwright, playwright}.
+          CASES_FILE: ${{ inputs.cases_file }}
+          BACKENDS: ${{ inputs.backends }}
+          REPS: ${{ inputs.reps }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+        run: |
+          # shellcheck disable=SC2086  # BACKENDS is an intentional space-separated list
+          PYTHONPATH="$PWD/benchmarks/form_fill" \
+            .venv-rw/bin/python benchmarks/form_fill/harness/run_suite.py \
+            --cases "$CASES_FILE" \
+            --backends $BACKENDS \
+            --reps "$REPS" \
+            --concurrency "$CONCURRENCY" \
+            --python "rustwright=$PWD/.venv-rw/bin/python" "playwright=$PWD/.venv-pw/bin/python" \
+            --output out/suite
 
       - name: Print benchmark summary
         if: always()
         run: cat out/suite/suite_summary.txt
 
-      # NOTE: Pin this action to a full commit SHA before merge.
       - name: Upload benchmark results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: form-fill-cloud-benchmark
           path: out/suite/

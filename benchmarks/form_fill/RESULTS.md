@@ -2,14 +2,17 @@
 
 ## Cloud CDP benchmark (2026-07-16) — replication-grade
 
-Three green CI runs on Blacksmith 8-vCPU Ubuntu 24.04 runners, each rep driving
-a fresh remote Skyvern cloud browser over CDP (browser memory off-box):
-reference Playwright 1.59.0 vs rustwright built from source at main. **182/182
-sessions completed, zero failures, 36 cases.** Website time is excluded from
-the latency metric (navigation and page waits are timed as separate bands),
-and the live lane shows both backends wait comparably (0.94×), so the
-exclusion does not favor either side. Full methodology, per-case tables, and
-caveats: [`reports/rustwright_benchmark_report.html`](reports/rustwright_benchmark_report.html).
+Three green CI runs on Blacksmith 8-vCPU Ubuntu 24.04 runners (rustwright-cloud
+repository CI; run IDs below), each rep driving a fresh remote Skyvern cloud
+browser over CDP (browser memory off-box): reference Playwright 1.59.0 vs
+rustwright built from source — engine and suite at rustwright-cloud commit
+`e63087b` (its `main` of 2026-07-16). **182/182 sessions completed, zero
+failures, 36 cases.** Website time is excluded from the latency metric
+(navigation and page waits are timed as separate bands); the live lane shows
+both backends wait comparably (0.94×), and since rustwright waited slightly
+*less*, the exclusion removes a small rustwright advantage — it cannot flatter
+rustwright's latency numbers. Full methodology, per-case tables, and caveats:
+[`reports/rustwright_benchmark_report.html`](reports/rustwright_benchmark_report.html).
 
 | Lane (Actions run ID) | Sessions | Client PSS peak, rw ÷ pw | Library latency, rw ÷ pw |
 |---|---:|---:|---:|
@@ -33,13 +36,23 @@ caveats: [`reports/rustwright_benchmark_report.html`](reports/rustwright_benchma
   Linux).
 
 Reproduce (dispatch-only workflow; requires the `SKYVERN_CLOUD_API_KEY`
-repository secret):
+repository secret). One dispatch per lane:
 
 ```bash
 gh workflow run form-fill-cloud-benchmark.yml \
   -f cases_file=benchmarks/form_fill/cases/controlled.json \
   -f backends="rustwright playwright" -f reps=3 -f concurrency=6
+gh workflow run form-fill-cloud-benchmark.yml \
+  -f cases_file=benchmarks/form_fill/cases/controlled_more.json \
+  -f backends="rustwright playwright" -f reps=3 -f concurrency=6
+gh workflow run form-fill-cloud-benchmark.yml \
+  -f cases_file=benchmarks/form_fill/cases/nav_the_internet.json \
+  -f backends="rustwright playwright" -f reps=2 -f concurrency=6
 ```
+
+Reruns build rustwright from the dispatched ref, so numbers will drift as the
+engine evolves; the figures above correspond to the commit recorded in this
+section.
 
 ## Recorded demo results (2026-07-14, June-alpha build)
 
