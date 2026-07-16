@@ -85,15 +85,22 @@ def has_data_rows(path: Path) -> bool:
 
 
 def validated_output(path: Path) -> Path:
-    """Limit destructive cleanup to one named run under the output mount."""
-    root = OUTPUT_ROOT.resolve()
+    """Limit destructive cleanup to a named run directory under the benchmark root.
+
+    The root defaults to the Docker ``/output`` mount but is overridable via
+    ``BENCH_OUTPUT_ROOT`` for the non-container suite runner, which nests run
+    dirs as ``<root>/<case>/<backend>/<rep>``. The run dir must resolve to a
+    non-symlink descendant of the root so the ``rmtree`` below stays contained.
+    """
+    root_env = os.environ.get("BENCH_OUTPUT_ROOT")
+    root = Path(root_env).resolve() if root_env else OUTPUT_ROOT.resolve()
     if not path.is_absolute() or not OUTPUT_NAME.fullmatch(path.name):
         raise ValueError("output must be an absolute, simply named run directory")
-    if path.is_symlink() or path.parent.resolve() != root:
-        raise ValueError(f"output must be a non-symlink direct child of {OUTPUT_ROOT}")
+    if path.is_symlink():
+        raise ValueError("output run directory must not be a symlink")
     resolved = path.resolve()
-    if resolved.parent != root:
-        raise ValueError(f"output resolves outside {OUTPUT_ROOT}")
+    if root not in resolved.parents:
+        raise ValueError(f"output must resolve under {root}")
     return resolved
 
 
@@ -115,20 +122,37 @@ def main() -> int:
 
     with log_path.open("wb", buffering=0) as log:
         try:
-            cgroup_sampler = start_process(
-                [
-                    sys.executable,
-                    str(SCRIPT_DIR / "sample_cgroup_memory.py"),
-                    "--output",
-                    str(output / "cgroup.csv"),
-                    "--peak-output",
-                    str(output / "cgroup_memory_peak_bytes.txt"),
-                ],
-                log,
+            # cgroup-v2 whole-tree memory is only meaningful (and only readable)
+            # when this process runs inside its own memory cgroup, e.g. the
+            # Docker benchmark image. On a bare CI runner the root cgroup does
+            # not expose memory.current/memory.peak, and with a remote browser
+            # the metric of record is the client PSS anyway. Sample cgroup when
+            # available; otherwise skip it and rely on stack_pss.csv.
+            cgroup_root = Path("/sys/fs/cgroup")
+            cgroup_available = (
+                (cgroup_root / "memory.current").is_file()
+                and (cgroup_root / "memory.peak").is_file()
             )
-            processes.append(cgroup_sampler)
-            epochs["cgroup_sampler_start"] = time.time()
-            wait_for_file(output / "cgroup.csv", cgroup_sampler)
+            if cgroup_available:
+                cgroup_sampler = start_process(
+                    [
+                        sys.executable,
+                        str(SCRIPT_DIR / "sample_cgroup_memory.py"),
+                        "--output",
+                        str(output / "cgroup.csv"),
+                        "--peak-output",
+                        str(output / "cgroup_memory_peak_bytes.txt"),
+                    ],
+                    log,
+                )
+                processes.append(cgroup_sampler)
+                epochs["cgroup_sampler_start"] = time.time()
+                wait_for_file(output / "cgroup.csv", cgroup_sampler)
+            else:
+                log.write(
+                    b"cgroup-v2 memory files unavailable; skipping cgroup "
+                    b"sampling (client PSS still collected)\n"
+                )
 
             workload_environment = {
                 **os.environ,
@@ -243,14 +267,12 @@ def main() -> int:
             final_code = workload_code
             if final_code == 0 and (stack_code != 0 or cgroup_code != 0):
                 final_code = 125
-            required = [
-                output / "timeline.json",
-                output / "timings.json",
-                output / "cgroup_memory_peak_bytes.txt",
-            ]
+            required = [output / "timeline.json", output / "timings.json"]
+            if cgroup_available:
+                required.append(output / "cgroup_memory_peak_bytes.txt")
             if final_code == 0 and not all(path.is_file() and path.stat().st_size for path in required):
                 final_code = 125
-            if final_code == 0 and not has_data_rows(output / "cgroup.csv"):
+            if final_code == 0 and cgroup_available and not has_data_rows(output / "cgroup.csv"):
                 final_code = 125
             if final_code == 0 and not has_data_rows(output / "stack_pss.csv"):
                 final_code = 125

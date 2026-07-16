@@ -945,7 +945,7 @@
 <body>
   <header class="site-header">
     <div class="page-shell header-bar">
-      <div class="brand-mark">Benchmark instrument / smoke stage</div>
+      <div class="brand-mark">Benchmark instrument / Blacksmith Linux</div>
       <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch color theme">
         <span class="theme-toggle-dot" aria-hidden="true"></span>
         <span class="theme-toggle-text">Theme</span>
@@ -955,10 +955,10 @@
 
   <div class="page-shell">
     <div class="hero">
-      <p class="eyebrow">Remote CDP · reference Playwright 1.59</p>
+      <p class="eyebrow">Remote CDP · reference Playwright 1.59 · Blacksmith 8-vCPU Linux</p>
       <h1>Rustwright vs Playwright — Cloud CDP Benchmark</h1>
-      <p class="subtitle">Smoke-stage findings · remote Skyvern browsers · library-isolated metrics</p>
-      <p class="smoke-note">Smoke-stage evidence only: repetition counts are low, and memory is macOS process-tree RSS rather than proportional set size (PSS).</p>
+      <p class="subtitle">Real Linux PSS · remote Skyvern browsers · library-isolated metrics</p>
+      <p class="smoke-note">Blacksmith CI run <code>29465108042</code> (commit <code>e63087b</code>), <code>cases/controlled.json</code>, 3 reps × 10 fixtures × 2 backends = <strong>60/60 sessions, 0 failures</strong>. Memory is real Linux proportional set size (PSS); page-load and navigation time are excluded from latency.</p>
     </div>
   </div>
 
@@ -968,39 +968,39 @@
         <div class="section-index">00</div>
         <div>
           <h2 id="summary-title">Executive readout</h2>
-          <p class="section-intro">Rustwright is a Rust CDP engine implementing Playwright’s Python API. Its client architecture shows a clear memory advantage and wins the controlled click workload, while three concentrated latency regressions remain.</p>
+          <p class="section-intro">Rustwright is a Rust CDP engine implementing Playwright’s Python API. It delivers a decisive <span class="num">~4x</span> memory reduction, but currently trades that for higher per-operation latency — <span class="num">1.1–2.6x</span> slower across every controlled case. Raw CDP round-trips are at parity, so the deficit is concentrated in connection setup and object/DOM-heavy operations, not the wire.</p>
         </div>
       </div>
 
       <div class="stat-grid">
         <article class="stat-card win-card">
           <div class="stat-kicker"><span>Memory</span><span class="status-mark" aria-hidden="true"></span></div>
-          <p class="metric-value">2.8x smaller — 45 MB vs 126 MB</p>
-          <p class="metric-context">Client process-tree RSS; browser runs remotely and is not included.</p>
+          <p class="metric-value">~4x smaller — 28 MB vs 110 MB</p>
+          <p class="metric-context">Client PSS (Linux proportional set size), median of 10 cases; rustwright is smaller in every case. Browser runs remotely and is excluded.</p>
         </article>
 
-        <article class="stat-card win-card">
-          <div class="stat-kicker"><span>Controlled latency</span><span class="status-mark" aria-hidden="true"></span></div>
-          <p class="metric-value">1.35x faster — 7.9s vs 10.7s</p>
-          <p class="metric-context"><span class="num">20</span> identical clicks on a controlled fixture with <code>page_wait=0</code>.</p>
+        <article class="stat-card loss-card">
+          <div class="stat-kicker"><span>Latency</span><span class="status-mark" aria-hidden="true"></span></div>
+          <p class="metric-value">1.1–2.6x slower — median ~1.8x</p>
+          <p class="metric-context">Library latency with <code>page_wait=0</code>; rustwright is slower on all <span class="num">10</span> controlled cases.</p>
+        </article>
+
+        <article class="stat-card">
+          <div class="stat-kicker"><span>Transport</span><span class="status-mark" aria-hidden="true"></span></div>
+          <p class="metric-value">raw CDP evaluate at parity — 55 vs 56 ms</p>
+          <p class="metric-context">Trivial-return <code>evaluate</code> RTT is identical (n=30). The wire is not the bottleneck.</p>
         </article>
 
         <article class="stat-card loss-card">
           <div class="stat-kicker"><span>Weakness</span><span class="status-mark" aria-hidden="true"></span></div>
-          <p class="metric-value">query_selector_all ~300x slower — ~270 ms/element vs ~1 ms</p>
-          <p class="metric-context">Handle materialization scales linearly because it is not batched.</p>
+          <p class="metric-value">object-return evaluate ~2.6x slower</p>
+          <p class="metric-context">25 object-returning evals: <span class="num">6.4s</span> vs <span class="num">2.5s</span> — the sharpest per-op gap.</p>
         </article>
 
         <article class="stat-card loss-card">
           <div class="stat-kicker"><span>Weakness</span><span class="status-mark" aria-hidden="true"></span></div>
-          <p class="metric-value">object-evaluate ~2.5x slower</p>
-          <p class="metric-context">Small object return: <span class="num">138 ms</span> vs <span class="num">55 ms</span>.</p>
-        </article>
-
-        <article class="stat-card loss-card caveat-card">
-          <div class="stat-kicker"><span>Weakness</span><span class="caveat-tag">variance-sensitive</span></div>
-          <p class="metric-value">connect ~3x slower — 1336 vs 449 ms</p>
-          <p class="metric-context">Current smoke result; higher-repetition confirmation is still required.</p>
+          <p class="metric-value">connect ~2.3x slower — 2136 vs 925 ms</p>
+          <p class="metric-context">Session/target attach + event-stream setup (n=30). Confirms the smoke finding.</p>
         </article>
       </div>
     </section>
@@ -1060,28 +1060,22 @@
             </thead>
             <tbody>
               <tr>
-                <td class="metric-name">evaluate RTT</td>
-                <td class="win">41.6 ms</td>
-                <td class="loss">42.8 ms</td>
-                <td class="note-cell">Parity; network-bound</td>
-              </tr>
-              <tr>
-                <td class="metric-name">property read</td>
-                <td class="win">37.7 ms</td>
-                <td class="loss">43.9 ms</td>
-                <td class="note-cell">Rustwright lower</td>
+                <td class="metric-name">evaluate RTT (trivial return)</td>
+                <td class="win">55 ms</td>
+                <td class="loss">56 ms</td>
+                <td class="note-cell">Parity — transport-bound (n=30)</td>
               </tr>
               <tr>
                 <td class="metric-name">stable-element click pipeline</td>
-                <td class="win">270.7 ms</td>
-                <td class="loss">473.7 ms</td>
-                <td class="note-cell">Rustwright <span class="num">1.75x</span> faster</td>
+                <td class="loss">797 ms</td>
+                <td class="win">680 ms</td>
+                <td class="note-cell">Rustwright <span class="num">1.17x</span> slower</td>
               </tr>
               <tr>
                 <td class="metric-name">connect</td>
-                <td class="loss">1336 ms</td>
-                <td class="win">449 ms</td>
-                <td class="note-cell">Rustwright <span class="num">~3x</span> slower</td>
+                <td class="loss">2136 ms</td>
+                <td class="win">925 ms</td>
+                <td class="note-cell">Rustwright <span class="num">2.31x</span> slower (n=30)</td>
               </tr>
             </tbody>
           </table>
@@ -1090,32 +1084,30 @@
 
       <div class="table-block">
         <div class="table-title-row">
-          <h3>Controlled fixture (20 clicks, identical work, page_wait=0)</h3>
-          <p class="unit-note mono">milliseconds</p>
+          <h3>Controlled fixtures — library latency by case (page_wait=0, 3 reps)</h3>
+          <p class="unit-note mono">median milliseconds</p>
         </div>
         <div class="table-scroll" role="region" aria-label="Controlled fixture latency results" tabindex="0">
           <table>
             <thead>
               <tr>
-                <th scope="col">Measure</th>
+                <th scope="col">Case (ops)</th>
                 <th scope="col">Rustwright</th>
                 <th scope="col">Playwright 1.59</th>
-                <th scope="col">Finding</th>
+                <th scope="col">rw ÷ pw</th>
               </tr>
             </thead>
             <tbody>
-              <tr>
-                <td class="metric-name">library latency</td>
-                <td class="win">7890 ms</td>
-                <td class="loss">10674 ms</td>
-                <td class="note-cell">Rustwright <span class="num">1.35x</span> faster</td>
-              </tr>
-              <tr>
-                <td class="metric-name">per-click latency</td>
-                <td class="win">294 ms</td>
-                <td class="loss">461 ms</td>
-                <td class="note-cell">Rustwright lower</td>
-              </tr>
+              <tr><td class="metric-name">form checkbox click ×24</td><td class="loss">17993 ms</td><td class="win">14834 ms</td><td class="note-cell"><span class="num">1.21x</span> slower</td></tr>
+              <tr><td class="metric-name">button click ×20</td><td class="loss">15570 ms</td><td class="win">12601 ms</td><td class="note-cell"><span class="num">1.24x</span> slower</td></tr>
+              <tr><td class="metric-name">large-DOM id lookup ×100</td><td class="loss">7805 ms</td><td class="win">6740 ms</td><td class="note-cell"><span class="num">1.16x</span> slower</td></tr>
+              <tr><td class="metric-name">evaluate RTT ×100</td><td class="loss">7572 ms</td><td class="win">6694 ms</td><td class="note-cell"><span class="num">1.13x</span> slower</td></tr>
+              <tr><td class="metric-name">object-eval small ×25</td><td class="loss">6428 ms</td><td class="win">2487 ms</td><td class="note-cell"><span class="num">2.58x</span> slower</td></tr>
+              <tr><td class="metric-name">deep-DOM query ×50</td><td class="loss">4994 ms</td><td class="win">3872 ms</td><td class="note-cell"><span class="num">1.29x</span> slower</td></tr>
+              <tr><td class="metric-name">object-eval large ×10</td><td class="loss">4089 ms</td><td class="win">1978 ms</td><td class="note-cell"><span class="num">2.07x</span> slower</td></tr>
+              <tr><td class="metric-name">large-DOM all cells ×20</td><td class="loss">3339 ms</td><td class="win">2411 ms</td><td class="note-cell"><span class="num">1.38x</span> slower</td></tr>
+              <tr><td class="metric-name">dynamic wait 300 ms</td><td class="loss">2972 ms</td><td class="win">1779 ms</td><td class="note-cell"><span class="num">1.67x</span> slower</td></tr>
+              <tr><td class="metric-name">goto data: URL ×20</td><td class="loss">2126 ms</td><td class="win">936 ms</td><td class="note-cell"><span class="num">2.27x</span> slower</td></tr>
             </tbody>
           </table>
         </div>
@@ -1128,58 +1120,58 @@
         </div>
 
         <div class="bar-group">
-          <div class="bar-metric"><span>Client process-tree RSS</span><span class="mono">max 126 MB</span></div>
+          <div class="bar-metric"><span>Client PSS (median of cases)</span><span class="mono">max 110 MB</span></div>
           <div class="bar-scale">
             <div class="bar-series">Rustwright</div>
-            <div class="bar-track"><div class="bar-fill good" style="width: 35.7%"></div></div>
-            <div class="bar-value win">45 MB</div>
+            <div class="bar-track"><div class="bar-fill good" style="width: 25.5%"></div></div>
+            <div class="bar-value win">28 MB</div>
           </div>
           <div class="bar-scale">
             <div class="bar-series">Playwright</div>
             <div class="bar-track"><div class="bar-fill bad" style="width: 100%"></div></div>
-            <div class="bar-value loss">126 MB</div>
+            <div class="bar-value loss">110 MB</div>
           </div>
         </div>
 
         <div class="bar-group">
-          <div class="bar-metric"><span>Controlled fixture · 20 clicks</span><span class="mono">max 10674 ms</span></div>
+          <div class="bar-metric"><span>Controlled library latency · median of 10 cases</span><span class="mono">max 5711 ms</span></div>
           <div class="bar-scale">
             <div class="bar-series">Rustwright</div>
-            <div class="bar-track"><div class="bar-fill good" style="width: 73.9%"></div></div>
-            <div class="bar-value win">7890 ms</div>
+            <div class="bar-track"><div class="bar-fill bad" style="width: 100%"></div></div>
+            <div class="bar-value loss">5711 ms</div>
           </div>
           <div class="bar-scale">
             <div class="bar-series">Playwright</div>
-            <div class="bar-track"><div class="bar-fill bad" style="width: 100%"></div></div>
-            <div class="bar-value loss">10674 ms</div>
+            <div class="bar-track"><div class="bar-fill good" style="width: 55.7%"></div></div>
+            <div class="bar-value win">3180 ms</div>
           </div>
         </div>
 
         <div class="bar-group">
-          <div class="bar-metric"><span>Stable-element click pipeline</span><span class="mono">max 473.7 ms</span></div>
+          <div class="bar-metric"><span>Stable-element click pipeline</span><span class="mono">max 797 ms</span></div>
           <div class="bar-scale">
             <div class="bar-series">Rustwright</div>
-            <div class="bar-track"><div class="bar-fill good" style="width: 57.1%"></div></div>
-            <div class="bar-value win">270.7 ms</div>
+            <div class="bar-track"><div class="bar-fill bad" style="width: 100%"></div></div>
+            <div class="bar-value loss">797 ms</div>
           </div>
           <div class="bar-scale">
             <div class="bar-series">Playwright</div>
-            <div class="bar-track"><div class="bar-fill bad" style="width: 100%"></div></div>
-            <div class="bar-value loss">473.7 ms</div>
+            <div class="bar-track"><div class="bar-fill good" style="width: 85.3%"></div></div>
+            <div class="bar-value win">680 ms</div>
           </div>
         </div>
 
         <div class="bar-group">
-          <div class="bar-metric"><span>Connect</span><span class="mono">max 1336 ms</span></div>
+          <div class="bar-metric"><span>Connect</span><span class="mono">max 2136 ms</span></div>
           <div class="bar-scale">
             <div class="bar-series">Rustwright</div>
             <div class="bar-track"><div class="bar-fill bad" style="width: 100%"></div></div>
-            <div class="bar-value loss">1336 ms</div>
+            <div class="bar-value loss">2136 ms</div>
           </div>
           <div class="bar-scale">
             <div class="bar-series">Playwright</div>
-            <div class="bar-track"><div class="bar-fill good" style="width: 33.6%"></div></div>
-            <div class="bar-value win">449 ms</div>
+            <div class="bar-track"><div class="bar-fill good" style="width: 43.3%"></div></div>
+            <div class="bar-value win">925 ms</div>
           </div>
         </div>
       </div>
@@ -1190,7 +1182,7 @@
         <div class="section-index">03</div>
         <div>
           <h2 id="weaknesses-title">Concentrated weaknesses</h2>
-          <p class="section-intro">The smoke suite exposes specific implementation paths, not a general across-the-board slowdown.</p>
+          <p class="section-intro">Rustwright is slower on every controlled case, but the gap is far from uniform: object-return and connection paths dominate it. These are the sharpest, most actionable concentrations.</p>
         </div>
       </div>
 
@@ -1204,7 +1196,7 @@
             <h3><code>query_selector_all</code> handle-returning path</h3>
             <p><span class="num">~270 ms/element</span>: <span class="num">N=10 → 2.8s</span>, <span class="num">N=50 → 13.5s</span>, and <span class="num">N=100 → 27s</span>. Playwright is <span class="num">~1 ms/element</span>, including <span class="num">N=1000 → 875 ms</span>.</p>
             <p><code>locator.count()</code> is fine and remains flat at <span class="num">~150 ms</span>, localizing the regression to the handle-returning path.</p>
-            <p class="mechanism"><strong>Cause:</strong> one CDP round-trip per <code>ElementHandle</code>, with no batching. <strong>Fix:</strong> batch handle materialization.</p>
+            <p class="mechanism"><strong>Cause:</strong> one CDP round-trip per <code>ElementHandle</code>, with no batching. <strong>Fix:</strong> batch handle materialization. <em>Measured in the dedicated weakness lane (smoke stage); not re-run in the Blacksmith pass.</em></p>
           </div>
         </article>
 
@@ -1215,8 +1207,8 @@
           </div>
           <div class="weakness-copy">
             <h3>Object-evaluate return path</h3>
-            <p>Small-object evaluation is <span class="num">~2.5x</span> slower: Rustwright <span class="num">138 ms</span> vs Playwright <span class="num">55 ms</span>.</p>
-            <p class="mechanism"><strong>Target:</strong> profile serialization and remote-object conversion on the object-return path.</p>
+            <p>Object-returning evaluation is the sharpest per-case gap on Blacksmith: small objects ×25 run <span class="num">2.58x</span> slower (<span class="num">6.4s</span> vs <span class="num">2.5s</span>) and large objects ×10 run <span class="num">2.07x</span> slower (<span class="num">4.1s</span> vs <span class="num">2.0s</span>) — while trivial-return <code>evaluate</code> is at parity (<span class="num">55</span> vs <span class="num">56 ms</span>).</p>
+            <p class="mechanism"><strong>Target:</strong> profile serialization and remote-object conversion on the object-return path; the wire itself is exonerated by the trivial-return parity.</p>
           </div>
         </article>
 
@@ -1227,8 +1219,8 @@
           </div>
           <div class="weakness-copy">
             <h3>Initial CDP connection</h3>
-            <p>Connect is <span class="num">~3x</span> slower in the corrected smoke result: Rustwright <span class="num">1336 ms</span> vs Playwright <span class="num">449 ms</span>.</p>
-            <p class="mechanism"><strong>Likely mechanism:</strong> eager target attach plus Tokio and event-stream setup. Confirm with higher-repetition instrumentation before optimizing.</p>
+            <p>Connect is <span class="num">2.31x</span> slower on Blacksmith: Rustwright <span class="num">2136 ms</span> vs Playwright <span class="num">925 ms</span> (median, n=30 each). This also inflates the short <code>goto data: URL</code> case (<span class="num">2.27x</span>), where startup cost dominates.</p>
+            <p class="mechanism"><strong>Likely mechanism:</strong> eager target attach plus Tokio and event-stream setup. Now confirmed at n=30; profile session/target attach ordering.</p>
           </div>
         </article>
       </div>
@@ -1248,13 +1240,13 @@
       <div class="evidence-grid two-column">
         <article class="evidence-card">
           <h3>Client memory</h3>
-          <p class="evidence-value mono">45 vs 126 MB</p>
-          <p>Client process-tree RSS with the browser remote: Rustwright uses <span class="num">~2.8x</span> less, or <span class="num">65%</span> less memory.</p>
+          <p class="evidence-value mono">28 vs 110 MB PSS</p>
+          <p>Peak client PSS with the browser remote (median of 10 cases): Rustwright uses <span class="num">~4x</span> less, or <span class="num">75%</span> less memory. Per-case range: <span class="num">26–69 MB</span> vs <span class="num">107–135 MB</span> — smaller in every case, all 30 sessions per backend.</p>
         </article>
         <article class="evidence-card">
           <h3>Architectural basis</h3>
           <p class="evidence-value mono">in-process Rust</p>
-          <p>The result is consistent with an in-process Rust client versus Python plus a Node driver, and matches the repository’s known <span class="num">66%</span>-less-memory claim.</p>
+          <p>An in-process Rust client replaces the Python-plus-Node-driver stack. PSS (proportional set size) counts shared pages fairly, so this is a stronger and more defensible figure than the earlier macOS RSS proxy.</p>
         </article>
       </div>
     </section>
@@ -1292,17 +1284,18 @@
         <div class="section-index">06</div>
         <div>
           <h2 id="caveats-title">Caveats and next evidence</h2>
-          <p class="section-intro">Read the direction of the controlled results, but do not treat this smoke stage as a publication-grade confidence interval.</p>
+          <p class="section-intro">The Blacksmith pass supplies real PSS and consistent direction across all cases; the remaining caveats bound precision, not direction.</p>
         </div>
       </div>
 
       <div class="caveat-panel">
         <ul>
-          <li>Memory is macOS process-tree RSS, not proportional set size (PSS).</li>
-          <li>Repetition counts are low; variance and tail latency are not characterized.</li>
-          <li>Single-sample connect variance was corrected during testing: an earlier “faster connect” result was a fluke.</li>
-          <li>The two clients were compared in separate remote browser sessions, not one shared session.</li>
-          <li>Precise PSS, high-repetition statistics, and complete provenance require the Blacksmith run.</li>
+          <li>Latency reps are still modest (3 per case/backend); p95 tracks the median closely, but tails are not deeply characterized.</li>
+          <li>The smoke stage’s “1.35x faster on controlled clicks” did <strong>not</strong> reproduce — Blacksmith shows clicks <span class="num">1.24x</span> slower. The Blacksmith numbers supersede all smoke latency claims.</li>
+          <li>The <code>query_selector_all</code> ~300x finding is from the smoke weakness lane and has not yet been re-measured on Linux.</li>
+          <li>The two clients ran in separate remote browser sessions (by design, for parallelism); sessions come from the same Skyvern pool but are not the same instance.</li>
+          <li>Remote CDP latency to Skyvern amplifies per-round-trip costs; local-browser gaps will be smaller in absolute terms.</li>
+          <li>Provenance: run <code>29465108042</code>, branch <code>bench/fix-maturin-venv</code> (commit <code>e63087b</code>), Blacksmith 8-vCPU Ubuntu 24.04, <code>controlled.json</code>, reps=3, concurrency=6, 60/60 sessions OK.</li>
         </ul>
       </div>
     </section>
@@ -1310,7 +1303,7 @@
 
   <footer class="site-footer">
     <div class="page-shell footer-inner">
-      <p>Generated from <code>bench/skyvern-cloud-suite</code></p>
+      <p>Generated from <code>Skyvern-AI/rustwright-cloud</code> · <code>benchmarks/form_fill</code> · Blacksmith run <code>29465108042</code></p>
       <p>Methodology per <code>WEAKNESSES.md</code></p>
     </div>
   </footer>

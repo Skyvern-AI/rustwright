@@ -42,14 +42,16 @@ def parse_args() -> argparse.Namespace:
         help="run one dedicated weakness-probe session per backend",
     )
     parser.add_argument(
-        "--python", dest="backend_python", action="append", default=[],
+        "--python", dest="backend_python", nargs="+", action="append", default=[],
         metavar="BACKEND=/ABS/PATH/TO/PYTHON",
     )
     args = parser.parse_args()
     if args.reps < 1 or args.concurrency < 1:
         parser.error("--reps and --concurrency must be positive")
     mappings = {}
-    for mapping in args.backend_python:
+    # nargs="+" with action="append" yields a list of token groups; flatten so
+    # both "--python A=x B=y" and repeated "--python A=x --python B=y" work.
+    for mapping in (token for group in args.backend_python for token in group):
         backend, separator, interpreter = mapping.partition("=")
         if (not separator or backend not in ("rustwright", "playwright")
                 or not Path(interpreter).is_absolute()):
@@ -107,6 +109,7 @@ def run_one(case: dict[str, Any], rep: int, backend: str) -> dict[str, Any]:
     }
     secrets: list[str] = []
     returncode: int | None = None
+    measure_stderr = ""
     try:
         with SkyvernSession() as session:
             if not session.browser_address:
@@ -118,6 +121,7 @@ def run_one(case: dict[str, Any], rep: int, backend: str) -> dict[str, Any]:
                 "BACKEND": backend,
                 "CDP_URL": session.browser_address,
                 "CDP_CONNECT_HEADERS": json.dumps(headers, separators=(",", ":")),
+                "BENCH_OUTPUT_ROOT": str(OUTPUT_DIR),
                 "BENCH_WORKLOAD": (
                     "download_workload.py" if category == "download" else
                     "nav_workload.py" if category == "navigation" else "fill_form.py"
@@ -131,10 +135,11 @@ def run_one(case: dict[str, Any], rep: int, backend: str) -> dict[str, Any]:
                 cwd=SUITE_DIR,
                 env=environment,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 check=False,
             )
             returncode = result.returncode
+            measure_stderr = result.stderr.decode("utf-8", "replace")[-1000:].strip()
 
         timings = json.loads((run_dir / "timings.json").read_text(encoding="utf-8"))
         library_latency_ms = timings.get("library_latency_ms")
@@ -164,9 +169,15 @@ def run_one(case: dict[str, Any], rep: int, backend: str) -> dict[str, Any]:
             "soft_fail": False,
         }
         if returncode != 0:
-            record["error"] = f"measure.py exited with status {returncode}"
+            record["error"] = redact(
+                f"measure.py exited with status {returncode}: {measure_stderr}",
+                secrets,
+            )
         return record
     except Exception as error:
+        detail = f"{type(error).__name__}: {error}"
+        if measure_stderr:
+            detail += f" | measure.py stderr: {measure_stderr}"
         return {
             **base, "ok": False, "returncode": returncode,
             "library_latency_ms": None, "library_probe": None,
@@ -179,7 +190,7 @@ def run_one(case: dict[str, Any], rep: int, backend: str) -> dict[str, Any]:
             "reached_final_step": False if requested_steps(case) is not None else None,
             "equivalent_work": None,
             "soft_fail": False,
-            "error": redact(f"{type(error).__name__}: {error}", secrets),
+            "error": redact(detail, secrets),
         }
     finally:
         try:
