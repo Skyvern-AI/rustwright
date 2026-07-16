@@ -1,0 +1,15 @@
+{
+  "name": "rustwright/rustwright",
+  "description": "PHP FFI binding for the Rustwright C API",
+  "type": "library",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.1",
+    "ext-ffi": "*"
+  },
+  "autoload": {
+    "psr-4": {
+      "Rustwright\\": "src/"
+    }
+  }
+}
