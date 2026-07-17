@@ -15092,9 +15092,6 @@ class Page:
         try:
             lifecycle_timeout = navigation_timeout if navigation_timeout > 0 else 24 * 60 * 60 * 1000
             deadline = time.monotonic() + (lifecycle_timeout / 1000)
-            lifecycle_waiter = (
-                None if normalized_state == "commit" else self._document_lifecycle_waiter(normalized_state)
-            )
             self._retain_navigation_response_bodies()
             self._mark_navigation_history_boundary()
             self._set_content_html_document_known = None
@@ -15155,7 +15152,6 @@ class Page:
                     normalized_state,
                     timeout=remaining,
                     timeout_label="navigation",
-                    lifecycle_waiter=lifecycle_waiter,
                 )
             if payload is None or target_url.lower().startswith(("about:", "data:")):
                 if self._context is not None:
@@ -15235,20 +15231,17 @@ class Page:
         timeout: float,
         prior_time_origin: Any = None,
         timeout_label: str = "document",
-        lifecycle_waiter: Any = None,
     ) -> None:
+        # Readiness on remote-CDP-attached pages is observed by polling document.readyState via
+        # Runtime.evaluate. The Page lifecycle events (Page.loadEventFired/domContentEventFired)
+        # are unreliable here: after set_content's document.write() on an already-loaded page they
+        # never re-fire, so an event wait would hang. Each poll gets the full remaining budget
+        # (a high-latency remote-CDP round trip can exceed a fixed short slice), and the single
+        # caller deadline bounds the whole wait.
         state = str(wait_until or "load")
         if timeout <= 0:
             timeout = 24 * 60 * 60 * 1000
         deadline = time.monotonic() + (timeout / 1000)
-        if lifecycle_waiter is not None:
-            try:
-                _call(lifecycle_waiter.wait, min(10.0, timeout))
-                if state == "networkidle":
-                    self._wait_for_network_idle(deadline, timeout_label=timeout_label)
-                return
-            except TimeoutError:
-                pass
         while time.monotonic() < deadline:
             remaining = max(1.0, (deadline - time.monotonic()) * 1000)
             try:
@@ -15283,14 +15276,6 @@ class Page:
                 return
             time.sleep(0.02)
         raise TimeoutError(f"timed out waiting for {timeout_label} {state}")
-
-    def _document_lifecycle_waiter(self, state: str) -> Any:
-        method = (
-            "Page.domContentEventFired"
-            if state == "domcontentloaded"
-            else "Page.loadEventFired"
-        )
-        return _call(self._core.cdp_session).event_waiter(method)
 
     def _network_idle_request_id(self, request: Request) -> Optional[str]:
         request_id = getattr(request, "_request_id", None)
@@ -16625,9 +16610,6 @@ class Page:
         call_id = self._trace_begin_action("setContent", trace_params)
         try:
             deadline = time.monotonic() + (timeout_ms / 1000)
-            lifecycle_waiter = (
-                None if normalized_state == "commit" else self._document_lifecycle_waiter(normalized_state)
-            )
             content_type = None
             if self._set_content_html_document_known is True:
                 content_type = "text/html"
@@ -16637,7 +16619,7 @@ class Page:
                         self._core.evaluate,
                         "() => document.contentType",
                         None,
-                        timeout_ms,
+                        max(1.0, (deadline - time.monotonic()) * 1000),
                     )
                     content_type = _decode_json_result(json.loads(content_type_result))
                 except Exception:
@@ -16647,22 +16629,31 @@ class Page:
                         "text/html",
                         "application/xhtml+xml",
                     }
-            if isinstance(content_type, str) and content_type.lower() not in {"text/html", "application/xhtml+xml"}:
-                _call_with_method_prefix(
-                    "Page.set_content",
-                    self._core.evaluate,
-                    """html => {
-                    document.open();
-                    document.write(html);
-                    document.close();
-                    }""",
-                    json.dumps(html),
-                    timeout_ms,
-                )
-                self._set_content_html_document_known = False
-            else:
-                _call_wait_with_playwright_timeout("Page.set_content", self._core.set_content, html, timeout_ms)
-                self._set_content_html_document_known = True
+            # Materialize the document via document.open/write/close through Runtime.evaluate for
+            # every content type, including the real text/html attach path. This is the mechanism
+            # the remote-CDP attach probe proves reliable (case c5); the native command path is not
+            # used for the materialize-and-wait flow because its post-write lifecycle observation
+            # hangs on connect_over_cdp-attached pages. window.stop() halts any in-flight load first,
+            # matching Playwright. Stealth defaults re-apply automatically via the registered
+            # addScriptToEvaluateOnNewDocument script when document.write() creates the new document,
+            # so no separate injection is needed. The HTML is transported as a JSON-encoded evaluate
+            # argument, preserving escaping, and every step is bounded by the single caller deadline.
+            _call_with_method_prefix(
+                "Page.set_content",
+                self._core.evaluate,
+                """html => {
+                try { window.stop(); } catch (error) {}
+                document.open();
+                document.write(html);
+                document.close();
+                }""",
+                json.dumps(html),
+                max(1.0, (deadline - time.monotonic()) * 1000),
+            )
+            self._set_content_html_document_known = not (
+                isinstance(content_type, str)
+                and content_type.lower() not in {"text/html", "application/xhtml+xml"}
+            )
             if normalized_state != "commit":
                 remaining = max(1.0, (deadline - time.monotonic()) * 1000)
                 try:
@@ -16670,7 +16661,6 @@ class Page:
                         normalized_state,
                         timeout=remaining,
                         timeout_label="set_content",
-                        lifecycle_waiter=lifecycle_waiter,
                     )
                 except TimeoutError:
                     raise _method_timeout_error("Page.set_content", timeout_ms) from None

@@ -2157,6 +2157,84 @@ def test_document_state_fallback_uses_remaining_budget_for_high_latency_attach()
     assert owner._core.timeouts[0] > 600
 
 
+def test_set_content_text_html_materializes_via_evaluate_not_native_command():
+    # Regression (RUS-5, third cycle): on a remote-CDP *attached* text/html page, Page.set_content
+    # must materialize the document via Runtime.evaluate(document.open/write/close) — the mechanism
+    # the attach probe proves is reliable (case c5) — and must NOT route the real text/html branch
+    # through the native command path nor stack an unbounded lifecycle-event wait. After
+    # document.write() on an already-loaded page the load/domcontentloaded CDP lifecycle events do
+    # not re-fire, so readiness is confirmed by polling document.readyState, and the whole operation
+    # is bounded by a single caller deadline.
+    from rustwright.sync_api import Page
+
+    class RecordingCore:
+        def __init__(self):
+            self.evaluate_calls = []
+            self.set_content_calls = []
+            self.event_waiters = 0
+
+        def evaluate(self, expression, arg, timeout):
+            self.evaluate_calls.append((expression, arg, timeout))
+            if "document.contentType" in expression:
+                return json.dumps("text/html")
+            if "document.write" in expression:
+                return json.dumps(None)
+            if "readyState" in expression:
+                return json.dumps({"readyState": "complete", "resourcesLoaded": True})
+            return json.dumps(None)
+
+        def set_content(self, html, timeout):
+            self.set_content_calls.append((html, timeout))
+
+        def cdp_session(self):
+            outer = self
+
+            class _Waiter:
+                def wait(self, timeout):
+                    raise TimeoutError("no lifecycle event refires after document.write on attach")
+
+            class _Session:
+                def event_waiter(self, method):
+                    outer.event_waiters += 1
+                    return _Waiter()
+
+            return _Session()
+
+    html = (
+        "<!doctype html><html><head><title>Attached</title></head>"
+        "<body><h1 id='hdr'>Header</h1></body></html>"
+    )
+
+    owner = Page.__new__(Page)
+    owner._core = RecordingCore()
+    owner._context = None
+    owner._slow_mo_ms = 0
+    owner._set_content_html_document_known = None
+    owner._mark_request_cookie_sync_required = lambda: None
+    owner._trace_begin_action = lambda *args, **kwargs: None
+    owner._trace_end_action = lambda *args, **kwargs: None
+    owner._slow_mo = lambda: None
+
+    owner.set_content(html, wait_until="load", timeout=5_000)
+
+    # The text/html attach path must not hang on the native command; it materializes via evaluate.
+    assert owner._core.set_content_calls == []
+    materialize = [call for call in owner._core.evaluate_calls if "document.write" in call[0]]
+    assert len(materialize) == 1, owner._core.evaluate_calls
+    expression, arg, materialize_timeout = materialize[0]
+    assert "document.open()" in expression
+    assert "document.close()" in expression
+    # HTML is transported as a JSON-encoded evaluate argument (escaping preserved), not interpolated.
+    assert json.loads(arg) == html
+    # A single caller deadline bounds the whole operation: the materialize evaluate receives a
+    # remaining-bounded timeout, never a fresh full budget stacked on top of the content-type probe.
+    assert materialize_timeout <= 5_000
+    # The unreliable Page lifecycle-event waiter is gone (it never re-fires after document.write).
+    assert owner._core.event_waiters == 0
+    # The document was materialized (evaluate) and readiness confirmed via the readyState poll.
+    assert any("readyState" in call[0] for call in owner._core.evaluate_calls)
+
+
 def test_connect_over_cdp_context_request_syncs_remote_cookies_for_download(playwright, http_server):
     launched = playwright.chromium.launch(headless=True)
     connected = None
