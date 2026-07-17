@@ -4174,27 +4174,6 @@ fn resolve_cached_main_frame_url(
 }
 
 impl PageInner {
-    async fn main_frame_id(
-        &self,
-        client: &CdpClient,
-        session_id: &str,
-        timeout: Duration,
-    ) -> RwResult<String> {
-        if let Some(frame_id) = self.main_frame_id.lock().unwrap().clone() {
-            return Ok(frame_id);
-        }
-        let frame_tree = client
-            .send("Page.getFrameTree", json!({}), Some(session_id), timeout)
-            .await?;
-        let frame_id = frame_tree
-            .pointer("/frameTree/frame/id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RwError::Message("CDP did not return a main frame id".to_string()))?
-            .to_string();
-        *self.main_frame_id.lock().unwrap() = Some(frame_id.clone());
-        Ok(frame_id)
-    }
-
     fn session_for_frame_id(&self, frame_id: &str) -> String {
         self.frame_state
             .lock()
@@ -8096,14 +8075,25 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         let session_id = page.session_id.clone();
         browser
             .block_on(async move {
-                let frame_id = page.main_frame_id(&client, &session_id, timeout).await?;
-                let frame_id_json = serde_json::to_string(&frame_id)?;
                 let html_json = serde_json::to_string(&html)?;
-                let params_json = format!("{{\"frameId\":{frame_id_json},\"html\":{html_json}}}");
+                // Materialize the document via document.open/write/close through
+                // Runtime.evaluate rather than the Page.setDocumentContent command.
+                // Page.setDocumentContent deterministically hangs on
+                // connect_over_cdp-attached pages (the browser never returns the command
+                // result, so the call blocks until timeout), while Runtime.evaluate is
+                // reliable over the same remote-CDP transport. This mirrors how Playwright
+                // sets content, and delivers the byte-identical document.
+                let materialize = format!(
+                    "(() => {{ try {{ window.stop(); }} catch (e) {{}} document.open(); document.write({html_json}); document.close(); }})()"
+                );
                 client
-                    .send_raw_params_json(
-                        "Page.setDocumentContent",
-                        params_json,
+                    .send(
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": materialize,
+                            "awaitPromise": false,
+                            "returnByValue": true,
+                        }),
                         Some(&session_id),
                         timeout,
                     )

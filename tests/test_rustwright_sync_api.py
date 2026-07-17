@@ -2083,6 +2083,49 @@ def test_chromium_connect_over_cdp_adopts_default_context_pages_and_disconnects_
         launched.close()
 
 
+def test_connect_over_cdp_set_content_on_adopted_and_new_pages(playwright):
+    # Regression: Page.set_content() over a connect_over_cdp attach must materialize the
+    # document without relying on the Page.setDocumentContent command, which hangs on
+    # remote-CDP-attached pages (the browser never returns the command result, so the call
+    # blocks until timeout on both reused and freshly-created pages). set_content now uses
+    # document.open/write/close through Runtime.evaluate, matching Playwright, and delivers
+    # the byte-identical document over the same transport.
+    launched = playwright.chromium.launch(headless=True)
+    connected = None
+    try:
+        origin = launched.new_page()
+        origin.goto(data_url("<title>Origin</title><h1>origin</h1>"))
+
+        connected = playwright.chromium.connect_over_cdp(launched._ws_endpoint)
+        context = connected.contexts[0]
+
+        html = (
+            "<!doctype html><html><head><title>Adopted SC</title></head><body>"
+            "<h1 id='hdr'>Header</h1>"
+            "<select id='sel'><option value='x'>X</option><option value='y'>Y</option></select>"
+            "<iframe id='frm' srcdoc=\"<p id='m'>frame-hello</p>\"></iframe>"
+            "</body></html>"
+        )
+
+        # Reused/adopted page (probe c1 path) with wait_until="load".
+        adopted = next(page for page in context.pages if page.url == origin.url)
+        adopted.set_content(html, wait_until="load", timeout=5_000)
+        assert adopted.title() == "Adopted SC"
+        assert adopted.locator("#hdr").text_content() == "Header"
+        assert adopted.select_option("#sel", "y") == ["y"]
+        assert adopted.frame_locator("#frm").locator("#m").text_content() == "frame-hello"
+
+        # Freshly created page (probe c3 path) with wait_until="domcontentloaded".
+        fresh = context.new_page()
+        fresh.set_content(html, wait_until="domcontentloaded", timeout=5_000)
+        assert fresh.title() == "Adopted SC"
+        assert fresh.frame_locator("#frm").locator("#m").text_content() == "frame-hello"
+    finally:
+        if connected is not None:
+            connected.close()
+        launched.close()
+
+
 def test_connect_over_cdp_context_request_syncs_remote_cookies_for_download(playwright, http_server):
     launched = playwright.chromium.launch(headless=True)
     connected = None
@@ -10175,6 +10218,41 @@ def test_locator_click_waits_for_delayed_element(page):
     page.locator("#late").click(timeout=2_000)
 
     assert page.evaluate("document.body.dataset.clicked") == "yes"
+
+
+def test_actionability_probe_tolerates_slow_remote_cdp_round_trips(page, monkeypatch):
+    # Regression for remote-CDP interaction timeouts (connect_over_cdp attach): over a
+    # high-latency transport a single actionability probe's CDP round-trips can outlast the
+    # per-probe budget. The action must keep polling until the outer deadline instead of
+    # aborting on that transient probe timeout. Before the fix, click()/select_option()
+    # failed in ~1s with a raw "timed out after 1000 ms" (the old fixed per-probe cap) even
+    # though the outer timeout was 30s, so 13/60 remote-CDP interactions timed out.
+    from rustwright.sync_api import Locator
+
+    page.set_content(
+        "<select id='sel'><option value='a'>A</option><option value='b'>B</option></select>"
+        "<button id='mutate' onclick=\"document.getElementById('state').textContent='after'\">go</button>"
+        "<span id='state'>before</span>"
+    )
+
+    real_target_state = Locator._target_state
+    probe_calls = {"count": 0}
+
+    def slow_probe_target_state(self, timeout=None, **kwargs):
+        probe_calls["count"] += 1
+        # Model a probe whose round-trips need more than the old 1000ms cap to complete.
+        if timeout is not None and timeout < 1_500.0:
+            raise TimeoutError(f"timed out after {int(timeout)} ms")
+        return real_target_state(self, timeout, **kwargs)
+
+    monkeypatch.setattr(Locator, "_target_state", slow_probe_target_state)
+
+    # With the outer timeout at 30s, each probe must be granted well over 1500ms, so the
+    # interaction completes rather than dying on the first under-budgeted probe.
+    page.click("#mutate", timeout=30_000)
+    assert page.locator("#state").text_content() == "after"
+    assert page.select_option("#sel", "b", timeout=30_000) == ["b"]
+    assert probe_calls["count"] > 0
 
 
 def test_locator_fill_waits_for_delayed_editable(page):
