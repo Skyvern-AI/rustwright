@@ -2115,15 +2115,46 @@ def test_connect_over_cdp_set_content_on_adopted_and_new_pages(playwright):
         assert adopted.select_option("#sel", "y") == ["y"]
         assert adopted.frame_locator("#frm").locator("#m").text_content() == "frame-hello"
 
-        # Freshly created page (probe c3 path) with wait_until="domcontentloaded".
+        # Reused page with the weaker lifecycle state (probe c2 path).
+        adopted.set_content(html, wait_until="domcontentloaded", timeout=5_000)
+        assert adopted.title() == "Adopted SC"
+
+        # Freshly created page with wait_until="load" (probe c3 path).
         fresh = context.new_page()
-        fresh.set_content(html, wait_until="domcontentloaded", timeout=5_000)
+        fresh.set_content(html, wait_until="load", timeout=5_000)
         assert fresh.title() == "Adopted SC"
         assert fresh.frame_locator("#frm").locator("#m").text_content() == "frame-hello"
+
+        # Deterministic data-URL navigation on the reused page (probe c4 shape).
+        adopted.goto(data_url(html), wait_until="load", timeout=5_000)
+        assert adopted.title() == "Adopted SC"
+        assert adopted.locator("#hdr").text_content() == "Header"
     finally:
         if connected is not None:
             connected.close()
         launched.close()
+
+
+def test_document_state_fallback_uses_remaining_budget_for_high_latency_attach():
+    from rustwright.sync_api import Page
+
+    class HighLatencyCore:
+        def __init__(self):
+            self.timeouts = []
+
+        def evaluate(self, expression, arg, timeout):
+            self.timeouts.append(timeout)
+            if timeout < 300:
+                raise TimeoutError("remote CDP round trip exceeded command slice")
+            return json.dumps({"readyState": "complete", "resourcesLoaded": True})
+
+    owner = Page.__new__(Page)
+    owner._core = HighLatencyCore()
+
+    owner._wait_for_document_state("load", timeout=700)
+
+    assert len(owner._core.timeouts) == 1
+    assert owner._core.timeouts[0] > 600
 
 
 def test_connect_over_cdp_context_request_syncs_remote_cookies_for_download(playwright, http_server):

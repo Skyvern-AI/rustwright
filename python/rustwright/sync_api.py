@@ -15090,6 +15090,11 @@ class Page:
             self._uses_single_process_fallback() and target_url.lower().startswith("chrome://crash")
         )
         try:
+            lifecycle_timeout = navigation_timeout if navigation_timeout > 0 else 24 * 60 * 60 * 1000
+            deadline = time.monotonic() + (lifecycle_timeout / 1000)
+            lifecycle_waiter = (
+                None if normalized_state == "commit" else self._document_lifecycle_waiter(normalized_state)
+            )
             self._retain_navigation_response_bodies()
             self._mark_navigation_history_boundary()
             self._set_content_html_document_known = None
@@ -15105,7 +15110,7 @@ class Page:
                     "Page.goto",
                     self._core.goto,
                     target_url,
-                    normalized_state,
+                    "commit",
                     navigation_timeout,
                     normalized_referer,
                 ))
@@ -15144,6 +15149,14 @@ class Page:
                     self._trace_end_action(call_id, result={"response": {"url": response.url, "status": response.status}})
                     return self._remember_navigation_response(response)
                 raise
+            if normalized_state != "commit":
+                remaining = max(1.0, (deadline - time.monotonic()) * 1000)
+                self._wait_for_document_state(
+                    normalized_state,
+                    timeout=remaining,
+                    timeout_label="navigation",
+                    lifecycle_waiter=lifecycle_waiter,
+                )
             if payload is None or target_url.lower().startswith(("about:", "data:")):
                 if self._context is not None:
                     self._context._apply_storage_state_to_page(self)
@@ -15222,11 +15235,20 @@ class Page:
         timeout: float,
         prior_time_origin: Any = None,
         timeout_label: str = "document",
+        lifecycle_waiter: Any = None,
     ) -> None:
         state = str(wait_until or "load")
         if timeout <= 0:
             timeout = 24 * 60 * 60 * 1000
         deadline = time.monotonic() + (timeout / 1000)
+        if lifecycle_waiter is not None:
+            try:
+                _call(lifecycle_waiter.wait, min(10.0, timeout))
+                if state == "networkidle":
+                    self._wait_for_network_idle(deadline, timeout_label=timeout_label)
+                return
+            except TimeoutError:
+                pass
         while time.monotonic() < deadline:
             remaining = max(1.0, (deadline - time.monotonic()) * 1000)
             try:
@@ -15239,7 +15261,7 @@ class Page:
                       && Array.from(document.querySelectorAll('link[rel~="stylesheet"]')).every((link) => !!link.sheet)
                     })""",
                     None,
-                    min(250.0, remaining),
+                    remaining,
                 )))
             except Error:
                 time.sleep(0.02)
@@ -15261,6 +15283,14 @@ class Page:
                 return
             time.sleep(0.02)
         raise TimeoutError(f"timed out waiting for {timeout_label} {state}")
+
+    def _document_lifecycle_waiter(self, state: str) -> Any:
+        method = (
+            "Page.domContentEventFired"
+            if state == "domcontentloaded"
+            else "Page.loadEventFired"
+        )
+        return _call(self._core.cdp_session).event_waiter(method)
 
     def _network_idle_request_id(self, request: Request) -> Optional[str]:
         request_id = getattr(request, "_request_id", None)
@@ -16595,6 +16625,9 @@ class Page:
         call_id = self._trace_begin_action("setContent", trace_params)
         try:
             deadline = time.monotonic() + (timeout_ms / 1000)
+            lifecycle_waiter = (
+                None if normalized_state == "commit" else self._document_lifecycle_waiter(normalized_state)
+            )
             content_type = None
             if self._set_content_html_document_known is True:
                 content_type = "text/html"
@@ -16633,7 +16666,12 @@ class Page:
             if normalized_state != "commit":
                 remaining = max(1.0, (deadline - time.monotonic()) * 1000)
                 try:
-                    self._wait_for_document_state(normalized_state, timeout=remaining, timeout_label="set_content")
+                    self._wait_for_document_state(
+                        normalized_state,
+                        timeout=remaining,
+                        timeout_label="set_content",
+                        lifecycle_waiter=lifecycle_waiter,
+                    )
                 except TimeoutError:
                     raise _method_timeout_error("Page.set_content", timeout_ms) from None
             self._slow_mo()
