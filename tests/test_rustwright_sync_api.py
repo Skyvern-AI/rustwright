@@ -2040,6 +2040,58 @@ def test_evaluate_plain_expression_still_returns_completion_value(page):
     assert page.evaluate("document.title") == "expr"
 
 
+def test_evaluate_statement_form_iife_runs_once_like_playwright(page):
+    # Libraries commonly wrap user scripts as `(async () => {...})();` — an
+    # invocation statement with a trailing semicolon. Playwright evaluates the
+    # string as a program; it must not be misdetected as a function expression
+    # (which parenthesizes the source and turns the trailing `;` into
+    # "SyntaxError: Unexpected token ';'"), and it must execute exactly once.
+    page.goto(data_url("<title>iife</title>"))
+    page.evaluate("window.__rw_count = 0")
+
+    page.evaluate("(async () => { window.__rw_count += 1; document.title = 'mutated'; })();")
+    assert page.evaluate("document.title") == "mutated"
+    assert page.evaluate("window.__rw_count") == 1
+
+    # Synchronous invocation form without a trailing semicolon: the completion
+    # value is the call's result, and it also runs exactly once.
+    assert page.evaluate("((n) => { window.__rw_count += n; return window.__rw_count; })(10)") == 11
+
+    # A declaration followed by an invocation statement is a program too.
+    assert page.evaluate("function bump() { window.__rw_count += 1; return window.__rw_count; }; bump();") == 12
+
+
+def test_evaluate_runtime_probe_matches_playwright_classification(page):
+    # Shapes that defeat any lexical function-vs-program heuristic; the
+    # runtime probe (compile `(<source>)` without executing, call the value if
+    # it is a function) classifies them the way Playwright does.
+    page.goto(data_url("<title>probe</title>"))
+
+    # Parenthesized arrow with no invocation: it is a function and must be
+    # invoked, not returned as an uncalled function object.
+    assert page.evaluate("(() => 42)") == 42
+
+    # Arrow whose default parameter hides a ')' inside a string literal.
+    assert page.evaluate('(sep = ")") => "x" + sep') == "x)"
+
+    # Function expression with a stray trailing semicolon: evaluates as a
+    # program whose completion value is the function, which is then invoked.
+    assert page.evaluate("() => document.title;") == "probe"
+
+    # Statement-form source with an argument: same program-then-invoke path,
+    # and the argument reaches the call.
+    assert page.evaluate("(x) => x * 2;", 5) == 10
+
+    # Non-function expressions run exactly once (no probe re-execution).
+    page.evaluate("window.__rw_probe_count = 0")
+    assert page.evaluate("window.__rw_probe_count += 1") == 1
+    assert page.evaluate("window.__rw_probe_count") == 1
+
+    # Strict-mode functions get a bare call: `this` stays undefined, matching
+    # Playwright's global-eval + bare-invocation semantics.
+    assert page.evaluate("(function() { 'use strict'; return this === undefined; })") is True
+
+
 def test_chromium_connect_uses_direct_cdp_endpoint(playwright):
     launched = playwright.chromium.launch(headless=True)
     connected = None
@@ -21607,8 +21659,15 @@ def test_ignore_https_errors_context_arg(browser_context_args):
 
 
 @pytest.mark.browser_context_args(ignore_https_errors=False)
-def test_marker_can_override_ignore_https_errors_cli(browser_context_args):
-    assert browser_context_args["ignore_https_errors"] is False
+def test_marker_can_override_ignore_https_errors_cli(new_context):
+    # The marker merges at context-creation time (browser_context_args is
+    # session-scoped, matching pytest-playwright), so the override is
+    # observable on the created context rather than on the fixture value.
+    context = new_context()
+    try:
+        assert context._options["ignore_https_errors"] is False
+    finally:
+        context.close()
 """,
         encoding="utf-8",
     )
@@ -21646,8 +21705,10 @@ from pathlib import Path
 
 
 def test_video_context_args(browser_context_args, new_context, output_path):
+    # The session-scoped fixture stays free of per-test values; the video
+    # directory is added when the context is created.
+    assert "record_video_dir" not in browser_context_args
     expected = Path(output_path) / "videos"
-    assert Path(browser_context_args["record_video_dir"]) == expected
     context = new_context()
     try:
         assert Path(context._options["record_video_dir"]) == expected
