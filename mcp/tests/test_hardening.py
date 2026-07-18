@@ -31,7 +31,10 @@ def test_snapshot_refs_are_never_reused():
         result = await session.call_tool("browser_click", {"target": old_ref})
         text = "\n".join(c.text for c in result.content if c.type == "text")
         assert result.isError
-        assert "stale snapshot" in text
+        assert (
+            "Ref " + old_ref
+            + " is not in the current page snapshot; take a fresh snapshot."
+        ) in text
         await _call(session, "browser_close")
 
     asyncio.run(_run_session(checks))

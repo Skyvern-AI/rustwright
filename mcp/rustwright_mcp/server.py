@@ -12,6 +12,8 @@ Environment variables:
     RUSTWRIGHT_MCP_CDP_HEADERS optional JSON object of CDP connection headers
     RUSTWRIGHT_MCP_CDP_TIMEOUT_MS remote connection timeout in milliseconds (default: 60000)
     RUSTWRIGHT_MCP_ALLOW_EVAL  "1", "true", or "yes" to expose browser_evaluate
+    RUSTWRIGHT_MCP_OUTPUT_DIR   root for files written by tools
+    RUSTWRIGHT_MCP_WORKSPACE    allowed input root for future upload tools
 
 When RUSTWRIGHT_MCP_CDP_ENDPOINT is set, the local headless, channel, and
 executable options are ignored.
@@ -20,19 +22,27 @@ executable options are ignored.
 from __future__ import annotations
 
 import functools
+from dataclasses import dataclass
+from importlib import metadata
 import json
 import os
-import tempfile
+import re
 import threading
-from typing import Optional
+from typing import Any, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from rustwright_mcp.filepolicy import get_file_policy
+from rustwright_mcp.session import SessionState
 from rustwright_mcp.snapshot import SNAPSHOT_JS
 
-mcp = FastMCP("rustwright")
+PACKAGE_VERSION = metadata.version("rustwright-mcp")
+mcp = FastMCP("rustwright-mcp")
+# FastMCP 1.x does not expose its low-level Server's version constructor
+# argument, so set the same field that initialize reads.
+mcp._mcp_server.version = PACKAGE_VERSION
 
-_session: dict = {}
+_state = SessionState()
 # FastMCP executes sync tools on a thread pool; the browser session is
 # shared state, so tool bodies are serialized.
 _lock = threading.Lock()
@@ -47,30 +57,11 @@ def _serialized(fn):
     return wrapper
 
 SNAPSHOT_CHAR_LIMIT = 30_000
+_OUTLINE_REF_PATTERN = re.compile(r"\[ref=(e[1-9][0-9]*)\]")
 
 
-def _handle_dialog(page, dialog) -> None:
-    policy = _session.get("dialog_policy")
-    if policy is None or policy["page"] is not page:
-        dialog.dismiss()
-        return
-
-    _session.pop("dialog_policy")
-    if policy["accept"]:
-        if policy["prompt_text"] is None:
-            dialog.accept()
-        else:
-            dialog.accept(policy["prompt_text"])
-    else:
-        dialog.dismiss()
-
-
-def _register_dialog_handler(page) -> None:
-    pages = _session.setdefault("dialog_pages", [])
-    if any(existing is page for existing in pages):
-        return
-    page.on("dialog", functools.partial(_handle_dialog, page))
-    pages.append(page)
+def _register_page_handlers(page: Any) -> None:
+    _state.register_page_handlers(page)
 
 
 def _page():
@@ -79,20 +70,27 @@ def _page():
     In remote CDP mode, local launch options (headless, channel, and executable)
     are ignored.
     """
-    if "page" in _session:
+    if _state.page is not None:
         try:
             # The user may have closed a headed window; detect a dead
             # session and relaunch instead of failing every call.
-            _session["page"].evaluate("() => 1")
+            _state.page.evaluate("() => 1")
+            _register_page_handlers(_state.page)
         except Exception:
-            if _session.get("remote"):
+            if _state.remote:
                 _teardown()
                 raise RuntimeError(
                     "Remote CDP session is no longer reachable — "
                     "reconnect/restart the MCP server."
                 ) from None
             _teardown()
-    if "page" not in _session:
+    if _state.page is None and _state.browser is not None and _state.context is not None:
+        pages = list(_state.context.pages)
+        page = pages[0] if pages else _state.context.new_page()
+        _register_page_handlers(page)
+        _state.page = page
+        return page
+    if _state.page is None:
         from rustwright.sync_api import sync_playwright
 
         endpoint = os.environ.get("RUSTWRIGHT_MCP_CDP_ENDPOINT")
@@ -141,16 +139,14 @@ def _page():
                 context = browser.contexts[0]
                 pages = context.pages
                 page = pages[0] if pages else context.new_page()
-                _session.update(
+                _state.attach(
                     pw=pw,
                     browser=browser,
+                    context=context,
                     page=page,
                     remote=True,
-                    snapshot_taken=False,
-                    next_ref=1,
-                    dialog_pages=[],
                 )
-                _register_dialog_handler(page)
+                _register_page_handlers(page)
             except Exception:
                 for close in (
                     lambda: browser.close() if browser is not None else None,
@@ -160,12 +156,12 @@ def _page():
                         close()
                     except Exception:
                         pass
-                _session.clear()
+                _state.clear()
                 raise RuntimeError(
                     "Remote CDP browser is unreachable; check the connection "
                     "settings and try again."
                 ) from None
-            return _session["page"]
+            return _state.page
 
         headless = os.environ.get("RUSTWRIGHT_MCP_HEADLESS", "1") != "0"
         launch_kwargs: dict = {"headless": headless}
@@ -178,17 +174,15 @@ def _page():
         pw = sync_playwright().start()
         browser = pw.chromium.launch(**launch_kwargs)
         page = browser.new_page()
-        _session.update(
+        _state.attach(
             pw=pw,
             browser=browser,
+            context=page.context,
             page=page,
             remote=False,
-            snapshot_taken=False,
-            next_ref=1,
-            dialog_pages=[],
         )
-        _register_dialog_handler(page)
-    return _session["page"]
+        _register_page_handlers(page)
+    return _state.page
 
 
 def _snapshot(page) -> str:
@@ -197,14 +191,18 @@ def _snapshot(page) -> str:
         page.wait_for_load_state(timeout=10_000)
     except Exception:
         pass
-    result = page.evaluate(SNAPSHOT_JS, _session["next_ref"])
+    result = page.evaluate(SNAPSHOT_JS, _state.snapshot_start_ref())
     outline = result["outline"]
-    _session["next_ref"] = result["nextRef"]
-    _session["snapshot_taken"] = True
     header = f"Page: {page.title()}\nURL: {page.url}\n\n"
     body = outline[:SNAPSHOT_CHAR_LIMIT]
     if len(outline) > SNAPSHOT_CHAR_LIMIT:
         body += "\n- … (snapshot truncated, use browser_get_text for full content)"
+    delivered_refs = set(_OUTLINE_REF_PATTERN.findall(body))
+    _state.record_snapshot(
+        page,
+        [ref for ref in result["refs"] if ref in delivered_refs],
+        result["nextRef"],
+    )
     return header + body
 
 
@@ -212,35 +210,53 @@ def _teardown() -> None:
     # For remote sessions, closing the connected Browser detaches this client;
     # Rustwright leaves the remotely owned browser running.
     for close in (
-        lambda: _session["browser"].close(),
-        lambda: _session["pw"].stop(),
+        lambda: _state.browser.close(),
+        lambda: _state.pw.stop(),
     ):
         try:
             close()
         except Exception:
             pass
-    _session.clear()
+    _state.clear()
 
 
-def _resolve(target: str) -> str:
-    """Map a snapshot ref like ``e12`` to its attribute selector; pass CSS through.
+@dataclass(frozen=True)
+class ResolvedTarget:
+    locator: Any
+    display_name: str
+    source: Literal["ref", "selector"]
 
-    Refs fail fast when absent from the live DOM (stale snapshot) instead of
-    hitting the full action timeout.
-    """
-    if target and target[0] == "e" and target[1:].isdigit():
-        if not _session.get("snapshot_taken"):
+
+_REF_PATTERN = re.compile(r"^e[1-9][0-9]*$")
+
+
+def _resolve(
+    page: Any,
+    target: str,
+    element_description: str | None = None,
+) -> ResolvedTarget:
+    """Resolve a current stamped ref or exactly one selector match."""
+    display_name = target if element_description is None else element_description
+    if _REF_PATTERN.fullmatch(target):
+        snapshot_taken, snapshot_refs = _state.snapshot_status(page)
+        if not snapshot_taken:
+            raise ValueError("No current snapshot; call browser_snapshot first.")
+        if target not in snapshot_refs:
             raise ValueError(
-                "No snapshot taken on this page yet; call browser_snapshot first"
+                f"Ref {target} is not in the current page snapshot; take a fresh snapshot."
             )
-        selector = f'[data-mcp-ref="{target}"]'
-        if _session["page"].query_selector(selector) is None:
-            raise ValueError(
-                f"Ref {target} is not on the current page (stale snapshot); "
-                "call browser_snapshot and use a fresh ref"
-            )
-        return selector
-    return target
+        locator = page.locator(f'[data-mcp-ref="{target}"]')
+        return ResolvedTarget(locator, display_name, "ref")
+
+    locator = page.locator(target)
+    count = locator.count()
+    if count == 0:
+        raise ValueError(f"Target selector matched no elements: {target}")
+    if count > 1:
+        raise ValueError(
+            f"Target selector matched {count} elements; provide a unique selector: {target}"
+        )
+    return ResolvedTarget(locator, display_name, "selector")
 
 
 @mcp.tool()
@@ -266,11 +282,11 @@ def browser_click(target: str, double_click: bool = False) -> str:
     """Click an element. `target` is a ref from the snapshot (e.g. "e12") or a
     CSS selector. Returns a fresh snapshot."""
     page = _page()
-    selector = _resolve(target)
+    resolved = _resolve(page, target)
     if double_click:
-        page.dblclick(selector)
+        resolved.locator.dblclick()
     else:
-        page.click(selector)
+        resolved.locator.click()
     return _snapshot(page)
 
 
@@ -280,13 +296,13 @@ def browser_type(target: str, text: str, submit: bool = False, clear: bool = Tru
     """Type into an input. `target` is a snapshot ref or CSS selector. Set
     submit=True to press Enter afterwards. Returns a fresh snapshot."""
     page = _page()
-    selector = _resolve(target)
+    resolved = _resolve(page, target)
     if clear:
-        page.fill(selector, text)
+        resolved.locator.fill(text)
     else:
-        page.type(selector, text)
+        resolved.locator.type(text)
     if submit:
-        page.press(selector, "Enter")
+        resolved.locator.press("Enter")
     return _snapshot(page)
 
 
@@ -295,11 +311,11 @@ def browser_type(target: str, text: str, submit: bool = False, clear: bool = Tru
 def browser_select_option(target: str, value: str) -> str:
     """Select an option in a <select> element by value or visible label."""
     page = _page()
-    selector = _resolve(target)
+    resolved = _resolve(page, target)
     try:
-        page.select_option(selector, value=value)
+        resolved.locator.select_option(value=value)
     except Exception:
-        page.select_option(selector, label=value)
+        resolved.locator.select_option(label=value)
     return _snapshot(page)
 
 
@@ -308,7 +324,7 @@ def browser_select_option(target: str, value: str) -> str:
 def browser_hover(target: str) -> str:
     """Hover over an element identified by snapshot ref or CSS selector."""
     page = _page()
-    page.hover(_resolve(target))
+    _resolve(page, target).locator.hover()
     return _snapshot(page)
 
 
@@ -360,8 +376,8 @@ def browser_tabs(
         )
     if action == "new":
         page = context.new_page()
-        _register_dialog_handler(page)
-        _session["page"] = page
+        _register_page_handlers(page)
+        _state.page = page
         if url:
             page.goto(url)
         return _snapshot(page)
@@ -372,8 +388,8 @@ def browser_tabs(
 
     if action == "select":
         page = pages[index]
-        _register_dialog_handler(page)
-        _session["page"] = page
+        _register_page_handlers(page)
+        _state.page = page
         page.bring_to_front()
         return _snapshot(page)
 
@@ -385,8 +401,8 @@ def browser_tabs(
         page = context.new_page()
     elif was_active:
         page = remaining[min(index, len(remaining) - 1)]
-    _register_dialog_handler(page)
-    _session["page"] = page
+    _register_page_handlers(page)
+    _state.page = page
     return _snapshot(page)
 
 
@@ -395,15 +411,11 @@ def browser_tabs(
 def browser_handle_dialog(accept: bool, prompt_text: str | None = None) -> str:
     """Accept or dismiss the next JavaScript dialog on the active page.
 
-    A dialog opened by a brand-new popup may be auto-dismissed before its page
-    can be registered. The policy is consumed once; other dialogs auto-dismiss.
+    A dialog opened by a brand-new popup may appear before its page can be
+    registered. The policy is consumed once; unarmed dialogs remain pending.
     """
     page = _page()
-    _session["dialog_policy"] = {
-        "page": page,
-        "accept": accept,
-        "prompt_text": prompt_text,
-    }
+    _state.arm_dialog(page, accept, prompt_text)
     action = "accepted" if accept else "dismissed"
     return f"The next dialog on the active page will be {action}."
 
@@ -425,7 +437,9 @@ def browser_wait_for(text: Optional[str] = None, timeout_ms: float = 10_000) -> 
 @_serialized
 def browser_get_text(selector: str = "body", max_chars: int = 20_000) -> str:
     """Visible text content of a CSS selector (defaults to the whole page)."""
-    return _page().inner_text(selector)[:max_chars]
+    page = _page()
+    text = _resolve(page, selector).locator.inner_text() or ""
+    return text[:max_chars]
 
 
 def browser_evaluate(expression: str) -> str:
@@ -449,20 +463,22 @@ if _allow_eval():
 @mcp.tool()
 @_serialized
 def browser_take_screenshot(path: Optional[str] = None, full_page: bool = False) -> str:
-    """Save a PNG screenshot and return its file path. Writes to a temporary
-    file when no path is given."""
-    if path is None:
-        fd, path = tempfile.mkstemp(prefix="rustwright-mcp-", suffix=".png")
-        os.close(fd)
-    _page().screenshot(path=path, full_page=full_page)
-    return path
+    """Save a PNG under the configured output root and return its artifact path."""
+    policy = get_file_policy()
+    output_path = policy.reserve_output(path, purpose="screenshot")
+    try:
+        _page().screenshot(path=str(output_path), full_page=full_page)
+        return policy.finalize_output(output_path)
+    except Exception:
+        policy.discard_output(output_path)
+        raise
 
 
 @mcp.tool()
 @_serialized
 def browser_close() -> str:
     """Close the browser. The next tool call starts a fresh session."""
-    if "browser" in _session:
+    if _state.browser is not None:
         _teardown()
         return "Browser closed."
     return "No browser session was open."

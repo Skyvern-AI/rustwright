@@ -127,7 +127,7 @@ Example Domains
 | `browser_wait_for(text?, timeout_ms?)` | Wait for text or load state |
 | `browser_get_text(selector?)` | Visible text of a selector |
 | `browser_evaluate(expression)` | Run JavaScript in the page (opt-in) |
-| `browser_take_screenshot(path?)` | Save a PNG, returns the path |
+| `browser_take_screenshot(path?)` | Save a confined PNG artifact, returns its output-root-relative path |
 | `browser_close()` | End the browser session |
 
 ## Configuration
@@ -141,6 +141,28 @@ Example Domains
 | `RUSTWRIGHT_MCP_CDP_HEADERS` | Optional JSON object of extra CDP connection headers |
 | `RUSTWRIGHT_MCP_CDP_TIMEOUT_MS` | Remote connection timeout in milliseconds (default `60000`) |
 | `RUSTWRIGHT_MCP_ALLOW_EVAL` | `1`, `true`, or `yes` exposes `browser_evaluate` (default off) |
+| `RUSTWRIGHT_MCP_OUTPUT_DIR` | Root for files written by tools |
+| `RUSTWRIGHT_MCP_OUTPUT_MAX_FILE_BYTES` | Per-file output cap (default `20971520`, or 20 MiB) |
+| `RUSTWRIGHT_MCP_OUTPUT_MAX_TOTAL_BYTES` | Total output cap (default `209715200`, or 200 MiB) |
+| `RUSTWRIGHT_MCP_WORKSPACE` | Allowed input root for future file-upload tools |
+
+### File outputs
+
+All tool-written files are confined to `RUSTWRIGHT_MCP_OUTPUT_DIR`. If that
+variable is unset, each server process creates a private session directory at
+`${XDG_CACHE_HOME:-~/.cache}/rustwright-mcp/output/<session-uuid>/`. Output
+directories use mode `0700`; files are created exclusively with mode `0600`.
+Artifact paths returned by tools are relative to the output root.
+
+Each output is limited to 20 MiB by default, and all retained outputs together
+are limited to 200 MiB. The byte-cap variables in the table above can override
+those values. When the total cap is crossed, the oldest files are evicted first.
+
+**Migration note:** screenshot `path` values are now interpreted inside the
+output root. An absolute path is accepted only when it is beneath that root.
+Paths outside it fail with `screenshot paths are confined to
+RUSTWRIGHT_MCP_OUTPUT_DIR (<root>); got <path>` instead of being written.
+Omitting `path` still creates a temporary PNG, now inside the output root.
 
 ### Remote browsers over CDP
 

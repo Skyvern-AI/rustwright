@@ -13,6 +13,7 @@ SNAPSHOT_JS = r"""
   const MAX_LINES = 1200;
   let refCounter = startRef;
   const lines = [];
+  const refs = [];
 
   for (const el of document.querySelectorAll('[data-mcp-ref]')) {
     el.removeAttribute('data-mcp-ref');
@@ -111,6 +112,7 @@ SNAPSHOT_JS = r"""
         const ref = `e${refCounter}`;
         refCounter += 1;
         el.setAttribute('data-mcp-ref', ref);
+        refs.push(ref);
         parts.push(`[ref=${ref}]`);
       }
       lines.push(parts.join(' '));
@@ -134,10 +136,10 @@ SNAPSHOT_JS = r"""
   };
 
   if (!document.body) {
-    return {outline: '- (page has no body yet)', nextRef: refCounter};
+    return {outline: '- (page has no body yet)', nextRef: refCounter, refs};
   }
   walk(document.body, 0);
   if (lines.length >= MAX_LINES) lines.push('- … (snapshot truncated)');
-  return {outline: lines.join('\n'), nextRef: refCounter};
+  return {outline: lines.join('\n'), nextRef: refCounter, refs};
 }
 """

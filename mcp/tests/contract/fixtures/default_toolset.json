@@ -1,0 +1,26 @@
+{
+  "browser_close": {
+    "params": []
+  },
+  "browser_navigate": {
+    "params": [
+      {
+        "name": "url",
+        "type": "string",
+        "required": true
+      }
+    ]
+  },
+  "browser_navigate_back": {
+    "params": []
+  },
+  "browser_press_key": {
+    "params": [
+      {
+        "name": "key",
+        "type": "string",
+        "required": true
+      }
+    ]
+  }
+}
