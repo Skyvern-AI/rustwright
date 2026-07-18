@@ -5,7 +5,7 @@ require 'monitor'
 require 'rbconfig'
 
 module Rustwright
-  VERSION = '0.1.0'
+  VERSION = '0.1.1'
   UNSET = Object.new.freeze
 
   class Error < StandardError; end
@@ -97,13 +97,23 @@ require_relative 'rustwright/wire'
 module Rustwright
   class << self
     def default_library_path
-      extension = RbConfig::CONFIG['host_os'].match?(/darwin/) ? 'dylib' : 'so'
-      File.join('target', 'release', "librustwright_capi.#{extension}")
+      # Installed platform gems carry one matching native. Source checkouts keep
+      # the historical repository-relative target/release fallback.
+      bundled_library_path || source_library_path
     end
 
     def chromium(library_path: nil)
+      # An explicit argument or environment override remains an exact pin.
       path = library_path || ENV['RUSTWRIGHT_CAPI_LIB'] || default_library_path
       Chromium.new(native_for(path))
+    end
+
+    def bundled_library_path
+      platform, extension = bundled_platform
+      return nil unless platform
+
+      path = File.join(__dir__, 'rustwright', 'native', platform, "librustwright_capi.#{extension}")
+      File.file?(path) ? path : nil
     end
 
     def inline_html_url(html)
@@ -121,6 +131,26 @@ module Rustwright
     end
 
     private
+
+    def source_library_path
+      extension = RbConfig::CONFIG['host_os'].match?(/darwin/) ? 'dylib' : 'so'
+      File.join('target', 'release', "librustwright_capi.#{extension}")
+    end
+
+    def bundled_platform
+      cpu = RbConfig::CONFIG['host_cpu']
+      os = RbConfig::CONFIG['host_os']
+
+      if os.match?(/darwin/)
+        return ['arm64-darwin', 'dylib'] if cpu.match?(/arm64|aarch64/)
+        return ['x86_64-darwin', 'dylib'] if cpu.match?(/x86_64|amd64/)
+      elsif os.match?(/linux/)
+        return ['aarch64-linux', 'so'] if cpu.match?(/arm64|aarch64/)
+        return ['x86_64-linux', 'so'] if cpu.match?(/x86_64|amd64/)
+      end
+
+      nil
+    end
 
     def native_for(path)
       expanded = File.expand_path(path)

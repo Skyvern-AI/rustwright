@@ -4,7 +4,27 @@ This Phase 0 binding exposes the complete Rustwright alpha API through Ruby's
 stdlib `Fiddle`; it has no native gem dependency and supports Ruby 2.6 or newer.
 JSON is handled by the stdlib `json` package.
 
-## Run it
+## Install (RubyGems)
+
+The platform gems are not published yet. Once available, install the gem with:
+
+```sh
+gem install rustwright
+```
+
+Published gems will include the native C API library and require no separate
+Rust build. Supported gem platforms are `arm64-darwin`, `x86_64-darwin`,
+`aarch64-linux`, and `x86_64-linux`. Windows is not currently shipped because
+the Rust target, Ruby runtime, and RubyGems platform combinations have not yet
+been validated together.
+
+The bundled library lives at
+`lib/rustwright/native/<platform>/librustwright_capi.<dylib|so>`. Runtime
+resolution uses an explicit `library_path` first, then
+`RUSTWRIGHT_CAPI_LIB`, then the bundled native, and finally the source-checkout
+fallback described below.
+
+## Run from source
 
 From the repository root, run the browser smoke test:
 
@@ -25,6 +45,16 @@ that default when `--lib` is omitted. The runner requires `--lib`, and an
 explicit path always loads that exact library. The runner also supports `--cases
 id1,id2`, preserves manifest order, exits 0 only when all selected cases pass,
 and exits 1 for case failures (invocation/manifest errors use exit 2).
+
+Build a platform gem from an already-built native library with:
+
+```sh
+ruby ruby/package.rb arm64-darwin target/release/librustwright_capi.dylib
+```
+
+The package is written to `ruby/pkg/`; its temporary staged native is removed
+after the build. Replace the platform and extension with one of the supported
+combinations listed above.
 
 Run the dependency-free contract tests with:
 
