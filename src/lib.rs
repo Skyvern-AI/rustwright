@@ -1035,30 +1035,36 @@ mod tests {
         );
     }
 
-    #[test]
-    fn plain_string_script_is_wrapped_in_indirect_eval() {
-        // A plain statement script (not a function, no arg) must not be handed
-        // to Runtime.evaluate verbatim: top-level `let`/`const` would leak into
-        // the global lexical environment and break repeated evaluation. It is
-        // instead wrapped in an indirect `eval` that scopes those declarations
-        // to the call while preserving the script's completion value.
-        let script = "let browserNameForWorkarounds = 'chromium';\nhelper();";
-        let wrapped = make_evaluate_expression(script, None);
-        assert_eq!(
-            wrapped,
-            r#"(0, eval)("let browserNameForWorkarounds = 'chromium';\nhelper();")"#
-        );
+    fn assert_probe_wrapped(wrapped: &str, source: &str) {
+        // The runtime-probe wrapper embeds the source as a JSON literal,
+        // probe-compiles it as an expression without executing, falls back to
+        // indirect eval for program sources, and never inlines the raw source
+        // where a stray `;` could break parsing.
+        let literal = serde_json::to_string(source).unwrap();
+        assert!(wrapped.contains(&literal), "missing literal in {wrapped}");
+        assert!(wrapped.contains("new Function"), "missing probe in {wrapped}");
+        assert!(wrapped.contains("(0, eval)(__rw_src)"), "missing program fallback in {wrapped}");
+        assert!(!wrapped.contains("__rw_fn"), "unexpected direct wrap in {wrapped}");
     }
 
     #[test]
-    fn plain_expression_is_wrapped_in_indirect_eval() {
-        assert_eq!(
-            make_evaluate_expression("1 + 2", None),
-            r#"(0, eval)("1 + 2")"#
-        );
-        assert_eq!(
-            make_evaluate_expression("document.title", None),
-            r#"(0, eval)("document.title")"#
+    fn plain_string_script_uses_runtime_probe_wrapper() {
+        // A plain statement script (not a function, no arg) must not be handed
+        // to Runtime.evaluate verbatim: top-level `let`/`const` would leak into
+        // the global lexical environment and break repeated evaluation. The
+        // probe wrapper's program fallback runs it through an indirect `eval`
+        // that scopes those declarations to the call while preserving the
+        // script's completion value.
+        let script = "let browserNameForWorkarounds = 'chromium';\nhelper();";
+        assert_probe_wrapped(&make_evaluate_expression(script, None), script);
+    }
+
+    #[test]
+    fn plain_expression_uses_runtime_probe_wrapper() {
+        assert_probe_wrapped(&make_evaluate_expression("1 + 2", None), "1 + 2");
+        assert_probe_wrapped(
+            &make_evaluate_expression("document.title", None),
+            "document.title",
         );
     }
 
@@ -1080,20 +1086,19 @@ mod tests {
     }
 
     #[test]
-    fn declaration_without_function_stays_in_indirect_eval() {
-        assert_eq!(
-            make_evaluate_expression("let localValue = 1; localValue", None),
-            r#"(0, eval)("let localValue = 1; localValue")"#
-        );
+    fn declaration_without_function_uses_runtime_probe_wrapper() {
+        let script = "let localValue = 1; localValue";
+        assert_probe_wrapped(&make_evaluate_expression(script, None), script);
     }
 
     #[test]
-    fn indirect_eval_wrapper_escapes_embedded_quotes_and_newlines() {
+    fn probe_wrapper_escapes_embedded_quotes_and_newlines() {
         // The source is embedded as a JS string literal, so any quotes,
         // backslashes, or newlines in the script must be escaped safely.
         let script = "const s = \"a\\tb\";\ns;";
         let wrapped = make_evaluate_expression(script, None);
-        assert_eq!(wrapped, r#"(0, eval)("const s = \"a\\tb\";\ns;")"#);
+        assert!(wrapped.contains(r#""const s = \"a\\tb\";\ns;""#), "{wrapped}");
+        assert!(!wrapped.contains("const s = \"a\tb\""), "{wrapped}");
     }
 
     #[test]
@@ -1103,6 +1108,72 @@ mod tests {
         // the indirect-eval branch.
         assert!(!make_evaluate_expression("() => 1", None).contains("(0, eval)"));
         assert!(!make_evaluate_expression("(x) => x + 1", Some("2")).contains("(0, eval)"));
+        assert!(!make_evaluate_expression("(a, b) => a + b", None).contains("(0, eval)"));
+        assert!(!make_evaluate_expression("async () => fetch('/x')", None).contains("(0, eval)"));
+    }
+
+    #[test]
+    fn statement_form_iife_scripts_use_runtime_probe_wrapper() {
+        // `(async () => {...})();` is an invocation statement, not a function
+        // expression. Parenthesizing it inside the fast-path IIFE traps the
+        // trailing `;` inside `( ... )` and V8 rejects the whole script with
+        // "SyntaxError: Unexpected token ';'". Statement-form sources must go
+        // through the runtime probe, whose program fallback runs them once and
+        // preserves the completion value.
+        let source = "(async () => { document.title = 'x'; })();";
+        assert_probe_wrapped(&make_evaluate_expression(source, None), source);
+
+        // The same invocation without the semicolon is still not a function
+        // expression: calling its parenthesized form would invoke the IIFE's
+        // *result*, not the IIFE.
+        let source = "(() => 1)()";
+        assert_probe_wrapped(&make_evaluate_expression(source, None), source);
+
+        // A `function` declaration followed by an invocation statement is a
+        // program too — with or without a trailing semicolon.
+        let source = "function f() { return 1; }; f();";
+        assert_probe_wrapped(&make_evaluate_expression(source, None), source);
+        let source = "function f() { return 1; }; f()";
+        assert_probe_wrapped(&make_evaluate_expression(source, None), source);
+    }
+
+    #[test]
+    fn ambiguous_function_shapes_use_runtime_probe_wrapper() {
+        // A parenthesized arrow with no invocation, an arrow whose default
+        // parameter hides a ')' inside a string, and a trailing-semicolon
+        // one-liner are all beyond the lexical fast-path heuristic; they must
+        // route through the runtime probe (which classifies by compiling)
+        // rather than being guessed wrong.
+        for source in [
+            "(() => 42)",
+            "(sep = \")\") => \"x\" + sep",
+            "() => document.title;",
+        ] {
+            assert_probe_wrapped(&make_evaluate_expression(source, None), source);
+        }
+
+        // With an argument, statement-form sources take the probe wrapper too
+        // (the fast path previously produced a guaranteed SyntaxError), and
+        // the argument reaches the bare function call.
+        let wrapped = make_evaluate_expression("(x) => x * 2;", Some("5"));
+        assert!(wrapped.contains("new Function"), "{wrapped}");
+        assert!(wrapped.contains("__rw_result(5)"), "{wrapped}");
+    }
+
+    #[test]
+    fn top_level_semicolon_detection_respects_nesting_strings_and_comments() {
+        assert!(has_top_level_semicolon("() => 1;"));
+        assert!(has_top_level_semicolon("function f() {}; f()"));
+        assert!(!has_top_level_semicolon("() => { a(); b(); }"));
+        assert!(!has_top_level_semicolon("(s = \";\") => s"));
+        assert!(!has_top_level_semicolon("() => ';'"));
+        assert!(!has_top_level_semicolon("function f() { return 1; }"));
+        // Comment contents must neither unbalance the depth count nor hide a
+        // following top-level semicolon.
+        assert!(has_top_level_semicolon("() => 1 /* { */;"));
+        assert!(has_top_level_semicolon("() => 1 // {\n;"));
+        assert!(!has_top_level_semicolon("() => 1 /* ; */"));
+        assert!(!has_top_level_semicolon("() => 1 // ;"));
     }
 
     #[test]
@@ -16300,28 +16371,111 @@ const RUNTIME_VALUE_SERIALIZER: &str = r#"(function __rw_serialize(value) {
 
 fn make_evaluate_expression(expression: &str, arg_json: Option<&str>) -> String {
     let trimmed = expression.trim();
-    if let Some(arg_json) = arg_json {
-        format!(
-            "(async () => {{ const __rw_fn = ({trimmed}); return await __rw_fn({arg_json}); }})()"
-        )
-    } else if looks_like_function(trimmed) {
-        format!("(async () => {{ const __rw_fn = ({trimmed}); return await __rw_fn(); }})()")
-    } else if let Some(wrapped) = wrap_declaration_helper_script(trimmed) {
-        wrapped
-    } else {
-        // Plain expression/statement string. Run it through an indirect `eval`
-        // so that top-level `let`/`const`/`class` declarations are scoped to
-        // this single evaluation instead of leaking into the global lexical
-        // environment. Passing the raw source to `Runtime.evaluate` executes it
-        // at the REPL-style global top level, where those declarations persist
-        // across calls and make repeated evaluation of the same script fail
-        // with "Identifier '...' has already been declared". Playwright avoids
-        // this by running non-function expressions via indirect `eval` in its
-        // utility script; this mirrors that, including preserving the script's
-        // completion value and the standard `var`/`function` global hoisting.
-        let literal = serde_json::to_string(trimmed).unwrap_or_else(|_| "\"\"".to_string());
-        format!("(0, eval)({literal})")
+    if is_confident_function_expression(trimmed) {
+        // Fast path: the source is confidently a lone function expression, so
+        // it can be parenthesized and invoked directly with no eval in the
+        // emitted script. This keeps the common evaluate(function) shape
+        // working on pages whose CSP blocks eval/new Function.
+        let call_args = arg_json.unwrap_or("");
+        return format!(
+            "(async () => {{ const __rw_fn = ({trimmed}); return await __rw_fn({call_args}); }})()"
+        );
     }
+    if arg_json.is_none() {
+        if let Some(wrapped) = wrap_declaration_helper_script(trimmed) {
+            return wrapped;
+        }
+    }
+    // Everything else is classified at runtime, mirroring Playwright's utility
+    // script: probe-compile `(<source>)` with `new Function` purely to test
+    // whether it parses as an expression (never executed — a runtime error
+    // must not trigger re-execution), then evaluate exactly once through an
+    // indirect `eval` and call the value if it turned out to be a function.
+    // Evaluating via `eval` rather than the compiled probe keeps expression
+    // semantics identical to Playwright's global eval: no `arguments` binding
+    // leaks in, `new.target` stays illegal, and the bare call preserves
+    // strict-mode `this === undefined`. Statement-form sources (a trailing
+    // `;`, an IIFE invocation, `function f() {...}; f();`) fail the probe and
+    // run as a program instead; the indirect `eval` scopes top-level
+    // `let`/`const`/`class` to the single evaluation (REPL-style
+    // Runtime.evaluate would leak them and break repeated evaluation with
+    // "Identifier '...' has already been declared") while preserving the
+    // completion value and standard `var`/`function` hoisting.
+    let literal = serde_json::to_string(trimmed).unwrap_or_else(|_| "\"\"".to_string());
+    let call_args = arg_json.unwrap_or("");
+    format!(
+        r#"(async () => {{
+    const __rw_src = {literal};
+    let __rw_is_expression = true;
+    try {{
+        new Function("return (" + __rw_src + "\n)");
+    }} catch (__rw_parse_error) {{
+        __rw_is_expression = false;
+    }}
+    let __rw_result;
+    if (__rw_is_expression) {{
+        __rw_result = (0, eval)("(" + __rw_src + "\n)");
+    }} else {{
+        __rw_result = (0, eval)(__rw_src);
+    }}
+    if (typeof __rw_result === "function") {{
+        __rw_result = __rw_result({call_args});
+    }}
+    return await __rw_result;
+}})()"#
+    )
+}
+
+fn is_confident_function_expression(expression: &str) -> bool {
+    looks_like_function(expression) && !has_top_level_semicolon(expression)
+}
+
+/// True when the source contains a `;` outside every paren/brace/bracket
+/// nesting level, outside string literals, and outside comments — i.e. the
+/// source is a statement sequence, not a lone function expression. Comments
+/// are skipped so their contents cannot unbalance the depth count or hide the
+/// semicolon that follows them. Regex literals are not modeled; a brace inside
+/// one can only make this return false and send a source to the runtime-probe
+/// path, which still evaluates it correctly.
+fn has_top_level_semicolon(expression: &str) -> bool {
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < expression.len() {
+        let rest = &expression[index..];
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        if rest.starts_with("//") {
+            match rest.find('\n') {
+                Some(newline) => {
+                    index += newline + 1;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        if rest.starts_with("/*") {
+            match rest[2..].find("*/") {
+                Some(end) => {
+                    index += 2 + end + 2;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        match ch {
+            '\'' | '"' | '`' => {
+                index = skip_js_string(expression, index, ch);
+                continue;
+            }
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth = depth.saturating_sub(1),
+            ';' if depth == 0 => return true,
+            _ => {}
+        }
+        index += ch.len_utf8();
+    }
+    false
 }
 
 fn wrap_declaration_helper_script(expression: &str) -> Option<String> {
@@ -16508,7 +16662,11 @@ fn looks_like_function(expression: &str) -> bool {
             .map(|index| {
                 let before_arrow = expression[..index].trim();
                 if before_arrow.starts_with('(') {
-                    return true;
+                    // Either arrow parameters — `(a, b) => ...` — or a
+                    // parenthesized function being invoked, like the IIFE
+                    // `(async () => {...})()`. Only the former is a function
+                    // expression; an invocation must evaluate as a program.
+                    return leading_paren_group_is_arrow_parameters(expression);
                 }
                 if let Some(parameter) = before_arrow.strip_prefix("async ") {
                     let parameter = parameter.trim();
@@ -16517,6 +16675,23 @@ fn looks_like_function(expression: &str) -> bool {
                 is_js_identifier(before_arrow)
             })
             .unwrap_or(false)
+}
+
+fn leading_paren_group_is_arrow_parameters(expression: &str) -> bool {
+    let mut depth = 0usize;
+    for (index, ch) in expression.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return expression[index + 1..].trim_start().starts_with("=>");
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn is_js_identifier(value: &str) -> bool {
