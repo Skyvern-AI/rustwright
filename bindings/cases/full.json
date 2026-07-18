@@ -2845,6 +2845,2246 @@
           "equals": "Shot 09"
         }
       ]
+    },
+    {
+      "id": "dom-00",
+      "description": "Read a deeply nested DOM target and mix exact and contains assertions.",
+      "html": "<!doctype html><html><head><title>Deep DOM 00</title></head><body><main id=\"root-00\"><div data-level=\"4\"><div data-level=\"3\"><div data-level=\"2\"><div data-level=\"1\"><div data-level=\"0\"><span id=\"leaf-00\"><strong>level-00</strong> payload-00 <em>end</em></span></div></div></div></div></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#root-00 div > div > div > div > div > #leaf-00",
+          "capture": "deepText"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-00 div > div > div > div > div > #leaf-00",
+          "equals": "level-00 payload-00 end"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-00",
+          "contains": "payload-00"
+        }
+      ]
+    },
+    {
+      "id": "dom-01",
+      "description": "Read a deeply nested DOM target and mix exact and contains assertions.",
+      "html": "<!doctype html><html><head><title>Deep DOM 01</title></head><body><main id=\"root-01\"><div data-level=\"5\"><div data-level=\"4\"><div data-level=\"3\"><div data-level=\"2\"><div data-level=\"1\"><div data-level=\"0\"><span id=\"leaf-01\"><strong>level-01</strong> payload-01 <em>end</em></span></div></div></div></div></div></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#root-01 div > div > div > div > div > div > #leaf-01",
+          "capture": "deepText"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-01 div > div > div > div > div > div > #leaf-01",
+          "equals": "level-01 payload-01 end"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-01",
+          "contains": "payload-01"
+        }
+      ]
+    },
+    {
+      "id": "dom-02",
+      "description": "Read a deeply nested DOM target and mix exact and contains assertions.",
+      "html": "<!doctype html><html><head><title>Deep DOM 02</title></head><body><main id=\"root-02\"><div data-level=\"6\"><div data-level=\"5\"><div data-level=\"4\"><div data-level=\"3\"><div data-level=\"2\"><div data-level=\"1\"><div data-level=\"0\"><span id=\"leaf-02\"><strong>level-02</strong> payload-02 <em>end</em></span></div></div></div></div></div></div></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#root-02 div > div > div > div > div > div > div > #leaf-02",
+          "capture": "deepText"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-02 div > div > div > div > div > div > div > #leaf-02",
+          "equals": "level-02 payload-02 end"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-02",
+          "contains": "payload-02"
+        }
+      ]
+    },
+    {
+      "id": "dom-03",
+      "description": "Read a deeply nested DOM target and mix exact and contains assertions.",
+      "html": "<!doctype html><html><head><title>Deep DOM 03</title></head><body><main id=\"root-03\"><div data-level=\"7\"><div data-level=\"6\"><div data-level=\"5\"><div data-level=\"4\"><div data-level=\"3\"><div data-level=\"2\"><div data-level=\"1\"><div data-level=\"0\"><span id=\"leaf-03\"><strong>level-03</strong> payload-03 <em>end</em></span></div></div></div></div></div></div></div></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#root-03 div > div > div > div > div > div > div > div > #leaf-03",
+          "capture": "deepText"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-03 div > div > div > div > div > div > div > div > #leaf-03",
+          "equals": "level-03 payload-03 end"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-03",
+          "contains": "payload-03"
+        }
+      ]
+    },
+    {
+      "id": "dom-04",
+      "description": "Read a deeply nested DOM target and mix exact and contains assertions.",
+      "html": "<!doctype html><html><head><title>Deep DOM 04</title></head><body><main id=\"root-04\"><div data-level=\"8\"><div data-level=\"7\"><div data-level=\"6\"><div data-level=\"5\"><div data-level=\"4\"><div data-level=\"3\"><div data-level=\"2\"><div data-level=\"1\"><div data-level=\"0\"><span id=\"leaf-04\"><strong>level-04</strong> payload-04 <em>end</em></span></div></div></div></div></div></div></div></div></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#root-04 div > div > div > div > div > div > div > div > div > #leaf-04",
+          "capture": "deepText"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-04 div > div > div > div > div > div > div > div > div > #leaf-04",
+          "equals": "level-04 payload-04 end"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-04",
+          "contains": "payload-04"
+        }
+      ]
+    },
+    {
+      "id": "dom-05",
+      "description": "Read a deeply nested DOM target and mix exact and contains assertions.",
+      "html": "<!doctype html><html><head><title>Deep DOM 05</title></head><body><main id=\"root-05\"><div data-level=\"4\"><div data-level=\"3\"><div data-level=\"2\"><div data-level=\"1\"><div data-level=\"0\"><span id=\"leaf-05\"><strong>level-05</strong> payload-05 <em>end</em></span></div></div></div></div></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#root-05 div > div > div > div > div > #leaf-05",
+          "capture": "deepText"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-05 div > div > div > div > div > #leaf-05",
+          "equals": "level-05 payload-05 end"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-05",
+          "contains": "payload-05"
+        }
+      ]
+    },
+    {
+      "id": "dom-06",
+      "description": "Read a deeply nested DOM target and mix exact and contains assertions.",
+      "html": "<!doctype html><html><head><title>Deep DOM 06</title></head><body><main id=\"root-06\"><div data-level=\"5\"><div data-level=\"4\"><div data-level=\"3\"><div data-level=\"2\"><div data-level=\"1\"><div data-level=\"0\"><span id=\"leaf-06\"><strong>level-06</strong> payload-06 <em>end</em></span></div></div></div></div></div></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#root-06 div > div > div > div > div > div > #leaf-06",
+          "capture": "deepText"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-06 div > div > div > div > div > div > #leaf-06",
+          "equals": "level-06 payload-06 end"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-06",
+          "contains": "payload-06"
+        }
+      ]
+    },
+    {
+      "id": "dom-07",
+      "description": "Read a deeply nested DOM target and mix exact and contains assertions.",
+      "html": "<!doctype html><html><head><title>Deep DOM 07</title></head><body><main id=\"root-07\"><div data-level=\"6\"><div data-level=\"5\"><div data-level=\"4\"><div data-level=\"3\"><div data-level=\"2\"><div data-level=\"1\"><div data-level=\"0\"><span id=\"leaf-07\"><strong>level-07</strong> payload-07 <em>end</em></span></div></div></div></div></div></div></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#root-07 div > div > div > div > div > div > div > #leaf-07",
+          "capture": "deepText"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-07 div > div > div > div > div > div > div > #leaf-07",
+          "equals": "level-07 payload-07 end"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-07",
+          "contains": "payload-07"
+        }
+      ]
+    },
+    {
+      "id": "dom-08",
+      "description": "Read a deeply nested DOM target and mix exact and contains assertions.",
+      "html": "<!doctype html><html><head><title>Deep DOM 08</title></head><body><main id=\"root-08\"><div data-level=\"7\"><div data-level=\"6\"><div data-level=\"5\"><div data-level=\"4\"><div data-level=\"3\"><div data-level=\"2\"><div data-level=\"1\"><div data-level=\"0\"><span id=\"leaf-08\"><strong>level-08</strong> payload-08 <em>end</em></span></div></div></div></div></div></div></div></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#root-08 div > div > div > div > div > div > div > div > #leaf-08",
+          "capture": "deepText"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-08 div > div > div > div > div > div > div > div > #leaf-08",
+          "equals": "level-08 payload-08 end"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-08",
+          "contains": "payload-08"
+        }
+      ]
+    },
+    {
+      "id": "dom-09",
+      "description": "Read a deeply nested DOM target and mix exact and contains assertions.",
+      "html": "<!doctype html><html><head><title>Deep DOM 09</title></head><body><main id=\"root-09\"><div data-level=\"8\"><div data-level=\"7\"><div data-level=\"6\"><div data-level=\"5\"><div data-level=\"4\"><div data-level=\"3\"><div data-level=\"2\"><div data-level=\"1\"><div data-level=\"0\"><span id=\"leaf-09\"><strong>level-09</strong> payload-09 <em>end</em></span></div></div></div></div></div></div></div></div></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "textContent",
+          "selector": "#root-09 div > div > div > div > div > div > div > div > div > #leaf-09",
+          "capture": "deepText"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-09 div > div > div > div > div > div > div > div > div > #leaf-09",
+          "equals": "level-09 payload-09 end"
+        },
+        {
+          "op": "assertText",
+          "selector": "#root-09",
+          "contains": "payload-09"
+        }
+      ]
+    },
+    {
+      "id": "seq-00",
+      "description": "Click controls repeatedly and verify cumulative DOM and structured state.",
+      "html": "<!doctype html><html><head><title>Sequence 00</title></head><body><output id=\"state\" data-value=\"0\" data-clicks=\"0\">value=0; clicks=0</output><button id=\"one\" onclick=\"bump(1)\">One</button><button id=\"delta\" onclick=\"bump(2)\">Delta</button><script>function bump(n){const s=document.querySelector('#state');const v=Number(s.dataset.value)+n;const c=Number(s.dataset.clicks)+1;s.dataset.value=String(v);s.dataset.clicks=String(c);s.textContent='value='+v+'; clicks='+c}</script></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=0; clicks=0"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "afterFirst"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "contains": "clicks=1"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "finalText"
+        },
+        {
+          "op": "evaluate",
+          "expression": "() => { const s = document.querySelector('#state'); return { value: Number(s.dataset.value), clicks: Number(s.dataset.clicks) }; }",
+          "capture": "finalState"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=6; clicks=4"
+        },
+        {
+          "op": "assertEval",
+          "expression": "() => { const s = document.querySelector('#state'); return [Number(s.dataset.value), Number(s.dataset.clicks)]; }",
+          "equals": [
+            6,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "id": "seq-01",
+      "description": "Click controls repeatedly and verify cumulative DOM and structured state.",
+      "html": "<!doctype html><html><head><title>Sequence 01</title></head><body><output id=\"state\" data-value=\"0\" data-clicks=\"0\">value=0; clicks=0</output><button id=\"one\" onclick=\"bump(1)\">One</button><button id=\"delta\" onclick=\"bump(3)\">Delta</button><script>function bump(n){const s=document.querySelector('#state');const v=Number(s.dataset.value)+n;const c=Number(s.dataset.clicks)+1;s.dataset.value=String(v);s.dataset.clicks=String(c);s.textContent='value='+v+'; clicks='+c}</script></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=0; clicks=0"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "afterFirst"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "contains": "clicks=1"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "finalText"
+        },
+        {
+          "op": "evaluate",
+          "expression": "() => { const s = document.querySelector('#state'); return { value: Number(s.dataset.value), clicks: Number(s.dataset.clicks) }; }",
+          "capture": "finalState"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=9; clicks=5"
+        },
+        {
+          "op": "assertEval",
+          "expression": "() => { const s = document.querySelector('#state'); return [Number(s.dataset.value), Number(s.dataset.clicks)]; }",
+          "equals": [
+            9,
+            5
+          ]
+        }
+      ]
+    },
+    {
+      "id": "seq-02",
+      "description": "Click controls repeatedly and verify cumulative DOM and structured state.",
+      "html": "<!doctype html><html><head><title>Sequence 02</title></head><body><output id=\"state\" data-value=\"0\" data-clicks=\"0\">value=0; clicks=0</output><button id=\"one\" onclick=\"bump(1)\">One</button><button id=\"delta\" onclick=\"bump(4)\">Delta</button><script>function bump(n){const s=document.querySelector('#state');const v=Number(s.dataset.value)+n;const c=Number(s.dataset.clicks)+1;s.dataset.value=String(v);s.dataset.clicks=String(c);s.textContent='value='+v+'; clicks='+c}</script></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=0; clicks=0"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "afterFirst"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "contains": "clicks=1"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "finalText"
+        },
+        {
+          "op": "evaluate",
+          "expression": "() => { const s = document.querySelector('#state'); return { value: Number(s.dataset.value), clicks: Number(s.dataset.clicks) }; }",
+          "capture": "finalState"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=10; clicks=4"
+        },
+        {
+          "op": "assertEval",
+          "expression": "() => { const s = document.querySelector('#state'); return [Number(s.dataset.value), Number(s.dataset.clicks)]; }",
+          "equals": [
+            10,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "id": "seq-03",
+      "description": "Click controls repeatedly and verify cumulative DOM and structured state.",
+      "html": "<!doctype html><html><head><title>Sequence 03</title></head><body><output id=\"state\" data-value=\"0\" data-clicks=\"0\">value=0; clicks=0</output><button id=\"one\" onclick=\"bump(1)\">One</button><button id=\"delta\" onclick=\"bump(5)\">Delta</button><script>function bump(n){const s=document.querySelector('#state');const v=Number(s.dataset.value)+n;const c=Number(s.dataset.clicks)+1;s.dataset.value=String(v);s.dataset.clicks=String(c);s.textContent='value='+v+'; clicks='+c}</script></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=0; clicks=0"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "afterFirst"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "contains": "clicks=1"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "finalText"
+        },
+        {
+          "op": "evaluate",
+          "expression": "() => { const s = document.querySelector('#state'); return { value: Number(s.dataset.value), clicks: Number(s.dataset.clicks) }; }",
+          "capture": "finalState"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=13; clicks=5"
+        },
+        {
+          "op": "assertEval",
+          "expression": "() => { const s = document.querySelector('#state'); return [Number(s.dataset.value), Number(s.dataset.clicks)]; }",
+          "equals": [
+            13,
+            5
+          ]
+        }
+      ]
+    },
+    {
+      "id": "seq-04",
+      "description": "Click controls repeatedly and verify cumulative DOM and structured state.",
+      "html": "<!doctype html><html><head><title>Sequence 04</title></head><body><output id=\"state\" data-value=\"0\" data-clicks=\"0\">value=0; clicks=0</output><button id=\"one\" onclick=\"bump(1)\">One</button><button id=\"delta\" onclick=\"bump(2)\">Delta</button><script>function bump(n){const s=document.querySelector('#state');const v=Number(s.dataset.value)+n;const c=Number(s.dataset.clicks)+1;s.dataset.value=String(v);s.dataset.clicks=String(c);s.textContent='value='+v+'; clicks='+c}</script></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=0; clicks=0"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "afterFirst"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "contains": "clicks=1"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "finalText"
+        },
+        {
+          "op": "evaluate",
+          "expression": "() => { const s = document.querySelector('#state'); return { value: Number(s.dataset.value), clicks: Number(s.dataset.clicks) }; }",
+          "capture": "finalState"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=6; clicks=4"
+        },
+        {
+          "op": "assertEval",
+          "expression": "() => { const s = document.querySelector('#state'); return [Number(s.dataset.value), Number(s.dataset.clicks)]; }",
+          "equals": [
+            6,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "id": "seq-05",
+      "description": "Click controls repeatedly and verify cumulative DOM and structured state.",
+      "html": "<!doctype html><html><head><title>Sequence 05</title></head><body><output id=\"state\" data-value=\"0\" data-clicks=\"0\">value=0; clicks=0</output><button id=\"one\" onclick=\"bump(1)\">One</button><button id=\"delta\" onclick=\"bump(3)\">Delta</button><script>function bump(n){const s=document.querySelector('#state');const v=Number(s.dataset.value)+n;const c=Number(s.dataset.clicks)+1;s.dataset.value=String(v);s.dataset.clicks=String(c);s.textContent='value='+v+'; clicks='+c}</script></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=0; clicks=0"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "afterFirst"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "contains": "clicks=1"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "finalText"
+        },
+        {
+          "op": "evaluate",
+          "expression": "() => { const s = document.querySelector('#state'); return { value: Number(s.dataset.value), clicks: Number(s.dataset.clicks) }; }",
+          "capture": "finalState"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=9; clicks=5"
+        },
+        {
+          "op": "assertEval",
+          "expression": "() => { const s = document.querySelector('#state'); return [Number(s.dataset.value), Number(s.dataset.clicks)]; }",
+          "equals": [
+            9,
+            5
+          ]
+        }
+      ]
+    },
+    {
+      "id": "seq-06",
+      "description": "Click controls repeatedly and verify cumulative DOM and structured state.",
+      "html": "<!doctype html><html><head><title>Sequence 06</title></head><body><output id=\"state\" data-value=\"0\" data-clicks=\"0\">value=0; clicks=0</output><button id=\"one\" onclick=\"bump(1)\">One</button><button id=\"delta\" onclick=\"bump(4)\">Delta</button><script>function bump(n){const s=document.querySelector('#state');const v=Number(s.dataset.value)+n;const c=Number(s.dataset.clicks)+1;s.dataset.value=String(v);s.dataset.clicks=String(c);s.textContent='value='+v+'; clicks='+c}</script></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=0; clicks=0"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "afterFirst"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "contains": "clicks=1"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "finalText"
+        },
+        {
+          "op": "evaluate",
+          "expression": "() => { const s = document.querySelector('#state'); return { value: Number(s.dataset.value), clicks: Number(s.dataset.clicks) }; }",
+          "capture": "finalState"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=10; clicks=4"
+        },
+        {
+          "op": "assertEval",
+          "expression": "() => { const s = document.querySelector('#state'); return [Number(s.dataset.value), Number(s.dataset.clicks)]; }",
+          "equals": [
+            10,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "id": "seq-07",
+      "description": "Click controls repeatedly and verify cumulative DOM and structured state.",
+      "html": "<!doctype html><html><head><title>Sequence 07</title></head><body><output id=\"state\" data-value=\"0\" data-clicks=\"0\">value=0; clicks=0</output><button id=\"one\" onclick=\"bump(1)\">One</button><button id=\"delta\" onclick=\"bump(5)\">Delta</button><script>function bump(n){const s=document.querySelector('#state');const v=Number(s.dataset.value)+n;const c=Number(s.dataset.clicks)+1;s.dataset.value=String(v);s.dataset.clicks=String(c);s.textContent='value='+v+'; clicks='+c}</script></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=0; clicks=0"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "afterFirst"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "contains": "clicks=1"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "finalText"
+        },
+        {
+          "op": "evaluate",
+          "expression": "() => { const s = document.querySelector('#state'); return { value: Number(s.dataset.value), clicks: Number(s.dataset.clicks) }; }",
+          "capture": "finalState"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=13; clicks=5"
+        },
+        {
+          "op": "assertEval",
+          "expression": "() => { const s = document.querySelector('#state'); return [Number(s.dataset.value), Number(s.dataset.clicks)]; }",
+          "equals": [
+            13,
+            5
+          ]
+        }
+      ]
+    },
+    {
+      "id": "seq-08",
+      "description": "Click controls repeatedly and verify cumulative DOM and structured state.",
+      "html": "<!doctype html><html><head><title>Sequence 08</title></head><body><output id=\"state\" data-value=\"0\" data-clicks=\"0\">value=0; clicks=0</output><button id=\"one\" onclick=\"bump(1)\">One</button><button id=\"delta\" onclick=\"bump(2)\">Delta</button><script>function bump(n){const s=document.querySelector('#state');const v=Number(s.dataset.value)+n;const c=Number(s.dataset.clicks)+1;s.dataset.value=String(v);s.dataset.clicks=String(c);s.textContent='value='+v+'; clicks='+c}</script></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=0; clicks=0"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "afterFirst"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "contains": "clicks=1"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "finalText"
+        },
+        {
+          "op": "evaluate",
+          "expression": "() => { const s = document.querySelector('#state'); return { value: Number(s.dataset.value), clicks: Number(s.dataset.clicks) }; }",
+          "capture": "finalState"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=6; clicks=4"
+        },
+        {
+          "op": "assertEval",
+          "expression": "() => { const s = document.querySelector('#state'); return [Number(s.dataset.value), Number(s.dataset.clicks)]; }",
+          "equals": [
+            6,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "id": "seq-09",
+      "description": "Click controls repeatedly and verify cumulative DOM and structured state.",
+      "html": "<!doctype html><html><head><title>Sequence 09</title></head><body><output id=\"state\" data-value=\"0\" data-clicks=\"0\">value=0; clicks=0</output><button id=\"one\" onclick=\"bump(1)\">One</button><button id=\"delta\" onclick=\"bump(3)\">Delta</button><script>function bump(n){const s=document.querySelector('#state');const v=Number(s.dataset.value)+n;const c=Number(s.dataset.clicks)+1;s.dataset.value=String(v);s.dataset.clicks=String(c);s.textContent='value='+v+'; clicks='+c}</script></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=0; clicks=0"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "afterFirst"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "contains": "clicks=1"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "click",
+          "selector": "#delta"
+        },
+        {
+          "op": "click",
+          "selector": "#one"
+        },
+        {
+          "op": "textContent",
+          "selector": "#state",
+          "capture": "finalText"
+        },
+        {
+          "op": "evaluate",
+          "expression": "() => { const s = document.querySelector('#state'); return { value: Number(s.dataset.value), clicks: Number(s.dataset.clicks) }; }",
+          "capture": "finalState"
+        },
+        {
+          "op": "assertText",
+          "selector": "#state",
+          "equals": "value=9; clicks=5"
+        },
+        {
+          "op": "assertEval",
+          "expression": "() => { const s = document.querySelector('#state'); return [Number(s.dataset.value), Number(s.dataset.clicks)]; }",
+          "equals": [
+            9,
+            5
+          ]
+        }
+      ]
+    },
+    {
+      "id": "uni-00",
+      "description": "Fill Unicode or long text and verify its exact DOM round trip.",
+      "html": "<!doctype html><html><head><title>Unicode Fill 00</title></head><body><textarea id=\"name\"></textarea><button id=\"copy\" onclick=\"document.querySelector('#out').textContent=document.querySelector('#name').value\">Copy</button><pre id=\"out\">empty</pre></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "caf\u00e9 d\u00e9j\u00e0 vu \u2014 cr\u00e8me br\u00fbl\u00e9e"
+        },
+        {
+          "op": "click",
+          "selector": "#copy"
+        },
+        {
+          "op": "textContent",
+          "selector": "#out",
+          "capture": "copied"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelector('#name').value",
+          "capture": "inputValue"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "contains": "caf\u00e9 d\u00e9j\u00e0 vu \u2014 cr\u00e8me br\u00fb"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "equals": "caf\u00e9 d\u00e9j\u00e0 vu \u2014 cr\u00e8me br\u00fbl\u00e9e"
+        }
+      ]
+    },
+    {
+      "id": "uni-01",
+      "description": "Fill Unicode or long text and verify its exact DOM round trip.",
+      "html": "<!doctype html><html><head><title>Unicode Fill 01</title></head><body><textarea id=\"name\"></textarea><button id=\"copy\" onclick=\"document.querySelector('#out').textContent=document.querySelector('#name').value\">Copy</button><pre id=\"out\">empty</pre></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "\u6771\u4eac\u304b\u3089\u4eac\u90fd\u3078\u3001\u3053\u3093\u306b\u3061\u306f\u4e16\u754c"
+        },
+        {
+          "op": "click",
+          "selector": "#copy"
+        },
+        {
+          "op": "textContent",
+          "selector": "#out",
+          "capture": "copied"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelector('#name').value",
+          "capture": "inputValue"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "contains": "\u6771\u4eac\u304b\u3089\u4eac\u90fd\u3078\u3001\u3053\u3093\u306b\u3061\u306f\u4e16\u754c"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "equals": "\u6771\u4eac\u304b\u3089\u4eac\u90fd\u3078\u3001\u3053\u3093\u306b\u3061\u306f\u4e16\u754c"
+        }
+      ]
+    },
+    {
+      "id": "uni-02",
+      "description": "Fill Unicode or long text and verify its exact DOM round trip.",
+      "html": "<!doctype html><html><head><title>Unicode Fill 02</title></head><body><textarea id=\"name\"></textarea><button id=\"copy\" onclick=\"document.querySelector('#out').textContent=document.querySelector('#name').value\">Copy</button><pre id=\"out\">empty</pre></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "\u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645 \u2014 \u0627\u062e\u062a\u0628\u0627\u0631 \u0631\u0633\u062a\u0631\u0627\u064a\u062a"
+        },
+        {
+          "op": "click",
+          "selector": "#copy"
+        },
+        {
+          "op": "textContent",
+          "selector": "#out",
+          "capture": "copied"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelector('#name').value",
+          "capture": "inputValue"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "contains": "\u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645 \u2014 \u0627\u062e\u062a\u0628\u0627\u0631 \u0631"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "equals": "\u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645 \u2014 \u0627\u062e\u062a\u0628\u0627\u0631 \u0631\u0633\u062a\u0631\u0627\u064a\u062a"
+        }
+      ]
+    },
+    {
+      "id": "uni-03",
+      "description": "Fill Unicode or long text and verify its exact DOM round trip.",
+      "html": "<!doctype html><html><head><title>Unicode Fill 03</title></head><body><textarea id=\"name\"></textarea><button id=\"copy\" onclick=\"document.querySelector('#out').textContent=document.querySelector('#name').value\">Copy</button><pre id=\"out\">empty</pre></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "\u0417\u0434\u0440\u0430\u0432\u0441\u0442\u0432\u0443\u0439, \u043c\u0438\u0440 \u2014 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0431\u0440\u0430\u0443\u0437\u0435\u0440\u0430"
+        },
+        {
+          "op": "click",
+          "selector": "#copy"
+        },
+        {
+          "op": "textContent",
+          "selector": "#out",
+          "capture": "copied"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelector('#name').value",
+          "capture": "inputValue"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "contains": "\u0417\u0434\u0440\u0430\u0432\u0441\u0442\u0432\u0443\u0439, \u043c\u0438\u0440 \u2014 \u043f\u0440\u043e\u0432\u0435\u0440"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "equals": "\u0417\u0434\u0440\u0430\u0432\u0441\u0442\u0432\u0443\u0439, \u043c\u0438\u0440 \u2014 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0431\u0440\u0430\u0443\u0437\u0435\u0440\u0430"
+        }
+      ]
+    },
+    {
+      "id": "uni-04",
+      "description": "Fill Unicode or long text and verify its exact DOM round trip.",
+      "html": "<!doctype html><html><head><title>Unicode Fill 04</title></head><body><textarea id=\"name\"></textarea><button id=\"copy\" onclick=\"document.querySelector('#out').textContent=document.querySelector('#name').value\">Copy</button><pre id=\"out\">empty</pre></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "\u0928\u092e\u0938\u094d\u0924\u0947 \u0926\u0941\u0928\u093f\u092f\u093e \u2014 \u092c\u094d\u0930\u093e\u0909\u091c\u093c\u0930 \u092a\u0930\u0940\u0915\u094d\u0937\u0923"
+        },
+        {
+          "op": "click",
+          "selector": "#copy"
+        },
+        {
+          "op": "textContent",
+          "selector": "#out",
+          "capture": "copied"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelector('#name').value",
+          "capture": "inputValue"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "contains": "\u0928\u092e\u0938\u094d\u0924\u0947 \u0926\u0941\u0928\u093f\u092f\u093e \u2014 \u092c\u094d\u0930\u093e\u0909\u091c\u093c\u0930"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "equals": "\u0928\u092e\u0938\u094d\u0924\u0947 \u0926\u0941\u0928\u093f\u092f\u093e \u2014 \u092c\u094d\u0930\u093e\u0909\u091c\u093c\u0930 \u092a\u0930\u0940\u0915\u094d\u0937\u0923"
+        }
+      ]
+    },
+    {
+      "id": "uni-05",
+      "description": "Fill Unicode or long text and verify its exact DOM round trip.",
+      "html": "<!doctype html><html><head><title>Unicode Fill 05</title></head><body><textarea id=\"name\"></textarea><button id=\"copy\" onclick=\"document.querySelector('#out').textContent=document.querySelector('#name').value\">Copy</button><pre id=\"out\">empty</pre></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "emoji \ud83d\ude80\u2728\ud83e\uddea and flags \ud83c\udde8\ud83c\udde6\ud83c\uddef\ud83c\uddf5"
+        },
+        {
+          "op": "click",
+          "selector": "#copy"
+        },
+        {
+          "op": "textContent",
+          "selector": "#out",
+          "capture": "copied"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelector('#name').value",
+          "capture": "inputValue"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "contains": "emoji \ud83d\ude80\u2728\ud83e\uddea and flags \ud83c\udde8\ud83c\udde6\ud83c\uddef\ud83c\uddf5"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "equals": "emoji \ud83d\ude80\u2728\ud83e\uddea and flags \ud83c\udde8\ud83c\udde6\ud83c\uddef\ud83c\uddf5"
+        }
+      ]
+    },
+    {
+      "id": "uni-06",
+      "description": "Fill Unicode or long text and verify its exact DOM round trip.",
+      "html": "<!doctype html><html><head><title>Unicode Fill 06</title></head><body><textarea id=\"name\"></textarea><button id=\"copy\" onclick=\"document.querySelector('#out').textContent=document.querySelector('#name').value\">Copy</button><pre id=\"out\">empty</pre></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "combining e\u0301 and precomposed \u00e9 stay distinct"
+        },
+        {
+          "op": "click",
+          "selector": "#copy"
+        },
+        {
+          "op": "textContent",
+          "selector": "#out",
+          "capture": "copied"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelector('#name').value",
+          "capture": "inputValue"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "contains": "combining e\u0301 and precomp"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "equals": "combining e\u0301 and precomposed \u00e9 stay distinct"
+        }
+      ]
+    },
+    {
+      "id": "uni-07",
+      "description": "Fill Unicode or long text and verify its exact DOM round trip.",
+      "html": "<!doctype html><html><head><title>Unicode Fill 07</title></head><body><textarea id=\"name\"></textarea><button id=\"copy\" onclick=\"document.querySelector('#out').textContent=document.querySelector('#name').value\">Copy</button><pre id=\"out\">empty</pre></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "quotes: \"double\", 'single', ampersand &, angle <tag>"
+        },
+        {
+          "op": "click",
+          "selector": "#copy"
+        },
+        {
+          "op": "textContent",
+          "selector": "#out",
+          "capture": "copied"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelector('#name').value",
+          "capture": "inputValue"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "contains": "quotes: \"double\", 'singl"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "equals": "quotes: \"double\", 'single', ampersand &, angle <tag>"
+        }
+      ]
+    },
+    {
+      "id": "uni-08",
+      "description": "Fill Unicode or long text and verify its exact DOM round trip.",
+      "html": "<!doctype html><html><head><title>Unicode Fill 08</title></head><body><textarea id=\"name\"></textarea><button id=\"copy\" onclick=\"document.querySelector('#out').textContent=document.querySelector('#name').value\">Copy</button><pre id=\"out\">empty</pre></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "line one\nline two\tTabbed\nline three"
+        },
+        {
+          "op": "click",
+          "selector": "#copy"
+        },
+        {
+          "op": "textContent",
+          "selector": "#out",
+          "capture": "copied"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelector('#name').value",
+          "capture": "inputValue"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "contains": "line one\nline two\tTabbed"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "equals": "line one\nline two\tTabbed\nline three"
+        }
+      ]
+    },
+    {
+      "id": "uni-09",
+      "description": "Fill Unicode or long text and verify its exact DOM round trip.",
+      "html": "<!doctype html><html><head><title>Unicode Fill 09</title></head><body><textarea id=\"name\"></textarea><button id=\"copy\" onclick=\"document.querySelector('#out').textContent=document.querySelector('#name').value\">Copy</button><pre id=\"out\">empty</pre></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "fill",
+          "selector": "#name",
+          "value": "Rustwright-long-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef-\u7d42"
+        },
+        {
+          "op": "click",
+          "selector": "#copy"
+        },
+        {
+          "op": "textContent",
+          "selector": "#out",
+          "capture": "copied"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelector('#name').value",
+          "capture": "inputValue"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "contains": "Rustwright-long-01234567"
+        },
+        {
+          "op": "assertText",
+          "selector": "#out",
+          "equals": "Rustwright-long-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef-\u7d42"
+        }
+      ]
+    },
+    {
+      "id": "evalx-00",
+      "description": "Capture nested JSON values with booleans, null, arrays, objects, and safe numeric edges.",
+      "html": "<!doctype html><html><head><title>Extended Evaluate 00</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ input: v, summary: { count: v.nested.values.length, active: v.enabled, edge: v.edge }, mirror: [v.nothing, v.enabled, v.edge, [...v.nested.values]] })",
+          "arg": {
+            "index": 0,
+            "enabled": true,
+            "nothing": null,
+            "edge": 0,
+            "nested": {
+              "values": [
+                0,
+                1,
+                2
+              ],
+              "flags": {
+                "yes": true,
+                "no": false
+              },
+              "matrix": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  null,
+                  0
+                ]
+              ]
+            }
+          },
+          "capture": "complex"
+        },
+        {
+          "op": "assertEval",
+          "expression": "[true, false, null, { edge: 0 }, [[0, 1], []]]",
+          "equals": [
+            true,
+            false,
+            null,
+            {
+              "edge": 0
+            },
+            [
+              [
+                0,
+                1
+              ],
+              []
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "evalx-01",
+      "description": "Capture nested JSON values with booleans, null, arrays, objects, and safe numeric edges.",
+      "html": "<!doctype html><html><head><title>Extended Evaluate 01</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ input: v, summary: { count: v.nested.values.length, active: v.enabled, edge: v.edge }, mirror: [v.nothing, v.enabled, v.edge, [...v.nested.values]] })",
+          "arg": {
+            "index": 1,
+            "enabled": false,
+            "nothing": null,
+            "edge": 1e-06,
+            "nested": {
+              "values": [
+                1,
+                2,
+                3
+              ],
+              "flags": {
+                "yes": true,
+                "no": false
+              },
+              "matrix": [
+                [
+                  1,
+                  1e-06
+                ],
+                [
+                  null,
+                  -1
+                ]
+              ]
+            }
+          },
+          "capture": "complex"
+        },
+        {
+          "op": "assertEval",
+          "expression": "[true, false, null, { edge: 1e-06 }, [[1, 2], []]]",
+          "equals": [
+            true,
+            false,
+            null,
+            {
+              "edge": 1e-06
+            },
+            [
+              [
+                1,
+                2
+              ],
+              []
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "evalx-02",
+      "description": "Capture nested JSON values with booleans, null, arrays, objects, and safe numeric edges.",
+      "html": "<!doctype html><html><head><title>Extended Evaluate 02</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ input: v, summary: { count: v.nested.values.length, active: v.enabled, edge: v.edge }, mirror: [v.nothing, v.enabled, v.edge, [...v.nested.values]] })",
+          "arg": {
+            "index": 2,
+            "enabled": true,
+            "nothing": null,
+            "edge": -1e-06,
+            "nested": {
+              "values": [
+                2,
+                3,
+                4
+              ],
+              "flags": {
+                "yes": true,
+                "no": false
+              },
+              "matrix": [
+                [
+                  2,
+                  -1e-06
+                ],
+                [
+                  null,
+                  -2
+                ]
+              ]
+            }
+          },
+          "capture": "complex"
+        },
+        {
+          "op": "assertEval",
+          "expression": "[true, false, null, { edge: -1e-06 }, [[2, 3], []]]",
+          "equals": [
+            true,
+            false,
+            null,
+            {
+              "edge": -1e-06
+            },
+            [
+              [
+                2,
+                3
+              ],
+              []
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "evalx-03",
+      "description": "Capture nested JSON values with booleans, null, arrays, objects, and safe numeric edges.",
+      "html": "<!doctype html><html><head><title>Extended Evaluate 03</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ input: v, summary: { count: v.nested.values.length, active: v.enabled, edge: v.edge }, mirror: [v.nothing, v.enabled, v.edge, [...v.nested.values]] })",
+          "arg": {
+            "index": 3,
+            "enabled": false,
+            "nothing": null,
+            "edge": 2147483647,
+            "nested": {
+              "values": [
+                3,
+                4,
+                5
+              ],
+              "flags": {
+                "yes": true,
+                "no": false
+              },
+              "matrix": [
+                [
+                  3,
+                  2147483647
+                ],
+                [
+                  null,
+                  -3
+                ]
+              ]
+            }
+          },
+          "capture": "complex"
+        },
+        {
+          "op": "assertEval",
+          "expression": "[true, false, null, { edge: 2147483647 }, [[3, 4], []]]",
+          "equals": [
+            true,
+            false,
+            null,
+            {
+              "edge": 2147483647
+            },
+            [
+              [
+                3,
+                4
+              ],
+              []
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "evalx-04",
+      "description": "Capture nested JSON values with booleans, null, arrays, objects, and safe numeric edges.",
+      "html": "<!doctype html><html><head><title>Extended Evaluate 04</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ input: v, summary: { count: v.nested.values.length, active: v.enabled, edge: v.edge }, mirror: [v.nothing, v.enabled, v.edge, [...v.nested.values]] })",
+          "arg": {
+            "index": 4,
+            "enabled": true,
+            "nothing": null,
+            "edge": -2147483648,
+            "nested": {
+              "values": [
+                4,
+                5,
+                6
+              ],
+              "flags": {
+                "yes": true,
+                "no": false
+              },
+              "matrix": [
+                [
+                  4,
+                  -2147483648
+                ],
+                [
+                  null,
+                  -4
+                ]
+              ]
+            }
+          },
+          "capture": "complex"
+        },
+        {
+          "op": "assertEval",
+          "expression": "[true, false, null, { edge: -2147483648 }, [[4, 5], []]]",
+          "equals": [
+            true,
+            false,
+            null,
+            {
+              "edge": -2147483648
+            },
+            [
+              [
+                4,
+                5
+              ],
+              []
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "evalx-05",
+      "description": "Capture nested JSON values with booleans, null, arrays, objects, and safe numeric edges.",
+      "html": "<!doctype html><html><head><title>Extended Evaluate 05</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ input: v, summary: { count: v.nested.values.length, active: v.enabled, edge: v.edge }, mirror: [v.nothing, v.enabled, v.edge, [...v.nested.values]] })",
+          "arg": {
+            "index": 5,
+            "enabled": false,
+            "nothing": null,
+            "edge": 4294967295,
+            "nested": {
+              "values": [
+                5,
+                6,
+                7
+              ],
+              "flags": {
+                "yes": true,
+                "no": false
+              },
+              "matrix": [
+                [
+                  5,
+                  4294967295
+                ],
+                [
+                  null,
+                  -5
+                ]
+              ]
+            }
+          },
+          "capture": "complex"
+        },
+        {
+          "op": "assertEval",
+          "expression": "[true, false, null, { edge: 4294967295 }, [[5, 6], []]]",
+          "equals": [
+            true,
+            false,
+            null,
+            {
+              "edge": 4294967295
+            },
+            [
+              [
+                5,
+                6
+              ],
+              []
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "evalx-06",
+      "description": "Capture nested JSON values with booleans, null, arrays, objects, and safe numeric edges.",
+      "html": "<!doctype html><html><head><title>Extended Evaluate 06</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ input: v, summary: { count: v.nested.values.length, active: v.enabled, edge: v.edge }, mirror: [v.nothing, v.enabled, v.edge, [...v.nested.values]] })",
+          "arg": {
+            "index": 6,
+            "enabled": true,
+            "nothing": null,
+            "edge": 9007199254740991,
+            "nested": {
+              "values": [
+                6,
+                7,
+                8
+              ],
+              "flags": {
+                "yes": true,
+                "no": false
+              },
+              "matrix": [
+                [
+                  6,
+                  9007199254740991
+                ],
+                [
+                  null,
+                  -6
+                ]
+              ]
+            }
+          },
+          "capture": "complex"
+        },
+        {
+          "op": "assertEval",
+          "expression": "[true, false, null, { edge: 9007199254740991 }, [[6, 7], []]]",
+          "equals": [
+            true,
+            false,
+            null,
+            {
+              "edge": 9007199254740991
+            },
+            [
+              [
+                6,
+                7
+              ],
+              []
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "evalx-07",
+      "description": "Capture nested JSON values with booleans, null, arrays, objects, and safe numeric edges.",
+      "html": "<!doctype html><html><head><title>Extended Evaluate 07</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ input: v, summary: { count: v.nested.values.length, active: v.enabled, edge: v.edge }, mirror: [v.nothing, v.enabled, v.edge, [...v.nested.values]] })",
+          "arg": {
+            "index": 7,
+            "enabled": false,
+            "nothing": null,
+            "edge": -9007199254740991,
+            "nested": {
+              "values": [
+                7,
+                8,
+                9
+              ],
+              "flags": {
+                "yes": true,
+                "no": false
+              },
+              "matrix": [
+                [
+                  7,
+                  -9007199254740991
+                ],
+                [
+                  null,
+                  -7
+                ]
+              ]
+            }
+          },
+          "capture": "complex"
+        },
+        {
+          "op": "assertEval",
+          "expression": "[true, false, null, { edge: -9007199254740991 }, [[7, 8], []]]",
+          "equals": [
+            true,
+            false,
+            null,
+            {
+              "edge": -9007199254740991
+            },
+            [
+              [
+                7,
+                8
+              ],
+              []
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "evalx-08",
+      "description": "Capture nested JSON values with booleans, null, arrays, objects, and safe numeric edges.",
+      "html": "<!doctype html><html><head><title>Extended Evaluate 08</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ input: v, summary: { count: v.nested.values.length, active: v.enabled, edge: v.edge }, mirror: [v.nothing, v.enabled, v.edge, [...v.nested.values]] })",
+          "arg": {
+            "index": 8,
+            "enabled": true,
+            "nothing": null,
+            "edge": 123456789.125,
+            "nested": {
+              "values": [
+                8,
+                9,
+                10
+              ],
+              "flags": {
+                "yes": true,
+                "no": false
+              },
+              "matrix": [
+                [
+                  8,
+                  123456789.125
+                ],
+                [
+                  null,
+                  -8
+                ]
+              ]
+            }
+          },
+          "capture": "complex"
+        },
+        {
+          "op": "assertEval",
+          "expression": "[true, false, null, { edge: 123456789.125 }, [[8, 9], []]]",
+          "equals": [
+            true,
+            false,
+            null,
+            {
+              "edge": 123456789.125
+            },
+            [
+              [
+                8,
+                9
+              ],
+              []
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "evalx-09",
+      "description": "Capture nested JSON values with booleans, null, arrays, objects, and safe numeric edges.",
+      "html": "<!doctype html><html><head><title>Extended Evaluate 09</title></head><body></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "evaluate",
+          "expression": "v => ({ input: v, summary: { count: v.nested.values.length, active: v.enabled, edge: v.edge }, mirror: [v.nothing, v.enabled, v.edge, [...v.nested.values]] })",
+          "arg": {
+            "index": 9,
+            "enabled": false,
+            "nothing": null,
+            "edge": -987654321.875,
+            "nested": {
+              "values": [
+                9,
+                10,
+                11
+              ],
+              "flags": {
+                "yes": true,
+                "no": false
+              },
+              "matrix": [
+                [
+                  9,
+                  -987654321.875
+                ],
+                [
+                  null,
+                  -9
+                ]
+              ]
+            }
+          },
+          "capture": "complex"
+        },
+        {
+          "op": "assertEval",
+          "expression": "[true, false, null, { edge: -987654321.875 }, [[9, 10], []]]",
+          "equals": [
+            true,
+            false,
+            null,
+            {
+              "edge": -987654321.875
+            },
+            [
+              [
+                9,
+                10
+              ],
+              []
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "shotx-00",
+      "description": "Record PNG bytes for a fixed palette and geometric CSS layout.",
+      "html": "<!doctype html><html><head><title>Extended Shot 00</title><style>html,body{margin:0;width:100%;height:100%;background:#0f172a}main{width:640px;height:360px;padding:40px;box-sizing:border-box;display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.tile{background:#38bdf8;border:8px solid #f8fafc;box-sizing:border-box}.tile:nth-child(3n){background:#f8fafc;border-color:#38bdf8;border-radius:50%}</style></head><body><main id=\"canvas\"><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelectorAll('.tile').length",
+          "capture": "tileCount"
+        },
+        {
+          "op": "assertEval",
+          "expression": "document.querySelectorAll('.tile').length",
+          "equals": 12
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Shot 00"
+        }
+      ]
+    },
+    {
+      "id": "shotx-01",
+      "description": "Record PNG bytes for a fixed palette and geometric CSS layout.",
+      "html": "<!doctype html><html><head><title>Extended Shot 01</title><style>html,body{margin:0;width:100%;height:100%;background:#1f2937}main{width:640px;height:360px;padding:40px;box-sizing:border-box;display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.tile{background:#f59e0b;border:8px solid #fef3c7;box-sizing:border-box}.tile:nth-child(3n){background:#fef3c7;border-color:#f59e0b;border-radius:50%}</style></head><body><main id=\"canvas\"><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelectorAll('.tile').length",
+          "capture": "tileCount"
+        },
+        {
+          "op": "assertEval",
+          "expression": "document.querySelectorAll('.tile').length",
+          "equals": 12
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Shot 01"
+        }
+      ]
+    },
+    {
+      "id": "shotx-02",
+      "description": "Record PNG bytes for a fixed palette and geometric CSS layout.",
+      "html": "<!doctype html><html><head><title>Extended Shot 02</title><style>html,body{margin:0;width:100%;height:100%;background:#312e81}main{width:640px;height:360px;padding:40px;box-sizing:border-box;display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.tile{background:#a78bfa;border:8px solid #ede9fe;box-sizing:border-box}.tile:nth-child(3n){background:#ede9fe;border-color:#a78bfa;border-radius:50%}</style></head><body><main id=\"canvas\"><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelectorAll('.tile').length",
+          "capture": "tileCount"
+        },
+        {
+          "op": "assertEval",
+          "expression": "document.querySelectorAll('.tile').length",
+          "equals": 12
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Shot 02"
+        }
+      ]
+    },
+    {
+      "id": "shotx-03",
+      "description": "Record PNG bytes for a fixed palette and geometric CSS layout.",
+      "html": "<!doctype html><html><head><title>Extended Shot 03</title><style>html,body{margin:0;width:100%;height:100%;background:#3f0d1e}main{width:640px;height:360px;padding:40px;box-sizing:border-box;display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.tile{background:#fb7185;border:8px solid #fff1f2;box-sizing:border-box}.tile:nth-child(3n){background:#fff1f2;border-color:#fb7185;border-radius:50%}</style></head><body><main id=\"canvas\"><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelectorAll('.tile').length",
+          "capture": "tileCount"
+        },
+        {
+          "op": "assertEval",
+          "expression": "document.querySelectorAll('.tile').length",
+          "equals": 12
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Shot 03"
+        }
+      ]
+    },
+    {
+      "id": "shotx-04",
+      "description": "Record PNG bytes for a fixed palette and geometric CSS layout.",
+      "html": "<!doctype html><html><head><title>Extended Shot 04</title><style>html,body{margin:0;width:100%;height:100%;background:#052e16}main{width:640px;height:360px;padding:40px;box-sizing:border-box;display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.tile{background:#4ade80;border:8px solid #dcfce7;box-sizing:border-box}.tile:nth-child(3n){background:#dcfce7;border-color:#4ade80;border-radius:50%}</style></head><body><main id=\"canvas\"><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelectorAll('.tile').length",
+          "capture": "tileCount"
+        },
+        {
+          "op": "assertEval",
+          "expression": "document.querySelectorAll('.tile').length",
+          "equals": 12
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Shot 04"
+        }
+      ]
+    },
+    {
+      "id": "shotx-05",
+      "description": "Record PNG bytes for a fixed palette and geometric CSS layout.",
+      "html": "<!doctype html><html><head><title>Extended Shot 05</title><style>html,body{margin:0;width:100%;height:100%;background:#164e63}main{width:640px;height:360px;padding:40px;box-sizing:border-box;display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.tile{background:#22d3ee;border:8px solid #cffafe;box-sizing:border-box}.tile:nth-child(3n){background:#cffafe;border-color:#22d3ee;border-radius:50%}</style></head><body><main id=\"canvas\"><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelectorAll('.tile').length",
+          "capture": "tileCount"
+        },
+        {
+          "op": "assertEval",
+          "expression": "document.querySelectorAll('.tile').length",
+          "equals": 12
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Shot 05"
+        }
+      ]
+    },
+    {
+      "id": "shotx-06",
+      "description": "Record PNG bytes for a fixed palette and geometric CSS layout.",
+      "html": "<!doctype html><html><head><title>Extended Shot 06</title><style>html,body{margin:0;width:100%;height:100%;background:#422006}main{width:640px;height:360px;padding:40px;box-sizing:border-box;display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.tile{background:#facc15;border:8px solid #fef9c3;box-sizing:border-box}.tile:nth-child(3n){background:#fef9c3;border-color:#facc15;border-radius:50%}</style></head><body><main id=\"canvas\"><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelectorAll('.tile').length",
+          "capture": "tileCount"
+        },
+        {
+          "op": "assertEval",
+          "expression": "document.querySelectorAll('.tile').length",
+          "equals": 12
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Shot 06"
+        }
+      ]
+    },
+    {
+      "id": "shotx-07",
+      "description": "Record PNG bytes for a fixed palette and geometric CSS layout.",
+      "html": "<!doctype html><html><head><title>Extended Shot 07</title><style>html,body{margin:0;width:100%;height:100%;background:#450a0a}main{width:640px;height:360px;padding:40px;box-sizing:border-box;display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.tile{background:#f87171;border:8px solid #fee2e2;box-sizing:border-box}.tile:nth-child(3n){background:#fee2e2;border-color:#f87171;border-radius:50%}</style></head><body><main id=\"canvas\"><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelectorAll('.tile').length",
+          "capture": "tileCount"
+        },
+        {
+          "op": "assertEval",
+          "expression": "document.querySelectorAll('.tile').length",
+          "equals": 12
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Shot 07"
+        }
+      ]
+    },
+    {
+      "id": "shotx-08",
+      "description": "Record PNG bytes for a fixed palette and geometric CSS layout.",
+      "html": "<!doctype html><html><head><title>Extended Shot 08</title><style>html,body{margin:0;width:100%;height:100%;background:#2e1065}main{width:640px;height:360px;padding:40px;box-sizing:border-box;display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.tile{background:#c084fc;border:8px solid #f3e8ff;box-sizing:border-box}.tile:nth-child(3n){background:#f3e8ff;border-color:#c084fc;border-radius:50%}</style></head><body><main id=\"canvas\"><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelectorAll('.tile').length",
+          "capture": "tileCount"
+        },
+        {
+          "op": "assertEval",
+          "expression": "document.querySelectorAll('.tile').length",
+          "equals": 12
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Shot 08"
+        }
+      ]
+    },
+    {
+      "id": "shotx-09",
+      "description": "Record PNG bytes for a fixed palette and geometric CSS layout.",
+      "html": "<!doctype html><html><head><title>Extended Shot 09</title><style>html,body{margin:0;width:100%;height:100%;background:#111827}main{width:640px;height:360px;padding:40px;box-sizing:border-box;display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.tile{background:#94a3b8;border:8px solid #f1f5f9;box-sizing:border-box}.tile:nth-child(3n){background:#f1f5f9;border-color:#94a3b8;border-radius:50%}</style></head><body><main id=\"canvas\"><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div><div class=\"tile\"></div></main></body></html>",
+      "steps": [
+        {
+          "op": "goto",
+          "useCaseHtml": true
+        },
+        {
+          "op": "screenshot",
+          "capture": "pngBytes"
+        },
+        {
+          "op": "evaluate",
+          "expression": "document.querySelectorAll('.tile').length",
+          "capture": "tileCount"
+        },
+        {
+          "op": "assertEval",
+          "expression": "document.querySelectorAll('.tile').length",
+          "equals": 12
+        },
+        {
+          "op": "assertTitle",
+          "contains": "Shot 09"
+        }
+      ]
     }
   ]
 }
