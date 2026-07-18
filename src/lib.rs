@@ -9046,12 +9046,18 @@ return true;
     #[pyo3(signature = (locator_json, index, body, timeout_ms=None))]
     fn locator_eval(
         &self,
+        py: Python<'_>,
         locator_json: &str,
         index: usize,
         body: &str,
         timeout_ms: Option<f64>,
     ) -> PyResult<String> {
-        self.evaluate_locator(locator_json, index, body, timeout_ms)
+        // Release the GIL for the duration of the blocking CDP round-trip, matching
+        // `click` and `locator_eval_handle`. `evaluate_locator` already detaches inside
+        // `block_on`, but keeping the detach explicit at the binding layer keeps the
+        // three locator bindings consistent and guards against a future refactor that
+        // adds GIL-holding work before `block_on` or changes the transport.
+        py.detach(|| self.evaluate_locator(locator_json, index, body, timeout_ms))
             .map_err(py_err)
     }
 

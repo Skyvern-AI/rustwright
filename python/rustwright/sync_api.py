@@ -21812,8 +21812,13 @@ return new Promise(resolve => {
             except TimeoutError:
                 # A single actionability probe that exceeds its own budget is transient,
                 # not fatal: over a high-latency remote-CDP transport one probe's round
-                # trips can outlast a small fixed cap. Keep polling until the outer
-                # deadline instead of aborting the whole action (matches Playwright).
+                # trips can outlast a small fixed cap. Surface owner unavailability
+                # immediately, otherwise keep polling until the outer deadline instead of
+                # aborting the whole action (matches Playwright and the fill/select-apply
+                # loops). Doing this before the deadline check means a page/context/browser
+                # that closed mid-probe raises the precise owner error rather than a
+                # generic timeout when the deadline coincides.
+                _raise_if_owner_unavailable(self._page, method=method)
                 if time.monotonic() >= deadline:
                     break
                 _sleep_until_next_poll(deadline)
@@ -21886,7 +21891,12 @@ return new Promise(resolve => {
                 last_info = self._target_state(command_timeout)
             except TimeoutError:
                 # A single fill-readiness probe timing out is transient over a slow
-                # remote-CDP transport: keep polling until the outer deadline.
+                # remote-CDP transport: surface owner unavailability immediately, otherwise
+                # keep polling until the outer deadline (matches the fill/select-apply
+                # loops). Checking the owner before the deadline break means a closed
+                # page/context/browser raises the precise owner error rather than a generic
+                # timeout when the deadline coincides.
+                _raise_if_owner_unavailable(self._page, method=method)
                 if time.monotonic() >= deadline:
                     break
                 _sleep_until_next_poll(deadline)
