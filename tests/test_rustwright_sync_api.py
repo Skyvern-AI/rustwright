@@ -10177,39 +10177,139 @@ def test_locator_click_waits_for_delayed_element(page):
     assert page.evaluate("document.body.dataset.clicked") == "yes"
 
 
-def test_actionability_probe_tolerates_slow_remote_cdp_round_trips(page, monkeypatch):
-    # Regression for remote-CDP interaction timeouts (connect_over_cdp attach): over a
-    # high-latency transport a single actionability probe's CDP round-trips can outlast the
-    # per-probe budget. The action must keep polling until the outer deadline instead of
-    # aborting on that transient probe timeout. Before the fix, click()/select_option()
-    # failed in ~1s with a raw "timed out after 1000 ms" (the old fixed per-probe cap) even
-    # though the outer timeout was 30s, so 13/60 remote-CDP interactions timed out.
+def test_wait_for_single_retries_transient_actionability_probe_timeout(page, monkeypatch):
+    # A single actionability probe can exceed its own budget over a high-latency remote-CDP
+    # transport (connect_over_cdp attach): its several CDP round trips outlast the per-probe
+    # budget even though the outer action deadline is still far off. The wait loop must treat
+    # that probe TimeoutError as transient and keep polling, not abort the whole action.
+    from rustwright.sync_api import Locator
+
+    page.set_content("<button id='go' onclick=\"document.body.dataset.clicked='yes'\">go</button>")
+
+    real_target_state = Locator._target_state
+    probe = {"calls": 0, "timed_out": 0}
+
+    def flaky_target_state(self, timeout=None, **kwargs):
+        probe["calls"] += 1
+        # Time out only the first probe regardless of how large its budget is, so the retry
+        # path itself is exercised rather than merely the enlarged per-probe budget.
+        if probe["timed_out"] == 0:
+            probe["timed_out"] += 1
+            raise TimeoutError(f"timed out after {int(timeout)} ms")
+        return real_target_state(self, timeout, **kwargs)
+
+    monkeypatch.setattr(Locator, "_target_state", flaky_target_state)
+
+    page.click("#go", timeout=30_000)
+
+    assert page.evaluate("document.body.dataset.clicked") == "yes"
+    assert probe["timed_out"] == 1
+    assert probe["calls"] >= 2  # retried after the transient probe timeout
+
+
+def test_fill_apply_loop_retries_transient_probe_timeout(page, monkeypatch):
+    # The fill-apply loop performs the actual fill via _eval. A first probe whose CDP round
+    # trips outlast the per-probe budget raises TimeoutError; the loop must retry until the
+    # outer deadline instead of re-raising that transient timeout as a fatal error.
+    from rustwright.sync_api import Locator
+
+    page.set_content("<input id='name'>")
+
+    real_eval = Locator._eval
+    probe = {"calls": 0, "timed_out": 0}
+
+    def flaky_eval(self, body, timeout=None, *, method=None):
+        if "nonFillableInputTypes" in body:
+            probe["calls"] += 1
+            if probe["timed_out"] == 0:
+                probe["timed_out"] += 1
+                raise TimeoutError(f"timed out after {int(timeout)} ms")
+        return real_eval(self, body, timeout, method=method)
+
+    monkeypatch.setattr(Locator, "_eval", flaky_eval)
+
+    page.fill("#name", "Ada", timeout=30_000)
+
+    assert page.locator("#name").input_value() == "Ada"
+    assert probe["timed_out"] == 1
+    assert probe["calls"] >= 2  # retried after the transient probe timeout
+
+
+def test_select_apply_loop_retries_transient_probe_timeout(page, monkeypatch):
+    # The select-apply loop performs the final selection via _eval. A first transient probe
+    # timeout must be retried until the outer deadline rather than aborting select_option.
     from rustwright.sync_api import Locator
 
     page.set_content(
         "<select id='sel'><option value='a'>A</option><option value='b'>B</option></select>"
-        "<button id='mutate' onclick=\"document.getElementById('state').textContent='after'\">go</button>"
-        "<span id='state'>before</span>"
     )
 
-    real_target_state = Locator._target_state
-    probe_calls = {"count": 0}
+    real_eval = Locator._eval
+    probe = {"calls": 0, "timed_out": 0}
 
-    def slow_probe_target_state(self, timeout=None, **kwargs):
-        probe_calls["count"] += 1
-        # Model a probe whose round-trips need more than the old 1000ms cap to complete.
-        if timeout is not None and timeout < 1_500.0:
-            raise TimeoutError(f"timed out after {int(timeout)} ms")
-        return real_target_state(self, timeout, **kwargs)
+    def flaky_eval(self, body, timeout=None, *, method=None):
+        if "foundValues" in body:
+            probe["calls"] += 1
+            if probe["timed_out"] == 0:
+                probe["timed_out"] += 1
+                raise TimeoutError(f"timed out after {int(timeout)} ms")
+        return real_eval(self, body, timeout, method=method)
 
-    monkeypatch.setattr(Locator, "_target_state", slow_probe_target_state)
+    monkeypatch.setattr(Locator, "_eval", flaky_eval)
 
-    # With the outer timeout at 30s, each probe must be granted well over 1500ms, so the
-    # interaction completes rather than dying on the first under-budgeted probe.
-    page.click("#mutate", timeout=30_000)
-    assert page.locator("#state").text_content() == "after"
     assert page.select_option("#sel", "b", timeout=30_000) == ["b"]
-    assert probe_calls["count"] > 0
+    assert probe["timed_out"] == 1
+    assert probe["calls"] >= 2  # retried after the transient probe timeout
+
+
+def test_fill_apply_loop_surfaces_outer_deadline_on_persistent_probe_timeout(page, monkeypatch):
+    # When every fill-apply probe keeps timing out, the loop must still end at the outer
+    # deadline with its own editable-timeout message (not the raw per-probe timeout) and
+    # without busy-looping past the deadline.
+    from rustwright.sync_api import Locator
+
+    page.set_content("<input id='name'>")
+
+    real_eval = Locator._eval
+
+    def always_timeout_eval(self, body, timeout=None, *, method=None):
+        if "nonFillableInputTypes" in body:
+            raise TimeoutError(f"timed out after {int(timeout)} ms")
+        return real_eval(self, body, timeout, method=method)
+
+    monkeypatch.setattr(Locator, "_eval", always_timeout_eval)
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="editable"):
+        page.fill("#name", "Ada", timeout=300)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 5  # honored the ~300ms outer deadline; no runaway busy-loop
+
+
+def test_fill_apply_loop_propagates_owner_crash_on_probe_timeout(page, monkeypatch):
+    # A probe timeout must not mask owner unavailability: if the page crashes while a fill
+    # probe is timing out, the loop surfaces the crash immediately instead of polling until
+    # the outer deadline.
+    from rustwright.sync_api import Locator
+
+    page.set_content("<input id='name'>")
+
+    real_eval = Locator._eval
+
+    def crashing_probe_eval(self, body, timeout=None, *, method=None):
+        if "nonFillableInputTypes" in body:
+            self._page._crashed = True
+            raise TimeoutError(f"timed out after {int(timeout)} ms")
+        return real_eval(self, body, timeout, method=method)
+
+    monkeypatch.setattr(Locator, "_eval", crashing_probe_eval)
+
+    try:
+        with pytest.raises(Error, match="Page crashed"):
+            page.fill("#name", "Ada", timeout=30_000)
+    finally:
+        page._crashed = False
 
 
 def test_locator_fill_waits_for_delayed_editable(page):

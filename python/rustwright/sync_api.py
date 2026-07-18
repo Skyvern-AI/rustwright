@@ -23649,6 +23649,18 @@ return {{ ok: true, info }};
             self._page._run_locator_handlers(deadline)
             try:
                 result = self._eval(fill_script, command_timeout)
+            except TimeoutError:
+                # A single fill-apply probe timing out is transient over a slow remote-CDP
+                # transport: one probe's CDP round trips can outlast the per-probe budget.
+                # Surface owner unavailability immediately, otherwise keep polling until the
+                # outer deadline instead of aborting the whole action (matches Playwright and
+                # the sibling wait/select loops). TimeoutError subclasses Error, so this must
+                # precede the generic Error handler below.
+                _raise_if_owner_unavailable(self._page, method=_locator_method_for_action(action))
+                if time.monotonic() >= deadline:
+                    break
+                _sleep_until_next_poll(deadline)
+                continue
             except Error as exc:
                 if "No element matches locator" not in str(exc):
                     raise
@@ -24432,6 +24444,9 @@ return {{ ok: true, selected: Array.from(el.selectedOptions).map(option => optio
             try:
                 result = self._eval(select_script, command_timeout, method=method)
             except TimeoutError:
+                # A transient select-apply probe timeout is retried until the outer deadline
+                # (see the fill-apply loop), but owner unavailability is surfaced immediately.
+                _raise_if_owner_unavailable(self._page, method=method)
                 if time.monotonic() >= deadline:
                     break
                 _sleep_until_next_poll(deadline)
