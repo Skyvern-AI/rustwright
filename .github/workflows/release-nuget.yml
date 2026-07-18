@@ -1,0 +1,268 @@
+name: Release .NET package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and upload artifacts without publishing"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-nuget-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: validate package versions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Validate release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import tomllib
+          import xml.etree.ElementTree as ET
+
+          root = pathlib.Path(".")
+          cargo_lock = tomllib.loads((root / "Cargo.lock").read_text())
+          cargo_versions = {
+              package["name"]: package["version"]
+              for package in cargo_lock["package"]
+              if package["name"] in {"rustwright-core", "rustwright-node"}
+          }
+          node_lock = json.loads((root / "node/package-lock.json").read_text())
+          csharp_project = ET.parse(root / "csharp/Rustwright/Rustwright.csproj").getroot()
+          versions = {
+              "pyproject.toml": tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"],
+              "Cargo.toml": tomllib.loads((root / "Cargo.toml").read_text())["package"]["version"],
+              "node/Cargo.toml": tomllib.loads((root / "node/Cargo.toml").read_text())["package"]["version"],
+              "node/package.json": json.loads((root / "node/package.json").read_text())["version"],
+              "csharp/Rustwright/Rustwright.csproj": csharp_project.findtext("PropertyGroup/Version"),
+              "Cargo.lock rustwright-core": cargo_versions["rustwright-core"],
+              "Cargo.lock rustwright-node": cargo_versions["rustwright-node"],
+              "node/package-lock.json": node_lock["version"],
+              'node/package-lock.json packages[""]': node_lock["packages"][""]["version"],
+          }
+
+          expected = next(iter(versions.values()))
+          if any(version != expected for version in versions.values()):
+              raise SystemExit(f"Package versions do not match: {versions}")
+
+          if os.environ["GITHUB_REF_TYPE"] == "tag":
+              tag_version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+              if tag_version != expected:
+                  raise SystemExit(
+                      f"Tag version {tag_version!r} does not match package version {expected!r}"
+                  )
+          print(f"Validated package version {expected}")
+          PY
+
+  native:
+    name: native library - ${{ matrix.platform.target }}
+    needs: metadata
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            rid: osx-arm64
+            library: librustwright_capi.dylib
+            zig_target: ""
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            rid: osx-x64
+            library: librustwright_capi.dylib
+            zig_target: ""
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rid: linux-x64
+            library: librustwright_capi.so
+            zig_target: x86_64-linux-gnu.2.17
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            rid: linux-arm64
+            library: librustwright_capi.so
+            zig_target: aarch64-linux-gnu.2.17
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            rid: win-x64
+            library: rustwright_capi.dll
+            zig_target: ""
+
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.platform.target }}
+      MACOSX_DEPLOYMENT_TARGET: "10.13"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.platform.target }}
+
+      - name: Set up Zig
+        if: ${{ matrix.platform.zig_target != '' }}
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.1
+
+      - name: Configure Linux linker
+        if: ${{ matrix.platform.zig_target != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          linker="$RUNNER_TEMP/zig-cc"
+          cat > "$linker" <<'SH'
+          #!/bin/sh
+          exec zig cc -target "${ZIG_TARGET}" "$@"
+          SH
+          chmod +x "$linker"
+          target_env="$(printf '%s' "$CARGO_BUILD_TARGET" | tr '[:lower:]-' '[:upper:]_')"
+          cc_env="$(printf '%s' "$CARGO_BUILD_TARGET" | tr '-' '_')"
+          echo "ZIG_TARGET=${{ matrix.platform.zig_target }}" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${target_env}_LINKER=$linker" >> "$GITHUB_ENV"
+          echo "CC_${cc_env}=$linker" >> "$GITHUB_ENV"
+
+      - name: Build native library
+        run: cargo build -p rustwright-capi --release --locked
+
+      - name: Upload native library
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nuget-native-${{ matrix.platform.rid }}
+          path: target/${{ matrix.platform.target }}/release/${{ matrix.platform.library }}
+          if-no-files-found: error
+
+  package:
+    name: assemble NuGet package
+    needs: native
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Download native libraries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: nuget-native-*
+          path: nuget-native
+
+      - name: Assemble runtime layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_root="csharp/Rustwright/runtimes"
+          while IFS='|' read -r rid library; do
+            source="nuget-native/nuget-native-${rid}/${library}"
+            test -f "$source"
+            mkdir -p "$runtime_root/$rid/native"
+            cp "$source" "$runtime_root/$rid/native/$library"
+          done <<'RIDS'
+          osx-arm64|librustwright_capi.dylib
+          osx-x64|librustwright_capi.dylib
+          linux-arm64|librustwright_capi.so
+          linux-x64|librustwright_capi.so
+          win-x64|rustwright_capi.dll
+          RIDS
+          count="$(find "$runtime_root" -type f ! -name .gitignore | wc -l | tr -d ' ')"
+          test "$count" -eq 5
+
+      - name: Pack NuGet package
+        run: dotnet pack csharp/Rustwright -c Release -o nuget-dist
+
+      - name: Upload NuGet package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nuget-package
+          path: nuget-dist/*.nupkg
+          if-no-files-found: error
+
+  publish:
+    name: publish to NuGet
+    needs: package
+    if: >-
+      ${{
+        github.repository == 'Skyvern-AI/rustwright' &&
+        github.ref_type == 'tag' &&
+        (
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+        )
+      }}
+    runs-on: ubuntu-latest
+    environment:
+      name: nuget
+      url: https://www.nuget.org/packages/Rustwright
+    # Trusted Publishing (OIDC): exchange the workflow's GitHub identity for a
+    # short-lived nuget.org API key — no long-lived NUGET_API_KEY secret.
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Download NuGet package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nuget-package
+          path: nuget-dist
+
+      - name: Require a prerelease version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          case "$version" in
+            *-*) ;;
+            *)
+              echo "The experimental NuGet package requires a prerelease version such as 0.2.0-alpha.1" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: NuGet login (Trusted Publishing)
+        id: nuget_login
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      - name: Publish experimental package
+        run: dotnet nuget push ./nuget-dist/*.nupkg --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json
+        env:
+          NUGET_API_KEY: ${{ steps.nuget_login.outputs.NUGET_API_KEY }}
