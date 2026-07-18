@@ -1,0 +1,268 @@
+name: Release Maven package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and upload artifacts without publishing"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-maven-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: validate package versions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Validate release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+          import tomllib
+
+          root = pathlib.Path(".")
+          build_script = (root / "java/build.gradle.kts").read_text()
+          match = re.search(r'^version = "([^"]+)"$', build_script, re.MULTILINE)
+          if match is None:
+              raise SystemExit("Could not read the Java version from java/build.gradle.kts")
+
+          cargo_lock = tomllib.loads((root / "Cargo.lock").read_text())
+          capi_lock_versions = [
+              package["version"]
+              for package in cargo_lock["package"]
+              if package["name"] == "rustwright-capi"
+          ]
+          versions = {
+              "java/build.gradle.kts": match.group(1),
+              "capi/Cargo.toml": tomllib.loads(
+                  (root / "capi/Cargo.toml").read_text()
+              )["package"]["version"],
+              "Cargo.lock rustwright-capi": (
+                  capi_lock_versions[0] if len(capi_lock_versions) == 1 else None
+              ),
+          }
+
+          expected = next(iter(versions.values()))
+          if any(version != expected for version in versions.values()):
+              raise SystemExit(f"Package versions do not match: {versions}")
+          if "-" not in expected:
+              raise SystemExit(
+                  f"The experimental Maven package requires a prerelease version, got {expected!r}"
+              )
+
+          if os.environ["GITHUB_REF_TYPE"] == "tag":
+              tag_version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+              if tag_version != expected:
+                  raise SystemExit(
+                      f"Tag version {tag_version!r} does not match package version {expected!r}"
+                  )
+          print(f"Validated package version {expected}")
+          PY
+
+  native:
+    name: native library - ${{ matrix.platform.target }}
+    needs: metadata
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            resource: osx-aarch64
+            library: librustwright_capi.dylib
+            zig_target: ""
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            resource: osx-x86_64
+            library: librustwright_capi.dylib
+            zig_target: ""
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            resource: linux-x86_64
+            library: librustwright_capi.so
+            zig_target: x86_64-linux-gnu.2.17
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            resource: linux-aarch64
+            library: librustwright_capi.so
+            zig_target: aarch64-linux-gnu.2.17
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            resource: windows-x86_64
+            library: rustwright_capi.dll
+            zig_target: ""
+
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.platform.target }}
+      MACOSX_DEPLOYMENT_TARGET: "10.13"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.platform.target }}
+
+      - name: Set up Zig
+        if: ${{ matrix.platform.zig_target != '' }}
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.1
+
+      - name: Configure Linux linker
+        if: ${{ matrix.platform.zig_target != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          linker="$RUNNER_TEMP/zig-cc"
+          cat > "$linker" <<'SH'
+          #!/bin/sh
+          exec zig cc -target "${ZIG_TARGET}" "$@"
+          SH
+          chmod +x "$linker"
+          target_env="$(printf '%s' "$CARGO_BUILD_TARGET" | tr '[:lower:]-' '[:upper:]_')"
+          cc_env="$(printf '%s' "$CARGO_BUILD_TARGET" | tr '-' '_')"
+          echo "ZIG_TARGET=${{ matrix.platform.zig_target }}" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${target_env}_LINKER=$linker" >> "$GITHUB_ENV"
+          echo "CC_${cc_env}=$linker" >> "$GITHUB_ENV"
+
+      - name: Build native library
+        run: cargo build -p rustwright-capi --release --locked
+
+      - name: Upload native library
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: maven-native-${{ matrix.platform.resource }}
+          path: target/${{ matrix.platform.target }}/release/${{ matrix.platform.library }}
+          if-no-files-found: error
+
+  package:
+    name: assemble Maven package
+    needs: native
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up JDK
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: "23"
+          cache: gradle
+          cache-dependency-path: |
+            java/*.gradle.kts
+            java/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Download native libraries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: maven-native-*
+          path: maven-native
+
+      - name: Stage native resources
+        run: bash java/scripts/stage-natives.sh maven-native --require-all
+
+      - name: Build and publish locally
+        working-directory: java
+        run: ./gradlew build publishToMavenLocal --no-daemon
+
+      - name: Upload Maven package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: maven-package
+          path: |
+            java/build/libs/*.jar
+            java/build/publications/maven/pom-default.xml
+          if-no-files-found: error
+
+  publish:
+    name: publish to Maven Central
+    needs: package
+    if: >-
+      ${{
+        github.repository == 'Skyvern-AI/rustwright' &&
+        github.ref_type == 'tag' &&
+        (
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+        )
+      }}
+    runs-on: ubuntu-latest
+    environment:
+      name: maven-central
+      url: https://central.sonatype.com/artifact/io.github.skyvern-ai/rustwright
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up JDK
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: "23"
+          cache: gradle
+          cache-dependency-path: |
+            java/*.gradle.kts
+            java/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Download native libraries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: maven-native-*
+          path: maven-native
+
+      - name: Stage native resources
+        run: bash java/scripts/stage-natives.sh maven-native --require-all
+
+      - name: Require Maven Central credentials
+        shell: bash
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PRIVATE_KEY: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -n "$MAVEN_CENTRAL_USERNAME"
+          test -n "$MAVEN_CENTRAL_PASSWORD"
+          test -n "$MAVEN_GPG_PRIVATE_KEY"
+          test -n "$MAVEN_GPG_PASSPHRASE"
+
+      - name: Publish signed package through Central Portal
+        working-directory: java
+        run: ./gradlew publishToMavenCentral --no-daemon
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
