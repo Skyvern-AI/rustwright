@@ -1,18 +1,10 @@
 # Rustwright MCP server
 
-Exposes Rustwright browser automation as [Model Context Protocol](https://modelcontextprotocol.io)
-tools, so MCP-compatible agents can browse through the Rustwright backend.
+Give any MCP client `browser_*` tools over stdio with no clone or browser download.
 
-Tool names mirror the de-facto standard `browser_*` toolset
-(`browser_navigate`, `browser_snapshot`, `browser_click`, ...) so agents can
-switch without re-learning the surface. `browser_snapshot` returns an accessibility-style
-outline where interactive elements carry `[ref=eN]` handles; pass a ref (or a
-raw CSS selector) to the action tools.
+## Install
 
-## Quick start (no clone needed)
-
-With [uv](https://docs.astral.sh/uv/) installed, register the server with
-Claude Code in one command — `uvx` fetches and runs it straight from GitHub:
+### Claude Code
 
 ```bash
 claude mcp add rustwright \
@@ -20,11 +12,11 @@ claude mcp add rustwright \
   -- uvx --from 'git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp' rustwright-mcp
 ```
 
-Note the `--` before the command: `--env` is variadic, so without the
-separator it swallows the command and `claude mcp add` fails with
-`missing required argument 'commandOrUrl'`.
+Uses the Chrome you already have — no browser download.
 
-Or add to any MCP client config (Claude Desktop, Cursor, etc.):
+### Claude Desktop
+
+Open `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS or `%APPDATA%\Claude\claude_desktop_config.json` on Windows, then use:
 
 ```json
 {
@@ -36,77 +28,37 @@ Or add to any MCP client config (Claude Desktop, Cursor, etc.):
         "git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp",
         "rustwright-mcp"
       ],
-      "env": { "RUSTWRIGHT_MCP_CHANNEL": "chrome" }
+      "env": {
+        "RUSTWRIGHT_MCP_CHANNEL": "chrome"
+      }
     }
   }
 }
 ```
 
-`RUSTWRIGHT_MCP_CHANNEL=chrome` uses your installed Google Chrome. Drop it
-to use rustwright's bundled Chromium instead (install once with
-`uvx --from 'git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp' python -m rustwright install chromium`).
+### Any MCP client
 
-Without uv, install into a plain venv from git:
-
-```bash
-python3 -m venv ~/.rustwright-mcp
-~/.rustwright-mcp/bin/pip install 'rustwright-mcp @ git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp'
+```json
+{
+  "mcpServers": {
+    "rustwright": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp",
+        "rustwright-mcp"
+      ],
+      "env": {
+        "RUSTWRIGHT_MCP_CHANNEL": "chrome"
+      }
+    }
+  }
+}
 ```
 
-## Install from a source checkout
+## Verify it works
 
-```bash
-cd mcp
-python3 -m venv .venv && .venv/bin/pip install -e .
-```
-
-Then either install the bundled Chromium
-(`.venv/bin/python -m rustwright install chromium`) or use
-`RUSTWRIGHT_MCP_CHANNEL=chrome`.
-
-## Register with Claude Code (installed binary)
-
-Use the **absolute path** to the `rustwright-mcp` binary — the server is
-spawned from arbitrary working directories, so relative paths break:
-
-```bash
-claude mcp add rustwright \
-  --env RUSTWRIGHT_MCP_CHANNEL=chrome \
-  -- "$HOME/.rustwright-mcp/bin/rustwright-mcp"
-```
-
-Example with a source checkout at `~/code/rustwright`:
-
-```bash
-claude mcp add rustwright \
-  --env RUSTWRIGHT_MCP_CHANNEL=chrome \
-  -- "$HOME/code/rustwright/mcp/.venv/bin/rustwright-mcp"
-```
-
-Verify with `claude mcp list` — the entry should show `✔ Connected`.
-
-## Example session
-
-What an agent sees. `browser_navigate` returns a snapshot; interactive
-elements carry `[ref=eN]` handles that later calls act on:
-
-```
-> browser_navigate(url="https://example.com")
-Page: Example Domain
-URL: https://example.com/
-
-- heading "Example Domain" [level=1]
-- text: This domain is for use in documentation examples...
-- link "Learn more" [href=https://iana.org/domains/example] [ref=e1]
-
-> browser_click(target="e1")
-Page: Example Domains
-URL: https://www.iana.org/help/example-domains
-...
-
-> browser_get_text(selector="h1")
-Example Domains
-```
+Ask your agent to “take a browser snapshot of example.com”.
 
 ## Tools
 

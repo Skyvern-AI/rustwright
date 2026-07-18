@@ -94,42 +94,15 @@ Already have a Chromium/Chrome binary? Point Rustwright at it with `RUSTWRIGHT_C
 
 ## Browser automation for AI agents
 
-Two agent-facing surfaces drive Chromium from a compact accessibility snapshot
-with stable element refs (`e1`, `e2`, …) instead of raw HTML or screenshots:
-take a snapshot, then act on an element by its ref. Refs are session-scoped and
-never reused; resolution is best-effort for cooperative pages (not a security
-boundary), and snapshots reflect page values with password fields masked.
+Give an agent or shell script a browser through compact accessibility snapshots with element refs (`e1`, `e2`, …), instead of raw HTML or screenshots. Refs are session-scoped, never reused, and best-effort rather than a security boundary; snapshots include page values but mask password fields.
 
-### CLI — drive a browser from your shell
+### MCP server — give your agent a browser
 
-Ships with the `rustwright` package (pure Python, no extra runtime dependency).
-Named sessions keep one browser alive across commands:
+`rustwright-mcp` gives any MCP client `browser_*` tools over stdio.
 
-```bash
-pip install rustwright
-python -m rustwright install chromium   # one-time browser download
+#### Fastest path
 
-rustwright open example.com       # launch + navigate; prints a snapshot
-rustwright snapshot               # accessibility tree with refs (e1, e2, …)
-rustwright click e3               # act on an element by its ref
-rustwright fill e2 "hi@example.com"
-rustwright --json snapshot        # one JSON object, for scripting
-rustwright close
-```
-
-The CLI verbs and the MCP server's tools are the same surface.
-
-Full verbs, flags, session model, and threat model:
-[docs/agent-interfaces.md](docs/agent-interfaces.md).
-
-### MCP server — `rustwright-mcp`
-
-A [Model Context Protocol](https://modelcontextprotocol.io) server (a separate,
-opt-in package under [`mcp/`](mcp/)) exposing browser tools — `browser_navigate`,
-`browser_snapshot`, `browser_click`, `browser_type`, … — over stdio, so
-MCP-compatible agents (Claude Code, Claude Desktop, and others) can browse with
-Rustwright. After installing both packages, start the stdio server with `rustwright mcp`.
-Register it with Claude Code, no clone required:
+##### Claude Code
 
 ```bash
 claude mcp add rustwright \
@@ -137,25 +110,81 @@ claude mcp add rustwright \
   -- uvx --from 'git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp' rustwright-mcp
 ```
 
-…or point any MCP client at it:
+Uses the Chrome you already have — no browser download.
+
+##### Claude Desktop
+
+Open `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS or `%APPDATA%\Claude\claude_desktop_config.json` on Windows, then use:
 
 ```json
 {
   "mcpServers": {
     "rustwright": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp", "rustwright-mcp"],
-      "env": { "RUSTWRIGHT_MCP_CHANNEL": "chrome" }
+      "args": [
+        "--from",
+        "git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp",
+        "rustwright-mcp"
+      ],
+      "env": {
+        "RUSTWRIGHT_MCP_CHANNEL": "chrome"
+      }
     }
   }
 }
 ```
 
-Key environment variables: `RUSTWRIGHT_MCP_HEADLESS` (`0` runs headed),
-`RUSTWRIGHT_MCP_CHANNEL` (Chromium channel, e.g. `chrome`), and
-`RUSTWRIGHT_MCP_ALLOW_EVAL` (`browser_evaluate` is available by default; `0`
-disables it). See the [MCP security note](mcp/README.md#security--scope). Full
-setup, tool list, and configuration: [mcp/README.md](mcp/README.md).
+##### Any MCP client
+
+```json
+{
+  "mcpServers": {
+    "rustwright": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp",
+        "rustwright-mcp"
+      ],
+      "env": {
+        "RUSTWRIGHT_MCP_CHANNEL": "chrome"
+      }
+    }
+  }
+}
+```
+
+| If... | Do this |
+|---|---|
+| You do not have Chrome installed | Drop `RUSTWRIGHT_MCP_CHANNEL`, then run `uvx --from 'git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp' python -m rustwright install chromium`. |
+| You want a visible browser | Set `RUSTWRIGHT_MCP_HEADLESS=0`. |
+| You want to disable page evaluation | Set `RUSTWRIGHT_MCP_ALLOW_EVAL=0`; see [Security & scope](mcp/README.md#security--scope). |
+
+PyPI package coming soon — the command shrinks to `uvx rustwright-mcp`.
+
+See [the MCP guide](mcp/README.md) for the full tool list and configuration.
+
+### CLI — drive a browser from your shell
+
+Drive one persistent Chromium session straight from the `rustwright` command, with no application code.
+
+#### Try it in 60 seconds
+
+```bash
+pip install rustwright
+python -m rustwright install chromium
+
+rustwright open example.com
+rustwright snapshot
+rustwright click e1001
+rustwright close
+```
+
+- `snapshot` shows refs; act by ref, then use the fresh snapshot returned after the action.
+- Add `--json` for one JSON object per command when scripting.
+- Use `--session NAME` for named browser sessions.
+
+See [the agent interface guide](docs/agent-interfaces.md) for every verb, flag, and security detail.
 
 ## Remote browsers (Skyvern)
 
