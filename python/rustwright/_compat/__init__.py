@@ -12,18 +12,29 @@ _ALIASES = (
     ("playwright", "rustwright._compat.playwright"),
     ("playwright.__main__", "rustwright._compat.playwright.__main__"),
     ("playwright._impl", "rustwright._compat.playwright._impl"),
+    ("playwright._impl._api_structures", "rustwright._compat.playwright._impl._api_structures"),
     ("playwright._impl._errors", "rustwright._compat.playwright._impl._errors"),
     ("playwright.async_api", "rustwright._compat.playwright.async_api"),
+    ("playwright.async_api._generated", "rustwright._compat.playwright.async_api._generated"),
     ("playwright.pytest_plugin", "rustwright._compat.playwright.pytest_plugin"),
     ("playwright.sync_api", "rustwright._compat.playwright.sync_api"),
+    ("playwright.sync_api._generated", "rustwright._compat.playwright.sync_api._generated"),
     ("patchright", "rustwright._compat.patchright"),
     ("patchright.__main__", "rustwright._compat.patchright.__main__"),
     ("patchright._impl", "rustwright._compat.patchright._impl"),
+    ("patchright._impl._api_structures", "rustwright._compat.patchright._impl._api_structures"),
     ("patchright._impl._errors", "rustwright._compat.patchright._impl._errors"),
     ("patchright.async_api", "rustwright._compat.patchright.async_api"),
+    ("patchright.async_api._generated", "rustwright._compat.patchright.async_api._generated"),
     ("patchright.pytest_plugin", "rustwright._compat.patchright.pytest_plugin"),
     ("patchright.sync_api", "rustwright._compat.patchright.sync_api"),
+    ("patchright.sync_api._generated", "rustwright._compat.patchright.sync_api._generated"),
     ("cloakbrowser", "rustwright._compat.cloakbrowser"),
+    # The pytest_playwright aliases re-export the full rustwright plugin. A
+    # real pytest-playwright distribution's entry point resolving here loads
+    # the plugin a second time, which is safe by construction: option
+    # registration skips already-taken flags and browser_name parametrization
+    # is guarded to run at most once per test.
     ("pytest_playwright", "rustwright._compat.pytest_playwright"),
     ("pytest_playwright.pytest_playwright", "rustwright._compat.pytest_playwright.pytest_playwright"),
 )

@@ -3,44 +3,117 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import shutil
-from typing import Any, Callable
+from typing import Any, Callable, Dict, Literal, Optional, Pattern, Protocol, Sequence, Union
 
 import pytest
 
-from .sync_api import Browser, BrowserContext, BrowserType, Page, Playwright, sync_playwright
+from .sync_api import (
+    Browser,
+    BrowserContext,
+    BrowserType,
+    Geolocation,
+    HttpCredentials,
+    Page,
+    Playwright,
+    ProxySettings,
+    StorageState,
+    ViewportSize,
+    sync_playwright,
+)
 from ._devices import DEVICE_DESCRIPTORS
+
+
+def _registered_option_strings(parser: pytest.Parser) -> set[str]:
+    """Collect every option string already registered on the parser.
+
+    Conflicting strings must be skipped at registration time: pytest
+    materializes the argparse parser only later, where a duplicate surfaces as
+    an unrecoverable ``argparse.ArgumentError`` during startup.
+
+    Reads pytest's private ``Parser._groups``/``Parser._anonymous`` (stable
+    across pytest 7-9). If a future pytest renames them, this degrades to an
+    empty set and duplicate registration aborts startup again — update the
+    attribute names here in that case.
+    """
+    names: set[str] = set()
+    groups = list(getattr(parser, "_groups", []))
+    anonymous = getattr(parser, "_anonymous", None)
+    if anonymous is not None:
+        groups.append(anonymous)
+    for group in groups:
+        for option in getattr(group, "options", []):
+            try:
+                names.update(option.names())
+            except Exception:
+                continue
+    return names
+
+
+def _addoption(group: Any, taken: set[str], *args: Any, **kwargs: Any) -> None:
+    """Register an option unless another plugin already owns the flag.
+
+    pytest-playwright and pytest-base-url register overlapping option strings
+    (``--browser``, ``--base-url``, ...). When they are installed alongside
+    Rustwright and load first, re-registering must not abort pytest startup;
+    option values are then read through :func:`_getoption` fallbacks.
+    """
+    if any(arg in taken for arg in args if isinstance(arg, str)):
+        return
+    try:
+        group.addoption(*args, **kwargs)
+    except ValueError:
+        pass
+
+
+def _getoption(config: pytest.Config, *dests: str, default: Any = None) -> Any:
+    """Read the first available of several option destinations."""
+    for dest in dests:
+        try:
+            value = config.getoption(dest)
+        except (KeyError, ValueError):
+            continue
+        if value is not None:
+            return value
+    return default
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     group = parser.getgroup("rustwright", "Rustwright browser automation")
-    group.addoption(
+    taken = _registered_option_strings(parser)
+    _addoption(
+        group,
+        taken,
         "--browser",
         action="append",
         choices=["chromium", "firefox", "webkit"],
         dest="rustwright_browser",
         help="Browser engine to run tests against. Can be passed multiple times.",
     )
-    group.addoption("--headed", action="store_true", help="Run browser headed.")
-    group.addoption("--browser-channel", default=None, help="Browser channel name accepted for Playwright CLI compatibility.")
-    group.addoption("--slowmo", type=int, default=0, help="Slow motion delay in milliseconds.")
-    group.addoption("--device", default=None, help="Device descriptor name to use for browser contexts.")
-    group.addoption("--output", default="test-results", help="Directory for browser artifacts.")
-    group.addoption("--tracing", choices=["on", "off", "retain-on-failure"], default="off")
-    group.addoption("--video", choices=["on", "off", "retain-on-failure"], default="off")
-    group.addoption("--screenshot", choices=["on", "off", "only-on-failure"], default="off")
-    group.addoption(
+    _addoption(group, taken, "--headed", action="store_true", help="Run browser headed.")
+    _addoption(group, taken, "--browser-channel", default=None, help="Browser channel name accepted for Playwright CLI compatibility.")
+    _addoption(group, taken, "--slowmo", type=int, default=0, help="Slow motion delay in milliseconds.")
+    _addoption(group, taken, "--device", default=None, help="Device descriptor name to use for browser contexts.")
+    _addoption(group, taken, "--output", default="test-results", help="Directory for browser artifacts.")
+    _addoption(group, taken, "--tracing", choices=["on", "off", "retain-on-failure"], default="off")
+    _addoption(group, taken, "--video", choices=["on", "off", "retain-on-failure"], default="off")
+    _addoption(group, taken, "--screenshot", choices=["on", "off", "only-on-failure"], default="off")
+    _addoption(
+        group,
+        taken,
         "--ignore-https-errors",
         action="store_true",
         default=False,
         help="Ignore HTTPS certificate errors in browser contexts.",
     )
-    group.addoption(
+    _addoption(
+        group,
+        taken,
         "--full-page-screenshot",
         action="store_true",
         default=False,
         help="Capture full-page screenshots for pytest screenshot artifacts.",
     )
-    group.addoption("--base-url", default=None, help="Base URL used by page.goto() and API requests.")
+    _addoption(group, taken, "--base-url", default=None, help="Base URL used by page.goto() and API requests.")
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -54,7 +127,7 @@ def pytest_configure(config: pytest.Config) -> None:
 
 @pytest.fixture(scope="session", autouse=True)
 def delete_output_dir(pytestconfig: pytest.Config) -> None:
-    output_dir = Path(str(pytestconfig.getoption("output"))).resolve()
+    output_dir = Path(str(_getoption(pytestconfig, "output", default="test-results"))).resolve()
     if not output_dir.exists():
         return
     try:
@@ -130,11 +203,25 @@ def _get_browser_skiplist(item: pytest.Item, values: list[str]) -> list[str]:
     return list(dict.fromkeys(skipped))
 
 
+def _selected_browsers(config: pytest.Config) -> list[str]:
+    browsers = _getoption(config, "rustwright_browser", "browser") or ["chromium"]
+    # The "browser" fallback dest belongs to whatever plugin won the --browser
+    # registration; some register it as a scalar string rather than append.
+    if isinstance(browsers, str):
+        return [browsers]
+    return [str(browser) for browser in browsers]
+
+
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     if "browser_name" not in metafunc.fixturenames:
         return
-    browsers = metafunc.config.getoption("rustwright_browser") or ["chromium"]
-    metafunc.parametrize("browser_name", browsers, scope="session")
+    # This hook may run twice for the same test when the plugin module is
+    # registered under a second name (e.g. a real pytest-playwright entry
+    # point resolving to the compat re-export); parametrize at most once.
+    if getattr(metafunc, "_rustwright_browser_parametrized", False):
+        return
+    metafunc._rustwright_browser_parametrized = True  # type: ignore[attr-defined]
+    metafunc.parametrize("browser_name", _selected_browsers(metafunc.config), scope="session")
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
@@ -154,18 +241,17 @@ def playwright() -> Playwright:
 
 @pytest.fixture(scope="session")
 def browser_channel(pytestconfig: pytest.Config) -> str | None:
-    return pytestconfig.getoption("browser_channel")
+    return _getoption(pytestconfig, "browser_channel")
 
 
 @pytest.fixture(scope="session")
 def browser_name(pytestconfig: pytest.Config) -> str:
-    browsers = pytestconfig.getoption("rustwright_browser") or ["chromium"]
-    return str(browsers[0])
+    return _selected_browsers(pytestconfig)[0]
 
 
 @pytest.fixture(scope="session")
 def device(pytestconfig: pytest.Config) -> str | None:
-    return pytestconfig.getoption("device")
+    return _getoption(pytestconfig, "device")
 
 
 @pytest.fixture(scope="session")
@@ -191,12 +277,12 @@ def browser_type(playwright: Playwright, browser_name: str) -> BrowserType:
 @pytest.fixture(scope="session")
 def browser_type_launch_args(pytestconfig: pytest.Config) -> dict[str, Any]:
     options: dict[str, Any] = {}
-    if pytestconfig.getoption("headed"):
+    if _getoption(pytestconfig, "headed", default=False):
         options["headless"] = False
-    slow_mo = pytestconfig.getoption("slowmo")
+    slow_mo = _getoption(pytestconfig, "slowmo", default=0)
     if slow_mo:
         options["slow_mo"] = slow_mo
-    browser_channel = pytestconfig.getoption("browser_channel")
+    browser_channel = _getoption(pytestconfig, "browser_channel")
     if browser_channel:
         options["channel"] = browser_channel
     return options
@@ -234,25 +320,28 @@ def browser(launch_browser: Callable[..., Browser]) -> Browser:
 
 @pytest.fixture(scope="session")
 def base_url(pytestconfig: pytest.Config) -> str | None:
-    return pytestconfig.getoption("base_url")
+    return _getoption(pytestconfig, "base_url")
 
 
 @pytest.fixture()
 def output_path(pytestconfig: pytest.Config, request: pytest.FixtureRequest) -> str:
-    path = Path(str(pytestconfig.getoption("output"))).resolve() / _slugify_nodeid(request.node.nodeid)
+    path = Path(str(_getoption(pytestconfig, "output", default="test-results"))).resolve() / _slugify_nodeid(request.node.nodeid)
     path.mkdir(parents=True, exist_ok=True)
     return str(path)
 
 
-@pytest.fixture()
+@pytest.fixture(scope="session")
 def browser_context_args(
     base_url: str | None,
-    output_path: str,
     pytestconfig: pytest.Config,
-    request: pytest.FixtureRequest,
 ) -> dict[str, Any]:
+    # Session-scoped to match pytest-playwright's contract: test suites
+    # override this fixture with scope="session" in their conftest, which is a
+    # ScopeMismatch collection error if the plugin's definition is
+    # function-scoped. Per-test additions (video artifact paths, the
+    # browser_context_args marker) are merged in the context fixtures instead.
     options: dict[str, Any] = {}
-    device_name = pytestconfig.getoption("device")
+    device_name = _getoption(pytestconfig, "device")
     if device_name:
         descriptor = DEVICE_DESCRIPTORS.get(str(device_name))
         if descriptor is None:
@@ -260,9 +349,19 @@ def browser_context_args(
         options.update({key: value for key, value in descriptor.items() if key != "default_browser_type"})
     if base_url:
         options["base_url"] = base_url
-    if pytestconfig.getoption("ignore_https_errors"):
+    if _getoption(pytestconfig, "ignore_https_errors", default=False):
         options["ignore_https_errors"] = True
-    if str(pytestconfig.getoption("video")) in {"on", "retain-on-failure"}:
+    return options
+
+
+def _per_test_context_args(
+    browser_context_args: dict[str, Any],
+    output_path: str,
+    pytestconfig: pytest.Config,
+    request: pytest.FixtureRequest,
+) -> dict[str, Any]:
+    options = dict(browser_context_args)
+    if str(_getoption(pytestconfig, "video", default="off")) in {"on", "retain-on-failure"}:
         options["record_video_dir"] = str(_test_artifact_dir(output_path, request.node) / "videos")
     context_args_marker = request.node.get_closest_marker("browser_context_args")
     if context_args_marker:
@@ -279,8 +378,8 @@ def new_context(
     request: pytest.FixtureRequest,
 ) -> Any:
     artifact_dir = _test_artifact_dir(output_path, request.node)
-    tracing_mode = str(pytestconfig.getoption("tracing"))
-    screenshot_mode = str(pytestconfig.getoption("screenshot"))
+    tracing_mode = str(_getoption(pytestconfig, "tracing", default="off"))
+    screenshot_mode = str(_getoption(pytestconfig, "screenshot", default="off"))
     contexts: list[BrowserContext] = []
     finalized_contexts: set[int] = set()
     trace_paths: list[Path] = []
@@ -306,7 +405,7 @@ def new_context(
                     try:
                         page_instance.screenshot(
                             path=str(screenshot_path),
-                            full_page=bool(pytestconfig.getoption("full_page_screenshot")),
+                            full_page=bool(_getoption(pytestconfig, "full_page_screenshot", default=False)),
                         )
                     except Exception:
                         continue
@@ -316,7 +415,7 @@ def new_context(
         return original_close(*args, **kwargs)
 
     def create_context(**kwargs: Any) -> BrowserContext:
-        options = dict(browser_context_args)
+        options = _per_test_context_args(browser_context_args, output_path, pytestconfig, request)
         options.update(kwargs)
         context_instance = browser.new_context(**options)
         original_close = context_instance.close
@@ -351,7 +450,7 @@ def new_context(
                     screenshot_path.unlink()
                 except FileNotFoundError:
                     pass
-        if str(pytestconfig.getoption("video")) == "retain-on-failure" and not failed:
+        if str(_getoption(pytestconfig, "video", default="off")) == "retain-on-failure" and not failed:
             shutil.rmtree(_test_artifact_dir(output_path, request.node) / "videos", ignore_errors=True)
 
 
@@ -363,10 +462,10 @@ def context(
     pytestconfig: pytest.Config,
     request: pytest.FixtureRequest,
 ) -> BrowserContext:
-    options = dict(browser_context_args)
+    options = _per_test_context_args(browser_context_args, output_path, pytestconfig, request)
     artifact_dir = _test_artifact_dir(output_path, request.node)
-    video_mode = str(pytestconfig.getoption("video"))
-    tracing_mode = str(pytestconfig.getoption("tracing"))
+    video_mode = str(_getoption(pytestconfig, "video", default="off"))
+    tracing_mode = str(_getoption(pytestconfig, "tracing", default="off"))
     context_instance = browser.new_context(**options)
     tracing_started = False
     if tracing_mode != "off":
@@ -395,15 +494,64 @@ def page(
     try:
         yield page_instance
     finally:
-        screenshot_mode = str(pytestconfig.getoption("screenshot"))
+        screenshot_mode = str(_getoption(pytestconfig, "screenshot", default="off"))
         failed = _test_failed(request.node)
         if screenshot_mode == "on" or (screenshot_mode == "only-on-failure" and failed):
             artifact_dir = _test_artifact_dir(output_path, request.node)
             try:
                 page_instance.screenshot(
                     path=str(artifact_dir / "screenshot.png"),
-                    full_page=bool(pytestconfig.getoption("full_page_screenshot")),
+                    full_page=bool(_getoption(pytestconfig, "full_page_screenshot", default=False)),
                 )
             except Exception:
                 pass
         page_instance.close()
+
+
+class CreateContextCallback(Protocol):
+    """Signature of the ``new_context`` fixture's factory callable.
+
+    Defined here so the pytest-playwright compat module can stay a typing-only
+    re-export with no pytest hooks of its own.
+    """
+
+    def __call__(
+        self,
+        viewport: Optional[ViewportSize] = None,
+        screen: Optional[ViewportSize] = None,
+        no_viewport: Optional[bool] = None,
+        ignore_https_errors: Optional[bool] = None,
+        java_script_enabled: Optional[bool] = None,
+        bypass_csp: Optional[bool] = None,
+        user_agent: Optional[str] = None,
+        locale: Optional[str] = None,
+        timezone_id: Optional[str] = None,
+        geolocation: Optional[Geolocation] = None,
+        permissions: Optional[Sequence[str]] = None,
+        extra_http_headers: Optional[Dict[str, str]] = None,
+        offline: Optional[bool] = None,
+        http_credentials: Optional[HttpCredentials] = None,
+        device_scale_factor: Optional[float] = None,
+        is_mobile: Optional[bool] = None,
+        has_touch: Optional[bool] = None,
+        color_scheme: Optional[Literal["dark", "light", "no-preference", "no-override", "null"]] = None,
+        reduced_motion: Optional[Literal["reduce", "no-preference", "no-override", "null"]] = None,
+        forced_colors: Optional[Literal["active", "none", "no-override", "null"]] = None,
+        contrast: Optional[Literal["no-preference", "more", "no-override"]] = None,
+        accept_downloads: Optional[bool] = None,
+        default_browser_type: Optional[str] = None,
+        proxy: Optional[ProxySettings] = None,
+        record_har_path: Optional[Union[str, Path]] = None,
+        record_har_omit_content: Optional[bool] = None,
+        record_video_dir: Optional[Union[str, Path]] = None,
+        record_video_size: Optional[ViewportSize] = None,
+        storage_state: Optional[Union[StorageState, str, Path]] = None,
+        base_url: Optional[str] = None,
+        strict_selectors: Optional[bool] = None,
+        service_workers: Optional[Literal["allow", "block"]] = None,
+        record_har_url_filter: Optional[Union[str, Pattern[str]]] = None,
+        record_har_mode: Optional[Literal["full", "minimal"]] = None,
+        record_har_content: Optional[Literal["attach", "embed", "omit"]] = None,
+        client_certificates: Optional[list[Any]] = None,
+    ) -> BrowserContext:
+        ...
