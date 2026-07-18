@@ -48,7 +48,7 @@ def test_screenshot_escape_variants_are_structured_and_write_nothing(
     for requested, escaped_path in cases:
         assert not escaped_path.exists()
         with pytest.raises(FilePolicyError) as error:
-            server.browser_take_screenshot(path=requested)
+            server.browser_take_screenshot(filename=requested)
         assert str(error.value) == (
             "screenshot paths are confined to RUSTWRIGHT_MCP_OUTPUT_DIR "
             f"({policy.output_root}); got {requested}"
@@ -67,7 +67,7 @@ def test_screenshot_symlink_swap_cannot_write_outside_root(monkeypatch) -> None:
         monkeypatch.setattr(server, "get_file_policy", lambda: policy)
 
         class RacingPage:
-            def screenshot(self, *, path, full_page) -> None:
+            def screenshot(self, *, path, full_page, type) -> None:
                 reserved = Path(path)
                 reserved.unlink()
                 reserved.symlink_to(escaped)
@@ -76,7 +76,7 @@ def test_screenshot_symlink_swap_cannot_write_outside_root(monkeypatch) -> None:
         monkeypatch.setattr(server, "_page", lambda: RacingPage())
 
         with pytest.raises(FilePolicyError, match="escaped the configured root"):
-            server.browser_take_screenshot(path="race.png")
+            server.browser_take_screenshot(filename="race.png")
         assert not escaped.exists(), "screenshot bytes escaped through a symlink swap"
 
 

@@ -82,6 +82,20 @@ def _advertised_types(schema: Mapping[str, Any]) -> set[str]:
     }
 
 
+def _advertised_enum(schema: Mapping[str, Any]) -> list[Any] | None:
+    candidates = [schema, *schema.get("anyOf", ())]
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        enum = candidate.get("enum")
+        if isinstance(enum, list):
+            return enum
+        items = candidate.get("items")
+        if isinstance(items, Mapping) and isinstance(items.get("enum"), list):
+            return items["enum"]
+    return None
+
+
 def compare_tool_schema(
     advertised: Mapping[str, Any], contract: ToolContract
 ) -> list[str]:
@@ -101,7 +115,7 @@ def compare_tool_schema(
         property_schema = properties[param.name]
         if param.type not in _advertised_types(property_schema):
             errors.append(f"type mismatch for {param.name}: expected {param.type}")
-        if param.enum is not None and property_schema.get("enum") != list(param.enum):
+        if param.enum is not None and _advertised_enum(property_schema) != list(param.enum):
             errors.append(f"enum mismatch for {param.name}")
         if (
             param.default is not _MISSING

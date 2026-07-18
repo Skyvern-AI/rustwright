@@ -34,6 +34,23 @@ def test_contract_fixture_round_trip():
     assert dump_contract(contract) == json.loads(FIXTURE.read_text())
 
 
+def test_comparator_allows_required_subset_and_accepted_superset():
+    contract = ToolContract(
+        name="example_tool",
+        params=(ParamContract(name="target", type="string", required=True),),
+    )
+    advertised = {
+        "type": "object",
+        "properties": {
+            "target": {"type": "string"},
+            "extension": {"type": "boolean", "default": False},
+        },
+        "required": [],
+    }
+
+    assert compare_tool_schema(advertised, contract) == []
+
+
 def test_deliberate_contract_mismatch_is_reported():
     contract = ToolContract(
         name="example_tool",

@@ -109,9 +109,14 @@ class FilePolicy:
             raise FilePolicyError("output byte caps must be positive")
         self._lock = threading.RLock()
 
-    def _confined_output_path(self, requested: str | None, purpose: str) -> Path:
+    def _confined_output_path(
+        self,
+        requested: str | None,
+        purpose: str,
+        suffix: str,
+    ) -> Path:
         if requested is None:
-            candidate = self.output_root / f"{purpose}-{uuid.uuid4().hex}.png"
+            candidate = self.output_root / f"{purpose}-{uuid.uuid4().hex}{suffix}"
         else:
             raw_path = Path(requested).expanduser()
             candidate = raw_path if raw_path.is_absolute() else self.output_root / raw_path
@@ -142,10 +147,13 @@ class FilePolicy:
         requested: str | None = None,
         *,
         purpose: str = "output",
+        suffix: str = ".png",
     ) -> Path:
         """Exclusively create a mode-0600 file beneath the output root."""
+        if not suffix.startswith(".") or "/" in suffix or "\\" in suffix:
+            raise FilePolicyError("output suffix must be a simple file extension")
         with self._lock:
-            path = self._confined_output_path(requested, purpose)
+            path = self._confined_output_path(requested, purpose, suffix)
             self._ensure_secure_parent(path)
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             flags |= getattr(os, "O_NOFOLLOW", 0)

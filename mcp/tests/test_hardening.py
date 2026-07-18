@@ -4,7 +4,7 @@ import asyncio
 import re
 from pathlib import Path
 
-from test_smoke import _call, _run_session
+from test_smoke import _call, _result_section, _run_session
 
 FIXTURE = Path(__file__).parent / "fixtures" / "hardening.html"
 
@@ -40,18 +40,18 @@ def test_snapshot_refs_are_never_reused():
     asyncio.run(_run_session(checks))
 
 
-def test_browser_evaluate_registration_is_opt_in():
+def test_browser_evaluate_is_default_on_and_explicitly_disableable():
     async def check_default(session):
-        tools = {t.name for t in (await session.list_tools()).tools}
-        assert "browser_evaluate" not in tools
-
-    async def check_enabled(session):
         tools = {t.name for t in (await session.list_tools()).tools}
         assert "browser_evaluate" in tools
 
+    async def check_disabled(session):
+        tools = {t.name for t in (await session.list_tools()).tools}
+        assert "browser_evaluate" not in tools
+
     asyncio.run(_run_session(check_default))
     asyncio.run(
-        _run_session(check_enabled, {"RUSTWRIGHT_MCP_ALLOW_EVAL": "1"})
+        _run_session(check_disabled, {"RUSTWRIGHT_MCP_ALLOW_EVAL": "0"})
     )
 
 
@@ -59,7 +59,8 @@ def test_browser_reload_returns_snapshot():
     async def checks(session):
         await _call(session, "browser_navigate", url=FIXTURE.as_uri())
         snap = await _call(session, "browser_reload")
-        assert snap.startswith("Page: Hardening Test")
+        assert "- Title: Hardening Test" in snap
+        assert "### Snapshot" in snap
         assert "SECRET_PW" not in snap
         await _call(session, "browser_close")
 
@@ -75,7 +76,8 @@ def test_browser_tabs_and_dialog_policy():
         snap = await _call(
             session, "browser_tabs", action="new", url=FIXTURE.as_uri()
         )
-        assert snap.startswith("Page: Hardening Test")
+        assert "- Title: Hardening Test" in snap
+        assert "### Tabs" in snap
         tabs = await _call(session, "browser_tabs", action="list")
         assert "1: Hardening Test" in tabs
         await _call(session, "browser_tabs", action="close", index=1)
@@ -86,9 +88,13 @@ def test_browser_tabs_and_dialog_policy():
             accept=True,
             prompt_text="Rustwright",
         )
-        assert confirmation == "The next dialog on the active page will be accepted."
+        assert _result_section(confirmation) == (
+            "The next dialog on the active page will be accepted."
+        )
         await _call(session, "browser_click", target="#prompt")
-        assert await _call(session, "browser_get_text", selector="#out") == "Rustwright"
+        assert _result_section(
+            await _call(session, "browser_get_text", selector="#out")
+        ) == "Rustwright"
         await _call(session, "browser_close")
 
     asyncio.run(_run_session(checks))

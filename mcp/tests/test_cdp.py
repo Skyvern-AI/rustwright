@@ -5,7 +5,7 @@ from pathlib import Path
 
 from rustwright.sync_api import sync_playwright
 
-from test_smoke import _call, _run_session
+from test_smoke import _call, _result_section, _run_session
 
 FIXTURE = Path(__file__).parent / "fixtures" / "form.html"
 
@@ -20,14 +20,17 @@ def test_stdio_connects_over_cdp():
 
         async def checks(session):
             snap = await _call(session, "browser_navigate", url=FIXTURE.as_uri())
-            assert snap.startswith("Page: Form Test")
+            assert "- Title: Form Test" in snap
+            assert "### Snapshot" in snap
             assert "Customer name" in snap
 
             snap = await _call(session, "browser_snapshot")
-            assert snap.startswith("Page: Form Test")
+            assert "- Title: Form Test" in snap
             assert "Place order" in snap
 
-            assert await _call(session, "browser_close") == "Browser closed."
+            assert _result_section(await _call(session, "browser_close")) == (
+                "Browser closed."
+            )
 
         try:
             asyncio.run(

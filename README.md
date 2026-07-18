@@ -153,8 +153,9 @@ claude mcp add rustwright \
 
 Key environment variables: `RUSTWRIGHT_MCP_HEADLESS` (`0` runs headed),
 `RUSTWRIGHT_MCP_CHANNEL` (Chromium channel, e.g. `chrome`), and
-`RUSTWRIGHT_MCP_ALLOW_EVAL` (`1` exposes the `browser_evaluate` tool, off by
-default). Full setup, tool list, and configuration: [mcp/README.md](mcp/README.md).
+`RUSTWRIGHT_MCP_ALLOW_EVAL` (`browser_evaluate` is available by default; `0`
+disables it). See the [MCP security note](mcp/README.md#security--scope). Full
+setup, tool list, and configuration: [mcp/README.md](mcp/README.md).
 
 ## Remote browsers (Skyvern)
 

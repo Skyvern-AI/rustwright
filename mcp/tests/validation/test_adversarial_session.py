@@ -144,7 +144,8 @@ def test_callback_flood_completes_while_slow_tool_holds_tool_lock(monkeypatch) -
     worker.join(timeout=2)
     assert not worker.is_alive(), "tool/callback lock inversion deadlocked"
     assert failures == []
-    assert result == ["snapshot"]
+    assert len(result) == 1
+    assert "### Snapshot\nsnapshot" in result[0]
 
 
 def test_late_response_does_not_resurrect_an_evicted_network_record() -> None:

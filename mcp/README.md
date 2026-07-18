@@ -1,12 +1,11 @@
 # Rustwright MCP server
 
 Exposes Rustwright browser automation as [Model Context Protocol](https://modelcontextprotocol.io)
-tools, so MCP-compatible agents (Claude Code, Claude Desktop, others) can browse
-with Rustwright instead of Playwright.
+tools, so MCP-compatible agents can browse through the Rustwright backend.
 
-Tool names mirror the Playwright MCP server (`browser_navigate`,
-`browser_snapshot`, `browser_click`, ...) so agents can switch without
-re-learning the surface. `browser_snapshot` returns an accessibility-style
+Tool names mirror the de-facto standard `browser_*` toolset
+(`browser_navigate`, `browser_snapshot`, `browser_click`, ...) so agents can
+switch without re-learning the surface. `browser_snapshot` returns an accessibility-style
 outline where interactive elements carry `[ref=eN]` handles; pass a ref (or a
 raw CSS selector) to the action tools.
 
@@ -114,20 +113,20 @@ Example Domains
 | Tool | Purpose |
 |---|---|
 | `browser_navigate(url)` | Open a URL, returns snapshot |
-| `browser_snapshot()` | Outline of the page with `[ref=eN]` handles |
-| `browser_click(target)` | Click a ref or CSS selector |
-| `browser_type(target, text, submit?)` | Fill or type into an input |
-| `browser_select_option(target, value)` | Select a dropdown option |
+| `browser_snapshot(target?, filename?, depth?, boxes?)` | Full or targeted outline with `[ref=eN]` handles |
+| `browser_click(target, element?, doubleClick?, button?, modifiers?)` | Click a ref or unique CSS selector |
+| `browser_type(target, text, element?, submit?, slowly?, clear?)` | Fill or character-type into an input; `clear` is an extension |
+| `browser_select_option(target, values, element?)` | Select one or more dropdown options; legacy `value` is accepted |
 | `browser_hover(target)` | Hover an element |
 | `browser_press_key(key)` | Press a keyboard key |
 | `browser_navigate_back()` | History back |
 | `browser_reload()` | Reload the active page, returns snapshot |
 | `browser_tabs(action, index?, url?)` | List, open, select, or close tabs |
-| `browser_handle_dialog(accept, prompt_text?)` | Set a one-shot policy for the next dialog |
-| `browser_wait_for(text?, timeout_ms?)` | Wait for text or load state |
+| `browser_handle_dialog(accept, promptText?)` | Set a one-shot policy for the next dialog |
+| `browser_wait_for(time?, text?, textGone?, timeout_ms?)` | Wait up to 30 seconds and/or for visible/hidden text |
 | `browser_get_text(selector?)` | Visible text of a selector |
-| `browser_evaluate(expression)` | Run JavaScript in the page (opt-in) |
-| `browser_take_screenshot(path?)` | Save a confined PNG artifact, returns its output-root-relative path |
+| `browser_evaluate(function, element?, target?, filename?)` | Run page-world JavaScript and return JSON plus a fresh snapshot |
+| `browser_take_screenshot(element?, target?, type?, filename?, fullPage?, scale?)` | Save a confined page or element image |
 | `browser_close()` | End the browser session |
 
 ## Configuration
@@ -140,7 +139,9 @@ Example Domains
 | `RUSTWRIGHT_MCP_CDP_ENDPOINT` | Remote browser CDP endpoint; enables remote mode when set |
 | `RUSTWRIGHT_MCP_CDP_HEADERS` | Optional JSON object of extra CDP connection headers |
 | `RUSTWRIGHT_MCP_CDP_TIMEOUT_MS` | Remote connection timeout in milliseconds (default `60000`) |
-| `RUSTWRIGHT_MCP_ALLOW_EVAL` | `1`, `true`, or `yes` exposes `browser_evaluate` (default off) |
+| `RUSTWRIGHT_MCP_ALLOW_EVAL` | Page-world evaluation is on by default; an explicit `0`, `false`, `no`, or `off` disables it |
+| `RUSTWRIGHT_MCP_CAPS` | Comma-separated capability groups; unavailable groups warn and are ignored |
+| `RUSTWRIGHT_MCP_TOOLSET` | `mirror` (all 16 tools, default) or `lean` (core interaction loop plus evaluate) |
 | `RUSTWRIGHT_MCP_OUTPUT_DIR` | Root for files written by tools |
 | `RUSTWRIGHT_MCP_OUTPUT_MAX_FILE_BYTES` | Per-file output cap (default `20971520`, or 20 MiB) |
 | `RUSTWRIGHT_MCP_OUTPUT_MAX_TOTAL_BYTES` | Total output cap (default `209715200`, or 200 MiB) |
@@ -158,11 +159,11 @@ Each output is limited to 20 MiB by default, and all retained outputs together
 are limited to 200 MiB. The byte-cap variables in the table above can override
 those values. When the total cap is crossed, the oldest files are evicted first.
 
-**Migration note:** screenshot `path` values are now interpreted inside the
+**Migration note:** screenshot `filename` values (and the legacy `path` alias) are interpreted inside the
 output root. An absolute path is accepted only when it is beneath that root.
 Paths outside it fail with `screenshot paths are confined to
 RUSTWRIGHT_MCP_OUTPUT_DIR (<root>); got <path>` instead of being written.
-Omitting `path` still creates a temporary PNG, now inside the output root.
+Omitting `filename` still creates an image inside the output root.
 
 ### Remote browsers over CDP
 
@@ -209,9 +210,9 @@ restart the session).
 
 ## Security & scope
 
-- `browser_evaluate` is off by default because it runs arbitrary JavaScript
-  in the page. Set `RUSTWRIGHT_MCP_ALLOW_EVAL=1` and restart the server to
-  expose it.
+- **SECURITY:** `browser_evaluate` performs page-world evaluation and is on by
+  default for compatibility. Set `RUSTWRIGHT_MCP_ALLOW_EVAL=0` and restart the
+  server to disable and remove the tool from `tools/list`.
 - Snapshots reflect page state, including field values. Password input values
   are masked in snapshot output; other field values are included as-is.
 - Snapshot refs are best-effort handles for cooperative pages, not a security

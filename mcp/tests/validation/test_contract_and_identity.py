@@ -14,6 +14,8 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 import pytest
 
+from test_smoke import _result_section
+
 FIXTURE = Path(__file__).parents[1] / "contract" / "fixtures" / "default_toolset.json"
 FORM_FIXTURE = Path(__file__).parents[1] / "fixtures" / "form.html"
 HARDENING_FIXTURE = Path(__file__).parents[1] / "fixtures" / "hardening.html"
@@ -101,9 +103,9 @@ def test_real_stdio_less_traveled_tool_regressions() -> None:
                 await session.initialize()
                 await _call(session, "browser_navigate", url=FORM_FIXTURE.as_uri())
                 waited = await _call(session, "browser_wait_for", text="Order form")
-                assert waited.startswith("Page: Form Test")
+                assert "- Title: Form Test" in waited
                 hovered = await _call(session, "browser_hover", target="#name")
-                assert hovered.startswith("Page: Form Test")
+                assert "- Title: Form Test" in hovered
                 await _call(session, "browser_click", target="#name")
                 keyed = await _call(session, "browser_press_key", key="A")
                 assert '[value="A"]' in keyed
@@ -114,21 +116,23 @@ def test_real_stdio_less_traveled_tool_regressions() -> None:
                     action="new",
                     url=HARDENING_FIXTURE.as_uri(),
                 )
-                assert opened.startswith("Page: Hardening Test")
+                assert "- Title: Hardening Test" in opened
                 selected = await _call(
                     session, "browser_tabs", action="select", index=0
                 )
-                assert selected.startswith("Page: Form Test")
+                assert "- Title: Form Test" in selected
                 selected = await _call(
                     session, "browser_tabs", action="select", index=1
                 )
-                assert selected.startswith("Page: Hardening Test")
+                assert "- Title: Hardening Test" in selected
 
                 await _call(
                     session, "browser_navigate", url=FORM_FIXTURE.as_uri()
                 )
                 backed = await _call(session, "browser_navigate_back")
-                assert backed.startswith("Page: Hardening Test")
-                assert await _call(session, "browser_close") == "Browser closed."
+                assert "- Title: Hardening Test" in backed
+                assert _result_section(await _call(session, "browser_close")) == (
+                    "Browser closed."
+                )
 
     asyncio.run(checks())

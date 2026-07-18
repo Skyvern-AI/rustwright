@@ -3,6 +3,7 @@
 import asyncio
 import os
 from pathlib import Path
+import re
 import stat
 
 import pytest
@@ -107,18 +108,19 @@ def test_screenshot_policy_error_and_no_path_artifact(monkeypatch, tmp_path):
 
     outside = tmp_path / "outside.png"
     with pytest.raises(FilePolicyError) as error:
-        server.browser_take_screenshot(path=str(outside))
+        server.browser_take_screenshot(filename=str(outside))
     assert str(error.value) == (
         f"screenshot paths are confined to RUSTWRIGHT_MCP_OUTPUT_DIR "
         f"({policy.output_root}); got {outside}"
     )
 
     class FakePage:
-        def screenshot(self, *, path, full_page):
+        def screenshot(self, *, path, full_page, type, scale):
             Path(path).write_bytes(b"PNG")
 
     monkeypatch.setattr(server, "_page", lambda: FakePage())
-    artifact = server.browser_take_screenshot()
+    response = server.browser_take_screenshot()
+    artifact = re.search(r"`([^`]+)`", response).group(1)
     assert not Path(artifact).is_absolute()
     assert (policy.output_root / artifact).read_bytes() == b"PNG"
 
@@ -151,7 +153,8 @@ def test_stdio_screenshot_without_path_stays_in_output_root(tmp_path):
 
     async def checks(session):
         await _call(session, "browser_navigate", url=FIXTURE.as_uri())
-        artifact = await _call(session, "browser_take_screenshot")
+        response = await _call(session, "browser_take_screenshot")
+        artifact = re.search(r"`([^`]+)`", response).group(1)
         assert not Path(artifact).is_absolute()
         screenshot = output_root / artifact
         assert screenshot.read_bytes().startswith(b"\x89PNG")
