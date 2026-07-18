@@ -1,0 +1,174 @@
+name: Language Bindings
+
+# Cross-language binding smoke: build the shared C ABI once, then run each
+# language's benchmark runner against the 5-case subset
+# (bindings/cases/smoke.json) and assert all present languages agree
+# (identical captures + screenshot byte length). Language packages land in
+# stacked PRs, so every job skips cleanly when its package directory is not
+# present on the ref under test. The full 100-case suite runs in
+# bindings-benchmark.yml, not here.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-capi:
+    name: Build shared C ABI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build librustwright_capi (release)
+        run: cargo build -p rustwright-capi --release --locked
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: librustwright_capi-linux
+          path: target/release/librustwright_capi.so
+          if-no-files-found: error
+
+  bindings:
+    name: ${{ matrix.lang }} runner (subset)
+    needs: build-capi
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [rust, go, java, csharp, ruby, php]
+    env:
+      RW_MANIFEST: bindings/cases/smoke.json
+      RW_LIB: target/release/librustwright_capi.so
+      RW_OUT: results/${{ matrix.lang }}.json
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Detect binding package
+        id: has
+        run: |
+          dir="${{ matrix.lang }}"
+          [ "$dir" = rust ] && dir=rust-native
+          if [ -d "$dir" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${dir}/ not present on this ref; skipping ${{ matrix.lang }}"
+          fi
+
+      - name: Download native library
+        if: steps.has.outputs.ok == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: librustwright_capi-linux
+          path: target/release
+
+      # The Rust core auto-discovers Chromium; point it at a real Chrome.
+      - name: Install Chrome
+        if: steps.has.outputs.ok == 'true'
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+      - name: Point engine at Chrome
+        if: steps.has.outputs.ok == 'true'
+        run: |
+          for v in RUSTWRIGHT_CHROMIUM CHROME CHROMIUM; do
+            echo "$v=${{ steps.chrome.outputs.chrome-path }}" >> "$GITHUB_ENV"
+          done
+      - name: Prepare output dir
+        if: steps.has.outputs.ok == 'true'
+        run: mkdir -p results
+
+      - name: Set up Rust
+        if: steps.has.outputs.ok == 'true' && matrix.lang == 'rust'
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run Rust runner
+        if: steps.has.outputs.ok == 'true' && matrix.lang == 'rust'
+        run: cargo run -p rustwright --bin runner --release --locked -- --manifest "$RW_MANIFEST" --lib "$RW_LIB" --out "$RW_OUT"
+
+      - name: Set up Go
+        if: steps.has.outputs.ok == 'true' && matrix.lang == 'go'
+        uses: actions/setup-go@v5
+        with: { go-version: '1.23' }
+      - name: Run Go runner
+        if: steps.has.outputs.ok == 'true' && matrix.lang == 'go'
+        working-directory: go
+        run: go run ./cmd/runner --manifest "../$RW_MANIFEST" --lib "../$RW_LIB" --out "../$RW_OUT"
+
+      - name: Set up JDK
+        if: steps.has.outputs.ok == 'true' && matrix.lang == 'java'
+        uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '23' }
+      - name: Run Java runner
+        if: steps.has.outputs.ok == 'true' && matrix.lang == 'java'
+        working-directory: java
+        run: bash run.sh runner --manifest "../$RW_MANIFEST" --lib "../$RW_LIB" --out "../$RW_OUT"
+
+      - name: Set up .NET
+        if: steps.has.outputs.ok == 'true' && matrix.lang == 'csharp'
+        uses: actions/setup-dotnet@v4
+        with: { dotnet-version: '8.0.x' }
+      - name: Run C# runner
+        if: steps.has.outputs.ok == 'true' && matrix.lang == 'csharp'
+        run: dotnet run --project csharp/Runner -c Release -- --manifest "$RW_MANIFEST" --lib "$RW_LIB" --out "$RW_OUT"
+
+      - name: Set up Ruby
+        if: steps.has.outputs.ok == 'true' && matrix.lang == 'ruby'
+        uses: ruby/setup-ruby@v1
+        with: { ruby-version: '3.2' }
+      - name: Run Ruby runner
+        if: steps.has.outputs.ok == 'true' && matrix.lang == 'ruby'
+        run: ruby ruby/runner.rb --manifest "$RW_MANIFEST" --lib "$RW_LIB" --out "$RW_OUT"
+
+      - name: Set up PHP
+        if: steps.has.outputs.ok == 'true' && matrix.lang == 'php'
+        uses: shivammathur/setup-php@v2
+        with: { php-version: '8.3', extensions: ffi }
+      - name: Run PHP runner
+        if: steps.has.outputs.ok == 'true' && matrix.lang == 'php'
+        run: php -d ffi.enable=1 php/runner.php --manifest "$RW_MANIFEST" --lib "$RW_LIB" --out "$RW_OUT"
+
+      - name: Show + assert results
+        if: steps.has.outputs.ok == 'true'
+        run: |
+          cat "$RW_OUT"
+          python3 - "$RW_OUT" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          bad = [r["id"] for r in d["results"] if not r["ok"]]
+          assert not bad, f"{d['lang']}: failing cases {bad}"
+          print(f"{d['lang']}: {len(d['results'])} cases OK")
+          PY
+      - name: Upload results
+        if: steps.has.outputs.ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.lang }}
+          path: ${{ env.RW_OUT }}
+          if-no-files-found: error
+
+  equivalence:
+    name: Cross-language equivalence
+    needs: bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download all language results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          path: results
+          merge-multiple: true
+      - name: Assert every language agrees (captures + screenshot bytes)
+        run: |
+          n=$(ls results/*.json 2>/dev/null | wc -l)
+          if [ "$n" -lt 2 ]; then
+            echo "::notice::only $n language result(s) on this ref; skipping equivalence"
+            exit 0
+          fi
+          python3 tools/compare_binding_results.py results
