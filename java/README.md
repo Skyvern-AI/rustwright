@@ -1,20 +1,70 @@
 # Rustwright Java alpha binding
 
-This dependency-free Java 23 package uses the finalized `java.lang.foreign` API to load an explicit Rustwright C ABI dynamic library. It owns and serializes native browser/page handles, copies native errors immediately, and releases all transferred Rust strings, screenshot buffers, and opaque handles with their matching ABI free function.
+This dependency-free Java 23 package uses the finalized `java.lang.foreign` API. Published JARs bundle the Rustwright C ABI native libraries, while from-source and exact-path loading remain available. The binding owns and serializes native browser/page handles, copies native errors immediately, and releases all transferred Rust strings, screenshot buffers, and opaque handles with their matching ABI free function.
+
+## Install (not yet published)
+
+The planned Maven Central coordinates are `io.github.skyvern-ai:rustwright:0.1.1`. The artifact is not yet published. Once it is available, add it with Gradle:
+
+```kotlin
+dependencies {
+    implementation("io.github.skyvern-ai:rustwright:0.1.1")
+}
+```
+
+Or with Maven:
+
+```xml
+<dependency>
+  <groupId>io.github.skyvern-ai</groupId>
+  <artifactId>rustwright</artifactId>
+  <version>0.1.1</version>
+</dependency>
+```
+
+The JAR selects and extracts one of these resources when `new Chromium()` is used:
+
+| Runtime | JAR resource |
+| --- | --- |
+| macOS arm64 | `native/osx-aarch64/librustwright_capi.dylib` |
+| macOS x86-64 | `native/osx-x86_64/librustwright_capi.dylib` |
+| Linux x86-64 | `native/linux-x86_64/librustwright_capi.so` |
+| Linux arm64 | `native/linux-aarch64/librustwright_capi.so` |
+| Windows x86-64 | `native/windows-x86_64/librustwright_capi.dll` |
+
+An explicit `new Chromium(path)` remains an exact pin: it never substitutes a bundled or fallback library. Without an explicit path, the resolver tries the bundled resource first and then `target/release` for from-source use.
 
 ## Requirements
 
-- A 64-bit JDK 23 (`java` and `javac` on `PATH`)
-- The shared library at `target/release/librustwright_capi.dylib` on macOS or `target/release/librustwright_capi.so` on Linux
+- A 64-bit JDK 23 or newer (`java` and `javac` on `PATH`); compilation targets Java 23
+- Gradle 9 (the checked-in wrapper downloads it automatically)
+- For from-source use, the shared library at `target/release/librustwright_capi.dylib` on macOS or `target/release/librustwright_capi.so` on Linux
 - `--enable-native-access=ALL-UNNAMED` (already supplied by `run.sh`)
 
-Run all commands from the repository root. On macOS, the exact smoke command is:
+## From source
+
+Run all commands from the repository root. The existing dependency-free `run.sh` entrypoint remains supported. On macOS, the exact smoke command is:
 
 ```sh
 ./java/run.sh smoke --lib target/release/librustwright_capi.dylib
 ```
 
-The smoke command also accepts no arguments, defaulting to `target/release/librustwright_capi.dylib` on macOS and `target/release/librustwright_capi.so` on Linux, relative to the repository-root working directory.
+The smoke command also accepts no arguments. It first tries a native bundled in the classpath and then defaults to `target/release/librustwright_capi.dylib` on macOS or `target/release/librustwright_capi.so` on Linux, relative to the repository-root working directory.
+
+Build the Gradle artifacts from `java/`:
+
+```sh
+./gradlew build
+./gradlew publishToMavenLocal
+```
+
+Release automation downloads natives beneath per-platform directories and stages them with:
+
+```sh
+./java/scripts/stage-natives.sh <native-artifact-directory> --require-all
+```
+
+For a local one-platform build, omit `--require-all`. Staged binaries live below `java/src/main/resources/native/` and are ignored by git.
 
 The exact five-case runner command is:
 

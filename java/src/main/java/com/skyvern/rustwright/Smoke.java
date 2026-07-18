@@ -22,7 +22,7 @@ public final class Smoke {
 
     public static void main(String[] arguments) {
         Path library = parseLibrary(arguments);
-        Chromium chromium = new Chromium(library);
+        Chromium chromium = library == null ? new Chromium() : new Chromium(library);
         Map<String, Object> output = new LinkedHashMap<>();
         try (Browser browser = chromium.launch(Map.of("headless", true));
                 Page page = browser.newPage()) {
@@ -40,9 +40,7 @@ public final class Smoke {
 
     private static Path parseLibrary(String[] arguments) {
         if (arguments.length == 0) {
-            String extension = System.getProperty("os.name", "").toLowerCase().contains("linux")
-                    ? ".so" : ".dylib";
-            return Path.of("target/release/librustwright_capi" + extension);
+            return null;
         }
         if (arguments.length == 2 && arguments[0].equals("--lib") && !arguments[1].isEmpty()) {
             return Path.of(arguments[1]);
