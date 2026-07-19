@@ -286,15 +286,31 @@ def test_evaluate_function_expression_target_json_and_precedence(
 
 
 def test_dialog_camel_snake_and_canonical_precedence(fake_page) -> None:
+    class Dialog:
+        def __init__(self) -> None:
+            self.prompt_text = None
+
+        def accept(self, prompt_text=None) -> None:
+            self.prompt_text = prompt_text
+
+    def pending_dialog() -> Dialog:
+        registry = server._state.registry_for(fake_page, create=True)
+        dialog = Dialog()
+        registry.pending_dialog = dialog
+        return dialog
+
+    camel = pending_dialog()
     _tool_call("browser_handle_dialog", {"accept": True, "promptText": "camel"})
-    assert server._state.dialog_intent.prompt_text == "camel"
+    assert camel.prompt_text == "camel"
+    snake = pending_dialog()
     _tool_call("browser_handle_dialog", {"accept": True, "prompt_text": "snake"})
-    assert server._state.dialog_intent.prompt_text == "snake"
+    assert snake.prompt_text == "snake"
+    winner = pending_dialog()
     _tool_call(
         "browser_handle_dialog",
         {"accept": True, "promptText": "winner", "prompt_text": "loser"},
     )
-    assert server._state.dialog_intent.prompt_text == "winner"
+    assert winner.prompt_text == "winner"
 
 
 def test_wait_camel_snake_precedence_time_cap_and_text_states(fake_page) -> None:
@@ -444,8 +460,20 @@ def test_caps_argv_and_env_warn_without_blocking_tools_list() -> None:
 
 def test_mirror_and_lean_tool_profiles_with_eval_default_on() -> None:
     mirror, _ = asyncio.run(_stdio_tools())
-    assert len(mirror) == 16
-    assert {"browser_evaluate", "browser_get_text", "browser_handle_dialog"} <= mirror
+    assert len(mirror) == 24
+    assert {
+        "browser_evaluate",
+        "browser_get_text",
+        "browser_handle_dialog",
+        "browser_console_messages",
+        "browser_drag",
+        "browser_file_upload",
+        "browser_fill_form",
+        "browser_find",
+        "browser_network_request",
+        "browser_network_requests",
+        "browser_resize",
+    } <= mirror
 
     lean, _ = asyncio.run(
         _stdio_tools(env_overrides={"RUSTWRIGHT_MCP_TOOLSET": "lean"})

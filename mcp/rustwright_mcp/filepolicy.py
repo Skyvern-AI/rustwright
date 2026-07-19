@@ -1,4 +1,4 @@
-"""Filesystem policy for MCP-produced artifacts and future upload inputs."""
+"""Filesystem policy for MCP-produced artifacts and upload inputs."""
 
 from __future__ import annotations
 

@@ -15,7 +15,7 @@ Environment variables:
     RUSTWRIGHT_MCP_CAPS        accepted comma-separated capability groups
     RUSTWRIGHT_MCP_TOOLSET     "mirror" (default) or the smaller "lean" profile
     RUSTWRIGHT_MCP_OUTPUT_DIR   root for files written by tools
-    RUSTWRIGHT_MCP_WORKSPACE    allowed input root for future upload tools
+    RUSTWRIGHT_MCP_WORKSPACE    allowed absolute input root for upload tools
 
 When RUSTWRIGHT_MCP_CDP_ENDPOINT is set, the local headless, channel, and
 executable options are ignored.
@@ -23,15 +23,20 @@ executable options are ignored.
 
 from __future__ import annotations
 
+import base64
 import functools
 from dataclasses import dataclass
 from importlib import metadata
 import json
+import math
 import os
 import re
 import sys
 import threading
 from typing import Annotated, Any, Literal
+import uuid
+
+from typing_extensions import NotRequired, TypedDict
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import (
@@ -62,12 +67,30 @@ def _serialized(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         with _lock:
+            if (
+                fn.__name__ not in _MODAL_SAFE_TOOLS
+                and _state.page is not None
+                and _has_pending_modal()
+            ):
+                return _render_response(
+                    f"{fn.__name__} deferred until the pending modal is handled.",
+                    page=_state.page,
+                )
             return fn(*args, **kwargs)
 
     return wrapper
 
 
 _FALSE_VALUES = {"0", "false", "no", "off"}
+_MODAL_SAFE_TOOLS = {
+    "browser_handle_dialog",
+    "browser_file_upload",
+    "browser_console_messages",
+    "browser_network_requests",
+    "browser_network_request",
+    "browser_tabs",
+    "browser_close",
+}
 _LEAN_TOOLS = {
     "browser_navigate",
     "browser_navigate_back",
@@ -82,6 +105,8 @@ _LEAN_TOOLS = {
     "browser_tabs",
     "browser_take_screenshot",
     "browser_close",
+    # PR-3 intentionally adds only viewport resize to the lean profile.
+    "browser_resize",
     # Evaluation is controlled only by RUSTWRIGHT_MCP_ALLOW_EVAL. Profiles
     # must not quietly change that security setting.
     "browser_evaluate",
@@ -169,11 +194,103 @@ def _tool():
 
 
 SNAPSHOT_CHAR_LIMIT = 30_000
+NETWORK_BODY_INLINE_BYTES = 64 * 1024
+FIND_MATCH_LIMIT = 20
 _OUTLINE_REF_PATTERN = re.compile(r"\[ref=(e[1-9][0-9]*)\]")
+_CONSOLE_LEVEL_RANK = {
+    "error": 0,
+    "warning": 1,
+    "warn": 1,
+    "info": 2,
+    "log": 2,
+    "debug": 3,
+}
 
 
 def _register_page_handlers(page: Any) -> None:
+    _state.download_saver = _save_download
     _state.register_page_handlers(page)
+    _capture_page_title(page)
+
+
+def _pending_modals(page: Any) -> tuple[Any | None, Any | None]:
+    return _state.pending_modals(page)
+
+
+def _context_pages(reference_page: Any | None = None) -> list[Any]:
+    page = reference_page if reference_page is not None else _state.page
+    try:
+        pages = list(page.context.pages) if page is not None else []
+    except Exception:
+        pages = []
+    for registered_page, _, _ in _state.pending_modal_pages():
+        if not any(candidate is registered_page for candidate in pages):
+            pages.append(registered_page)
+    return pages
+
+
+def _pending_modal_entries(
+    reference_page: Any | None = None,
+) -> list[tuple[int, Any, Any | None, Any | None]]:
+    """Return every pending modal ordered by its owning tab index."""
+    pages = _context_pages(reference_page)
+    entries: list[tuple[int, Any, Any | None, Any | None]] = []
+    for owner, dialog, chooser in _state.pending_modal_pages():
+        index = next(
+            (position for position, tab in enumerate(pages) if tab is owner), -1
+        )
+        entries.append((index, owner, dialog, chooser))
+    entries.sort(key=lambda entry: (entry[0] < 0, entry[0]))
+    return entries
+
+
+def _has_pending_modal(page: Any | None = None) -> bool:
+    del page
+    return bool(_state.pending_modal_pages())
+
+
+def _capture_page_title(page: Any) -> str | None:
+    """Cache a safe title without querying a page blocked by a dialog."""
+    dialog, _ = _pending_modals(page)
+    if dialog is not None:
+        return _state.known_page_title(page)
+    try:
+        title = str(page.title())
+    except Exception:
+        return _state.known_page_title(page)
+    _state.remember_page_title(page, title)
+    return title
+
+
+def _save_download(download: Any, suggested_filename: str) -> str:
+    """Save an untrusted download name into the confined artifact root."""
+    policy = get_file_policy()
+    leaf = suggested_filename.replace("\\", "/").rsplit("/", 1)[-1]
+    leaf = re.sub(r"[^A-Za-z0-9._-]+", "_", leaf).lstrip(".")
+    if not leaf:
+        leaf = "download"
+    if len(leaf) > 180:
+        stem, suffix = os.path.splitext(leaf)
+        leaf = stem[: max(1, 180 - len(suffix))] + suffix[:20]
+
+    candidate = leaf
+    while True:
+        try:
+            output_path = policy.reserve_output(
+                candidate, purpose="download", suffix=".bin"
+            )
+            break
+        except ValueError as exc:
+            if "already exists" not in str(exc):
+                raise
+            stem, suffix = os.path.splitext(leaf)
+            candidate = f"{stem}-{uuid.uuid4().hex[:8]}{suffix}"
+    try:
+        download.save_as(str(output_path))
+        return policy.finalize_output(output_path)
+    except Exception:
+        policy.discard_output(output_path)
+        raise
 
 
 def _page():
@@ -183,6 +300,11 @@ def _page():
     are ignored.
     """
     if _state.page is not None:
+        if _has_pending_modal(_state.page):
+            # Chromium blocks evaluation while a JavaScript dialog is live.
+            # Event state is enough to service the modal tools, so never run
+            # the health-check evaluation in this state.
+            return _state.page
         try:
             # The user may have closed a headed window; detect a dead
             # session and relaunch instead of failing every call.
@@ -303,14 +425,20 @@ def _snapshot(
     target: Any | None = None,
     depth: float | None = None,
     boxes: bool = False,
-) -> str:
+) -> str | None:
     if depth is not None and depth < 0:
         raise ValueError("depth must be non-negative")
+    if _has_pending_modal():
+        # This check is deliberately before wait_for_load_state/evaluate: a live
+        # dialog blocks both in Chromium. The triggering action can therefore
+        # return its Modal section promptly without attempting a fresh snapshot.
+        return None
     try:
         # An action may have triggered a navigation; settle before reading the DOM.
         page.wait_for_load_state(timeout=10_000)
     except Exception:
         pass
+    _capture_page_title(page)
     options = {
         "startRef": _state.snapshot_start_ref(),
         "maxDepth": depth,
@@ -335,10 +463,11 @@ def _snapshot(
 
 
 def _page_details(page: Any) -> tuple[str, str, int, list[Any]]:
-    try:
-        title = str(page.title())
-    except Exception:
-        title = "(unavailable)"
+    pending_dialog, _ = _pending_modals(page)
+    if pending_dialog is not None:
+        title = _state.known_page_title(page) or "(dialog pending)"
+    else:
+        title = _capture_page_title(page) or "(unavailable)"
     try:
         url = str(page.url)
     except Exception:
@@ -354,6 +483,62 @@ def _page_details(page: Any) -> tuple[str, str, int, list[Any]]:
     return title, url, active_index, pages
 
 
+def _metadata_value(items: tuple[tuple[str, Any], ...], *names: str) -> Any:
+    values = dict(items)
+    for name in names:
+        if name in values:
+            return values[name]
+    return None
+
+
+def _console_level(message_type: str) -> str:
+    normalized = message_type.lower()
+    if normalized in {"warning", "warn"}:
+        return "warning"
+    if normalized in {"error", "debug"}:
+        return normalized
+    return "info"
+
+
+def _format_console_record(record: Any) -> str:
+    level = _console_level(record.message_type).upper()
+    url = _metadata_value(record.location, "url") or "(unknown)"
+    line = _metadata_value(record.location, "lineNumber", "line")
+    location = str(url) if line is None else f"{url}:{line}"
+    text = str(record.text).replace("\r", " ").replace("\n", " ")
+    return f"{level} {location} {text}"
+
+
+def _format_modal(page: Any) -> str | None:
+    lines: list[str] = []
+    for tab_index, _, dialog, chooser in _pending_modal_entries(page):
+        owner = f"Tab {tab_index}" if tab_index >= 0 else "Registered page"
+        if dialog is not None:
+            try:
+                dialog_type = str(dialog.type)
+            except Exception:
+                dialog_type = "dialog"
+            try:
+                message = str(dialog.message)
+            except Exception:
+                message = "(message unavailable)"
+            lines.append(
+                f"- {owner}: Dialog pending: type={dialog_type}; "
+                f"message={message!r}. Call browser_handle_dialog."
+            )
+        if chooser is not None:
+            try:
+                multiple = bool(chooser.is_multiple())
+            except Exception:
+                multiple = False
+            hint = "multiple files allowed" if multiple else "single file only"
+            lines.append(
+                f"- {owner}: File chooser pending: {hint}. "
+                "Call browser_file_upload."
+            )
+    return "\n".join(lines) if lines else None
+
+
 def _render_response(
     result: str | None = None,
     *,
@@ -361,7 +546,7 @@ def _render_response(
     snapshot: str | None = None,
     include_tabs: bool = False,
 ) -> str:
-    """Render every successful tool result with deterministic section order."""
+    """Render an E2 envelope with deterministic, cursor-aware section order."""
     sections: list[str] = []
     details: tuple[str, str, int, list[Any]] | None = None
     if page is not None:
@@ -383,10 +568,49 @@ def _render_response(
         lines = []
         for index, tab in enumerate(pages):
             marker = " (active)" if index == active_index else ""
-            lines.append(f"- {index}: {tab.title()} — {tab.url}{marker}")
+            pending_dialog, _ = _pending_modals(tab)
+            if pending_dialog is not None:
+                tab_title = _state.known_page_title(tab) or "(dialog pending)"
+            else:
+                tab_title = _state.known_page_title(tab)
+                if tab_title is None:
+                    tab_title = _capture_page_title(tab) or "(unavailable)"
+            lines.append(f"- {index}: {tab_title} — {tab.url}{marker}")
         sections.append("### Tabs\n" + ("\n".join(lines) or "- (none)"))
     if snapshot is not None:
         sections.append(f"### Snapshot\n{snapshot}")
+
+    console_records, _, downloads = _state.response_events()
+    terse_console = [
+        record
+        for record in console_records
+        if _CONSOLE_LEVEL_RANK[_console_level(record.message_type)] <= 1
+    ]
+    if terse_console:
+        visible = terse_console[:5]
+        lines = [_format_console_record(record) for record in visible]
+        overflow = len(terse_console) - len(visible)
+        if overflow:
+            lines.append(f"(and {overflow} more)")
+        sections.append("### Console\n" + "\n".join(lines))
+
+    if page is not None:
+        modal = _format_modal(page)
+        if modal is not None:
+            sections.append(f"### Modal\n{modal}")
+
+    if downloads:
+        download_lines = []
+        for record in downloads:
+            if record.artifact is not None:
+                download_lines.append(
+                    f"- {record.suggested_filename}: `{record.artifact}`"
+                )
+            else:
+                download_lines.append(
+                    f"- {record.suggested_filename}: save failed ({record.error})"
+                )
+        sections.append("### Downloads\n" + "\n".join(download_lines))
     return "\n\n".join(sections)
 
 
@@ -426,6 +650,7 @@ class ResolvedTarget:
     locator: Any
     display_name: str
     source: Literal["ref", "selector"]
+    selector: str
 
 
 _REF_PATTERN = re.compile(r"^e[1-9][0-9]*$")
@@ -437,6 +662,11 @@ def _resolve(
     element_description: str | None = None,
 ) -> ResolvedTarget:
     """Resolve a current stamped ref or exactly one selector match."""
+    if _has_pending_modal():
+        raise ValueError(
+            "A modal is pending; handle the dialog or file chooser before "
+            "resolving page targets."
+        )
     display_name = target if element_description is None else element_description
     if _REF_PATTERN.fullmatch(target):
         snapshot_taken, snapshot_refs = _state.snapshot_status(page)
@@ -447,7 +677,8 @@ def _resolve(
                 f"Ref {target} is not in the current page snapshot; take a fresh snapshot."
             )
         locator = page.locator(f'[data-mcp-ref="{target}"]')
-        return ResolvedTarget(locator, display_name, "ref")
+        selector = f'[data-mcp-ref="{target}"]'
+        return ResolvedTarget(locator, display_name, "ref", selector)
 
     locator = page.locator(target)
     count = locator.count()
@@ -457,7 +688,7 @@ def _resolve(
         raise ValueError(
             f"Target selector matched {count} elements; provide a unique selector: {target}"
         )
-    return ResolvedTarget(locator, display_name, "selector")
+    return ResolvedTarget(locator, display_name, "selector", target)
 
 
 def _scalar_to_array(value: Any) -> Any:
@@ -499,6 +730,248 @@ Function = Annotated[
     str,
     Field(validation_alias=AliasChoices("function", "expression")),
 ]
+PositiveDimension = Annotated[float, Field(gt=0, allow_inf_nan=False)]
+NetworkIndex = Annotated[int, Field(ge=1)]
+UploadPaths = Annotated[list[str], Field(max_length=50)]
+
+
+class FillField(TypedDict):
+    """One strictly validated browser_fill_form operation."""
+
+    __pydantic_config__ = ConfigDict(extra="forbid")
+
+    element: NotRequired[str]
+    target: str
+    name: str
+    type: Literal["textbox", "checkbox", "radio", "combobox", "slider"]
+    value: str
+
+
+FillFields = Annotated[list[FillField], Field(min_length=1, max_length=50)]
+
+
+def _round_half_away_from_zero(value: float) -> int:
+    """Round a finite dimension to the nearest integer device pixel."""
+    return int(math.copysign(math.floor(abs(value) + 0.5), value))
+
+
+def _run_action_with_pending_dialog(page: Any, action: Any) -> None:
+    """Treat a dialog-stalled action as complete once the modal is recorded."""
+    try:
+        action()
+    except Exception:
+        dialog, _ = _pending_modals(page)
+        if dialog is None:
+            raise
+
+
+def _compile_find_regex(expression: str) -> re.Pattern[str]:
+    pattern = expression
+    flags = 0
+    if expression.startswith("/"):
+        closing = expression.rfind("/")
+        if closing == 0:
+            raise ValueError(
+                "regex slash form must be /pattern/flags (flags: i, m, s)"
+            )
+        pattern = expression[1:closing]
+        raw_flags = expression[closing + 1 :]
+        invalid = sorted(set(raw_flags) - {"i", "m", "s"})
+        if invalid:
+            raise ValueError(
+                "invalid regex flags: " + ", ".join(invalid) + "; supported: i, m, s"
+            )
+        if len(set(raw_flags)) != len(raw_flags):
+            raise ValueError("regex flags must not be repeated")
+        for flag in raw_flags:
+            flags |= {"i": re.IGNORECASE, "m": re.MULTILINE, "s": re.DOTALL}[flag]
+    try:
+        return re.compile(pattern, flags)
+    except re.error as exc:
+        raise ValueError(f"invalid regex: {exc}") from None
+
+
+def _outline_indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _find_outline_matches(
+    outline: str,
+    matcher: Any,
+    *,
+    limit: int = FIND_MATCH_LIMIT,
+) -> tuple[list[str], int]:
+    """Return path-qualified matches with one same-parent sibling each side."""
+    lines = outline.splitlines()
+    matching_indices = [index for index, line in enumerate(lines) if matcher(line)]
+    rendered: list[str] = []
+    for match_number, index in enumerate(matching_indices[:limit], start=1):
+        indent = _outline_indent(lines[index])
+        ancestors: list[str] = []
+        wanted_indent = indent - 2
+        for candidate in range(index - 1, -1, -1):
+            candidate_indent = _outline_indent(lines[candidate])
+            if candidate_indent == wanted_indent:
+                ancestors.append(lines[candidate].strip())
+                wanted_indent -= 2
+                if wanted_indent < 0:
+                    break
+        path = " > ".join(reversed(ancestors)) or "(root)"
+
+        siblings: list[int] = []
+        for direction in (-1, 1):
+            candidate = index + direction
+            while 0 <= candidate < len(lines):
+                candidate_indent = _outline_indent(lines[candidate])
+                if candidate_indent < indent:
+                    break
+                if candidate_indent == indent:
+                    siblings.append(candidate)
+                    break
+                candidate += direction
+        context = sorted({*siblings, index})
+        snippets = [
+            ("> " if candidate == index else "  ") + lines[candidate]
+            for candidate in context
+        ]
+        rendered.append(
+            f"Match {match_number}\nPath: {path}\n" + "\n".join(snippets)
+        )
+    return rendered, max(0, len(matching_indices) - limit)
+
+
+# Successful image/media/font/stylesheet requests are the chosen static set.
+# Scripts are intentionally visible because they often carry application logic.
+_STATIC_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
+
+
+def _filter_network_records(
+    records: list[Any],
+    *,
+    include_static: bool,
+    pattern: re.Pattern[str] | None,
+) -> list[Any]:
+    visible = []
+    for record in records:
+        successful_static = (
+            record.resource_type.lower() in _STATIC_RESOURCE_TYPES
+            and record.response_status is not None
+            and 200 <= record.response_status < 400
+        )
+        if not include_static and successful_static:
+            continue
+        if pattern is not None and pattern.search(record.url) is None:
+            continue
+        visible.append(record)
+    return visible
+
+
+def _thaw_metadata(value: Any) -> Any:
+    if isinstance(value, tuple):
+        if all(
+            isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
+            for item in value
+        ):
+            return {name: _thaw_metadata(item) for name, item in value}
+        return [_thaw_metadata(item) for item in value]
+    return value
+
+
+def _header_content_type(headers: tuple[tuple[str, Any], ...]) -> str:
+    for name, value in headers:
+        if name.lower() == "content-type":
+            return str(value).split(";", 1)[0].strip().lower()
+    return ""
+
+
+def _is_text_content_type(content_type: str) -> bool:
+    return (
+        content_type.startswith("text/")
+        or content_type.endswith("+json")
+        or content_type.endswith("+xml")
+        or content_type
+        in {
+            "application/json",
+            "application/xml",
+            "application/javascript",
+            "application/x-javascript",
+            "application/x-www-form-urlencoded",
+        }
+    )
+
+
+def _response_body_text(record: Any, *, byte_limit: int | None) -> str:
+    if record.response is None:
+        return "(response not received)"
+    try:
+        raw = record.response.body()
+    except Exception as exc:
+        return f"(body unavailable: {exc})"
+    if isinstance(raw, str):
+        body = raw.encode("utf-8")
+    else:
+        body = bytes(raw)
+    if not body:
+        return "(empty response body)"
+
+    truncated = byte_limit is not None and len(body) > byte_limit
+    delivered = body[:byte_limit] if truncated and byte_limit is not None else body
+    content_type = _header_content_type(record.response_headers)
+    if _is_text_content_type(content_type):
+        rendered = delivered.decode("utf-8", errors="replace")
+        note = ""
+    else:
+        rendered = base64.b64encode(delivered).decode("ascii")
+        note = "\n(base64-encoded non-text response body)"
+    if truncated:
+        note += (
+            f"\n(response body truncated to {byte_limit} bytes inline; "
+            "use filename for the full body)"
+        )
+    return rendered + note
+
+
+def _network_record_text(
+    record: Any,
+    part: Literal[
+        "request-headers", "request-body", "response-headers", "response-body"
+    ]
+    | None,
+    *,
+    body_limit: int | None,
+) -> str:
+    parts = (
+        [part]
+        if part is not None
+        else [
+            "request-headers",
+            "request-body",
+            "response-headers",
+            "response-body",
+        ]
+    )
+    rendered: list[str] = []
+    for selected in parts:
+        if selected == "request-headers":
+            value = json.dumps(
+                _thaw_metadata(record.headers), ensure_ascii=False, indent=2
+            )
+        elif selected == "request-body":
+            value = record.post_data if record.post_data not in {None, ""} else "(empty request body)"
+        elif selected == "response-headers":
+            value = (
+                "(response not received)"
+                if record.response is None
+                else json.dumps(
+                    _thaw_metadata(record.response_headers),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            value = _response_body_text(record, byte_limit=body_limit)
+        rendered.append(f"#### {selected}\n{value}")
+    return "\n\n".join(rendered)
 
 
 @_tool()
@@ -508,6 +981,25 @@ def browser_navigate(url: str) -> str:
     page.goto(url)
     snapshot = _snapshot(page)
     return _render_response(f"Navigated to {url}.", page=page, snapshot=snapshot)
+
+
+@_tool()
+def browser_resize(width: PositiveDimension, height: PositiveDimension) -> str:
+    """Resize the page viewport, not the operating-system browser window.
+
+    Responsive layout and the rendered DOM may change, so a fresh snapshot is
+    returned after ``page.set_viewport_size`` completes.
+    """
+    page = _page()
+    pixel_width = _round_half_away_from_zero(width)
+    pixel_height = _round_half_away_from_zero(height)
+    page.set_viewport_size({"width": pixel_width, "height": pixel_height})
+    snapshot = _snapshot(page)
+    return _render_response(
+        f"Viewport resized to {pixel_width}x{pixel_height} CSS pixels.",
+        page=page,
+        snapshot=snapshot,
+    )
 
 
 @_tool()
@@ -531,12 +1023,47 @@ def browser_snapshot(
         boxes=boxes,
     )
     if filename is not None:
+        if snapshot is None:
+            return _render_response(
+                "Snapshot deferred until the pending modal is handled.", page=page
+            )
         artifact = _write_text_output(snapshot, filename, purpose="snapshot")
         return _render_response(
             f"Snapshot written to `{artifact}`.",
             page=page,
         )
     return _render_response(page=page, snapshot=snapshot)
+
+
+@_tool()
+def browser_find(text: str | None = None, regex: str | None = None) -> str:
+    """Search one refreshed current outline and return compact actionable context."""
+    if (text is None) == (regex is None):
+        raise ValueError("Exactly one of text or regex is required.")
+    if regex is not None:
+        compiled = _compile_find_regex(regex)
+        matcher = compiled.search
+    else:
+        assert text is not None
+        needle = text.casefold()
+        matcher = lambda line: needle in line.casefold()
+
+    page = _page()
+    outline = _snapshot(page)
+    if outline is None:
+        return _render_response(
+            "Find deferred until the pending modal is handled.", page=page
+        )
+    matches, truncated = _find_outline_matches(
+        outline, lambda line: matcher(line) is not None if regex is not None else matcher(line)
+    )
+    if not matches:
+        result = "No matches in the current snapshot outline."
+    else:
+        result = "\n\n".join(matches)
+        if truncated:
+            result += f"\n\n… {truncated} additional matches truncated."
+    return _render_response(result, page=page)
 
 
 @_tool()
@@ -550,14 +1077,52 @@ def browser_click(
     """Click a unique target. ``element`` is only a human-readable description."""
     page = _page()
     resolved = _resolve(page, target, element)
-    resolved.locator.click(
-        click_count=2 if doubleClick else 1,
-        button=button,
-        modifiers=modifiers,
-    )
+    action = lambda: resolved.locator.click(
+            click_count=2 if doubleClick else 1,
+            button=button,
+            modifiers=modifiers,
+            timeout=1_000,
+        )
+    _run_action_with_pending_dialog(page, action)
+    with _state.event_lock:
+        registry = _state.registry_for(page)
+        retry_file_chooser = bool(
+            registry is not None and registry.file_chooser_retry_needed
+        )
+    if retry_file_chooser:
+        _, chooser = _pending_modals(page)
+        if chooser is None:
+            # A cancelled chooser after a validation failure is suppressed once
+            # by some backends. Replay this already-authorized input click once.
+            page.wait_for_timeout(50)
+            _run_action_with_pending_dialog(page, action)
+        with _state.event_lock:
+            registry = _state.registry_for(page)
+            if registry is not None:
+                registry.file_chooser_retry_needed = False
     snapshot = _snapshot(page)
     return _render_response(
         f"Clicked {resolved.display_name}.", page=page, snapshot=snapshot
+    )
+
+
+@_tool()
+def browser_drag(
+    startTarget: str,
+    endTarget: str,
+    startElement: str | None = None,
+    endElement: str | None = None,
+) -> str:
+    """Strict-resolve both endpoints and drag the first element to the second."""
+    page = _page()
+    start = _resolve(page, startTarget, startElement)
+    end = _resolve(page, endTarget, endElement)
+    page.drag_and_drop(start.selector, end.selector, strict=True)
+    snapshot = _snapshot(page)
+    return _render_response(
+        f"Dragged {start.display_name} to {end.display_name}.",
+        page=page,
+        snapshot=snapshot,
     )
 
 
@@ -617,6 +1182,51 @@ def browser_select_option(
 
 
 @_tool()
+def browser_fill_form(fields: FillFields) -> str:
+    """Fill up to 50 fields sequentially as a non-transactional batch.
+
+    If a field fails, earlier changes intentionally remain applied and the
+    structured error names the first failing field.
+    """
+    page = _page()
+    for field in fields:
+        name = field["name"]
+        try:
+            resolved = _resolve(page, field["target"], field.get("element"))
+            locator = resolved.locator
+            field_type = field["type"]
+            value = field["value"]
+            if field_type in {"textbox", "slider"}:
+                locator.fill(value)
+            elif field_type == "checkbox":
+                if value == "true":
+                    locator.check()
+                elif value == "false":
+                    locator.uncheck()
+                else:
+                    raise ValueError("checkbox value must be 'true' or 'false'")
+            elif field_type == "radio":
+                if value == "false":
+                    raise ValueError("unchecking a radio is not supported")
+                if value != "true":
+                    raise ValueError("radio value must be 'true'")
+                locator.check()
+            else:
+                try:
+                    locator.select_option(label=value)
+                except Exception:
+                    locator.select_option(value=value)
+        except Exception as exc:
+            raise ValueError(f"Field {name!r} failed: {exc}") from None
+    snapshot = _snapshot(page)
+    return _render_response(
+        f"Filled {len(fields)} fields sequentially (non-transactional).",
+        page=page,
+        snapshot=snapshot,
+    )
+
+
+@_tool()
 def browser_hover(target: str, element: str | None = None) -> str:
     """Hover a unique target. ``element`` is only a human description."""
     page = _page()
@@ -666,6 +1276,8 @@ def browser_tabs(
     context = page.context
     pages = list(context.pages)
     snapshot = None
+    for tab in pages:
+        _register_page_handlers(tab)
 
     if action == "new":
         page = context.new_page()
@@ -673,6 +1285,7 @@ def browser_tabs(
         _state.page = page
         if url is not None:
             page.goto(url)
+            _capture_page_title(page)
         snapshot = _snapshot(page)
     elif action == "select":
         if index is None or index < 0 or index >= len(pages):
@@ -682,7 +1295,9 @@ def browser_tabs(
         page = pages[index]
         _register_page_handlers(page)
         _state.page = page
-        page.bring_to_front()
+        pending_dialog, _ = _pending_modals(page)
+        if pending_dialog is None:
+            page.bring_to_front()
         snapshot = _snapshot(page)
     elif action == "close":
         if index is None:
@@ -697,6 +1312,10 @@ def browser_tabs(
                 )
             closing = pages[index]
             closing_index = index
+        if any(entry[1] is closing for entry in _pending_modal_entries(page)):
+            raise ValueError(
+                f"Tab {closing_index} has a pending modal; handle it before closing."
+            )
         was_active = closing is page
         closing.close()
         remaining = list(context.pages)
@@ -708,6 +1327,9 @@ def browser_tabs(
         _state.page = page
         snapshot = _snapshot(page)
 
+    for tab in list(context.pages):
+        _register_page_handlers(tab)
+
     return _render_response(
         f"Tab action `{action}` completed.",
         page=page,
@@ -717,14 +1339,259 @@ def browser_tabs(
 
 
 @_tool()
-def browser_handle_dialog(accept: bool, promptText: PromptText = None) -> str:
-    """Arm the one-shot policy for the next JavaScript dialog."""
+def browser_console_messages(
+    level: Literal["error", "warning", "info", "debug"] = "info",
+    all: bool = False,
+    filename: str | None = None,
+) -> str:
+    """List console records at the requested threshold under the event lock."""
     page = _page()
-    _state.arm_dialog(page, accept, promptText)
-    action = "accepted" if accept else "dismissed"
-    return _render_response(
-        f"The next dialog on the active page will be {action}.", page=page
+    with _state.event_lock:
+        registry = _state.registry_for(page)
+        epoch = 0 if registry is None else registry.navigation_epoch
+        records = [] if registry is None else list(registry.console_records)
+        if not all:
+            records = [record for record in records if record.epoch == epoch]
+        evicted = 0
+        if registry is not None:
+            evicted = (
+                sum(registry.console_evictions.values())
+                if all
+                else registry.console_evictions.get(epoch, 0)
+            )
+
+    threshold = _CONSOLE_LEVEL_RANK[level]
+    visible = [
+        record
+        for record in records
+        if _CONSOLE_LEVEL_RANK[_console_level(record.message_type)] <= threshold
+    ]
+    lines = [_format_console_record(record) for record in visible]
+    if evicted:
+        lines.append(
+            f"(console ring buffer evicted {evicted} earlier matching-scope records)"
+        )
+    content = "\n".join(lines) or "(no console messages)"
+    if filename is not None:
+        artifact = _write_text_output(content, filename, purpose="console")
+        result = f"Console messages written to `{artifact}`."
+    else:
+        result = content
+    return _render_response(result, page=page)
+
+
+@_tool()
+def browser_network_requests(
+    static: bool = False,
+    filter: str | None = None,
+    filename: str | None = None,
+) -> str:
+    """List current-navigation requests while preserving their stable indices."""
+    pattern = None
+    if filter is not None:
+        try:
+            pattern = re.compile(filter)
+        except re.error as exc:
+            raise ValueError(f"invalid network filter regex: {exc}") from None
+
+    page = _page()
+    with _state.event_lock:
+        registry = _state.registry_for(page)
+        epoch = 0 if registry is None else registry.navigation_epoch
+        records = (
+            []
+            if registry is None
+            else [
+                record
+                for record in registry.network_records
+                if record.epoch == epoch
+            ]
+        )
+        evicted = (
+            0 if registry is None else registry.network_evictions.get(epoch, 0)
+        )
+
+    visible = _filter_network_records(
+        records, include_static=static, pattern=pattern
     )
+    lines = []
+    for record in visible:
+        if record.response_status is not None:
+            status = str(record.response_status)
+        elif record.failure is not None:
+            status = "FAILED"
+        else:
+            status = "PENDING"
+        lines.append(
+            f"[{record.index}] {record.method} {status} {record.url} "
+            f"({record.resource_type})"
+        )
+    if evicted:
+        lines.append(
+            f"(network ring buffer evicted {evicted} earlier current-epoch records)"
+        )
+    content = "\n".join(lines) or "(no matching network requests)"
+    if filename is not None:
+        artifact = _write_text_output(content, filename, purpose="network")
+        result = f"Network requests written to `{artifact}`."
+    else:
+        result = content
+    return _render_response(result, page=page)
+
+
+@_tool()
+def browser_network_request(
+    index: NetworkIndex,
+    part: Literal[
+        "request-headers", "request-body", "response-headers", "response-body"
+    ]
+    | None = None,
+    filename: str | None = None,
+) -> str:
+    """Return lazy details for one stable current-navigation request index."""
+    page = _page()
+    with _state.event_lock:
+        registry = _state.registry_for(page)
+        epoch = 0 if registry is None else registry.navigation_epoch
+        navigation_start = (
+            _state.next_request_index
+            if registry is None
+            else registry.navigation_start_request_index
+        )
+        records = (
+            []
+            if registry is None
+            else [
+                record
+                for record in registry.network_records
+                if record.epoch == epoch
+            ]
+        )
+        record = next((item for item in records if item.index == index), None)
+        previous_navigation = registry is not None and (
+            index < navigation_start
+            or any(
+                item.index == index and item.epoch != epoch
+                for item in registry.network_records
+            )
+        )
+    if record is None:
+        if records:
+            valid = f"{min(item.index for item in records)}-{max(item.index for item in records)}"
+        else:
+            valid = "none"
+        if previous_navigation:
+            raise ValueError(
+                f"Request index {index} is from a previous navigation; "
+                f"current requests are {valid} (current navigation epoch)."
+            )
+        raise ValueError(
+            f"Network request index {index} is unavailable in the current "
+            f"navigation epoch; valid range: {valid}."
+        )
+
+    content = _network_record_text(
+        record,
+        part,
+        body_limit=None if filename is not None else NETWORK_BODY_INLINE_BYTES,
+    )
+    if filename is not None:
+        artifact = _write_text_output(content, filename, purpose="network-request")
+        result = f"Network request {index} written to `{artifact}`."
+    else:
+        result = content
+    return _render_response(result, page=page)
+
+
+@_tool()
+def browser_file_upload(paths: UploadPaths | None = None) -> str:
+    """Resolve a pending file chooser with confined files, or cancel with []."""
+    page = _page()
+    entries = _pending_modal_entries(page)
+    chooser_entry = next((entry for entry in entries if entry[3] is not None), None)
+    if chooser_entry is None:
+        raise ValueError("no file chooser is pending")
+    if any(dialog is not None for _, _, dialog, _ in entries):
+        raise ValueError("a dialog is pending; handle it before the file chooser")
+    _, owner_page, _, chooser = chooser_entry
+    assert chooser is not None
+
+    supplied = [] if paths is None else paths
+    chooser_released = False
+    try:
+        try:
+            multiple = bool(chooser.is_multiple())
+        except Exception:
+            multiple = False
+        if len(supplied) > 1 and not multiple:
+            raise ValueError("the pending file chooser accepts only one file")
+        policy = get_file_policy()
+        validated = [str(policy.validate_input(path)) for path in supplied]
+        # set_files([]) is the browser API's supported chooser cancellation path;
+        # unlike merely dropping our reference, it releases the chooser event.
+        chooser.set_files(validated)
+        chooser_released = True
+    finally:
+        if not chooser_released:
+            # Validation/multiplicity errors still have to release the live
+            # browser chooser before clearing our modal slot, or a later click
+            # on the same input will not produce a new chooser event.
+            try:
+                chooser.set_files([])
+            except Exception:
+                pass
+            try:
+                # Some browser backends acknowledge [] after an input already
+                # had a file without making the control reopenable. Resetting
+                # only the failed attempt's input is the compatibility
+                # workaround; explicit user cancellation still uses [] alone.
+                chooser.element.evaluate(
+                    "element => { element.value = ''; element.blur(); }"
+                )
+            except Exception:
+                pass
+            with _state.event_lock:
+                registry = _state.registry_for(owner_page)
+                if registry is not None:
+                    registry.file_chooser_retry_needed = True
+        _state.clear_pending_file_chooser(owner_page, chooser)
+
+    snapshot = _snapshot(page)
+    result = (
+        "Cancelled the pending file chooser."
+        if not supplied
+        else f"Uploaded {len(supplied)} file(s) through the pending chooser."
+    )
+    return _render_response(result, page=page, snapshot=snapshot)
+
+
+@_tool()
+def browser_handle_dialog(accept: bool, promptText: PromptText = None) -> str:
+    """Accept or dismiss the JavaScript dialog that is pending now."""
+    page = _page()
+    dialog_entry = next(
+        (
+            entry
+            for entry in _pending_modal_entries(page)
+            if entry[2] is not None
+        ),
+        None,
+    )
+    if dialog_entry is None:
+        raise ValueError("no dialog is pending")
+    _, owner_page, dialog, _ = dialog_entry
+    assert dialog is not None
+    if not accept and promptText is not None:
+        raise ValueError("promptText cannot be honored when dismissing a dialog")
+    try:
+        if accept:
+            dialog.accept(promptText)
+        else:
+            dialog.dismiss()
+    finally:
+        _state.clear_pending_dialog(owner_page, dialog)
+    action = "Accepted" if accept else "Dismissed"
+    return _render_response(f"{action} the pending dialog.", page=page)
 
 
 @_tool()

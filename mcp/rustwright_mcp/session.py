@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field, replace
 import threading
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 
 MetadataItems = tuple[tuple[str, Any], ...]
@@ -36,6 +36,7 @@ def _immutable_mapping(value: Any) -> MetadataItems:
 
 @dataclass(frozen=True)
 class ConsoleRecord:
+    sequence: int
     epoch: int
     message_type: str
     text: str
@@ -60,17 +61,15 @@ class NetworkRecord:
 
 @dataclass(frozen=True)
 class DownloadRecord:
+    sequence: int
     epoch: int
     url: str
     suggested_filename: str
     download: Any = field(compare=False, repr=False)
-
-
-@dataclass(frozen=True)
-class DialogIntent:
-    page: Any = field(compare=False, repr=False)
-    accept: bool
-    prompt_text: str | None
+    artifact: str | None = None
+    error: str | None = None
+    finished: bool = False
+    reported: bool = False
 
 
 @dataclass
@@ -83,9 +82,13 @@ class PageRegistry:
     snapshot_generation: int = 0
     snapshot_taken: bool = False
     navigation_epoch: int = 0
-    next_request_index: int = 1
+    navigation_start_request_index: int = 1
     navigation_pending: bool = False
+    last_known_title: str | None = None
+    console_evictions: dict[int, int] = field(default_factory=dict)
+    network_evictions: dict[int, int] = field(default_factory=dict)
     pending_file_chooser: Any = field(default=None, repr=False)
+    file_chooser_retry_needed: bool = False
     pending_dialog: Any = field(default=None, repr=False)
     request_keys: dict[int, tuple[int, int]] = field(default_factory=dict, repr=False)
     callbacks: dict[str, Any] = field(default_factory=dict, repr=False)
@@ -110,7 +113,13 @@ class SessionState:
     remote: bool = False
     next_ref: int = 1
     page_registries: dict[int, PageRegistry] = field(default_factory=dict)
-    dialog_intent: DialogIntent | None = None
+    next_request_index: int = 1
+    next_console_sequence: int = 1
+    next_download_sequence: int = 1
+    response_console_cursor: int = 0
+    download_saver: Callable[[Any, str], str] | None = field(
+        default=None, repr=False
+    )
     event_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def attach(
@@ -141,6 +150,7 @@ class SessionState:
             console_records=deque(maxlen=self.console_quota),
             network_records=deque(maxlen=self.network_quota),
             downloads=deque(maxlen=self.download_quota),
+            navigation_start_request_index=self.next_request_index,
         )
         self.page_registries[key] = registry
         return registry
@@ -186,21 +196,22 @@ class SessionState:
             registry = self.page_registries.get(id(page))
             if registry is not None and registry.page is page:
                 self.page_registries.pop(id(page), None)
-            if self.dialog_intent is not None and self.dialog_intent.page is page:
-                self.dialog_intent = None
             if self.page is page:
                 self.page = None
 
     def clear(self) -> None:
         with self.event_lock:
             self.page_registries.clear()
-            self.dialog_intent = None
             self.pw = None
             self.browser = None
             self.context = None
             self.page = None
             self.remote = False
             self.next_ref = 1
+            self.next_request_index = 1
+            self.next_console_sequence = 1
+            self.next_download_sequence = 1
+            self.response_console_cursor = 0
 
     def snapshot_start_ref(self) -> int:
         with self.event_lock:
@@ -222,9 +233,73 @@ class SessionState:
                 return False, frozenset()
             return registry.snapshot_taken, registry.snapshot_refs
 
-    def arm_dialog(self, page: Any, accept: bool, prompt_text: str | None) -> None:
+    def pending_modals(self, page: Any) -> tuple[Any | None, Any | None]:
+        """Return the current dialog and file chooser without browser calls."""
         with self.event_lock:
-            self.dialog_intent = DialogIntent(page, accept, prompt_text)
+            registry = self.registry_for(page)
+            if registry is None:
+                return None, None
+            return registry.pending_dialog, registry.pending_file_chooser
+
+    def pending_modal_pages(self) -> list[tuple[Any, Any | None, Any | None]]:
+        """Return every registered page with live modal state."""
+        with self.event_lock:
+            return [
+                (registry.page, registry.pending_dialog, registry.pending_file_chooser)
+                for registry in self.page_registries.values()
+                if registry.pending_dialog is not None
+                or registry.pending_file_chooser is not None
+            ]
+
+    def remember_page_title(self, page: Any, title: str) -> None:
+        with self.event_lock:
+            registry = self.registry_for(page, create=True)
+            assert registry is not None
+            registry.last_known_title = title
+
+    def known_page_title(self, page: Any) -> str | None:
+        with self.event_lock:
+            registry = self.registry_for(page)
+            return None if registry is None else registry.last_known_title
+
+    def clear_pending_dialog(self, page: Any, dialog: Any) -> None:
+        with self.event_lock:
+            registry = self.registry_for(page)
+            if registry is not None and registry.pending_dialog is dialog:
+                registry.pending_dialog = None
+
+    def clear_pending_file_chooser(self, page: Any, chooser: Any) -> None:
+        with self.event_lock:
+            registry = self.registry_for(page)
+            if registry is not None and registry.pending_file_chooser is chooser:
+                registry.pending_file_chooser = None
+
+    def response_events(
+        self,
+    ) -> tuple[list[ConsoleRecord], int, list[DownloadRecord]]:
+        """Consume response-scoped console and completed download events."""
+        with self.event_lock:
+            console = sorted(
+                (
+                    record
+                    for registry in self.page_registries.values()
+                    for record in registry.console_records
+                    if record.sequence > self.response_console_cursor
+                ),
+                key=lambda record: record.sequence,
+            )
+            latest_console = self.next_console_sequence - 1
+            self.response_console_cursor = latest_console
+
+            downloads: list[DownloadRecord] = []
+            for registry in self.page_registries.values():
+                for position, record in enumerate(registry.downloads):
+                    if not record.finished or record.reported:
+                        continue
+                    downloads.append(record)
+                    registry.downloads[position] = replace(record, reported=True)
+            downloads.sort(key=lambda record: record.sequence)
+            return console, latest_console, downloads
 
     def _invalidate_snapshot(self, registry: PageRegistry) -> None:
         registry.snapshot_refs = frozenset()
@@ -232,7 +307,7 @@ class SessionState:
 
     def _begin_navigation(self, registry: PageRegistry) -> None:
         registry.navigation_epoch += 1
-        registry.next_request_index = 1
+        registry.navigation_start_request_index = self.next_request_index
         registry.navigation_pending = True
         self._invalidate_snapshot(registry)
 
@@ -248,14 +323,24 @@ class SessionState:
             registry = self.registry_for(page)
             if registry is None:
                 return
+            if (
+                registry.console_records.maxlen is not None
+                and len(registry.console_records) == registry.console_records.maxlen
+            ):
+                evicted_epoch = registry.console_records[0].epoch
+                registry.console_evictions[evicted_epoch] = (
+                    registry.console_evictions.get(evicted_epoch, 0) + 1
+                )
             registry.console_records.append(
                 ConsoleRecord(
+                    sequence=self.next_console_sequence,
                     epoch=registry.navigation_epoch,
                     message_type=str(message.type),
                     text=str(message.text),
                     location=_immutable_mapping(message.location),
                 )
             )
+            self.next_console_sequence += 1
 
     def _on_request(self, page: Any, request: Any) -> None:
         with self.event_lock:
@@ -264,8 +349,8 @@ class SessionState:
                 return
             if self._is_main_navigation(page, request) and not registry.navigation_pending:
                 self._begin_navigation(registry)
-            index = registry.next_request_index
-            registry.next_request_index += 1
+            index = self.next_request_index
+            self.next_request_index += 1
             record = NetworkRecord(
                 epoch=registry.navigation_epoch,
                 index=index,
@@ -276,6 +361,14 @@ class SessionState:
                 post_data=request.post_data,
                 request=request,
             )
+            if (
+                registry.network_records.maxlen is not None
+                and len(registry.network_records) == registry.network_records.maxlen
+            ):
+                evicted_epoch = registry.network_records[0].epoch
+                registry.network_evictions[evicted_epoch] = (
+                    registry.network_evictions.get(evicted_epoch, 0) + 1
+                )
             registry.network_records.append(record)
             registry.request_keys[id(request)] = (record.epoch, record.index)
             live_keys = {(item.epoch, item.index) for item in registry.network_records}
@@ -353,41 +446,51 @@ class SessionState:
                 registry.pending_file_chooser = chooser
 
     def _on_dialog(self, page: Any, dialog: Any) -> None:
-        intent: DialogIntent | None = None
         with self.event_lock:
             registry = self.registry_for(page)
             if registry is None:
                 return
             registry.pending_dialog = dialog
-            if self.dialog_intent is not None and self.dialog_intent.page is page:
-                intent = self.dialog_intent
-                self.dialog_intent = None
-
-        # Keep the existing arm-next behavior. An unarmed dialog remains in the
-        # pending slot for the modal tools introduced by a later change.
-        if intent is None:
-            return
-        if intent.accept:
-            dialog.accept(intent.prompt_text)
-        else:
-            dialog.dismiss()
-        with self.event_lock:
-            registry = self.registry_for(page)
-            if registry is not None and registry.pending_dialog is dialog:
-                registry.pending_dialog = None
 
     def _on_download(self, page: Any, download: Any) -> None:
+        record: DownloadRecord | None = None
         with self.event_lock:
             registry = self.registry_for(page)
             if registry is not None:
-                registry.downloads.append(
-                    DownloadRecord(
-                        epoch=registry.navigation_epoch,
-                        url=str(download.url),
-                        suggested_filename=str(download.suggested_filename),
-                        download=download,
-                    )
+                record = DownloadRecord(
+                    sequence=self.next_download_sequence,
+                    epoch=registry.navigation_epoch,
+                    url=str(download.url),
+                    suggested_filename=str(download.suggested_filename),
+                    download=download,
                 )
+                self.next_download_sequence += 1
+                registry.downloads.append(record)
+
+        # Browser/file I/O must never run under event_lock. The callback may be
+        # delivered while a serialized tool is in flight, so record first and
+        # publish the finished artifact in a second short critical section.
+        if record is None or self.download_saver is None:
+            return
+        artifact: str | None = None
+        error: str | None = None
+        try:
+            artifact = self.download_saver(download, record.suggested_filename)
+        except Exception as exc:
+            error = str(exc)
+        with self.event_lock:
+            registry = self.registry_for(page)
+            if registry is None:
+                return
+            for position, candidate in enumerate(registry.downloads):
+                if candidate.sequence == record.sequence:
+                    registry.downloads[position] = replace(
+                        candidate,
+                        artifact=artifact,
+                        error=error,
+                        finished=True,
+                    )
+                    break
 
     def _on_frame_navigated(self, page: Any, frame: Any) -> None:
         with self.event_lock:

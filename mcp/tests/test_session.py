@@ -124,7 +124,7 @@ def test_event_records_are_immutable_bounded_and_epoch_indexed():
     page.emit("request", next_epoch)
     assert [(item.epoch, item.index) for item in registry.network_records] == [
         (1, 2),
-        (2, 1),
+        (2, 3),
     ]
 
     chooser = object()
@@ -134,7 +134,7 @@ def test_event_records_are_immutable_bounded_and_epoch_indexed():
     assert registry.downloads[-1].download.__class__ is FakeDownload
 
 
-def test_dialog_slot_preserves_arm_next_behavior():
+def test_dialog_slot_stays_pending_without_automatic_action():
     state = SessionState()
     page = FakePage()
     registry = state.register_page_handlers(page)
@@ -143,11 +143,7 @@ def test_dialog_slot_preserves_arm_next_behavior():
     page.emit("dialog", pending)
     assert registry.pending_dialog is pending
     assert pending.action is None
-
-    state.arm_dialog(page, True, "answer")
-    armed = FakeDialog()
-    page.emit("dialog", armed)
-    assert armed.action == ("accept", "answer")
+    state.clear_pending_dialog(page, pending)
     assert registry.pending_dialog is None
 
 

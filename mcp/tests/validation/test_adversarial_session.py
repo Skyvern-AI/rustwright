@@ -69,6 +69,8 @@ class MutableResponse:
 class FakeDialog:
     def __init__(self) -> None:
         self.dismissed = False
+        self.type = "alert"
+        self.message = "captured"
 
     def dismiss(self) -> None:
         self.dismissed = True
@@ -110,7 +112,6 @@ def test_callback_flood_completes_while_slow_tool_holds_tool_lock(monkeypatch) -
     state = SessionState(console_quota=200, network_quota=200)
     page = FakePage()
     registry = state.register_page_handlers(page)
-    state.arm_dialog(page, False, None)
     monkeypatch.setattr(server, "_state", state)
     monkeypatch.setattr(server, "_page", lambda: page)
     monkeypatch.setattr(server, "_snapshot", lambda current: "snapshot")
@@ -136,7 +137,8 @@ def test_callback_flood_completes_while_slow_tool_holds_tool_lock(monkeypatch) -
             MutableRequest(page, f"https://example.test/request/{index}"),
         )
 
-    assert dialog.dismissed
+    assert not dialog.dismissed
+    assert registry.pending_dialog is dialog
     assert len(registry.console_records) == 100
     assert len(registry.network_records) == 100
 
@@ -146,6 +148,7 @@ def test_callback_flood_completes_while_slow_tool_holds_tool_lock(monkeypatch) -
     assert failures == []
     assert len(result) == 1
     assert "### Snapshot\nsnapshot" in result[0]
+    assert "### Modal" in result[0]
 
 
 def test_late_response_does_not_resurrect_an_evicted_network_record() -> None:

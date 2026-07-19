@@ -147,6 +147,13 @@ def test_fixture_exactly_matches_the_ten_audited_schemas_and_has_no_prose() -> N
 
 def test_alias_conflicts_always_prefer_the_canonical_spelling(fake_runtime) -> None:
     page, state, policy = fake_runtime
+
+    class Dialog:
+        prompt_text = None
+
+        def accept(self, prompt_text=None) -> None:
+            self.prompt_text = prompt_text
+
     _tool_call(
         "browser_click",
         {"target": "#click", "doubleClick": True, "double_click": False},
@@ -167,6 +174,8 @@ def test_alias_conflicts_always_prefer_the_canonical_spelling(fake_runtime) -> N
         "browser_evaluate",
         {"function": "canonical", "expression": "legacy"},
     )
+    dialog = Dialog()
+    state.registry_for(page, create=True).pending_dialog = dialog
     _tool_call(
         "browser_handle_dialog",
         {"accept": True, "promptText": "canonical", "prompt_text": "legacy"},
@@ -185,8 +194,7 @@ def test_alias_conflicts_always_prefer_the_canonical_spelling(fake_runtime) -> N
     assert screenshot[-1] is True
     assert (policy.output_root / "capture.png").exists()
     assert "canonical" in evaluate and "legacy" not in evaluate
-    assert state.dialog_intent is not None
-    assert state.dialog_intent.prompt_text == "canonical"
+    assert dialog.prompt_text == "canonical"
     assert waits == [("text-wait", "canonical", "hidden", 10_000)]
 
 

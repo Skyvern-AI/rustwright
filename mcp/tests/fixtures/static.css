@@ -1,0 +1,3 @@
+body { font-family: sans-serif; }
+#drag-source, #drag-target { border: 1px solid black; margin: 8px; padding: 12px; }
+@media (max-width: 500px) { #responsive { font-size: 10px; } }

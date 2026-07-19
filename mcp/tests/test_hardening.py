@@ -82,16 +82,15 @@ def test_browser_tabs_and_dialog_policy():
         assert "1: Hardening Test" in tabs
         await _call(session, "browser_tabs", action="close", index=1)
 
+        pending = await _call(session, "browser_click", target="#prompt")
+        assert "### Modal" in pending
         confirmation = await _call(
             session,
             "browser_handle_dialog",
             accept=True,
             prompt_text="Rustwright",
         )
-        assert _result_section(confirmation) == (
-            "The next dialog on the active page will be accepted."
-        )
-        await _call(session, "browser_click", target="#prompt")
+        assert _result_section(confirmation) == "Accepted the pending dialog."
         assert _result_section(
             await _call(session, "browser_get_text", selector="#out")
         ) == "Rustwright"

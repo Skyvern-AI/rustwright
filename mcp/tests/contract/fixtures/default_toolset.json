@@ -11,12 +11,43 @@
   "browser_close": {
     "params": []
   },
+  "browser_console_messages": {
+    "params": [
+      {"name": "level", "type": "string", "required": false, "enum": ["error", "warning", "info", "debug"], "default": "info"},
+      {"name": "all", "type": "boolean", "required": false, "default": false},
+      {"name": "filename", "type": "string", "required": false}
+    ]
+  },
+  "browser_drag": {
+    "params": [
+      {"name": "startElement", "type": "string", "required": false},
+      {"name": "startTarget", "type": "string", "required": true},
+      {"name": "endElement", "type": "string", "required": false},
+      {"name": "endTarget", "type": "string", "required": true}
+    ]
+  },
   "browser_evaluate": {
     "params": [
       {"name": "element", "type": "string", "required": false},
       {"name": "target", "type": "string", "required": false},
       {"name": "function", "type": "string", "required": true},
       {"name": "filename", "type": "string", "required": false}
+    ]
+  },
+  "browser_file_upload": {
+    "params": [
+      {"name": "paths", "type": "array", "required": false}
+    ]
+  },
+  "browser_fill_form": {
+    "params": [
+      {"name": "fields", "type": "array", "required": true}
+    ]
+  },
+  "browser_find": {
+    "params": [
+      {"name": "text", "type": "string", "required": false},
+      {"name": "regex", "type": "string", "required": false}
     ]
   },
   "browser_handle_dialog": {
@@ -39,9 +70,29 @@
   "browser_navigate_back": {
     "params": []
   },
+  "browser_network_request": {
+    "params": [
+      {"name": "index", "type": "integer", "required": true},
+      {"name": "part", "type": "string", "required": false, "enum": ["request-headers", "request-body", "response-headers", "response-body"]},
+      {"name": "filename", "type": "string", "required": false}
+    ]
+  },
+  "browser_network_requests": {
+    "params": [
+      {"name": "static", "type": "boolean", "required": false, "default": false},
+      {"name": "filter", "type": "string", "required": false},
+      {"name": "filename", "type": "string", "required": false}
+    ]
+  },
   "browser_press_key": {
     "params": [
       {"name": "key", "type": "string", "required": true}
+    ]
+  },
+  "browser_resize": {
+    "params": [
+      {"name": "width", "type": "number", "required": true},
+      {"name": "height", "type": "number", "required": true}
     ]
   },
   "browser_select_option": {

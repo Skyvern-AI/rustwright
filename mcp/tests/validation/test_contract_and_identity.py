@@ -67,6 +67,14 @@ def test_real_stdio_identity_and_complete_tool_inventory() -> None:
         "browser_evaluate",
         "browser_take_screenshot",
         "browser_close",
+        "browser_console_messages",
+        "browser_drag",
+        "browser_file_upload",
+        "browser_fill_form",
+        "browser_find",
+        "browser_network_request",
+        "browser_network_requests",
+        "browser_resize",
     }
 
     async def checks() -> None:

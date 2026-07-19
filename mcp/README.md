@@ -65,16 +65,24 @@ Ask your agent to “take a browser snapshot of example.com”.
 | Tool | Purpose |
 |---|---|
 | `browser_navigate(url)` | Open a URL, returns snapshot |
+| `browser_resize(width, height)` | Change the page viewport and return a responsive snapshot |
 | `browser_snapshot(target?, filename?, depth?, boxes?)` | Full or targeted outline with `[ref=eN]` handles |
+| `browser_find(text?, regex?)` | Search one refreshed outline with paths, refs, and sibling context |
 | `browser_click(target, element?, doubleClick?, button?, modifiers?)` | Click a ref or unique CSS selector |
+| `browser_drag(startTarget, endTarget, startElement?, endElement?)` | Strict element-to-element drag with a fresh snapshot |
 | `browser_type(target, text, element?, submit?, slowly?, clear?)` | Fill or character-type into an input; `clear` is an extension |
 | `browser_select_option(target, values, element?)` | Select one or more dropdown options; legacy `value` is accepted |
+| `browser_fill_form(fields)` | Sequential, non-transactional typed form fill with one final snapshot |
 | `browser_hover(target)` | Hover an element |
 | `browser_press_key(key)` | Press a keyboard key |
 | `browser_navigate_back()` | History back |
 | `browser_reload()` | Reload the active page, returns snapshot |
 | `browser_tabs(action, index?, url?)` | List, open, select, or close tabs |
-| `browser_handle_dialog(accept, promptText?)` | Set a one-shot policy for the next dialog |
+| `browser_handle_dialog(accept, promptText?)` | Resolve the JavaScript dialog that is currently pending |
+| `browser_file_upload(paths?)` | Resolve or cancel the currently pending file chooser |
+| `browser_console_messages(level?, all?, filename?)` | Read thresholded console records inline or as an artifact |
+| `browser_network_requests(static?, filter?, filename?)` | List current-navigation requests by stable index |
+| `browser_network_request(index, part?, filename?)` | Read request/response details and lazy response bodies |
 | `browser_wait_for(time?, text?, textGone?, timeout_ms?)` | Wait up to 30 seconds and/or for visible/hidden text |
 | `browser_get_text(selector?)` | Visible text of a selector |
 | `browser_evaluate(function, element?, target?, filename?)` | Run page-world JavaScript and return JSON plus a fresh snapshot |
@@ -93,11 +101,11 @@ Ask your agent to “take a browser snapshot of example.com”.
 | `RUSTWRIGHT_MCP_CDP_TIMEOUT_MS` | Remote connection timeout in milliseconds (default `60000`) |
 | `RUSTWRIGHT_MCP_ALLOW_EVAL` | Page-world evaluation is on by default; an explicit `0`, `false`, `no`, or `off` disables it |
 | `RUSTWRIGHT_MCP_CAPS` | Comma-separated capability groups; unavailable groups warn and are ignored |
-| `RUSTWRIGHT_MCP_TOOLSET` | `mirror` (all 16 tools, default) or `lean` (core interaction loop plus evaluate) |
+| `RUSTWRIGHT_MCP_TOOLSET` | `mirror` (all 24 tools, default) or `lean` (core interaction loop, resize, and evaluate) |
 | `RUSTWRIGHT_MCP_OUTPUT_DIR` | Root for files written by tools |
 | `RUSTWRIGHT_MCP_OUTPUT_MAX_FILE_BYTES` | Per-file output cap (default `20971520`, or 20 MiB) |
 | `RUSTWRIGHT_MCP_OUTPUT_MAX_TOTAL_BYTES` | Total output cap (default `209715200`, or 200 MiB) |
-| `RUSTWRIGHT_MCP_WORKSPACE` | Allowed input root for future file-upload tools |
+| `RUSTWRIGHT_MCP_WORKSPACE` | Allowed absolute input root for file uploads |
 
 ### File outputs
 
@@ -171,6 +179,10 @@ restart the session).
   boundary. Refs increase for the browser session and stale refs fail fast.
 - Each server process controls a single local or remote browser session, which
   may have multiple tabs.
+- JavaScript dialogs and file choosers are pending modal state. Responses show
+  a `### Modal` section; use `browser_handle_dialog` or `browser_file_upload`
+  before another DOM-evaluating tool. Downloads are confined automatically and
+  reported once in `### Downloads`.
 
 ## Limitations
 
