@@ -307,6 +307,48 @@ class FilePolicy:
             raise FilePolicyError(f"input path is not a regular file: {raw_path}")
         return resolved
 
+    def read_inputs(
+        self, requested: Sequence[str | Path]
+    ) -> list[tuple[Path, bytes]]:
+        """Validate and read inputs while enforcing the shared byte caps.
+
+        The descriptor-backed reads repeat the regular-file check performed by
+        :meth:`validate_input` and never follow a final-component symlink.  The
+        limits are shared with outputs so one policy configuration bounds every
+        file payload crossing the MCP boundary.
+        """
+        loaded: list[tuple[Path, bytes]] = []
+        total = 0
+        for entry in requested:
+            path = self.validate_input(entry)
+            with self.open_input(path) as handle:
+                initial_size = os.fstat(handle.fileno()).st_size
+                if initial_size > self.max_file_bytes:
+                    raise FilePolicyError(
+                        f"input file exceeds the {self.max_file_bytes}-byte "
+                        f"per-file cap: {path}"
+                    )
+                if total + initial_size > self.max_total_bytes:
+                    raise FilePolicyError(
+                        f"input files exceed the {self.max_total_bytes}-byte total cap"
+                    )
+
+                content = bytearray()
+                while chunk := handle.read(1024 * 1024):
+                    content.extend(chunk)
+                    if len(content) > self.max_file_bytes:
+                        raise FilePolicyError(
+                            f"input file exceeds the {self.max_file_bytes}-byte "
+                            f"per-file cap: {path}"
+                        )
+                    if total + len(content) > self.max_total_bytes:
+                        raise FilePolicyError(
+                            f"input files exceed the {self.max_total_bytes}-byte total cap"
+                        )
+                loaded.append((path, bytes(content)))
+                total += len(content)
+        return loaded
+
     @contextmanager
     def open_input(self, requested: str | Path) -> Iterator[BinaryIO]:
         """Open a validated input without following a final-component symlink."""

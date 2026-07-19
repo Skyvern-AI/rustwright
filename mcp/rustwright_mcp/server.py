@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from importlib import metadata
 import json
 import math
+import mimetypes
 import os
 import re
 import sys
@@ -735,6 +736,45 @@ NetworkIndex = Annotated[int, Field(ge=1)]
 UploadPaths = Annotated[list[str], Field(max_length=50)]
 
 
+_SYNTHETIC_DROP_JS = """async (target, payload) => {
+    const transfer = new DataTransfer();
+    transfer.effectAllowed = "copy";
+    transfer.dropEffect = "copy";
+
+    for (const entry of payload.files) {
+        const binary = atob(entry.base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+            bytes[index] = binary.charCodeAt(index);
+        }
+        transfer.items.add(new File([bytes], entry.name, {
+            type: entry.mime,
+            lastModified: 0,
+        }));
+    }
+    for (const [mime, value] of payload.data) {
+        transfer.setData(mime, value);
+    }
+
+    const bounds = target.getBoundingClientRect();
+    const eventOptions = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        clientX: bounds.left + bounds.width / 2,
+        clientY: bounds.top + bounds.height / 2,
+        dataTransfer: transfer,
+    };
+    for (const type of ["dragenter", "dragover", "drop"]) {
+        target.dispatchEvent(new DragEvent(type, eventOptions));
+    }
+
+    // Let FileReader- and promise-based handlers make progress before the
+    // fresh snapshot. Application work that outlives this task remains async.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+}"""
+
+
 class FillField(TypedDict):
     """One strictly validated browser_fill_form operation."""
 
@@ -1121,6 +1161,62 @@ def browser_drag(
     snapshot = _snapshot(page)
     return _render_response(
         f"Dragged {start.display_name} to {end.display_name}.",
+        page=page,
+        snapshot=snapshot,
+    )
+
+
+@_tool()
+def browser_drop(
+    target: str,
+    element: str | None = None,
+    paths: UploadPaths | None = None,
+    data: dict[str, str] | None = None,
+) -> str:
+    """Best-effort drop files and/or MIME strings onto a unique target.
+
+    ``element`` is only a human-readable description. The tool uses synthetic DataTransfer semantics:
+    synthesized drop events; sites checking event trust or native drag sessions may behave differently.
+    """
+    supplied_paths = [] if paths is None else paths
+    supplied_data = {} if data is None else data
+    if not supplied_paths and not supplied_data:
+        raise ValueError("browser_drop requires at least one non-empty paths or data source")
+
+    normalized_mime_keys: set[str] = set()
+    for mime in supplied_data:
+        if not mime.strip():
+            raise ValueError("browser_drop data MIME keys must be non-empty")
+        normalized = mime.casefold()
+        if normalized in normalized_mime_keys:
+            raise ValueError(
+                "browser_drop data MIME keys must be unique ignoring case"
+            )
+        normalized_mime_keys.add(normalized)
+
+    page = _page()
+    resolved = _resolve(page, target, element)
+
+    policy = get_file_policy()
+    files = []
+    for path, content in policy.read_inputs(supplied_paths):
+        inferred_mime, _ = mimetypes.guess_type(path.name, strict=False)
+        files.append(
+            {
+                "name": path.name,
+                "mime": inferred_mime or "application/octet-stream",
+                "base64": base64.b64encode(content).decode("ascii"),
+            }
+        )
+
+    resolved.locator.evaluate(
+        _SYNTHETIC_DROP_JS,
+        {"files": files, "data": list(supplied_data.items())},
+    )
+    snapshot = _snapshot(page)
+    source_summary = f"{len(files)} file(s) and {len(supplied_data)} data item(s)"
+    return _render_response(
+        f"Synthesized a drop of {source_summary} on {resolved.display_name}.",
         page=page,
         snapshot=snapshot,
     )

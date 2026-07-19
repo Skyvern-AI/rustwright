@@ -26,6 +26,14 @@
       {"name": "endTarget", "type": "string", "required": true}
     ]
   },
+  "browser_drop": {
+    "params": [
+      {"name": "element", "type": "string", "required": false},
+      {"name": "target", "type": "string", "required": true},
+      {"name": "paths", "type": "array", "required": false},
+      {"name": "data", "type": "object", "required": false}
+    ]
+  },
   "browser_evaluate": {
     "params": [
       {"name": "element", "type": "string", "required": false},

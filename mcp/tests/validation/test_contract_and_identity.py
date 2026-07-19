@@ -69,6 +69,7 @@ def test_real_stdio_identity_and_complete_tool_inventory() -> None:
         "browser_close",
         "browser_console_messages",
         "browser_drag",
+        "browser_drop",
         "browser_file_upload",
         "browser_fill_form",
         "browser_find",

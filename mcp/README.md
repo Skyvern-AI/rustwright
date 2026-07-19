@@ -70,6 +70,7 @@ Ask your agent to “take a browser snapshot of example.com”.
 | `browser_find(text?, regex?)` | Search one refreshed outline with paths, refs, and sibling context |
 | `browser_click(target, element?, doubleClick?, button?, modifiers?)` | Click a ref or unique CSS selector |
 | `browser_drag(startTarget, endTarget, startElement?, endElement?)` | Strict element-to-element drag with a fresh snapshot |
+| `browser_drop(target, element?, paths?, data?)` | Best-effort synthetic DataTransfer drop with files and/or MIME strings |
 | `browser_type(target, text, element?, submit?, slowly?, clear?)` | Fill or character-type into an input; `clear` is an extension |
 | `browser_select_option(target, values, element?)` | Select one or more dropdown options; legacy `value` is accepted |
 | `browser_fill_form(fields)` | Sequential, non-transactional typed form fill with one final snapshot |
@@ -101,11 +102,11 @@ Ask your agent to “take a browser snapshot of example.com”.
 | `RUSTWRIGHT_MCP_CDP_TIMEOUT_MS` | Remote connection timeout in milliseconds (default `60000`) |
 | `RUSTWRIGHT_MCP_ALLOW_EVAL` | Page-world evaluation is on by default; an explicit `0`, `false`, `no`, or `off` disables it |
 | `RUSTWRIGHT_MCP_CAPS` | Comma-separated capability groups; unavailable groups warn and are ignored |
-| `RUSTWRIGHT_MCP_TOOLSET` | `mirror` (all 24 tools, default) or `lean` (core interaction loop, resize, and evaluate) |
+| `RUSTWRIGHT_MCP_TOOLSET` | `mirror` (all 25 tools, default) or `lean` (core interaction loop, resize, and evaluate) |
 | `RUSTWRIGHT_MCP_OUTPUT_DIR` | Root for files written by tools |
-| `RUSTWRIGHT_MCP_OUTPUT_MAX_FILE_BYTES` | Per-file output cap (default `20971520`, or 20 MiB) |
-| `RUSTWRIGHT_MCP_OUTPUT_MAX_TOTAL_BYTES` | Total output cap (default `209715200`, or 200 MiB) |
-| `RUSTWRIGHT_MCP_WORKSPACE` | Allowed absolute input root for file uploads |
+| `RUSTWRIGHT_MCP_OUTPUT_MAX_FILE_BYTES` | Shared per-file output and drop-input cap (default `20971520`, or 20 MiB) |
+| `RUSTWRIGHT_MCP_OUTPUT_MAX_TOTAL_BYTES` | Shared total output and per-drop input cap (default `209715200`, or 200 MiB) |
+| `RUSTWRIGHT_MCP_WORKSPACE` | Allowed absolute input root for file uploads and drops |
 
 ### File outputs
 
