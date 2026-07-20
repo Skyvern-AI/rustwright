@@ -61,8 +61,18 @@ def test_drop_schema_contract_description_and_profiles() -> None:
         "params": [
             {"name": "element", "type": "string", "required": False},
             {"name": "target", "type": "string", "required": True},
-            {"name": "paths", "type": "array", "required": False},
-            {"name": "data", "type": "object", "required": False},
+            {
+                "name": "paths",
+                "type": "array",
+                "required": False,
+                "items": {"type": "string"},
+            },
+            {
+                "name": "data",
+                "type": "object",
+                "required": False,
+                "additionalProperties": {"type": "string"},
+            },
         ]
     }
     assert raw_contract["browser_drop"] == expected
@@ -71,7 +81,8 @@ def test_drop_schema_contract_description_and_profiles() -> None:
     mismatched = copy.deepcopy(advertised)
     mismatched["properties"]["data"] = {"type": "array"}
     assert compare_tool_schema(mismatched, contract) == [
-        "type mismatch for data: expected object"
+        "type mismatch for data: expected object, got ['array']",
+        "missing additionalProperties schema for data",
     ]
 
     mirror, _ = asyncio.run(

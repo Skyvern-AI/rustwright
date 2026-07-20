@@ -87,9 +87,11 @@ class FilePolicy:
             root = Path(output_root).expanduser()
         if not root.is_absolute():
             root = Path.cwd() / root
+        root_existed = root.exists()
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.output_root = root.resolve(strict=True)
-        os.chmod(self.output_root, 0o700)
+        if not root_existed:
+            os.chmod(self.output_root, 0o700)
         self.roots_provider = roots_provider or EnvRootsProvider()
         self.max_file_bytes = (
             max_file_bytes
@@ -108,6 +110,7 @@ class FilePolicy:
         if self.max_file_bytes <= 0 or self.max_total_bytes <= 0:
             raise FilePolicyError("output byte caps must be positive")
         self._lock = threading.RLock()
+        self._created_outputs: set[Path] = set()
 
     def _confined_output_path(
         self,
@@ -165,6 +168,7 @@ class FilePolicy:
                 os.fchmod(descriptor, 0o600)
             finally:
                 os.close(descriptor)
+            self._created_outputs.add(path)
             return path
 
     def discard_output(self, path: Path) -> None:
@@ -173,6 +177,7 @@ class FilePolicy:
                 path.unlink()
             except FileNotFoundError:
                 pass
+            self._created_outputs.discard(path)
 
     @staticmethod
     def _remove_entry(path: Path) -> None:
@@ -195,13 +200,20 @@ class FilePolicy:
         resolved: Path | None,
         is_link: bool,
     ) -> None:
-        if (
-            is_link
-            and resolved is not None
-            and not _is_within(resolved, self.output_root)
-        ):
-            self._remove_entry(resolved)
-        self._remove_entry(path)
+        lexical_path = Path(os.path.abspath(path))
+        if not _is_within(lexical_path, self.output_root):
+            return
+        if is_link:
+            # Unlink the confined directory entry, never its resolved target.
+            try:
+                os.unlink(lexical_path)
+            except FileNotFoundError:
+                pass
+            self._created_outputs.discard(lexical_path)
+            return
+        if resolved is not None and _is_within(resolved, self.output_root):
+            self._remove_entry(lexical_path)
+            self._created_outputs.discard(lexical_path)
 
     def _artifact_link(self, path: Path) -> str:
         for root in self.roots_provider.roots():
@@ -237,6 +249,7 @@ class FilePolicy:
             os.chmod(resolved, 0o600)
             if info.st_size > self.max_file_bytes:
                 resolved.unlink()
+                self._created_outputs.discard(resolved)
                 raise FilePolicyError(
                     f"output file exceeds the {self.max_file_bytes}-byte per-file cap"
                 )
@@ -245,10 +258,11 @@ class FilePolicy:
 
     def _artifact_files(self) -> list[tuple[int, Path, int]]:
         artifacts: list[tuple[int, Path, int]] = []
-        for path in self.output_root.rglob("*"):
+        for path in tuple(self._created_outputs):
             try:
                 info = path.lstat()
             except FileNotFoundError:
+                self._created_outputs.discard(path)
                 continue
             if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
                 artifacts.append((info.st_mtime_ns, path, info.st_size))
@@ -267,6 +281,7 @@ class FilePolicy:
                 path.unlink()
             except FileNotFoundError:
                 continue
+            self._created_outputs.discard(path)
             total -= size
             if total <= self.max_total_bytes:
                 return
@@ -275,6 +290,7 @@ class FilePolicy:
                 protected.unlink()
             except FileNotFoundError:
                 pass
+            self._created_outputs.discard(protected)
             raise FilePolicyError(
                 f"output file cannot fit within the {self.max_total_bytes}-byte total cap"
             )

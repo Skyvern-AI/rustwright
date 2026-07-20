@@ -100,7 +100,7 @@ Ask your agent to “take a browser snapshot of example.com”.
 | `RUSTWRIGHT_MCP_CDP_ENDPOINT` | Remote browser CDP endpoint; enables remote mode when set |
 | `RUSTWRIGHT_MCP_CDP_HEADERS` | Optional JSON object of extra CDP connection headers |
 | `RUSTWRIGHT_MCP_CDP_TIMEOUT_MS` | Remote connection timeout in milliseconds (default `60000`) |
-| `RUSTWRIGHT_MCP_ALLOW_EVAL` | Page-world evaluation is on by default; an explicit `0`, `false`, `no`, or `off` disables it |
+| `RUSTWRIGHT_MCP_ALLOW_EVAL` | Page-world evaluation is on by default; accepts `1`, `true`, `yes`, `on` or `0`, `false`, `no`, `off`; any other value stops startup |
 | `RUSTWRIGHT_MCP_CAPS` | Comma-separated capability groups; unavailable groups warn and are ignored |
 | `RUSTWRIGHT_MCP_TOOLSET` | `mirror` (all 25 tools, default) or `lean` (core interaction loop, resize, and evaluate) |
 | `RUSTWRIGHT_MCP_OUTPUT_DIR` | Root for files written by tools |
@@ -113,7 +113,9 @@ Ask your agent to “take a browser snapshot of example.com”.
 All tool-written files are confined to `RUSTWRIGHT_MCP_OUTPUT_DIR`. If that
 variable is unset, each server process creates a private session directory at
 `${XDG_CACHE_HOME:-~/.cache}/rustwright-mcp/output/<session-uuid>/`. Output
-directories use mode `0700`; files are created exclusively with mode `0600`.
+directories created by the server use mode `0700`; files are created exclusively
+with mode `0600`. A pre-existing configured directory keeps its permissions, and
+only files reserved by the current server process are eligible for eviction.
 Artifact paths returned by tools are relative to the output root.
 
 Each output is limited to 20 MiB by default, and all retained outputs together

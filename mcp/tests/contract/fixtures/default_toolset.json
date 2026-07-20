@@ -5,7 +5,7 @@
       {"name": "target", "type": "string", "required": true},
       {"name": "doubleClick", "type": "boolean", "required": false, "default": false},
       {"name": "button", "type": "string", "required": false, "enum": ["left", "right", "middle"], "default": "left"},
-      {"name": "modifiers", "type": "array", "required": false, "enum": ["Alt", "Control", "ControlOrMeta", "Meta", "Shift"]}
+      {"name": "modifiers", "type": "array", "required": false, "items": {"type": "string", "enum": ["Alt", "Control", "ControlOrMeta", "Meta", "Shift"]}}
     ]
   },
   "browser_close": {
@@ -30,8 +30,8 @@
     "params": [
       {"name": "element", "type": "string", "required": false},
       {"name": "target", "type": "string", "required": true},
-      {"name": "paths", "type": "array", "required": false},
-      {"name": "data", "type": "object", "required": false}
+      {"name": "paths", "type": "array", "required": false, "items": {"type": "string"}},
+      {"name": "data", "type": "object", "required": false, "additionalProperties": {"type": "string"}}
     ]
   },
   "browser_evaluate": {
@@ -44,12 +44,18 @@
   },
   "browser_file_upload": {
     "params": [
-      {"name": "paths", "type": "array", "required": false}
+      {"name": "paths", "type": "array", "required": false, "items": {"type": "string"}}
     ]
   },
   "browser_fill_form": {
     "params": [
-      {"name": "fields", "type": "array", "required": true}
+      {"name": "fields", "type": "array", "required": true, "items": {"type": "object", "params": [
+        {"name": "element", "type": "string", "required": false},
+        {"name": "target", "type": "string", "required": true},
+        {"name": "name", "type": "string", "required": true},
+        {"name": "type", "type": "string", "required": true, "enum": ["textbox", "checkbox", "radio", "combobox", "slider"]},
+        {"name": "value", "type": "string", "required": true}
+      ]}}
     ]
   },
   "browser_find": {
@@ -64,6 +70,12 @@
       {"name": "promptText", "type": "string", "required": false}
     ]
   },
+  "browser_get_text": {
+    "params": [
+      {"name": "selector", "type": "string", "required": false, "default": "body"},
+      {"name": "max_chars", "type": "integer", "required": false, "default": 20000}
+    ]
+  },
   "browser_hover": {
     "params": [
       {"name": "element", "type": "string", "required": false},
@@ -76,6 +88,9 @@
     ]
   },
   "browser_navigate_back": {
+    "params": []
+  },
+  "browser_reload": {
     "params": []
   },
   "browser_network_request": {
@@ -107,7 +122,7 @@
     "params": [
       {"name": "element", "type": "string", "required": false},
       {"name": "target", "type": "string", "required": true},
-      {"name": "values", "type": "array", "required": true}
+      {"name": "values", "type": "array", "required": true, "items": {"type": "string"}}
     ]
   },
   "browser_snapshot": {
@@ -115,7 +130,7 @@
       {"name": "target", "type": "string", "required": false},
       {"name": "filename", "type": "string", "required": false},
       {"name": "depth", "type": "number", "required": false},
-      {"name": "boxes", "type": "boolean", "required": false}
+      {"name": "boxes", "type": "boolean", "required": false, "default": false}
     ]
   },
   "browser_tabs": {
@@ -141,14 +156,16 @@
       {"name": "target", "type": "string", "required": true},
       {"name": "text", "type": "string", "required": true},
       {"name": "submit", "type": "boolean", "required": false, "default": false},
-      {"name": "slowly", "type": "boolean", "required": false, "default": false}
+      {"name": "slowly", "type": "boolean", "required": false, "default": false},
+      {"name": "clear", "type": "boolean", "required": false, "default": true}
     ]
   },
   "browser_wait_for": {
     "params": [
       {"name": "time", "type": "number", "required": false},
       {"name": "text", "type": "string", "required": false},
-      {"name": "textGone", "type": "string", "required": false}
+      {"name": "textGone", "type": "string", "required": false},
+      {"name": "timeout_ms", "type": "number", "required": false, "default": 10000}
     ]
   }
 }

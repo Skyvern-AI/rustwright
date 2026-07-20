@@ -102,6 +102,31 @@ def test_per_file_cap_and_oldest_first_total_eviction(tmp_path):
     assert not too_large.exists()
 
 
+def test_existing_configured_root_file_is_never_evicted_or_chmodded(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "existing-output"
+    root.mkdir(mode=0o755)
+    os.chmod(root, 0o755)
+    preexisting = root / "unrelated.txt"
+    preexisting.write_text("keep this unrelated file")
+    monkeypatch.setenv("RUSTWRIGHT_MCP_OUTPUT_DIR", str(root))
+    policy = FilePolicy(max_file_bytes=4, max_total_bytes=6)
+
+    old = policy.reserve_output("old.bin")
+    old.write_bytes(b"1234")
+    policy.finalize_output(old)
+    os.utime(old, ns=(1, 1))
+    new = policy.reserve_output("new.bin")
+    new.write_bytes(b"5678")
+    policy.finalize_output(new)
+
+    assert not old.exists()
+    assert new.exists()
+    assert preexisting.read_text() == "keep this unrelated file"
+    assert stat.S_IMODE(root.stat().st_mode) == 0o755
+
+
 def test_screenshot_policy_error_and_no_path_artifact(monkeypatch, tmp_path):
     policy = FilePolicy(output_root=tmp_path / "output")
     monkeypatch.setattr(server, "get_file_policy", lambda: policy)

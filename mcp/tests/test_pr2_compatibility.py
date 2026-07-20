@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 
@@ -53,7 +54,9 @@ class FakeLocator:
     def hover(self) -> None:
         self.page.events.append(("hover", self.selector))
 
-    def evaluate(self, function: str):
+    def evaluate(self, function: str, argument=None):
+        if argument is not None:
+            return self.selector == argument.selector
         self.page.events.append(("locator-evaluate", self.selector, function))
         return {"context": self.selector, "function": function}
 
@@ -166,6 +169,43 @@ def test_click_camel_snake_scalar_array_and_canonical_precedence(fake_page) -> N
     assert clicks[0][2]["modifiers"] == ["Alt"]
     assert clicks[1][2]["click_count"] == 2
     assert clicks[2][2]["click_count"] == 1
+
+
+def test_failed_upload_does_not_replay_click_on_different_element(
+    fake_page, monkeypatch, tmp_path
+) -> None:
+    class OriginatingElement:
+        selector = "#upload"
+
+        def evaluate(self, function):
+            fake_page.events.append(("reset-upload", function))
+
+    class Chooser:
+        element = OriginatingElement()
+
+        def is_multiple(self):
+            return False
+
+        def set_files(self, paths):
+            fake_page.events.append(("set-files", paths))
+
+    state = server._state
+    registry = state.register_page_handlers(fake_page)
+    registry.pending_file_chooser = Chooser()
+    policy = FilePolicy(output_root=tmp_path / "output")
+    monkeypatch.setattr(server, "get_file_policy", lambda: policy)
+
+    with pytest.raises(ValueError, match="Retry by clicking the same file input"):
+        server.browser_file_upload(paths=["relative.txt"])
+    assert registry.file_chooser_retry_element is not None
+
+    server.browser_click(target="#unrelated")
+    unrelated_clicks = [
+        event
+        for event in fake_page.events
+        if event[0] == "click" and event[1] == "#unrelated"
+    ]
+    assert len(unrelated_clicks) == 1
 
 
 def test_type_canonical_slowly_and_legacy_clear_are_independent(fake_page) -> None:
@@ -410,6 +450,23 @@ def test_caps_parser_env_precedence_and_warnings(capsys) -> None:
     warning = capsys.readouterr().err
     assert "capability group 'vision' is not implemented" in warning
     assert "capability group 'pdf' is not implemented" in warning
+
+
+def test_unknown_allow_eval_value_fails_startup_instead_of_enabling_eval() -> None:
+    env = dict(os.environ)
+    env["RUSTWRIGHT_MCP_ALLOW_EVAL"] = "flase"
+    result = subprocess.run(
+        [sys.executable, "-c", "import rustwright_mcp.server"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "RUSTWRIGHT_MCP_ALLOW_EVAL must be one of" in result.stderr
+    assert "'flase'" in result.stderr
 
 
 async def _stdio_tools(

@@ -8,7 +8,9 @@ from rustwright_mcp.server import mcp
 
 from contract.contract_schema import (
     ParamContract,
+    SchemaContract,
     ToolContract,
+    compare_tool_inventory,
     compare_tool_schema,
     dump_contract,
     load_contract,
@@ -16,6 +18,7 @@ from contract.contract_schema import (
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "default_toolset.json"
+INTENTIONAL_TOOL_ADDITIONS: frozenset[str] = frozenset()
 
 
 def test_default_toolset_contract():
@@ -24,9 +27,11 @@ def test_default_toolset_contract():
         tool.name: tool.inputSchema for tool in asyncio.run(mcp.list_tools())
     }
 
-    for name, tool_contract in contract.items():
-        assert name in advertised
-        assert compare_tool_schema(advertised[name], tool_contract) == []
+    assert compare_tool_inventory(
+        advertised,
+        contract,
+        allowed_additions=INTENTIONAL_TOOL_ADDITIONS,
+    ) == []
 
 
 def test_contract_fixture_round_trip():
@@ -34,7 +39,7 @@ def test_contract_fixture_round_trip():
     assert dump_contract(contract) == json.loads(FIXTURE.read_text())
 
 
-def test_comparator_allows_required_subset_and_accepted_superset():
+def test_comparator_rejects_optional_superset_and_required_drift():
     contract = ToolContract(
         name="example_tool",
         params=(ParamContract(name="target", type="string", required=True),),
@@ -48,7 +53,46 @@ def test_comparator_allows_required_subset_and_accepted_superset():
         "required": [],
     }
 
-    assert compare_tool_schema(advertised, contract) == []
+    assert compare_tool_schema(advertised, contract) == [
+        "unexpected params: ['extension']",
+        "required params mismatch: expected ['target'], got []",
+    ]
+
+
+def test_inventory_rejects_unpinned_tool():
+    contract = {
+        "pinned": ToolContract(name="pinned", params=()),
+    }
+    empty_schema = {"type": "object", "properties": {}}
+
+    assert compare_tool_inventory(
+        {"pinned": empty_schema, "silent_addition": empty_schema}, contract
+    ) == ["unpinned tools: ['silent_addition']"]
+
+
+def test_comparator_rejects_nested_schema_change():
+    contract = ToolContract(
+        name="nested",
+        params=(
+            ParamContract(
+                name="items",
+                type="array",
+                required=True,
+                items=SchemaContract(type="string"),
+            ),
+        ),
+    )
+    advertised = {
+        "type": "object",
+        "properties": {
+            "items": {"type": "array", "items": {"type": "integer"}},
+        },
+        "required": ["items"],
+    }
+
+    assert compare_tool_schema(advertised, contract) == [
+        "type mismatch for items[]: expected string, got ['integer']"
+    ]
 
 
 def test_deliberate_contract_mismatch_is_reported():
@@ -73,9 +117,11 @@ def test_deliberate_contract_mismatch_is_reported():
         "required": ["extra"],
     }
 
-    assert compare_tool_schema(advertised, contract) == [
-        "unexpected required params: ['extra']",
-        "type mismatch for action: expected string",
-        "enum mismatch for action",
-        "default mismatch for action",
-    ]
+    errors = compare_tool_schema(advertised, contract)
+    assert "unexpected params: ['extra']" in errors
+    assert (
+        "required params mismatch: expected [], got ['extra']" in errors
+    )
+    assert "type mismatch for action: expected string, got ['integer']" in errors
+    assert "enum mismatch for action: expected ['one', 'two'], got ['one']" in errors
+    assert "default mismatch for action: expected 'one', got 'two'" in errors

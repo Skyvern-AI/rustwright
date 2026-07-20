@@ -12,30 +12,72 @@ _MISSING = object()
 
 
 @dataclass(frozen=True)
-class ParamContract:
-    name: str
+class SchemaContract:
     type: str
-    required: bool
     enum: tuple[Any, ...] | None = None
     default: Any = _MISSING
+    params: tuple["ParamContract", ...] = ()
+    items: "SchemaContract | None" = None
+    additional_properties: "SchemaContract | None" = None
 
     @classmethod
-    def from_mapping(cls, raw: Mapping[str, Any]) -> "ParamContract":
+    def from_mapping(cls, raw: Mapping[str, Any]) -> "SchemaContract":
         return cls(
-            name=raw["name"],
             type=raw["type"],
-            required=raw["required"],
             enum=tuple(raw["enum"]) if "enum" in raw else None,
             default=raw.get("default", _MISSING),
+            params=tuple(
+                ParamContract.from_mapping(item) for item in raw.get("params", ())
+            ),
+            items=(
+                cls.from_mapping(raw["items"])
+                if "items" in raw
+                else None
+            ),
+            additional_properties=(
+                cls.from_mapping(raw["additionalProperties"])
+                if isinstance(raw.get("additionalProperties"), Mapping)
+                else None
+            ),
         )
 
     def to_mapping(self) -> dict[str, Any]:
-        raw = {"name": self.name, "type": self.type, "required": self.required}
+        raw: dict[str, Any] = {"type": self.type}
         if self.enum is not None:
             raw["enum"] = list(self.enum)
         if self.default is not _MISSING:
             raw["default"] = self.default
+        if self.params:
+            raw["params"] = [param.to_mapping() for param in self.params]
+        if self.items is not None:
+            raw["items"] = self.items.to_mapping()
+        if self.additional_properties is not None:
+            raw["additionalProperties"] = self.additional_properties.to_mapping()
         return raw
+
+
+@dataclass(frozen=True)
+class ParamContract(SchemaContract):
+    name: str = ""
+    required: bool = False
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any]) -> "ParamContract":
+        shape = SchemaContract.from_mapping(raw)
+        return cls(
+            name=raw["name"],
+            required=raw["required"],
+            type=shape.type,
+            enum=shape.enum,
+            default=shape.default,
+            params=shape.params,
+            items=shape.items,
+            additional_properties=shape.additional_properties,
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        raw = super().to_mapping()
+        return {"name": self.name, **raw, "required": self.required}
 
 
 @dataclass(frozen=True)
@@ -90,10 +132,157 @@ def _advertised_enum(schema: Mapping[str, Any]) -> list[Any] | None:
         enum = candidate.get("enum")
         if isinstance(enum, list):
             return enum
-        items = candidate.get("items")
-        if isinstance(items, Mapping) and isinstance(items.get("enum"), list):
-            return items["enum"]
     return None
+
+
+def _resolve_ref(
+    schema: Mapping[str, Any], definitions: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    reference = schema.get("$ref")
+    if not isinstance(reference, str) or not reference.startswith("#/$defs/"):
+        return schema
+    name = reference.removeprefix("#/$defs/")
+    resolved = definitions.get(name)
+    return resolved if isinstance(resolved, Mapping) else schema
+
+
+def _schema_for_type(
+    schema: Mapping[str, Any], expected_type: str, definitions: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    resolved = _resolve_ref(schema, definitions)
+    if resolved.get("type") == expected_type:
+        return resolved
+    for candidate in resolved.get("anyOf", ()):
+        if not isinstance(candidate, Mapping):
+            continue
+        candidate = _resolve_ref(candidate, definitions)
+        if candidate.get("type") == expected_type:
+            return candidate
+    return resolved
+
+
+def _compare_params(
+    properties: Mapping[str, Any],
+    advertised_required: set[str],
+    expected_params: tuple[ParamContract, ...],
+    definitions: Mapping[str, Any],
+    path: str,
+    errors: list[str],
+) -> None:
+    expected_by_name = {param.name: param for param in expected_params}
+    advertised_names = set(properties)
+    expected_names = set(expected_by_name)
+    missing = expected_names - advertised_names
+    unexpected = advertised_names - expected_names
+    if missing:
+        errors.append(f"{path}missing params: {sorted(missing)}")
+    if unexpected:
+        errors.append(f"{path}unexpected params: {sorted(unexpected)}")
+
+    expected_required = {
+        param.name for param in expected_params if param.required
+    }
+    if advertised_required != expected_required:
+        errors.append(
+            f"{path}required params mismatch: expected "
+            f"{sorted(expected_required)}, got {sorted(advertised_required)}"
+        )
+
+    for name in sorted(advertised_names & expected_names):
+        property_schema = properties[name]
+        if not isinstance(property_schema, Mapping):
+            errors.append(f"{path}{name} schema is not an object")
+            continue
+        _compare_shape(
+            property_schema,
+            expected_by_name[name],
+            definitions,
+            f"{path}{name}",
+            errors,
+        )
+
+
+def _compare_shape(
+    advertised: Mapping[str, Any],
+    expected: SchemaContract,
+    definitions: Mapping[str, Any],
+    path: str,
+    errors: list[str],
+) -> None:
+    resolved_advertised = _resolve_ref(advertised, definitions)
+    advertised_types = _advertised_types(resolved_advertised) - {"null"}
+    if advertised_types != {expected.type}:
+        errors.append(
+            f"type mismatch for {path}: expected {expected.type}, "
+            f"got {sorted(advertised_types)}"
+        )
+
+    advertised_enum = _advertised_enum(resolved_advertised)
+    expected_enum = None if expected.enum is None else list(expected.enum)
+    if advertised_enum != expected_enum:
+        errors.append(
+            f"enum mismatch for {path}: expected {expected_enum}, "
+            f"got {advertised_enum}"
+        )
+
+    advertised_default = advertised.get(
+        "default", resolved_advertised.get("default", _MISSING)
+    )
+    if advertised_default is None and expected.default is _MISSING:
+        advertised_default = _MISSING
+    if advertised_default != expected.default:
+        shown_expected = "<missing>" if expected.default is _MISSING else expected.default
+        shown_actual = "<missing>" if advertised_default is _MISSING else advertised_default
+        errors.append(
+            f"default mismatch for {path}: expected {shown_expected!r}, "
+            f"got {shown_actual!r}"
+        )
+
+    typed_schema = _schema_for_type(
+        resolved_advertised, expected.type, definitions
+    )
+    if expected.type == "array":
+        advertised_items = typed_schema.get("items")
+        if expected.items is None:
+            if isinstance(advertised_items, Mapping):
+                errors.append(f"unexpected items schema for {path}")
+        elif not isinstance(advertised_items, Mapping):
+            errors.append(f"missing items schema for {path}")
+        else:
+            _compare_shape(
+                advertised_items,
+                expected.items,
+                definitions,
+                f"{path}[]",
+                errors,
+            )
+
+    if expected.type == "object":
+        advertised_properties = typed_schema.get("properties", {})
+        if not isinstance(advertised_properties, Mapping):
+            advertised_properties = {}
+        _compare_params(
+            advertised_properties,
+            set(typed_schema.get("required", ())),
+            expected.params,
+            definitions,
+            f"{path}.",
+            errors,
+        )
+        advertised_additional = typed_schema.get("additionalProperties")
+        if expected.additional_properties is None:
+            if isinstance(advertised_additional, Mapping):
+                errors.append(f"unexpected additionalProperties schema for {path}")
+        elif not isinstance(advertised_additional, Mapping):
+            errors.append(f"missing additionalProperties schema for {path}")
+        else:
+            _compare_shape(
+                advertised_additional,
+                expected.additional_properties,
+                definitions,
+                f"{path}.*",
+                errors,
+            )
 
 
 def compare_tool_schema(
@@ -102,24 +291,39 @@ def compare_tool_schema(
     """Return compatibility mismatches for one advertised input schema."""
     errors: list[str] = []
     properties = advertised.get("properties", {})
-    advertised_required = set(advertised.get("required", ()))
-    fixture_required = {param.name for param in contract.params if param.required}
-    extra_required = advertised_required - fixture_required
-    if extra_required:
-        errors.append(f"unexpected required params: {sorted(extra_required)}")
+    if not isinstance(properties, Mapping):
+        return ["tool properties schema is not an object"]
+    definitions = advertised.get("$defs", {})
+    if not isinstance(definitions, Mapping):
+        definitions = {}
+    _compare_params(
+        properties,
+        set(advertised.get("required", ())),
+        contract.params,
+        definitions,
+        "",
+        errors,
+    )
+    return errors
 
-    for param in contract.params:
-        if param.name not in properties:
-            errors.append(f"missing accepted param: {param.name}")
-            continue
-        property_schema = properties[param.name]
-        if param.type not in _advertised_types(property_schema):
-            errors.append(f"type mismatch for {param.name}: expected {param.type}")
-        if param.enum is not None and _advertised_enum(property_schema) != list(param.enum):
-            errors.append(f"enum mismatch for {param.name}")
-        if (
-            param.default is not _MISSING
-            and property_schema.get("default", _MISSING) != param.default
-        ):
-            errors.append(f"default mismatch for {param.name}")
+
+def compare_tool_inventory(
+    advertised: Mapping[str, Mapping[str, Any]],
+    contract: Mapping[str, ToolContract],
+    *,
+    allowed_additions: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Compare the exact tool inventory and every normalized input schema."""
+    errors: list[str] = []
+    advertised_names = set(advertised)
+    contract_names = set(contract)
+    missing = contract_names - advertised_names
+    unexpected = advertised_names - contract_names - set(allowed_additions)
+    if missing:
+        errors.append(f"missing tools: {sorted(missing)}")
+    if unexpected:
+        errors.append(f"unpinned tools: {sorted(unexpected)}")
+    for name in sorted(contract_names & advertised_names):
+        for mismatch in compare_tool_schema(advertised[name], contract[name]):
+            errors.append(f"{name}: {mismatch}")
     return errors

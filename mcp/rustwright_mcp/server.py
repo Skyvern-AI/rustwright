@@ -11,7 +11,7 @@ Environment variables:
     RUSTWRIGHT_MCP_CDP_ENDPOINT remote browser CDP endpoint (uses remote mode when set)
     RUSTWRIGHT_MCP_CDP_HEADERS optional JSON object of CDP connection headers
     RUSTWRIGHT_MCP_CDP_TIMEOUT_MS remote connection timeout in milliseconds (default: 60000)
-    RUSTWRIGHT_MCP_ALLOW_EVAL  explicit falsy value disables browser_evaluate
+    RUSTWRIGHT_MCP_ALLOW_EVAL  true/false toggle for browser_evaluate; unknown values fail startup
     RUSTWRIGHT_MCP_CAPS        accepted comma-separated capability groups
     RUSTWRIGHT_MCP_TOOLSET     "mirror" (default) or the smaller "lean" profile
     RUSTWRIGHT_MCP_OUTPUT_DIR   root for files written by tools
@@ -83,6 +83,7 @@ def _serialized(fn):
 
 
 _FALSE_VALUES = {"0", "false", "no", "off"}
+_TRUE_VALUES = {"1", "true", "yes", "on"}
 _MODAL_SAFE_TOOLS = {
     "browser_handle_dialog",
     "browser_file_upload",
@@ -116,7 +117,18 @@ _LEAN_TOOLS = {
 
 def _allow_eval() -> bool:
     raw = os.environ.get("RUSTWRIGHT_MCP_ALLOW_EVAL")
-    return raw is None or raw.strip().lower() not in _FALSE_VALUES
+    if raw is None:
+        return True
+    normalized = raw.strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    accepted = ", ".join(sorted(_TRUE_VALUES | _FALSE_VALUES))
+    raise ValueError(
+        "RUSTWRIGHT_MCP_ALLOW_EVAL must be one of "
+        f"{accepted}; got {raw!r}"
+    )
 
 
 def _toolset_profile() -> Literal["mirror", "lean"]:
@@ -1117,29 +1129,52 @@ def browser_click(
     """Click a unique target. ``element`` is only a human-readable description."""
     page = _page()
     resolved = _resolve(page, target, element)
-    action = lambda: resolved.locator.click(
+    with _state.event_lock:
+        registry = _state.registry_for(page)
+        retry_element = (
+            None if registry is None else registry.file_chooser_retry_element
+        )
+    retry_same_file_input = False
+    if retry_element is not None:
+        try:
+            retry_same_file_input = bool(
+                resolved.locator.evaluate(
+                    "(candidate, retryElement) => candidate === retryElement",
+                    retry_element,
+                )
+            )
+        except Exception:
+            # If DOM identity cannot be established, never replay a click.
+            with _state.event_lock:
+                registry = _state.registry_for(page)
+                if (
+                    registry is not None
+                    and registry.file_chooser_retry_element is retry_element
+                ):
+                    registry.file_chooser_retry_element = None
+    def action() -> None:
+        resolved.locator.click(
             click_count=2 if doubleClick else 1,
             button=button,
             modifiers=modifiers,
             timeout=1_000,
         )
+
     _run_action_with_pending_dialog(page, action)
-    with _state.event_lock:
-        registry = _state.registry_for(page)
-        retry_file_chooser = bool(
-            registry is not None and registry.file_chooser_retry_needed
-        )
-    if retry_file_chooser:
+    if retry_same_file_input:
         _, chooser = _pending_modals(page)
         if chooser is None:
             # A cancelled chooser after a validation failure is suppressed once
-            # by some backends. Replay this already-authorized input click once.
+            # by some backends. Replay only the originating input's click once.
             page.wait_for_timeout(50)
             _run_action_with_pending_dialog(page, action)
         with _state.event_lock:
             registry = _state.registry_for(page)
-            if registry is not None:
-                registry.file_chooser_retry_needed = False
+            if (
+                registry is not None
+                and registry.file_chooser_retry_element is retry_element
+            ):
+                registry.file_chooser_retry_element = None
     snapshot = _snapshot(page)
     return _render_response(
         f"Clicked {resolved.display_name}.", page=page, snapshot=snapshot
@@ -1451,9 +1486,9 @@ def browser_console_messages(
         evicted = 0
         if registry is not None:
             evicted = (
-                sum(registry.console_evictions.values())
+                registry.console_evictions_total
                 if all
-                else registry.console_evictions.get(epoch, 0)
+                else registry.console_evictions_current_epoch
             )
 
     threshold = _CONSOLE_LEVEL_RANK[level]
@@ -1614,6 +1649,7 @@ def browser_file_upload(paths: UploadPaths | None = None) -> str:
 
     supplied = [] if paths is None else paths
     chooser_released = False
+    failure: Exception | None = None
     try:
         try:
             multiple = bool(chooser.is_multiple())
@@ -1627,6 +1663,8 @@ def browser_file_upload(paths: UploadPaths | None = None) -> str:
         # unlike merely dropping our reference, it releases the chooser event.
         chooser.set_files(validated)
         chooser_released = True
+    except Exception as exc:
+        failure = exc
     finally:
         if not chooser_released:
             # Validation/multiplicity errors still have to release the live
@@ -1646,11 +1684,25 @@ def browser_file_upload(paths: UploadPaths | None = None) -> str:
                 )
             except Exception:
                 pass
+            try:
+                retry_element = chooser.element
+            except Exception:
+                retry_element = None
             with _state.event_lock:
                 registry = _state.registry_for(owner_page)
                 if registry is not None:
-                    registry.file_chooser_retry_needed = True
+                    registry.file_chooser_retry_element = retry_element
+        else:
+            with _state.event_lock:
+                registry = _state.registry_for(owner_page)
+                if registry is not None:
+                    registry.file_chooser_retry_element = None
         _state.clear_pending_file_chooser(owner_page, chooser)
+
+    if failure is not None:
+        raise ValueError(
+            f"{failure} Retry by clicking the same file input again."
+        ) from None
 
     snapshot = _snapshot(page)
     result = (

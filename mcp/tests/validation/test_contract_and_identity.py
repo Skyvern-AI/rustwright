@@ -39,14 +39,27 @@ async def _call(session, name: str, **arguments) -> str:
 
 
 def test_contract_fixture_contains_only_neutral_schema_fields() -> None:
+    def assert_shape(shape: dict, *, parameter: bool) -> None:
+        structural = {"type", "enum", "default", "items", "params", "additionalProperties"}
+        allowed = structural | ({"name", "required"} if parameter else set())
+        assert set(shape) <= allowed
+        assert "type" in shape
+        if parameter:
+            assert {"name", "required"} <= set(shape)
+        if "items" in shape:
+            assert_shape(shape["items"], parameter=False)
+        if "additionalProperties" in shape:
+            assert_shape(shape["additionalProperties"], parameter=False)
+        for nested in shape.get("params", []):
+            assert_shape(nested, parameter=True)
+
     raw = json.loads(FIXTURE.read_text())
     assert isinstance(raw, dict)
     for tool_name, tool in raw.items():
         assert isinstance(tool_name, str)
         assert set(tool) == {"params"}
         for param in tool["params"]:
-            assert set(param) <= {"name", "type", "enum", "default", "required"}
-            assert {"name", "type", "required"} <= set(param)
+            assert_shape(param, parameter=True)
 
 
 def test_real_stdio_identity_and_complete_tool_inventory() -> None:

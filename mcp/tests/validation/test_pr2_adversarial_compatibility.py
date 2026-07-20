@@ -41,7 +41,10 @@ ADAPTED_CONTRACT = {
             "name": "modifiers",
             "type": "array",
             "required": False,
-            "enum": ["Alt", "Control", "ControlOrMeta", "Meta", "Shift"],
+            "items": {
+                "type": "string",
+                "enum": ["Alt", "Control", "ControlOrMeta", "Meta", "Shift"],
+            },
         },
     ],
     "browser_type": [
@@ -50,11 +53,17 @@ ADAPTED_CONTRACT = {
         {"name": "text", "type": "string", "required": True},
         {"name": "submit", "type": "boolean", "required": False, "default": False},
         {"name": "slowly", "type": "boolean", "required": False, "default": False},
+        {"name": "clear", "type": "boolean", "required": False, "default": True},
     ],
     "browser_select_option": [
         {"name": "element", "type": "string", "required": False},
         {"name": "target", "type": "string", "required": True},
-        {"name": "values", "type": "array", "required": True},
+        {
+            "name": "values",
+            "type": "array",
+            "required": True,
+            "items": {"type": "string"},
+        },
     ],
     "browser_hover": [
         {"name": "element", "type": "string", "required": False},
@@ -64,7 +73,12 @@ ADAPTED_CONTRACT = {
         {"name": "target", "type": "string", "required": False},
         {"name": "filename", "type": "string", "required": False},
         {"name": "depth", "type": "number", "required": False},
-        {"name": "boxes", "type": "boolean", "required": False},
+        {
+            "name": "boxes",
+            "type": "boolean",
+            "required": False,
+            "default": False,
+        },
     ],
     "browser_take_screenshot": [
         {"name": "element", "type": "string", "required": False},
@@ -105,6 +119,12 @@ ADAPTED_CONTRACT = {
         {"name": "time", "type": "number", "required": False},
         {"name": "text", "type": "string", "required": False},
         {"name": "textGone", "type": "string", "required": False},
+        {
+            "name": "timeout_ms",
+            "type": "number",
+            "required": False,
+            "default": 10000,
+        },
     ],
     "browser_tabs": [
         {
@@ -132,6 +152,17 @@ def fake_runtime(monkeypatch, tmp_path) -> tuple[FakePage, SessionState, FilePol
 
 
 def test_fixture_exactly_matches_the_ten_audited_schemas_and_has_no_prose() -> None:
+    def assert_neutral(shape: dict, *, parameter: bool) -> None:
+        structural = {"type", "enum", "default", "items", "params", "additionalProperties"}
+        allowed = structural | ({"name", "required"} if parameter else set())
+        assert set(shape) <= allowed
+        if "items" in shape:
+            assert_neutral(shape["items"], parameter=False)
+        if "additionalProperties" in shape:
+            assert_neutral(shape["additionalProperties"], parameter=False)
+        for nested in shape.get("params", []):
+            assert_neutral(nested, parameter=True)
+
     fixture_path = (
         Path(__file__).parents[1] / "contract" / "fixtures" / "default_toolset.json"
     )
@@ -142,7 +173,7 @@ def test_fixture_exactly_matches_the_ten_audited_schemas_and_has_no_prose() -> N
     for tool in raw.values():
         assert set(tool) == {"params"}
         for param in tool["params"]:
-            assert set(param) <= {"name", "type", "required", "enum", "default"}
+            assert_neutral(param, parameter=True)
 
 
 def test_alias_conflicts_always_prefer_the_canonical_spelling(fake_runtime) -> None:

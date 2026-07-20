@@ -25,8 +25,18 @@ AUDITED_BROWSER_DROP = {
     "params": [
         {"name": "element", "type": "string", "required": False},
         {"name": "target", "type": "string", "required": True},
-        {"name": "paths", "type": "array", "required": False},
-        {"name": "data", "type": "object", "required": False},
+        {
+            "name": "paths",
+            "type": "array",
+            "required": False,
+            "items": {"type": "string"},
+        },
+        {
+            "name": "data",
+            "type": "object",
+            "required": False,
+            "additionalProperties": {"type": "string"},
+        },
     ]
 }
 
@@ -205,7 +215,8 @@ def test_schema_fixture_comparator_description_and_mirror_registration() -> None
     incompatible = copy.deepcopy(schema)
     incompatible["properties"]["paths"] = {"type": "object"}
     assert compare_tool_schema(incompatible, contract) == [
-        "type mismatch for paths: expected array"
+        "type mismatch for paths: expected array, got ['object']",
+        "missing items schema for paths",
     ]
 
     mirror, _ = asyncio.run(

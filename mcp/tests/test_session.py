@@ -22,6 +22,22 @@ class FakePage:
             callback(*args)
 
 
+class FakeContext:
+    def __init__(self, *pages):
+        self.pages = list(pages)
+        self.handlers = {}
+
+    def on(self, event, callback):
+        self.handlers.setdefault(event, []).append(callback)
+
+    def remove_listener(self, event, callback):
+        self.handlers[event].remove(callback)
+
+    def emit(self, event, *args):
+        for callback in list(self.handlers.get(event, ())):
+            callback(*args)
+
+
 class FakeConsole:
     def __init__(self, text):
         self.type = "log"
@@ -92,6 +108,36 @@ def test_registrar_is_once_per_page_and_cleanup_is_per_page():
     assert state.page is None
 
 
+def test_context_page_event_registers_window_open_popup_before_its_events():
+    initial = FakePage()
+    context = FakeContext(initial)
+    state = SessionState()
+    state.attach(
+        pw=object(),
+        browser=object(),
+        context=context,
+        page=initial,
+        remote=False,
+    )
+
+    popup = FakePage()
+    context.pages.append(popup)
+    context.emit("page", popup)
+    console = FakeConsole("popup console")
+    dialog = FakeDialog()
+    popup.emit("console", console)
+    popup.emit("dialog", dialog)
+
+    registry = state.registry_for(popup)
+    assert registry is not None
+    assert [record.text for record in registry.console_records] == ["popup console"]
+    assert registry.pending_dialog is dialog
+
+    callback = state.context_page_callback
+    state.clear()
+    assert callback not in context.handlers["page"]
+
+
 def test_event_records_are_immutable_bounded_and_epoch_indexed():
     state = SessionState(console_quota=2, network_quota=2, download_quota=1)
     page = FakePage()
@@ -132,6 +178,31 @@ def test_event_records_are_immutable_bounded_and_epoch_indexed():
     page.emit("download", FakeDownload())
     assert registry.pending_file_chooser is chooser
     assert registry.downloads[-1].download.__class__ is FakeDownload
+
+
+def test_navigation_eviction_counters_remain_bounded_across_many_epochs():
+    state = SessionState(console_quota=1, network_quota=1)
+    page = FakePage()
+    registry = state.register_page_handlers(page)
+
+    for index in range(100):
+        navigation = FakeRequest(
+            page, f"https://example.test/{index}", navigation=True
+        )
+        page.emit("request", navigation)
+        page.emit(
+            "request",
+            FakeRequest(page, f"https://example.test/{index}/resource"),
+        )
+        page.emit("console", FakeConsole(f"first-{index}"))
+        page.emit("console", FakeConsole(f"second-{index}"))
+        page.emit("framenavigated", page.main_frame)
+
+    assert registry.navigation_epoch == 100
+    assert len(registry.network_evictions) <= 1
+    assert set(registry.network_evictions) <= {registry.navigation_epoch}
+    assert registry.console_evictions_total > 100
+    assert isinstance(registry.console_evictions_current_epoch, int)
 
 
 def test_dialog_slot_stays_pending_without_automatic_action():

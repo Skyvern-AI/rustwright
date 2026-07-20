@@ -56,28 +56,24 @@ def test_screenshot_escape_variants_are_structured_and_write_nothing(
         assert not escaped_path.exists()
 
 
-def test_screenshot_symlink_swap_cannot_write_outside_root(monkeypatch) -> None:
-    """A swap after exclusive reservation must not turn the write into an escape."""
+def test_finalized_symlink_escape_unlinks_only_in_root_entry() -> None:
+    """Reject an escaped final link without deleting or changing its target."""
     with tempfile.TemporaryDirectory(
         prefix="rustwright-mcp-validation-", dir="/tmp"
     ) as temporary:
         temporary_path = Path(temporary)
         policy = FilePolicy(output_root=temporary_path / "output")
-        escaped = temporary_path / "escaped.png"
-        monkeypatch.setattr(server, "get_file_policy", lambda: policy)
-
-        class RacingPage:
-            def screenshot(self, *, path, full_page, type) -> None:
-                reserved = Path(path)
-                reserved.unlink()
-                reserved.symlink_to(escaped)
-                reserved.write_bytes(b"escaped screenshot bytes")
-
-        monkeypatch.setattr(server, "_page", lambda: RacingPage())
+        escaped = temporary_path / "external-sentinel.png"
+        escaped.write_bytes(b"unchanged external sentinel")
+        reserved = policy.reserve_output("race.png")
+        reserved.unlink()
+        reserved.symlink_to(escaped)
 
         with pytest.raises(FilePolicyError, match="escaped the configured root"):
-            server.browser_take_screenshot(filename="race.png")
-        assert not escaped.exists(), "screenshot bytes escaped through a symlink swap"
+            policy.finalize_output(reserved)
+        assert not reserved.exists()
+        assert escaped.exists()
+        assert escaped.read_bytes() == b"unchanged external sentinel"
 
 
 def test_cap_boundaries_and_oldest_first_eviction(tmp_path) -> None:

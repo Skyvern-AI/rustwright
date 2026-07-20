@@ -39,7 +39,32 @@ AUDITED_PR3_CONTRACT = {
         {"name": "endTarget", "type": "string", "required": True},
     ],
     "browser_fill_form": [
-        {"name": "fields", "type": "array", "required": True},
+        {
+            "name": "fields",
+            "type": "array",
+            "required": True,
+            "items": {
+                "type": "object",
+                "params": [
+                    {"name": "element", "type": "string", "required": False},
+                    {"name": "target", "type": "string", "required": True},
+                    {"name": "name", "type": "string", "required": True},
+                    {
+                        "name": "type",
+                        "type": "string",
+                        "required": True,
+                        "enum": [
+                            "textbox",
+                            "checkbox",
+                            "radio",
+                            "combobox",
+                            "slider",
+                        ],
+                    },
+                    {"name": "value", "type": "string", "required": True},
+                ],
+            },
+        },
     ],
     "browser_find": [
         {"name": "text", "type": "string", "required": False},
@@ -77,7 +102,12 @@ AUDITED_PR3_CONTRACT = {
         {"name": "filename", "type": "string", "required": False},
     ],
     "browser_file_upload": [
-        {"name": "paths", "type": "array", "required": False},
+        {
+            "name": "paths",
+            "type": "array",
+            "required": False,
+            "items": {"type": "string"},
+        },
     ],
 }
 

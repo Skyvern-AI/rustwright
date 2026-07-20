@@ -85,10 +85,11 @@ class PageRegistry:
     navigation_start_request_index: int = 1
     navigation_pending: bool = False
     last_known_title: str | None = None
-    console_evictions: dict[int, int] = field(default_factory=dict)
+    console_evictions_total: int = 0
+    console_evictions_current_epoch: int = 0
     network_evictions: dict[int, int] = field(default_factory=dict)
     pending_file_chooser: Any = field(default=None, repr=False)
-    file_chooser_retry_needed: bool = False
+    file_chooser_retry_element: Any = field(default=None, repr=False)
     pending_dialog: Any = field(default=None, repr=False)
     request_keys: dict[int, tuple[int, int]] = field(default_factory=dict, repr=False)
     callbacks: dict[str, Any] = field(default_factory=dict, repr=False)
@@ -120,6 +121,7 @@ class SessionState:
     download_saver: Callable[[Any, str], str] | None = field(
         default=None, repr=False
     )
+    context_page_callback: Any = field(default=None, repr=False)
     event_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def attach(
@@ -131,12 +133,41 @@ class SessionState:
         page: Any,
         remote: bool,
     ) -> None:
+        self._remove_context_page_handler()
         self.pw = pw
         self.browser = browser
         self.context = context
         self.page = page
         self.remote = remote
         self.next_ref = 1
+
+        callback = lambda created_page: self.register_page_handlers(created_page)
+        self.context_page_callback = callback
+        try:
+            context.on("page", callback)
+            existing_pages = list(context.pages)
+        except Exception:
+            try:
+                context.remove_listener("page", callback)
+            except Exception:
+                pass
+            self.context_page_callback = None
+            raise
+        for existing_page in existing_pages:
+            self.register_page_handlers(existing_page)
+        if not any(existing_page is page for existing_page in existing_pages):
+            self.register_page_handlers(page)
+
+    def _remove_context_page_handler(self) -> None:
+        context = self.context
+        callback = self.context_page_callback
+        self.context_page_callback = None
+        if context is None or callback is None:
+            return
+        try:
+            context.remove_listener("page", callback)
+        except Exception:
+            pass
 
     def registry_for(self, page: Any, *, create: bool = False) -> PageRegistry | None:
         key = id(page)
@@ -200,6 +231,7 @@ class SessionState:
                 self.page = None
 
     def clear(self) -> None:
+        self._remove_context_page_handler()
         with self.event_lock:
             self.page_registries.clear()
             self.pw = None
@@ -309,6 +341,9 @@ class SessionState:
         registry.navigation_epoch += 1
         registry.navigation_start_request_index = self.next_request_index
         registry.navigation_pending = True
+        registry.console_evictions_current_epoch = 0
+        registry.network_evictions.clear()
+        registry.file_chooser_retry_element = None
         self._invalidate_snapshot(registry)
 
     @staticmethod
@@ -328,9 +363,9 @@ class SessionState:
                 and len(registry.console_records) == registry.console_records.maxlen
             ):
                 evicted_epoch = registry.console_records[0].epoch
-                registry.console_evictions[evicted_epoch] = (
-                    registry.console_evictions.get(evicted_epoch, 0) + 1
-                )
+                registry.console_evictions_total += 1
+                if evicted_epoch == registry.navigation_epoch:
+                    registry.console_evictions_current_epoch += 1
             registry.console_records.append(
                 ConsoleRecord(
                     sequence=self.next_console_sequence,
@@ -366,9 +401,10 @@ class SessionState:
                 and len(registry.network_records) == registry.network_records.maxlen
             ):
                 evicted_epoch = registry.network_records[0].epoch
-                registry.network_evictions[evicted_epoch] = (
-                    registry.network_evictions.get(evicted_epoch, 0) + 1
-                )
+                if evicted_epoch == registry.navigation_epoch:
+                    registry.network_evictions[evicted_epoch] = (
+                        registry.network_evictions.get(evicted_epoch, 0) + 1
+                    )
             registry.network_records.append(record)
             registry.request_keys[id(request)] = (record.epoch, record.index)
             live_keys = {(item.epoch, item.index) for item in registry.network_records}
