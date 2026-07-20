@@ -15,7 +15,12 @@ const html = `<!doctype html>
 
 const browser = await chromium.launch({ headless: true });
 try {
-  const page = await browser.newPage();
+  // Exercise the BrowserContext shim and page-level default timeouts alongside
+  // the core page methods.
+  const context = await browser.newContext();
+  context.setDefaultTimeout(30_000);
+  const page = await context.newPage();
+  page.setDefaultNavigationTimeout(30_000);
   await page.goto(`data:text/html,${encodeURIComponent(html)}`);
   const title = await page.title();
   const before = await page.textContent('#message');
@@ -24,12 +29,14 @@ try {
   const after = await page.textContent('#message');
   const value = await page.evaluate(() => document.querySelector('#name').value);
   const screenshot = await page.screenshot({ path: screenshotPath });
-  await page.close();
+  const contextPages = context.pages().length;
+  await context.close();
   console.log(JSON.stringify({
     title,
     before,
     after,
     value,
+    contextPages,
     screenshotBytes: screenshot.length,
     screenshotPath
   }, null, 2));

@@ -38,6 +38,15 @@ function normalizeLaunchOptions(options = {}) {
   return out;
 }
 
+function normalizeContextOptions(options = {}) {
+  if (options == null) options = {};
+  const out = {};
+  if (hasOwn(options, 'ignoreHTTPSErrors')) out.ignoreHTTPSErrors = Boolean(options.ignoreHTTPSErrors);
+  if (hasOwn(options, 'timeout')) out.timeout = Number(options.timeout);
+  if (hasOwn(options, 'navigationTimeout')) out.navigationTimeout = Number(options.navigationTimeout);
+  return out;
+}
+
 function normalizeScreenshotOptions(options = {}) {
   if (options == null) return {};
   const out = {};
@@ -116,10 +125,25 @@ function parseRustJson(json) {
 class Browser {
   constructor(inner) {
     this._inner = inner;
+    this._contexts = [];
   }
 
   async newPage() {
     return new Page(await this._inner.newPage());
+  }
+
+  // Compatibility shim. The alpha Node engine drives a single Chromium process,
+  // so contexts created here do NOT provide the storage/cookie isolation a real
+  // Playwright BrowserContext does — they exist to keep the familiar
+  // `browser.newContext().newPage()` shape working and to carry default timeouts.
+  async newContext(options = {}) {
+    const context = new BrowserContext(this, normalizeContextOptions(options));
+    this._contexts.push(context);
+    return context;
+  }
+
+  contexts() {
+    return this._contexts.slice();
   }
 
   async close() {
@@ -131,53 +155,138 @@ class Browser {
   }
 }
 
+let warnedIgnoreHttpsErrors = false;
+
+class BrowserContext {
+  constructor(browser, options = {}) {
+    this._browser = browser;
+    this._options = options;
+    this._pages = [];
+    this._defaultTimeout = options.timeout;
+    this._defaultNavigationTimeout = options.navigationTimeout;
+
+    if (options.ignoreHTTPSErrors && !warnedIgnoreHttpsErrors) {
+      warnedIgnoreHttpsErrors = true;
+      // Certificate handling is a launch-time concern for the current engine and
+      // cannot be toggled per-context after the browser is running. Warn rather
+      // than silently pretend a security-relevant flag took effect.
+      console.warn(
+        'rustwright: newContext({ ignoreHTTPSErrors: true }) is accepted for API ' +
+          'compatibility but not yet enforced by the Node engine. Launch Chromium with ' +
+          "args: ['--ignore-certificate-errors'] if you need to bypass TLS errors."
+      );
+    }
+  }
+
+  browser() {
+    return this._browser;
+  }
+
+  pages() {
+    return this._pages.slice();
+  }
+
+  async newPage() {
+    const page = new Page(await this._browser._inner.newPage());
+    page._defaultTimeout = this._defaultTimeout;
+    page._defaultNavigationTimeout = this._defaultNavigationTimeout;
+    this._pages.push(page);
+    return page;
+  }
+
+  setDefaultTimeout(timeout) {
+    this._defaultTimeout = Number(timeout);
+    for (const page of this._pages) page.setDefaultTimeout(timeout);
+  }
+
+  setDefaultNavigationTimeout(timeout) {
+    this._defaultNavigationTimeout = Number(timeout);
+    for (const page of this._pages) page.setDefaultNavigationTimeout(timeout);
+  }
+
+  async close() {
+    const pages = this._pages.splice(0);
+    await Promise.all(
+      pages.map((page) => page.close().catch(() => {}))
+    );
+    const index = this._browser._contexts.indexOf(this);
+    if (index !== -1) this._browser._contexts.splice(index, 1);
+  }
+}
+
 class Page {
   constructor(inner) {
     this._inner = inner;
+    // undefined => defer to the engine's built-in default; a number set via
+    // setDefaultTimeout()/setDefaultNavigationTimeout() becomes the per-call fallback.
+    this._defaultTimeout = undefined;
+    this._defaultNavigationTimeout = undefined;
+  }
+
+  setDefaultTimeout(timeout) {
+    this._defaultTimeout = Number(timeout);
+  }
+
+  setDefaultNavigationTimeout(timeout) {
+    this._defaultNavigationTimeout = Number(timeout);
+  }
+
+  // An explicit per-call timeout wins; otherwise fall back to the page default.
+  // `undefined` is passed through so the native layer applies its own default.
+  _resolveTimeout(explicit) {
+    if (explicit != null) return Number(explicit);
+    return this._defaultTimeout;
+  }
+
+  _resolveNavigationTimeout(explicit) {
+    if (explicit != null) return Number(explicit);
+    if (this._defaultNavigationTimeout != null) return this._defaultNavigationTimeout;
+    return this._defaultTimeout;
   }
 
   async goto(url, options = {}) {
     const response = await this._inner.goto(
       String(url),
       options.waitUntil == null ? undefined : String(options.waitUntil),
-      options.timeout == null ? undefined : Number(options.timeout),
+      this._resolveNavigationTimeout(options.timeout),
       options.referer == null ? undefined : String(options.referer)
     );
     return response === 'null' ? null : parseRustJson(response);
   }
 
   async click(selector, options = {}) {
-    await this._inner.click(String(selector), options.timeout == null ? undefined : Number(options.timeout));
+    await this._inner.click(String(selector), this._resolveTimeout(options.timeout));
   }
 
   async fill(selector, value, options = {}) {
     await this._inner.fill(
       String(selector),
       String(value),
-      options.timeout == null ? undefined : Number(options.timeout)
+      this._resolveTimeout(options.timeout)
     );
   }
 
   async title(options = {}) {
-    return this._inner.title(options.timeout == null ? undefined : Number(options.timeout));
+    return this._inner.title(this._resolveTimeout(options.timeout));
   }
 
   async textContent(selector, options = {}) {
     return this._inner.textContent(
       String(selector),
-      options.timeout == null ? undefined : Number(options.timeout)
+      this._resolveTimeout(options.timeout)
     );
   }
 
   async evaluate(expression, arg, options = {}) {
     const source = typeof expression === 'function' ? expression.toString() : String(expression);
-    const timeout = options.timeout == null ? undefined : Number(options.timeout);
-    const json = await this._inner.evaluate(source, encodeEvaluateArg(arg), timeout);
+    const json = await this._inner.evaluate(source, encodeEvaluateArg(arg), this._resolveTimeout(options.timeout));
     return parseRustJson(json);
   }
 
   async screenshot(options = {}) {
     const normalized = normalizeScreenshotOptions(options);
+    const resolved = this._resolveTimeout(normalized.timeout);
+    if (resolved != null) normalized.timeout = resolved;
     const bytes = await this._inner.screenshot(JSON.stringify(normalized));
     return Buffer.from(bytes);
   }
@@ -203,6 +312,7 @@ const chromium = {
 module.exports = {
   chromium,
   Browser,
+  BrowserContext,
   Page,
   _native: native
 };

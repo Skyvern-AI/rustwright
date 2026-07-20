@@ -43,10 +43,39 @@ export interface ScreenshotOptions {
   omitBackground?: boolean;
 }
 
+export interface ContextOptions {
+  /**
+   * Accepted for API compatibility. The current Node engine drives a single
+   * Chromium process and cannot toggle certificate handling per context after
+   * launch; pass args: ['--ignore-certificate-errors'] to chromium.launch()
+   * instead. A one-time warning is emitted when this is set.
+   */
+  ignoreHTTPSErrors?: boolean;
+  /** Default timeout (ms) inherited by pages created from this context. */
+  timeout?: number;
+  /** Default navigation timeout (ms) inherited by pages created from this context. */
+  navigationTimeout?: number;
+}
+
 export class Browser {
   newPage(): Promise<Page>;
+  /**
+   * Compatibility shim: the alpha Node engine is single-process, so contexts do
+   * NOT provide the storage/cookie isolation of a real Playwright BrowserContext.
+   */
+  newContext(options?: ContextOptions): Promise<BrowserContext>;
+  contexts(): BrowserContext[];
   close(): Promise<void>;
   wsEndpoint(): string;
+}
+
+export class BrowserContext {
+  browser(): Browser;
+  pages(): Page[];
+  newPage(): Promise<Page>;
+  setDefaultTimeout(timeout: number): void;
+  setDefaultNavigationTimeout(timeout: number): void;
+  close(): Promise<void>;
 }
 
 export class Page {
@@ -57,6 +86,8 @@ export class Page {
   textContent(selector: string, options?: ActionOptions): Promise<string | null>;
   evaluate<T = unknown>(expression: string | ((arg?: unknown) => T | Promise<T>), arg?: unknown, options?: ActionOptions): Promise<T>;
   screenshot(options?: ScreenshotOptions): Promise<Buffer>;
+  setDefaultTimeout(timeout: number): void;
+  setDefaultNavigationTimeout(timeout: number): void;
   close(options?: { timeout?: number; runBeforeUnload?: boolean }): Promise<void>;
 }
 
@@ -68,6 +99,7 @@ export const chromium: {
 declare const rustwright: {
   chromium: typeof chromium;
   Browser: typeof Browser;
+  BrowserContext: typeof BrowserContext;
   Page: typeof Page;
 };
 
