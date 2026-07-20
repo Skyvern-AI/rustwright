@@ -20657,10 +20657,14 @@ def test_cli_top_level_version_help_and_explicit_unsupported_commands(capsys):
 
     assert cli.main(["help"], program="playwright") == 0
     help_output = capsys.readouterr()
-    assert "ff/firefox" in help_output.out
-    assert "wk/webkit" in help_output.out
+    assert "Browser session (persistent):" in help_output.out
+    assert "Playwright-compatible tools:" in help_output.out
     assert "uninstall" in help_output.out
     assert "trace" in help_output.out
+
+    assert cli.main(["firefox", "https://example.test"], program="playwright") == 1
+    unsupported_output = capsys.readouterr()
+    assert "firefox is not implemented" in unsupported_output.err
 
     assert cli.main(["trace"], program="playwright") == 0
     trace_output = capsys.readouterr()
@@ -20856,191 +20860,35 @@ def test_cli_codegen_python_pytest_includes_context_marker(tmp_path: Path):
     compile(source, str(output), "exec")
 
 
-def test_cli_open_launches_direct_cdp_browser_with_playwright_options(monkeypatch, tmp_path: Path, capsys):
+def test_cli_open_routes_to_persistent_session_cli(monkeypatch):
     from rustwright import cli
 
-    opened_file = tmp_path / "index.html"
-    opened_file.write_text("<title>CLI</title>", encoding="utf-8")
-    storage_path = tmp_path / "storage.json"
-    save_storage_path = tmp_path / "saved-storage.json"
-    har_path = tmp_path / "open.har"
+    calls = []
 
-    class FakePage:
-        def __init__(self):
-            self.url = ""
-            self.goto_url = None
+    def fake_agent_main(argv):
+        calls.append(list(argv))
+        return 0
 
-        def goto(self, url: str):
-            self.goto_url = url
-            self.url = url
+    monkeypatch.setattr(cli, "_agent_main", fake_agent_main)
 
-    class FakeContext:
-        def __init__(self):
-            self.pages = []
-            self.default_timeout = None
-            self.default_navigation_timeout = None
-            self.storage_state_path = None
-            self.closed = False
+    assert cli.main(["open", "https://example.test"], program="playwright") == 0
+    assert cli.main(["--session", "work", "open"], program="playwright") == 0
 
-        def new_page(self):
-            page = FakePage()
-            self.pages.append(page)
-            return page
-
-        def set_default_timeout(self, timeout: float):
-            self.default_timeout = timeout
-
-        def set_default_navigation_timeout(self, timeout: float):
-            self.default_navigation_timeout = timeout
-
-        def storage_state(self, *, path: str):
-            self.storage_state_path = path
-
-        def close(self):
-            self.closed = True
-
-    class FakeBrowser:
-        def __init__(self):
-            self.context = FakeContext()
-            self.new_context_options = None
-            self.closed = False
-
-        def new_context(self, **options):
-            self.new_context_options = options
-            return self.context
-
-        def close(self):
-            self.closed = True
-
-        def is_connected(self):
-            return True
-
-    class FakeChromium:
-        def __init__(self):
-            self.browser = FakeBrowser()
-            self.launch_options = None
-
-        def launch(self, **options):
-            self.launch_options = options
-            return self.browser
-
-    class FakePlaywright:
-        def __init__(self):
-            self.chromium = FakeChromium()
-            self.devices = {
-                "Pixel 5": {
-                    "user_agent": "Pixel UA",
-                    "viewport": {"width": 393, "height": 851},
-                    "device_scale_factor": 2.75,
-                    "is_mobile": True,
-                    "has_touch": True,
-                    "default_browser_type": "chromium",
-                }
-            }
-
-    class FakeSyncPlaywright:
-        def __init__(self, playwright):
-            self.playwright = playwright
-
-        def __enter__(self):
-            return self.playwright
-
-        def __exit__(self, exc_type, exc, tb):
-            return None
-
-    fake_playwright = FakePlaywright()
-    monkeypatch.setattr(cli, "sync_playwright", lambda: FakeSyncPlaywright(fake_playwright))
-    monkeypatch.setenv("PWTEST_CLI_HEADLESS", "1")
-    monkeypatch.setenv("PWTEST_CLI_EXECUTABLE_PATH", "/tmp/chromium")
-    monkeypatch.setenv("PWTEST_CLI_EXIT_AFTER_TIMEOUT", "0")
-
-    result = cli.open(
-        [
-            str(opened_file),
-            "--device",
-            "Pixel 5",
-            "--viewport-size",
-            "800, 600",
-            "--geolocation",
-            "37.819722,-122.478611",
-            "--color-scheme",
-            "dark",
-            "--lang",
-            "en-GB",
-            "--timezone",
-            "Europe/Rome",
-            "--user-agent",
-            "Custom UA",
-            "--ignore-https-errors",
-            "--block-service-workers",
-            "--load-storage",
-            str(storage_path),
-            "--save-har",
-            str(har_path),
-            "--save-har-glob",
-            "**/*.json",
-            "--save-storage",
-            str(save_storage_path),
-            "--proxy-server",
-            "http://proxy.test:3128",
-            "--proxy-bypass",
-            ".internal",
-            "--timeout",
-            "1234",
-        ]
-    )
-
-    context = fake_playwright.chromium.browser.context
-    assert result == 0
-    assert fake_playwright.chromium.launch_options == {
-        "headless": True,
-        "executable_path": "/tmp/chromium",
-        "proxy": {"server": "http://proxy.test:3128", "bypass": ".internal"},
-    }
-    assert fake_playwright.chromium.browser.new_context_options["viewport"] == {"width": 800, "height": 600}
-    assert fake_playwright.chromium.browser.new_context_options["geolocation"] == {
-        "latitude": 37.819722,
-        "longitude": -122.478611,
-    }
-    assert fake_playwright.chromium.browser.new_context_options["permissions"] == ["geolocation"]
-    assert fake_playwright.chromium.browser.new_context_options["color_scheme"] == "dark"
-    assert fake_playwright.chromium.browser.new_context_options["locale"] == "en-GB"
-    assert fake_playwright.chromium.browser.new_context_options["timezone_id"] == "Europe/Rome"
-    assert fake_playwright.chromium.browser.new_context_options["user_agent"] == "Custom UA"
-    assert fake_playwright.chromium.browser.new_context_options["ignore_https_errors"] is True
-    assert fake_playwright.chromium.browser.new_context_options["storage_state"] == str(storage_path)
-    assert fake_playwright.chromium.browser.new_context_options["record_har_path"] == str(har_path.resolve())
-    assert fake_playwright.chromium.browser.new_context_options["record_har_url_filter"] == "**/*.json"
-    assert fake_playwright.chromium.browser.new_context_options["record_har_mode"] == "minimal"
-    assert fake_playwright.chromium.browser.new_context_options["service_workers"] == "block"
-    assert context.default_timeout == 1234
-    assert context.default_navigation_timeout == 1234
-    assert context.pages[0].goto_url == opened_file.resolve().as_uri()
-    assert context.storage_state_path == str(save_storage_path)
-    assert context.closed is True
-    assert fake_playwright.chromium.browser.closed is True
-    assert "Rustwright opened" in capsys.readouterr().out
+    assert calls == [
+        ["open", "https://example.test"],
+        ["--session", "work", "open"],
+    ]
 
 
-def test_cli_open_rejects_unsupported_browser(monkeypatch, capsys):
+def test_cli_open_rejects_unsupported_browser(monkeypatch, tmp_path: Path, capsys):
     from rustwright import cli
 
-    class FakePlaywright:
-        devices = {}
+    monkeypatch.setenv("RUSTWRIGHT_AGENT_RUNTIME_DIR", str(tmp_path))
 
-    class FakeSyncPlaywright:
-        def __enter__(self):
-            return FakePlaywright()
-
-        def __exit__(self, exc_type, exc, tb):
-            return None
-
-    monkeypatch.setattr(cli, "sync_playwright", lambda: FakeSyncPlaywright())
-
-    result = cli.open(["-b", "firefox", "https://example.test"])
+    result = cli.main(["open", "-b", "firefox", "https://example.test"], program="playwright")
 
     output = capsys.readouterr()
-    assert result == 1
+    assert result == 2
     assert "firefox is not implemented" in output.err
 
 
@@ -21155,29 +21003,30 @@ def test_cli_screenshot_and_pdf_use_headless_cdp_capture(monkeypatch, tmp_path: 
     assert "Saving as pdf into" in output
 
 
-def test_cli_browser_aliases_delegate_to_open(monkeypatch):
+def test_cli_browser_aliases_delegate_to_open(monkeypatch, capsys):
     from rustwright import cli
 
     calls = []
-    programs = []
 
-    def fake_open(argv, *, program="playwright"):
-        calls.append(argv)
-        programs.append(program)
+    def fake_agent_main(argv):
+        calls.append(list(argv))
         return 0
 
-    monkeypatch.setattr(cli, "open", fake_open)
+    monkeypatch.setattr(cli, "_agent_main", fake_agent_main)
 
     assert cli.main(["cr", "https://example.test"], program="patchright") == 0
-    assert cli.main(["firefox", "https://example.test"], program="patchright") == 0
-    assert cli.main(["webkit", "https://example.test"], program="patchright") == 0
-
+    assert cli.main(["chromium", "https://example.test"], program="patchright") == 0
     assert calls == [
-        ["--browser", "chromium", "https://example.test"],
-        ["--browser", "firefox", "https://example.test"],
-        ["--browser", "webkit", "https://example.test"],
+        ["open", "--browser", "chromium", "https://example.test"],
+        ["open", "--browser", "chromium", "https://example.test"],
     ]
-    assert programs == ["patchright", "patchright", "patchright"]
+
+    assert cli.main(["firefox", "https://example.test"], program="patchright") == 1
+    assert cli.main(["webkit", "https://example.test"], program="patchright") == 1
+    err = capsys.readouterr().err
+    assert "firefox is not implemented" in err
+    assert "webkit is not implemented" in err
+    assert len(calls) == 2
 
 
 def test_cli_show_trace_renders_static_viewer(tmp_path: Path):
