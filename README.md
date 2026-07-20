@@ -100,7 +100,7 @@ take a snapshot, then act on an element by its ref. Refs are session-scoped and
 never reused; resolution is best-effort for cooperative pages (not a security
 boundary), and snapshots reflect page values with password fields masked.
 
-### CLI — `rustwright-agent`
+### CLI — drive a browser from your shell
 
 Ships with the `rustwright` package (pure Python, no extra runtime dependency).
 Named sessions keep one browser alive across commands:
@@ -109,13 +109,15 @@ Named sessions keep one browser alive across commands:
 pip install rustwright
 python -m rustwright install chromium   # one-time browser download
 
-rustwright-agent open example.com       # launch + navigate; prints a snapshot
-rustwright-agent snapshot               # accessibility tree with refs (e1, e2, …)
-rustwright-agent click e3               # act on an element by its ref
-rustwright-agent fill e2 "hi@example.com"
-rustwright-agent --json snapshot        # one JSON object, for scripting
-rustwright-agent close
+rustwright open example.com       # launch + navigate; prints a snapshot
+rustwright snapshot               # accessibility tree with refs (e1, e2, …)
+rustwright click e3               # act on an element by its ref
+rustwright fill e2 "hi@example.com"
+rustwright --json snapshot        # one JSON object, for scripting
+rustwright close
 ```
+
+The CLI verbs and the MCP server's tools are the same surface.
 
 Full verbs, flags, session model, and threat model:
 [docs/agent-interfaces.md](docs/agent-interfaces.md).
