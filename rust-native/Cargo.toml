@@ -12,5 +12,5 @@ categories = ["web-programming"]
 
 [dependencies]
 rustwright_core = { package = "rustwright-core", path = "..", version = "0.1.1", default-features = false }
-serde = { version = "=1.0.188", features = ["derive"] }
+serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.107"
