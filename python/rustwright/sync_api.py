@@ -1610,9 +1610,79 @@ class TargetClosedError(Error):
 
 
 _TARGET_CLOSED_MESSAGE = "Target page, context or browser has been closed"
+_PAGE_CRASHED_MESSAGE = "Page crashed"
+_DISCONNECTED_MESSAGE = "target or browser is closed"
+_TIMEOUT_WIRE_MARKER = "__rustwright_timeout__:"
+_TARGET_CLOSED_WIRE_MARKER = "__rustwright_target_closed__:"
+_PAGE_CRASHED_WIRE_MARKER = "__rustwright_page_crashed__:"
+_DISCONNECTED_WIRE_MARKER = "__rustwright_disconnected__:"
+_WIRE_ERROR_KIND_ATTRIBUTE = "_rustwright_error_kind"
+_WIRE_ERROR_PAYLOAD_ATTRIBUTE = "_rustwright_error_payload"
+_TARGET_CLOSED_KINDS = frozenset({"page", "context", "browser", "target"})
+
+
+def _annotate_wire_error(error: Error, kind: str, payload: dict[str, Any]) -> Error:
+    setattr(error, _WIRE_ERROR_KIND_ATTRIBUTE, kind)
+    setattr(error, _WIRE_ERROR_PAYLOAD_ATTRIBUTE, dict(payload))
+    return error
+
+
+def _copy_wire_error_metadata(source: Error, target: Error) -> Error:
+    kind = getattr(source, _WIRE_ERROR_KIND_ATTRIBUTE, None)
+    payload = getattr(source, _WIRE_ERROR_PAYLOAD_ATTRIBUTE, None)
+    if isinstance(kind, str) and isinstance(payload, dict):
+        return _annotate_wire_error(target, kind, payload)
+    return target
+
+
+def _decode_wire_error(message: str) -> Optional[Error]:
+    if message.startswith(_TIMEOUT_WIRE_MARKER):
+        marker = _TIMEOUT_WIRE_MARKER
+        kind = "timeout"
+    elif message.startswith(_TARGET_CLOSED_WIRE_MARKER):
+        marker = _TARGET_CLOSED_WIRE_MARKER
+        kind = "target_closed"
+    elif message.startswith(_PAGE_CRASHED_WIRE_MARKER):
+        marker = _PAGE_CRASHED_WIRE_MARKER
+        kind = "page_crashed"
+    elif message.startswith(_DISCONNECTED_WIRE_MARKER):
+        marker = _DISCONNECTED_WIRE_MARKER
+        kind = "disconnected"
+    else:
+        return None
+
+    try:
+        payload = json.loads(message[len(marker) :])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    if kind == "timeout":
+        if set(payload) != {"ms"} or type(payload["ms"]) is not int or payload["ms"] < 0:
+            return None
+        error: Error = TimeoutError(f"timed out after {payload['ms']} ms")
+    elif kind == "target_closed":
+        if (
+            set(payload) != {"kind"}
+            or type(payload["kind"]) is not str
+            or payload["kind"] not in _TARGET_CLOSED_KINDS
+        ):
+            return None
+        error = TargetClosedError(_TARGET_CLOSED_MESSAGE)
+    elif kind == "page_crashed":
+        if payload:
+            return None
+        error = Error(_PAGE_CRASHED_MESSAGE)
+    else:
+        if payload:
+            return None
+        error = Error(_DISCONNECTED_MESSAGE)
+    return _annotate_wire_error(error, kind, payload)
 
 
 def _is_target_closed_message(message: str) -> bool:
+    # Legacy prose fallback for native and shim paths that do not emit a wire marker yet.
     return _TARGET_CLOSED_MESSAGE in message or any(
         fragment in message
         for fragment in (
@@ -1628,10 +1698,14 @@ def _is_target_closed_message(message: str) -> bool:
 
 def _translate_error(exc: RuntimeError) -> Error:
     message = str(exc)
+    wire_error = _decode_wire_error(message)
+    if wire_error is not None:
+        return wire_error
     if message.startswith("Error: InvalidSelectorError:"):
         message = message.removeprefix("Error: ")
     if _is_target_closed_message(message):
         return TargetClosedError(message)
+    # Legacy prose fallback for unconverted timeout producers.
     if "timed out" in message:
         return TimeoutError(message)
     return Error(message)
@@ -1655,7 +1729,7 @@ def _call_with_method_prefix(method: str, fn, *args, **kwargs):
             error_type = TargetClosedError
         else:
             error_type = TimeoutError if isinstance(exc, TimeoutError) else Error
-        raise error_type(f"{method}: {message}") from None
+        raise _copy_wire_error_metadata(exc, error_type(f"{method}: {message}")) from None
 
 
 def _is_nonserializable_evaluate_result(message: str) -> bool:
@@ -1671,6 +1745,12 @@ def _call_wait_with_playwright_timeout(method: str, fn, *args, **kwargs):
         return _call(fn, *args, **kwargs)
     except TimeoutError as exc:
         message = str(exc)
+        kind = getattr(exc, _WIRE_ERROR_KIND_ATTRIBUTE, None)
+        payload = getattr(exc, _WIRE_ERROR_PAYLOAD_ATTRIBUTE, None)
+        if kind == "timeout" and isinstance(payload, dict) and type(payload.get("ms")) is int:
+            error = TimeoutError(f"{method}: Timeout {payload['ms']}ms exceeded.")
+            raise _copy_wire_error_metadata(exc, error) from None
+        # Legacy prose fallback for timeout errors from unconverted paths.
         match = re.fullmatch(r"timed out after ([0-9]+(?:\.[0-9]+)?) ms", message)
         if match:
             raise TimeoutError(f"{method}: Timeout {match.group(1)}ms exceeded.") from None
@@ -1680,6 +1760,15 @@ def _call_wait_with_playwright_timeout(method: str, fn, *args, **kwargs):
 
 
 def _is_ignorable_close_error(error: Error) -> bool:
+    # Structured wire kinds first: a close racing owner or transport loss is
+    # benign, while a genuine close timeout must still surface.
+    if getattr(error, _WIRE_ERROR_KIND_ATTRIBUTE, None) in (
+        "disconnected",
+        "target_closed",
+        "page_crashed",
+    ):
+        return True
+    # Legacy cleanup-only prose emitted by unconverted CDP/session close paths.
     message = str(error)
     return any(
         fragment in message
