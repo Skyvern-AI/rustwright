@@ -40,7 +40,8 @@
   ],
   "scripts": {
     "build": "napi build --release -p rustwright-node --dts native.d.ts && node ./scripts/generate-types.mjs",
-    "smoke": "node ./smoke.mjs"
+    "smoke": "node ./smoke.mjs",
+    "test": "node --test test/"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.4"
