@@ -1964,6 +1964,109 @@ def test_cloakbrowser_alias_launchers_for_skyvern_stealth_paths(tmp_path: Path):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    ("wire_message", "expected_type", "expected_message", "expected_kind", "expected_payload"),
+    [
+        (
+            '__rustwright_timeout__:{"ms":250}',
+            TimeoutError,
+            "timed out after 250 ms",
+            "timeout",
+            {"ms": 250},
+        ),
+        (
+            '__rustwright_target_closed__:{"kind":"page"}',
+            "TargetClosedError",
+            "Target page, context or browser has been closed",
+            "target_closed",
+            {"kind": "page"},
+        ),
+        (
+            '__rustwright_target_closed__:{"kind":"context"}',
+            "TargetClosedError",
+            "Target page, context or browser has been closed",
+            "target_closed",
+            {"kind": "context"},
+        ),
+        (
+            '__rustwright_target_closed__:{"kind":"browser"}',
+            "TargetClosedError",
+            "Target page, context or browser has been closed",
+            "target_closed",
+            {"kind": "browser"},
+        ),
+        (
+            '__rustwright_target_closed__:{"kind":"target"}',
+            "TargetClosedError",
+            "Target page, context or browser has been closed",
+            "target_closed",
+            {"kind": "target"},
+        ),
+        (
+            "__rustwright_page_crashed__:{}",
+            Error,
+            "Page crashed",
+            "page_crashed",
+            {},
+        ),
+        (
+            "__rustwright_disconnected__:{}",
+            Error,
+            "target or browser is closed",
+            "disconnected",
+            {},
+        ),
+    ],
+)
+def test_structured_native_error_markers_translate_without_wire_residue(
+    wire_message, expected_type, expected_message, expected_kind, expected_payload
+):
+    import rustwright.sync_api as sync_api
+
+    if expected_type == "TargetClosedError":
+        expected_type = sync_api.TargetClosedError
+    translated = sync_api._translate_error(RuntimeError(wire_message))
+
+    assert type(translated) is expected_type
+    assert str(translated) == expected_message
+    assert "__rustwright_" not in str(translated)
+    assert translated._rustwright_error_kind == expected_kind
+    assert translated._rustwright_error_payload == expected_payload
+
+
+@pytest.mark.parametrize(
+    ("legacy_message", "expected_type"),
+    [
+        ("legacy operation timed out", TimeoutError),
+        ("Target page, context or browser has been closed", "TargetClosedError"),
+    ],
+)
+def test_unmarked_legacy_native_errors_still_use_prose_fallback(legacy_message, expected_type):
+    import rustwright.sync_api as sync_api
+
+    if expected_type == "TargetClosedError":
+        expected_type = sync_api.TargetClosedError
+    translated = sync_api._translate_error(RuntimeError(legacy_message))
+
+    assert type(translated) is expected_type
+    assert str(translated) == legacy_message
+    assert not hasattr(translated, "_rustwright_error_kind")
+
+
+def test_structured_timeout_payload_survives_playwright_method_formatting():
+    import rustwright.sync_api as sync_api
+
+    def native_timeout():
+        raise RuntimeError('__rustwright_timeout__:{"ms":75}')
+
+    with pytest.raises(TimeoutError) as exc_info:
+        sync_api._call_wait_with_playwright_timeout("Page.goto", native_timeout)
+
+    assert str(exc_info.value) == "Page.goto: Timeout 75ms exceeded."
+    assert exc_info.value._rustwright_error_kind == "timeout"
+    assert exc_info.value._rustwright_error_payload == {"ms": 75}
+
+
 def test_playwright_private_errors_shim_and_target_closed_type():
     from benchmarks.automation_cases import playwright_private_target_closed_error_import_and_type
     from playwright._impl._errors import Error as ImplError
