@@ -122,12 +122,14 @@ impl ProxyOptions {
 /// Chromium process launch options.
 #[derive(Clone, Debug, Serialize)]
 pub struct LaunchOptions {
-    pub headless: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headless: Option<bool>,
     pub executable_path: Option<String>,
     pub channel: Option<String>,
     pub args: Vec<String>,
     pub ignore_all_default_args: bool,
     pub ignore_default_args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<f64>,
     pub user_data_dir: Option<String>,
     pub env: HashMap<String, String>,
@@ -138,13 +140,13 @@ pub struct LaunchOptions {
 impl Default for LaunchOptions {
     fn default() -> Self {
         Self {
-            headless: true,
+            headless: None,
             executable_path: None,
             channel: None,
             args: Vec::new(),
             ignore_all_default_args: false,
             ignore_default_args: Vec::new(),
-            timeout: Some(30_000.0),
+            timeout: None,
             user_data_dir: None,
             env: HashMap::new(),
             chromium_sandbox: false,
@@ -156,7 +158,7 @@ impl Default for LaunchOptions {
 impl LaunchOptions {
     /// Set whether Chromium launches headlessly.
     pub fn headless(mut self, headless: bool) -> Self {
-        self.headless = headless;
+        self.headless = Some(headless);
         self
     }
 
