@@ -21,7 +21,7 @@ jobs:
     name: Build shared C ABI
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build librustwright_capi (release)
@@ -46,7 +46,7 @@ jobs:
       RW_LIB: target/release/librustwright_capi.so
       RW_OUT: results/${{ matrix.lang }}.json
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Detect binding package
         id: has
@@ -157,7 +157,7 @@ jobs:
     needs: bindings
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - name: Download all language results
         uses: actions/download-artifact@v4
         with:
