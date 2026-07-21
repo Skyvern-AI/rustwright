@@ -4,7 +4,7 @@
 //! owns Chromium, CDP, and its async runtime; callers do not need Tokio.
 
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
@@ -684,6 +684,12 @@ impl Page {
     }
 
     /// Evaluate JavaScript and decode the core's JSON wire representation.
+    ///
+    /// JavaScript bigint values become decimal strings because
+    /// [`serde_json::Value`] has no arbitrary-precision integer variant.
+    /// Negative zero retains its sign. Non-finite `f64` values are mapped
+    /// through their Rust constants, which become `Value::Null` because JSON
+    /// cannot represent NaN or infinity.
     pub fn evaluate(
         &self,
         expression: &str,
@@ -708,8 +714,7 @@ impl Page {
             options.timeout,
             cancel,
         )?;
-        let wire: Value = serde_json::from_str(&json)?;
-        Ok(decode_wire_value(wire))
+        decode_evaluate_wire(&json)
     }
 
     /// Capture a screenshot and return its encoded bytes.
@@ -782,16 +787,27 @@ fn duration_from_timeout_ms(timeout_ms: Option<f64>) -> Duration {
     }
 }
 
-fn decode_wire_value(value: Value) -> Value {
+fn decode_evaluate_wire(wire_json: &str) -> Result<Value> {
+    let decoded = rustwright_core::decode_wire_value(wire_json)?;
+    let value = serde_json::from_str(&decoded)?;
+    Ok(map_wire_leaves(value))
+}
+
+fn map_wire_leaves(value: Value) -> Value {
     match value {
-        Value::Array(values) => Value::Array(values.into_iter().map(decode_wire_value).collect()),
+        Value::Array(values) => Value::Array(values.into_iter().map(map_wire_leaves).collect()),
         Value::Object(mut object) => {
             if object.contains_key("__rustwright_cdp_undefined__")
                 || object.contains_key("__rustwright_cdp_symbol__")
                 || object.contains_key("__rustwright_cdp_function__")
-                || object.contains_key("__rustwright_cdp_ref__")
             {
                 return Value::Null;
+            }
+            if let Some(value) = object.remove("__rustwright_cdp_unserializable_value__") {
+                return map_unserializable_value(value);
+            }
+            if let Some(value) = object.remove("__rustwright_cdp_bigint__") {
+                return map_bigint_value(value);
             }
             if let Some(value) = object.remove("__rustwright_cdp_date__") {
                 return value;
@@ -799,25 +815,130 @@ fn decode_wire_value(value: Value) -> Value {
             if let Some(value) = object.remove("__rustwright_cdp_url__") {
                 return value;
             }
-            if object.contains_key("__rustwright_cdp_array__") {
-                return object
-                    .remove("items")
-                    .map(decode_wire_value)
-                    .unwrap_or(Value::Array(Vec::new()));
+            if let Some(value) = object.remove("__rustwright_cdp_regexp__") {
+                return map_wire_leaves(value);
             }
-            if object.contains_key("__rustwright_cdp_object__") {
-                return object
-                    .remove("entries")
-                    .map(decode_wire_value)
-                    .unwrap_or_else(|| Value::Object(Map::new()));
+            if let Some(value) = object.remove("__rustwright_cdp_error__") {
+                return map_wire_leaves(value);
             }
             Value::Object(
                 object
                     .into_iter()
-                    .map(|(key, value)| (key, decode_wire_value(value)))
+                    .map(|(key, value)| (key, map_wire_leaves(value)))
                     .collect(),
             )
         }
         value => value,
+    }
+}
+
+fn map_unserializable_value(value: Value) -> Value {
+    let Value::String(value) = value else {
+        return value;
+    };
+    match value.as_str() {
+        "NaN" => Value::from(f64::NAN),
+        "Infinity" => Value::from(f64::INFINITY),
+        "-Infinity" => Value::from(f64::NEG_INFINITY),
+        "-0" => Value::from(-0.0_f64),
+        _ => value.strip_suffix('n').map_or_else(
+            || Value::String(value.clone()),
+            |digits| Value::String(digits.to_owned()),
+        ),
+    }
+}
+
+fn map_bigint_value(value: Value) -> Value {
+    match value {
+        Value::String(value) => {
+            Value::String(value.strip_suffix('n').unwrap_or(value.as_str()).to_owned())
+        }
+        value => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn decode_evaluate_wire_resolves_references_instead_of_dropping_them() {
+        let decoded = decode_evaluate_wire(
+            r#"{
+                "__rustwright_cdp_object__": 1,
+                "entries": {
+                    "first": {
+                        "__rustwright_cdp_array__": 2,
+                        "items": [1, {"ok": true}]
+                    },
+                    "again": {"__rustwright_cdp_ref__": 2}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decoded,
+            json!({
+                "first": [1, {"ok": true}],
+                "again": [1, {"ok": true}],
+            })
+        );
+    }
+
+    #[test]
+    fn decode_evaluate_wire_maps_leaf_values() {
+        let decoded = decode_evaluate_wire(
+            r#"[
+                {"__rustwright_cdp_unserializable_value__": "NaN"},
+                {"__rustwright_cdp_unserializable_value__": "Infinity"},
+                {"__rustwright_cdp_unserializable_value__": "-Infinity"},
+                {"__rustwright_cdp_unserializable_value__": "-0"},
+                {"__rustwright_cdp_unserializable_value__": "12345678901234567890n"},
+                {"__rustwright_cdp_bigint__": "98765432109876543210"},
+                {"__rustwright_cdp_date__": "2026-07-21T12:34:56.789Z"},
+                {"__rustwright_cdp_regexp__": {"p": "a+b", "f": "gi"}},
+                {"__rustwright_cdp_url__": "https://example.com/path"},
+                {"__rustwright_cdp_error__": {
+                    "name": "TypeError", "message": "broken", "stack": "trace"
+                }},
+                {"__rustwright_cdp_undefined__": true},
+                {"__rustwright_cdp_symbol__": true},
+                {"__rustwright_cdp_function__": true}
+            ]"#,
+        )
+        .unwrap();
+        let values = decoded.as_array().unwrap();
+
+        assert_eq!(values[0], Value::Null);
+        assert_eq!(values[1], Value::Null);
+        assert_eq!(values[2], Value::Null);
+        let negative_zero = values[3].as_f64().unwrap();
+        assert_eq!(negative_zero, 0.0);
+        assert!(negative_zero.is_sign_negative());
+        assert_eq!(values[4], "12345678901234567890");
+        assert_eq!(values[5], "98765432109876543210");
+        assert_eq!(values[6], "2026-07-21T12:34:56.789Z");
+        assert_eq!(values[7], json!({"p": "a+b", "f": "gi"}));
+        assert_eq!(values[8], "https://example.com/path");
+        assert_eq!(
+            values[9],
+            json!({"name": "TypeError", "message": "broken", "stack": "trace"})
+        );
+        assert_eq!(&values[10..], &[Value::Null, Value::Null, Value::Null]);
+    }
+
+    #[test]
+    fn decode_evaluate_wire_preserves_cycle_markers() {
+        let decoded = decode_evaluate_wire(
+            r#"{
+                "__rustwright_cdp_object__": 1,
+                "entries": {"self": {"__rustwright_cdp_ref__": 1}}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(decoded, json!({"self": {"__rustwright_cdp_cycle__": true}}));
     }
 }
