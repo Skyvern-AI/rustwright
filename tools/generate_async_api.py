@@ -81,11 +81,11 @@ GENERATED_METHODS = {
     "AsyncTracing": ("start", "stop", "start_chunk", "stop_chunk", "group", "group_end"),
     "AsyncBrowser": ("new_browser_cdp_session", "start_tracing", "stop_tracing", "bind", "unbind"),
     "AsyncBrowserContext": ("add_init_script", "cookies", "add_cookies", "clear_cookies", "storage_state", "set_storage_state", "set_extra_http_headers", "grant_permissions", "clear_permissions", "set_geolocation", "set_offline", "route_from_har", "new_cdp_session"),
-    "AsyncPage": ("reload", "go_back", "go_forward", "wait_for_timeout", "set_content", "add_init_script", "evaluate_handle", "set_extra_http_headers", "set_viewport_size", "emulate_media", "title", "content", "query_selector", "query_selector_all", "eval_on_selector", "eval_on_selector_all", "dispatch_event", "get_attribute", "inner_html", "text_content", "input_value", "is_visible", "is_hidden", "is_enabled", "is_disabled", "is_checked", "is_editable", "route_from_har", "pdf", "bring_to_front", "requests", "console_messages", "clear_console_messages", "page_errors", "clear_page_errors", "request_gc", "pause", "pick_locator", "cancel_pick_locator", "aria_snapshot"),
+    "AsyncPage": ("reload", "go_back", "go_forward", "wait_for_timeout", "set_content", "add_init_script", "evaluate_handle", "set_extra_http_headers", "set_viewport_size", "emulate_media", "title", "content", "query_selector", "query_selector_all", "eval_on_selector", "eval_on_selector_all", "dispatch_event", "get_attribute", "inner_html", "text_content", "input_value", "is_visible", "is_hidden", "is_enabled", "is_disabled", "is_checked", "is_editable", "route_from_har", "pdf", "bring_to_front", "requests", "console_messages", "clear_console_messages", "page_errors", "clear_page_errors", "request_gc", "pause", "pick_locator", "cancel_pick_locator", "aria_snapshot", "wait_for_url", "wait_for_function", "dblclick", "type", "press", "hover", "tap", "drag_and_drop", "focus", "check", "uncheck", "select_option", "set_input_files", "set_checked", "opener"),
     "AsyncJSHandle": ("json_value", "get_property", "get_properties", "evaluate", "evaluate_handle", "dispose"),
-    "AsyncFrame": ("query_selector", "query_selector_all", "evaluate", "evaluate_handle", "eval_on_selector", "eval_on_selector_all", "dispatch_event", "content", "title", "set_content", "goto", "wait_for_timeout", "add_script_tag", "add_style_tag", "text_content", "inner_text", "inner_html", "get_attribute", "input_value", "is_visible", "is_hidden", "is_enabled", "is_disabled", "is_checked", "is_editable", "frame_element"),
-    "AsyncLocator": ("count", "evaluate", "evaluate_handle", "evaluate_all", "dispatch_event", "inner_text", "inner_html", "text_content", "get_attribute", "is_visible", "is_hidden", "is_enabled", "is_disabled", "is_checked", "is_editable", "input_value", "all_inner_texts", "all_text_contents", "all", "element_handles", "bounding_box", "highlight", "aria_snapshot", "element_handle", "normalize"),
-    "AsyncElementHandle": ("dispatch_event", "evaluate", "evaluate_handle", "eval_on_selector", "eval_on_selector_all", "query_selector", "query_selector_all", "focus", "text_content", "inner_text", "inner_html", "get_attribute", "is_visible", "is_hidden", "is_enabled", "is_disabled", "is_editable", "input_value", "is_checked", "bounding_box", "get_property", "get_properties", "json_value", "content_frame", "owner_frame", "dispose"),
+    "AsyncFrame": ("query_selector", "query_selector_all", "evaluate", "evaluate_handle", "eval_on_selector", "eval_on_selector_all", "dispatch_event", "content", "title", "set_content", "goto", "wait_for_timeout", "add_script_tag", "add_style_tag", "text_content", "inner_text", "inner_html", "get_attribute", "input_value", "is_visible", "is_hidden", "is_enabled", "is_disabled", "is_checked", "is_editable", "frame_element", "wait_for_selector", "wait_for_url", "wait_for_function", "click", "dblclick", "fill", "type", "press", "hover", "tap", "focus", "check", "uncheck", "set_checked", "select_option", "set_input_files", "drag_and_drop"),
+    "AsyncLocator": ("count", "evaluate", "evaluate_handle", "evaluate_all", "dispatch_event", "inner_text", "inner_html", "text_content", "get_attribute", "is_visible", "is_hidden", "is_enabled", "is_disabled", "is_checked", "is_editable", "input_value", "all_inner_texts", "all_text_contents", "all", "element_handles", "bounding_box", "highlight", "aria_snapshot", "element_handle", "normalize", "click", "dblclick", "fill", "type", "press", "hover", "tap", "focus", "blur", "clear", "check", "uncheck", "set_checked", "select_option", "set_input_files", "scroll_into_view_if_needed", "select_text", "press_sequentially", "screenshot", "wait_for"),
+    "AsyncElementHandle": ("dispatch_event", "evaluate", "evaluate_handle", "eval_on_selector", "eval_on_selector_all", "query_selector", "query_selector_all", "focus", "text_content", "inner_text", "inner_html", "get_attribute", "is_visible", "is_hidden", "is_enabled", "is_disabled", "is_editable", "input_value", "is_checked", "bounding_box", "get_property", "get_properties", "json_value", "content_frame", "owner_frame", "dispose", "click", "dblclick", "fill", "type", "press", "hover", "tap", "wait_for_selector", "check", "uncheck", "set_checked", "select_option", "set_input_files", "scroll_into_view_if_needed", "select_text", "wait_for_element_state", "screenshot"),
     "AsyncKeyboard": ("type", "insert_text", "press", "down", "up"),
     "AsyncMouse": ("move", "click", "dblclick", "down", "up", "wheel"),
     "AsyncTouchscreen": ("tap",),
@@ -107,10 +107,9 @@ HAND_METHODS = {
     "AsyncExpectation": ("_run_sync_assertion", "to_have_text", "to_contain_text", "to_be_visible", "to_be_hidden", "to_be_enabled", "to_be_disabled", "to_be_editable", "to_be_checked", "to_be_attached", "to_be_empty", "to_be_focused", "to_have_count", "to_have_value", "to_have_values", "to_have_attribute", "to_have_id", "to_have_class", "to_contain_class", "to_have_role", "to_have_accessible_name", "to_have_accessible_description", "to_have_accessible_error_message", "to_match_aria_snapshot", "to_have_css", "to_have_js_property", "to_be_in_viewport", "to_be_ok", "to_have_title", "to_have_url"),
     "AsyncBrowser": ("__aenter__", "__aexit__", "new_page", "new_context", "close", "_close_native"),
     "AsyncBrowserContext": ("__aenter__", "__aexit__", "new_page", "close", "_close_for_browser_close", "_close_native", "_close_native_impl", "expose_function", "expose_binding", "route", "unroute", "unroute_all", "wait_for_event", "route_web_socket"),
-    "AsyncPage": ("_event_pump", "_consume_event_batch", "goto", "wait_for_url", "wait_for_load_state", "evaluate", "wait_for_function", "add_script_tag", "add_style_tag", "expose_function", "expose_binding", "wait_for_selector", "click", "dblclick", "fill", "type", "press", "hover", "tap", "drag_and_drop", "focus", "check", "uncheck", "select_option", "set_input_files", "inner_text", "set_checked", "wait_for_event", "route", "unroute", "unroute_all", "route_web_socket", "screenshot", "opener", "add_locator_handler", "remove_locator_handler", "close", "_close_native"),
-    "AsyncFrame": ("wait_for_selector", "wait_for_url", "wait_for_load_state", "wait_for_function", "click", "dblclick", "fill", "type", "press", "hover", "tap", "focus", "check", "uncheck", "set_checked", "select_option", "set_input_files", "drag_and_drop"),
-    "AsyncLocator": ("click", "dblclick", "fill", "type", "press", "hover", "tap", "drag_to", "focus", "blur", "clear", "check", "uncheck", "set_checked", "select_option", "set_input_files", "scroll_into_view_if_needed", "select_text", "press_sequentially", "screenshot", "wait_for"),
-    "AsyncElementHandle": ("click", "dblclick", "fill", "type", "press", "hover", "tap", "wait_for_selector", "check", "uncheck", "set_checked", "select_option", "set_input_files", "scroll_into_view_if_needed", "select_text", "wait_for_element_state", "screenshot"),
+    "AsyncPage": ("_event_pump", "_consume_event_batch", "goto", "wait_for_load_state", "evaluate", "add_script_tag", "add_style_tag", "expose_function", "expose_binding", "wait_for_selector", "click", "fill", "inner_text", "wait_for_event", "route", "unroute", "unroute_all", "route_web_socket", "screenshot", "add_locator_handler", "remove_locator_handler", "close", "_close_native"),
+    "AsyncFrame": ("wait_for_load_state",),
+    "AsyncLocator": ("drag_to",),
     "AsyncAPIRequestContext": ("_run_request", "fetch", "get", "post", "put", "patch", "delete", "head"),
     "AsyncWebSocket": ("wait_for_event",),
 }
@@ -173,6 +172,7 @@ UNWRAP_ARGUMENTS = {
     "AsyncBrowser.start_tracing": ("page",),
     "AsyncBrowserContext.new_cdp_session": ("page",),
     "AsyncPage.evaluate_handle": ("arg",),
+    "AsyncPage.wait_for_function": ("arg",),
     "AsyncPage.eval_on_selector": ("arg",),
     "AsyncPage.eval_on_selector_all": ("arg",),
     "AsyncPage.dispatch_event": ("event_init",),
@@ -180,6 +180,7 @@ UNWRAP_ARGUMENTS = {
     "AsyncJSHandle.evaluate_handle": ("arg",),
     "AsyncFrame.evaluate": ("arg",),
     "AsyncFrame.evaluate_handle": ("arg",),
+    "AsyncFrame.wait_for_function": ("arg",),
     "AsyncFrame.eval_on_selector": ("arg",),
     "AsyncFrame.eval_on_selector_all": ("arg",),
     "AsyncFrame.dispatch_event": ("event_init",),
@@ -195,6 +196,48 @@ UNWRAP_ARGUMENTS = {
     "AsyncRoute.fulfill": ("response",),
     "AsyncWorker.evaluate": ("arg",),
     "AsyncWorker.evaluate_handle": ("arg",),
+}
+
+
+# These methods intentionally slice blocking sync waits so cancellation and
+# unrelated event-loop work can make progress. The method bodies are otherwise
+# ordinary delegation, so the runner choice stays explicit generator data.
+SLICED_WAIT_METHODS = {
+    "AsyncPage": (
+        "wait_for_url", "wait_for_function", "dblclick", "type", "press",
+        "hover", "tap", "drag_and_drop", "focus", "check", "uncheck",
+        "select_option", "set_input_files", "set_checked",
+    ),
+    "AsyncFrame": (
+        "wait_for_selector", "wait_for_url", "wait_for_function", "click",
+        "dblclick", "fill", "type", "press", "hover", "tap", "focus",
+        "check", "uncheck", "set_checked", "select_option",
+        "set_input_files", "drag_and_drop",
+    ),
+    "AsyncLocator": (
+        "click", "dblclick", "fill", "type", "press", "hover", "tap",
+        "focus", "blur", "clear", "check", "uncheck", "set_checked",
+        "select_option", "set_input_files", "scroll_into_view_if_needed",
+        "select_text", "press_sequentially", "wait_for",
+    ),
+    "AsyncElementHandle": (
+        "click", "dblclick", "fill", "type", "press", "hover", "tap",
+        "wait_for_selector", "check", "uncheck", "set_checked",
+        "select_option", "set_input_files", "scroll_into_view_if_needed",
+        "select_text", "wait_for_element_state",
+    ),
+}
+
+
+# A few sync methods accept either one async wrapper or a sequence of wrappers.
+# Preserve the former hand-written behavior: tuples become lists and only the
+# direct sequence items are unwrapped.
+WRAPPER_SEQUENCE_ARGUMENTS = {
+    "AsyncFrame.select_option": ("element",),
+    "AsyncLocator.select_option": ("element",),
+    "AsyncLocator.screenshot": ("mask",),
+    "AsyncElementHandle.select_option": ("element",),
+    "AsyncElementHandle.screenshot": ("mask",),
 }
 
 
@@ -246,6 +289,43 @@ SIGNATURE_OVERRIDES = {
     "AsyncRoute.fulfill": "async def fulfill(self, *, status: Optional[int] = None, headers: Optional[dict[str, str]] = None, body: Any = None, json: Any = None, path: Any = None, content_type: Optional[str] = None, response: Optional[Any] = None) -> None: ...",
     "AsyncAPIRequest.new_context": "async def new_context(self, *, base_url: Optional[str] = None, extra_http_headers: Optional[dict[str, str]] = None, http_credentials: Optional[dict[str, Any]] = None, ignore_https_errors: Optional[bool] = None, proxy: Optional[dict[str, Any]] = None, user_agent: Optional[str] = None, timeout: Optional[float] = None, storage_state: Any = None, client_certificates: Optional[list[Any]] = None, fail_on_status_code: Optional[bool] = None, max_redirects: Optional[int] = None) -> 'AsyncAPIRequestContext': ...",
     "AsyncAPIRequestContext.storage_state": "async def storage_state(self, *, path: Any = None, indexed_db: Optional[bool] = None) -> dict[str, Any]: ...",
+    "AsyncPage.wait_for_url": "async def wait_for_url(self, url: Any, *, wait_until: Optional[str] = None, timeout: Optional[float] = None) -> None: ...",
+    "AsyncPage.wait_for_function": "async def wait_for_function(self, expression: str, *, arg: Any = None, timeout: Optional[float] = None, polling: Any = None) -> 'AsyncJSHandle': ...",
+    "AsyncPage.dblclick": "async def dblclick(self, selector: str, *, modifiers: Any = None, position: Any = None, delay: Optional[float] = None, button: Optional[str] = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, strict: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncPage.hover": "async def hover(self, selector: str, *, modifiers: Any = None, position: Any = None, timeout: Optional[float] = None, no_wait_after: Optional[bool] = None, force: Optional[bool] = None, strict: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncPage.tap": "async def tap(self, selector: str, *, modifiers: Any = None, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, strict: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncPage.drag_and_drop": "async def drag_and_drop(self, source: str, target: str, *, source_position: Any = None, target_position: Any = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, timeout: Optional[float] = None, strict: Optional[bool] = None, trial: Optional[bool] = None, steps: Optional[int] = None) -> None: ...",
+    "AsyncPage.check": "async def check(self, selector: str, *, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, strict: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncPage.uncheck": "async def uncheck(self, selector: str, *, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, strict: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncPage.set_checked": "async def set_checked(self, selector: str, checked: bool, *, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, strict: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncPage.opener": "async def opener(self) -> Any: ...",
+    "AsyncFrame.wait_for_url": "async def wait_for_url(self, url: Any, *, wait_until: Optional[str] = None, timeout: Optional[float] = None) -> None: ...",
+    "AsyncFrame.click": "async def click(self, selector: str, *, modifiers: Any = None, position: Any = None, delay: Optional[float] = None, button: Optional[str] = None, click_count: Optional[int] = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, strict: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncFrame.dblclick": "async def dblclick(self, selector: str, *, modifiers: Any = None, position: Any = None, delay: Optional[float] = None, button: Optional[str] = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, strict: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncFrame.type": "async def type(self, selector: str, text: str, *, delay: Optional[float] = None, strict: Optional[bool] = None, timeout: Optional[float] = None, no_wait_after: Optional[bool] = None) -> None: ...",
+    "AsyncFrame.press": "async def press(self, selector: str, key: str, *, delay: Optional[float] = None, strict: Optional[bool] = None, timeout: Optional[float] = None, no_wait_after: Optional[bool] = None) -> None: ...",
+    "AsyncFrame.hover": "async def hover(self, selector: str, *, modifiers: Any = None, position: Any = None, timeout: Optional[float] = None, no_wait_after: Optional[bool] = None, force: Optional[bool] = None, strict: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncFrame.tap": "async def tap(self, selector: str, *, modifiers: Any = None, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, strict: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncFrame.check": "async def check(self, selector: str, *, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, strict: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncFrame.uncheck": "async def uncheck(self, selector: str, *, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, strict: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncFrame.set_checked": "async def set_checked(self, selector: str, checked: bool, *, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, strict: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncFrame.drag_and_drop": "async def drag_and_drop(self, source: str, target: str, *, source_position: Any = None, target_position: Any = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, strict: Optional[bool] = None, timeout: Optional[float] = None, trial: Optional[bool] = None, steps: Optional[int] = None) -> None: ...",
+    "AsyncLocator.click": "async def click(self, *, modifiers: Any = None, position: Any = None, delay: Optional[float] = None, button: Optional[str] = None, click_count: Optional[int] = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, trial: Optional[bool] = None, steps: Optional[int] = None) -> None: ...",
+    "AsyncLocator.dblclick": "async def dblclick(self, *, modifiers: Any = None, position: Any = None, delay: Optional[float] = None, button: Optional[str] = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, trial: Optional[bool] = None, steps: Optional[int] = None) -> None: ...",
+    "AsyncLocator.hover": "async def hover(self, *, modifiers: Any = None, position: Any = None, timeout: Optional[float] = None, no_wait_after: Optional[bool] = None, force: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncLocator.tap": "async def tap(self, *, modifiers: Any = None, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncLocator.check": "async def check(self, *, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncLocator.uncheck": "async def uncheck(self, *, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncLocator.set_checked": "async def set_checked(self, checked: bool, *, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncLocator.select_option": "async def select_option(self, value: Any = None, *, index: Any = None, label: Any = None, element: Any = None, timeout: Optional[float] = None, no_wait_after: Optional[bool] = None, force: Optional[bool] = None) -> Any: ...",
+    "AsyncLocator.wait_for": "async def wait_for(self, *, timeout: Optional[float] = None, state: Optional[str] = None) -> None: ...",
+    "AsyncElementHandle.click": "async def click(self, *, modifiers: Any = None, position: Any = None, delay: Optional[float] = None, button: Optional[str] = None, click_count: Optional[int] = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, trial: Optional[bool] = None, steps: Optional[int] = None) -> None: ...",
+    "AsyncElementHandle.dblclick": "async def dblclick(self, *, modifiers: Any = None, position: Any = None, delay: Optional[float] = None, button: Optional[str] = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, trial: Optional[bool] = None, steps: Optional[int] = None) -> None: ...",
+    "AsyncElementHandle.hover": "async def hover(self, *, modifiers: Any = None, position: Any = None, timeout: Optional[float] = None, no_wait_after: Optional[bool] = None, force: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncElementHandle.tap": "async def tap(self, *, modifiers: Any = None, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncElementHandle.check": "async def check(self, *, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncElementHandle.uncheck": "async def uncheck(self, *, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
+    "AsyncElementHandle.set_checked": "async def set_checked(self, checked: bool, *, position: Any = None, timeout: Optional[float] = None, force: Optional[bool] = None, no_wait_after: Optional[bool] = None, trial: Optional[bool] = None) -> None: ...",
 }
 
 
@@ -344,7 +424,13 @@ def _generated_signature(
 
 def _argument_value(key: str, name: str) -> ast.expr:
     value: ast.expr = ast.Name(id=name, ctx=ast.Load())
-    if name in UNWRAP_ARGUMENTS.get(key, ()):
+    if name in WRAPPER_SEQUENCE_ARGUMENTS.get(key, ()):
+        value = ast.Call(
+            func=ast.Name(id="_generated_unwrap_async_wrapper_sequence", ctx=ast.Load()),
+            args=[value],
+            keywords=[],
+        )
+    elif name in UNWRAP_ARGUMENTS.get(key, ()):
         value = ast.Call(
             func=ast.Name(id="_generated_unwrap_async_arg", ctx=ast.Load()),
             args=[value],
@@ -393,10 +479,23 @@ def _delegating_call(
         attr=method.name,
         ctx=ast.Load(),
     )
+    runner = "_generated_run_sync_call"
+    runner_args: list[ast.expr] = [sync_method, *positional]
+    if method.name in SLICED_WAIT_METHODS.get(async_class, ()):
+        runner = "_generated_run_sync_wait_sliced"
+        runner_args = [
+            ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()),
+                attr="_sync",
+                ctx=ast.Load(),
+            ),
+            sync_method,
+            *positional,
+        ]
     return ast.Await(
         value=ast.Call(
-            func=ast.Name(id="_generated_run_sync_call", ctx=ast.Load()),
-            args=[sync_method, *positional],
+            func=ast.Name(id=runner, ctx=ast.Load()),
+            args=runner_args,
             keywords=keywords,
         )
     )
@@ -593,6 +692,12 @@ async def _generated_run_sync_call(func: Any, /, *args: Any, **kwargs: Any) -> A
     return await _run_sync_call(func, *args, **kwargs)
 
 
+async def _generated_run_sync_wait_sliced(sync_owner: Any, func: Any, /, *args: Any, **kwargs: Any) -> Any:
+    from .async_api import _run_sync_wait_sliced
+
+    return await _run_sync_wait_sliced(sync_owner, func, *args, **kwargs)
+
+
 def _generated_call_async_api(name: str, value: Any) -> Any:
     from . import async_api
 
@@ -603,6 +708,16 @@ def _generated_unwrap_async_arg(value: Any) -> Any:
     from .async_api import _unwrap_async_arg
 
     return _unwrap_async_arg(value)
+
+
+def _generated_unwrap_async_wrapper_sequence(value: Any) -> Any:
+    from .async_api import _AsyncWrapper
+
+    if isinstance(value, _AsyncWrapper):
+        return value._sync
+    if isinstance(value, (list, tuple)):
+        return [item._sync if isinstance(item, _AsyncWrapper) else item for item in value]
+    return value
 '''
     metadata_lines = [
         "",
