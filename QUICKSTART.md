@@ -112,6 +112,7 @@ The CLI verbs and the MCP server's tools are the same surface.
 See [docs/agent-interfaces.md](docs/agent-interfaces.md) for the CLI verbs,
 configuration, threat model, and current scope. An MCP server for Rustwright is
 available as a separate, opt-in package (`rustwright-mcp`).
+After installing both packages, start the stdio server with `rustwright mcp`.
 
 ## Node.js (experimental)
 
