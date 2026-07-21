@@ -50,3 +50,21 @@ risk. Treat a Critical finding as a strong signal to fix or explicitly justify
 before merging. Automated review is a guardrail, not a security boundary;
 repository rules and the publish-time sync remain the final checks before
 anything reaches the public mirror.
+
+## Local verification
+
+Run lightweight checks locally: `cargo check --locked`, `cargo test --lib`,
+`maturin develop --release`, and targeted pytest subsets.
+
+Do not run heavyweight verification on a developer host. This includes Docker
+verification-image builds, `tools/docker_test.sh` or `tools/docker_verify.sh`
+container modes, full pytest runs, and benchmark workloads. Run these checks in
+Blacksmith test containers: preflight with
+`python tools/check_testbox_visibility.py --json`, warm a testbox with
+`tools/run_benchmark_testbox.sh` through
+`.github/workflows/benchmark-testbox.yml`, and execute with
+`blacksmith testbox run --id <ID> "<command>"`. Alternatively, use a
+dispatch-only workflow on a Blacksmith runner.
+
+Follow `BENCHMARK.md` for benchmarks. Use a testbox first; never run benchmarks
+on the developer host.
