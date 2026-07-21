@@ -147,11 +147,31 @@ arrays as `{ "__rustwright_cdp_array__": id, "items": [...] }` and objects as
 `{ "__rustwright_cdp_object__": id, "entries": {...} }`; recursively unwrap
 `items` and `entries`. It uses `__rustwright_cdp_ref__` for repeated/cyclic
 references and tagged objects for undefined, non-finite numbers, dates,
-regular expressions, URLs, errors, symbols, and functions. General bindings
-should mirror the existing Node decoder's closest native representation.
-Manifest v1 expected/captured values are JSON-compatible and never require
-cycles; a runner must at least recursively decode array/object wrappers before
-capture or `assertEval` comparison.
+regular expressions, URLs, errors, symbols, and functions. The core
+serializer is the single source of truth for this vocabulary; a binding maps
+the core's tags to its closest native representation and must not invent or
+assume tags the core does not emit. Manifest v1 expected/captured values are
+JSON-compatible and never require cycles; a runner must at least recursively
+decode array/object wrappers before capture or `assertEval` comparison.
+
+### Thin-shim rule (single source of logic)
+
+Any behavior expressible as a pure function of JSON-in/JSON-out — launch and
+screenshot option normalization and defaulting, evaluate-wire decoding,
+timeout-precedence resolution, data-URL construction, and structural result
+comparison — is implemented once in `rustwright-core` and exposed through the
+C ABI (and napi/PyO3). A binding limits itself to:
+
+- marshalling native values to and from the documented JSON wire shapes,
+- handle, memory, and thread ownership per this contract, and
+- idiomatic naming and native-value coercion.
+
+A binding must not introduce option defaults, timeout policy, retry or
+polling loops, or its own copy of the evaluate decoder beyond leaf-scalar
+mapping. New engine-semantic surface (contexts, default timeouts,
+actionability waits, trusted input) lands in the core first and is exposed to
+all bindings in the same change; a single-binding implementation of engine
+semantics requires an explicit experimental gate and a core issue on file.
 
 ## Build and link
 
