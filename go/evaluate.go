@@ -32,23 +32,27 @@ func (e JavaScriptError) Error() string {
 }
 
 func decodeEvaluateJSON(data []byte) (any, error) {
+	native, err := currentWireDecodeNative()
+	if err != nil {
+		return nil, err
+	}
+	data, err = native.decodeWireJSON(data)
+	if err != nil {
+		return nil, err
+	}
 	var raw any
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("decode evaluate JSON: %w", err)
 	}
-	return (&wireDecoder{refs: make(map[string]any)}).decode(raw)
+	return mapEvaluateLeaves(raw)
 }
 
-type wireDecoder struct {
-	refs map[string]any
-}
-
-func (d *wireDecoder) decode(value any) (any, error) {
+func mapEvaluateLeaves(value any) (any, error) {
 	switch value := value.(type) {
 	case []any:
 		decoded := make([]any, len(value))
 		for i := range value {
-			item, err := d.decode(value[i])
+			item, err := mapEvaluateLeaves(value[i])
 			if err != nil {
 				return nil, err
 			}
@@ -56,52 +60,13 @@ func (d *wireDecoder) decode(value any) (any, error) {
 		}
 		return decoded, nil
 	case map[string]any:
-		return d.decodeObject(value)
+		return mapEvaluateObjectLeaves(value)
 	default:
 		return value, nil
 	}
 }
 
-func (d *wireDecoder) decodeObject(value map[string]any) (any, error) {
-	if id, ok := value["__rustwright_cdp_ref__"]; ok {
-		resolved, exists := d.refs[refKey(id)]
-		if !exists {
-			return nil, fmt.Errorf("decode evaluate JSON: unknown reference %v", id)
-		}
-		return resolved, nil
-	}
-	if id, ok := value["__rustwright_cdp_array__"]; ok {
-		items, ok := value["items"].([]any)
-		if !ok {
-			return nil, fmt.Errorf("decode evaluate JSON: array wrapper has invalid items")
-		}
-		decoded := make([]any, len(items))
-		d.refs[refKey(id)] = decoded
-		for i := range items {
-			item, err := d.decode(items[i])
-			if err != nil {
-				return nil, err
-			}
-			decoded[i] = item
-		}
-		return decoded, nil
-	}
-	if id, ok := value["__rustwright_cdp_object__"]; ok {
-		entries, ok := value["entries"].(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("decode evaluate JSON: object wrapper has invalid entries")
-		}
-		decoded := make(map[string]any, len(entries))
-		d.refs[refKey(id)] = decoded
-		for key, entry := range entries {
-			item, err := d.decode(entry)
-			if err != nil {
-				return nil, err
-			}
-			decoded[key] = item
-		}
-		return decoded, nil
-	}
+func mapEvaluateObjectLeaves(value map[string]any) (any, error) {
 	if number, ok := value["__rustwright_cdp_unserializable_value__"].(string); ok {
 		switch number {
 		case "NaN":
@@ -147,15 +112,11 @@ func (d *wireDecoder) decodeObject(value map[string]any) (any, error) {
 
 	decoded := make(map[string]any, len(value))
 	for key, entry := range value {
-		item, err := d.decode(entry)
+		item, err := mapEvaluateLeaves(entry)
 		if err != nil {
 			return nil, err
 		}
 		decoded[key] = item
 	}
 	return decoded, nil
-}
-
-func refKey(value any) string {
-	return fmt.Sprintf("%v", value)
 }
