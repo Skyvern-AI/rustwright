@@ -9777,6 +9777,37 @@ def test_locator_click_unsafe_dom_fastpath_opt_in_restores_dom_click(page, monke
     assert page.evaluate("document.body.dataset.clicked") == "yes"
 
 
+def test_native_actionability_js_templates_match_sync_oracle():
+    from rustwright import _rustwright
+    from rustwright import sync_api
+
+    assert _rustwright._LOCATOR_TARGET_STATE_TEMPLATE == sync_api._LOCATOR_TARGET_STATE_TEMPLATE
+    assert _rustwright._LOCATOR_FILL_TEMPLATE == sync_api._LOCATOR_FILL_TEMPLATE
+
+    def click_body(template):
+        for placeholder, value in (
+            ("__SCROLL__", "true"),
+            ("__STABLE__", "true"),
+            ("__RECEIVES_EVENTS__", "true"),
+            ("__STABLE_POSITION_REQUIRED__", "true"),
+            ("__ACTION_POSITION__", "null"),
+        ):
+            template = template.replace(placeholder, value)
+        return template
+
+    def fill_body(template):
+        return (
+            template.replace("__STRICT__", "true")
+            .replace("__FORCED__", "false")
+            .replace("__VALUE__", '"value"')
+        )
+
+    assert click_body(_rustwright._LOCATOR_TARGET_STATE_TEMPLATE) == click_body(
+        sync_api._LOCATOR_TARGET_STATE_TEMPLATE
+    )
+    assert fill_body(_rustwright._LOCATOR_FILL_TEMPLATE) == fill_body(sync_api._LOCATOR_FILL_TEMPLATE)
+
+
 def test_fill_sets_value_and_dispatches_events(page):
     page.set_content(
         """
@@ -32314,8 +32345,14 @@ def test_async_page_fill_default_rejects_readonly_input(monkeypatch):
             page = await browser.new_page()
             await page.set_content('<input id="x" readonly value="old">')
 
-            with pytest.raises(TimeoutError):
+            with pytest.raises(TimeoutError) as error:
                 await page.fill("#x", "new", timeout=100)
+            assert str(error.value) == (
+                "timed out waiting for locator to be editable while trying to fill; last state was "
+                "{'attached': True, 'count': 1, 'editable_for_fill': False, 'enabled': True, "
+                "'fillable_for_fill': True, 'frame_strict_violation': None, 'input_type': 'text', "
+                "'is_select': False, 'non_fillable_input': False, 'tag_name': 'INPUT', 'visible': True}"
+            )
             assert await page.locator("#x").input_value() == "old"
             await browser.close()
 
@@ -32354,12 +32391,196 @@ def test_async_page_click_and_fill_unsafe_dom_fastpath_stays_native(monkeypatch)
     asyncio.run(run())
 
 
+def test_async_page_click_default_dispatches_native_trusted_sequence(monkeypatch):
+    import rustwright.async_api as async_api
+
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+
+    async def reject_sync_dispatch(*args, **kwargs):
+        raise AssertionError("optionless page click should use native actionability")
+
+    monkeypatch.setattr(async_api, "_run_sync_wait_sliced", reject_sync_dispatch)
+
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content(
+                """
+                <button id="go">Go</button>
+                <script>
+                window.events = [];
+                for (const type of [
+                  'pointerover', 'pointerenter', 'mouseover', 'mouseenter',
+                  'pointermove', 'mousemove', 'pointerdown', 'mousedown',
+                  'focus', 'pointerup', 'mouseup', 'click', 'dblclick'
+                ]) {
+                  document.querySelector('#go').addEventListener(type, event => {
+                    window.events.push({ type, trusted: event.isTrusted });
+                  });
+                }
+                </script>
+                """
+            )
+
+            await page.click("#go", timeout=1_000)
+
+            events = await page.evaluate("window.events")
+            assert [event["type"] for event in events] == [
+                "pointerover",
+                "pointerenter",
+                "mouseover",
+                "mouseenter",
+                "pointermove",
+                "mousemove",
+                "pointerdown",
+                "mousedown",
+                "focus",
+                "pointerup",
+                "mouseup",
+                "click",
+            ]
+            assert all(event["trusted"] is True for event in events)
+            assert await page.evaluate("document.activeElement.id") == "go"
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_page_fill_default_commits_natively_with_input_and_change(monkeypatch):
+    import rustwright.async_api as async_api
+
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+
+    async def reject_sync_dispatch(*args, **kwargs):
+        raise AssertionError("optionless page fill should use native actionability")
+
+    monkeypatch.setattr(async_api, "_run_sync_wait_sliced", reject_sync_dispatch)
+
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content(
+                """
+                <input id="name" value="old">
+                <script>
+                window.events = [];
+                for (const type of ['input', 'change']) {
+                  document.querySelector('#name').addEventListener(type, event => {
+                    window.events.push({ type, value: event.target.value, bubbles: event.bubbles });
+                  });
+                }
+                </script>
+                """
+            )
+
+            await page.fill("#name", "Ada", timeout=3_000)
+
+            assert await page.evaluate("document.querySelector('#name').value") == "Ada"
+            assert await page.evaluate("window.events") == [
+                {"type": "input", "value": "Ada", "bubbles": True},
+                {"type": "change", "value": "Ada", "bubbles": True},
+            ]
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_page_actionable_error_messages_match_sync(monkeypatch):
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+
+    async def run() -> None:
+        from playwright.async_api import Error, TimeoutError, async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content(
+                """
+                <input id="checkbox" type="checkbox">
+                <input id="number" type="number">
+                <input id="date" type="date">
+                <select id="select"><option>one</option></select>
+                <div id="plain"></div>
+                """
+            )
+
+            with pytest.raises(TimeoutError) as click_error:
+                await page.click("#missing", timeout=50)
+            assert str(click_error.value) == (
+                "timed out waiting for locator to be actionable while trying to click; no element matched"
+            )
+
+            with pytest.raises(TimeoutError) as fill_error:
+                await page.fill("#missing", "value", timeout=50)
+            assert str(fill_error.value) == (
+                "timed out waiting for locator to be editable while trying to fill; no element matched"
+            )
+
+            with pytest.raises(Error) as type_error:
+                await page.fill("#checkbox", "value", timeout=500)
+            assert str(type_error.value) == 'Locator.fill: Error: Input of type "checkbox" cannot be filled'
+
+            with pytest.raises(Error) as number_error:
+                await page.fill("#number", "text", timeout=500)
+            assert str(number_error.value) == "Locator.fill: Error: Cannot type text into input[type=number]"
+
+            with pytest.raises(Error) as malformed_error:
+                await page.fill("#date", "1", timeout=500)
+            assert str(malformed_error.value) == "Locator.fill: Error: Malformed value"
+
+            non_fillable_message = (
+                "Locator.fill: Error: Element is not an <input>, <textarea>, <select> or "
+                "[contenteditable] and does not have a role allowing [aria-readonly]"
+            )
+            with pytest.raises(Error) as select_error:
+                await page.fill("#select", "value", timeout=500)
+            assert str(select_error.value) == (
+                "Locator.fill: Error: Element is not an <input>, <textarea> or [contenteditable] element"
+            )
+            with pytest.raises(Error) as plain_error:
+                await page.fill("#plain", "value", timeout=500)
+            assert str(plain_error.value) == non_fillable_message
+            await browser.close()
+
+    asyncio.run(run())
+
+
 def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monkeypatch):
     import rustwright.async_api as async_api
 
     class FakeCore:
-        def __init__(self):
+        def __init__(self, page):
+            self.page = page
             self.calls = []
+
+        def click_actionable_wait_async(self, *args):
+            async def run():
+                self.calls.append(("click_actionable_wait", args))
+                self.page.mouse._x = 5.0
+                self.page.mouse._y = 6.0
+                self.page.mouse._buttons = 3
+                self.page.keyboard._mask = 4
+                return (12.0, 34.0, 900.0)
+
+            return run()
+
+        def dispatch_mouse_click_async(self, *args):
+            async def run():
+                self.calls.append(("dispatch_mouse_click", args))
+
+            return run()
+
+        def fill_actionable_async(self, *args):
+            async def run():
+                self.calls.append(("fill_actionable", args))
+
+            return run()
 
         def click_async(self, *args):
             async def run():
@@ -32376,8 +32597,14 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
     class FakeSyncPage:
         def __init__(self):
             self._active_page_cdp_event_contexts = 0
-            self._core = FakeCore()
             self._default_timeout = 1_000.0
+            self.mouse = type("FakeMouse", (), {"_x": 1.0, "_y": 2.0, "_buttons": 0})()
+            self.keyboard = type(
+                "FakeKeyboard",
+                (),
+                {"_mask": 8, "_modifiers_mask": lambda self: self._mask},
+            )()
+            self._core = FakeCore(self)
 
         def click(self, *args, **kwargs):
             raise AssertionError("the dispatch stub should intercept sync click")
@@ -32399,28 +32626,174 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
         sync_calls.append((func.__name__, args, kwargs))
 
     monkeypatch.setattr(async_api, "_native_page_hot_path_supported", lambda _page: True)
-    monkeypatch.setattr(async_api, "_native_locator", lambda *args, **kwargs: FakeLocator())
+    monkeypatch.setattr(async_api, "_native_selector_locator", lambda *args, **kwargs: FakeLocator())
     monkeypatch.setattr(async_api, "_run_sync_wait_sliced", record_sync_dispatch)
 
     async def run() -> None:
         monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
         await page.click("#target")
         await page.fill("#target", "value")
-        assert [call[0] for call in sync_calls] == ["click", "fill"]
-        assert sync_page._core.calls == []
+        assert [call[0] for call in sync_page._core.calls] == [
+            "click_actionable_wait",
+            "dispatch_mouse_click",
+            "fill_actionable",
+        ]
+        assert sync_calls == []
+        assert sync_page._core.calls[0][1] == (
+            '{"kind":"css","selector":"#target"}',
+            0,
+            1_000.0,
+            False,
+        )
+        assert sync_page._core.calls[1][1] == (12.0, 34.0, 5.0, 6.0, 3, 4, 900.0)
+        assert (sync_page.mouse._x, sync_page.mouse._y) == (12.0, 34.0)
+        assert sync_page.mouse._buttons == 2
 
-        sync_calls.clear()
         monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
         await page.click("#target")
         await page.fill("#target", "value")
-        assert [call[0] for call in sync_page._core.calls] == ["click", "fill"]
+        assert [call[0] for call in sync_page._core.calls] == [
+            "click_actionable_wait",
+            "dispatch_mouse_click",
+            "fill_actionable",
+            "click",
+            "fill",
+        ]
         assert sync_calls == []
 
+        monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+        await page.click("#target", force=False)
+        await page.fill("#target", "value", force=False)
+        assert [call[0] for call in sync_calls] == ["click", "fill"]
+
+        sync_calls.clear()
         sync_page._active_page_cdp_event_contexts = 1
         await page.click("#target")
         await page.fill("#target", "value")
         assert [call[0] for call in sync_calls] == ["click", "fill"]
-        assert [call[0] for call in sync_page._core.calls] == ["click", "fill"]
+        assert [call[0] for call in sync_page._core.calls] == [
+            "click_actionable_wait",
+            "dispatch_mouse_click",
+            "fill_actionable",
+            "click",
+            "fill",
+        ]
+
+    asyncio.run(run())
+
+
+def test_async_page_click_preserves_sync_mouse_state_on_dispatch_failure(monkeypatch):
+    import rustwright.async_api as async_api
+    from playwright.async_api import TimeoutError as AsyncTimeoutError
+
+    class FakeCore:
+        def __init__(self, page):
+            self.page = page
+            self.dispatch_args = None
+
+        def click_actionable_wait_async(self, *args):
+            async def run():
+                self.page.mouse._x = 5.0
+                self.page.mouse._y = 6.0
+                self.page.mouse._buttons = 3
+                self.page.keyboard._mask = 4
+                return (12.0, 34.0, 5.0)
+
+            return run()
+
+        def dispatch_mouse_click_async(self, *args):
+            async def run():
+                self.dispatch_args = args
+                assert (self.page.mouse._x, self.page.mouse._y, self.page.mouse._buttons) == (12.0, 34.0, 2)
+                raise AsyncTimeoutError("Page.click: timed out after 5 ms")
+
+            return run()
+
+    class FakeSyncPage:
+        def __init__(self):
+            self._active_page_cdp_event_contexts = 0
+            self._default_timeout = 1_000.0
+            self.mouse = type("FakeMouse", (), {"_x": 1.0, "_y": 2.0, "_buttons": 1})()
+            self.keyboard = type(
+                "FakeKeyboard",
+                (),
+                {"_mask": 8, "_modifiers_mask": lambda self: self._mask},
+            )()
+            self._core = FakeCore(self)
+
+    class FakeLocator:
+        _spec = {"kind": "css", "selector": "#target"}
+        _index = 0
+        _strict = False
+
+    sync_page = FakeSyncPage()
+    page = object.__new__(async_api.AsyncPage)
+    page._sync = sync_page
+    monkeypatch.setattr(async_api, "_native_page_hot_path_supported", lambda _page: True)
+    monkeypatch.setattr(async_api, "_native_selector_locator", lambda *args, **kwargs: FakeLocator())
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+
+    async def run() -> None:
+        with pytest.raises(AsyncTimeoutError, match="Page.click: timed out after 5 ms"):
+            await page.click("#target")
+
+    asyncio.run(run())
+
+    assert sync_page._core.dispatch_args == (12.0, 34.0, 5.0, 6.0, 3, 4, 5.0)
+    # Sync Mouse._click updates coordinates and clears the button before dispatch.
+    assert (sync_page.mouse._x, sync_page.mouse._y) == (12.0, 34.0)
+    assert sync_page.mouse._buttons == 2
+
+
+def test_async_page_native_validation_order_matches_sync(monkeypatch):
+    import rustwright.async_api as async_api
+    import rustwright.sync_api as sync_api
+
+    sync_page = object.__new__(sync_api.Page)
+    async_page = object.__new__(async_api.AsyncPage)
+    async_page._sync = sync_page
+    monkeypatch.setattr(async_api, "_native_page_hot_path_supported", lambda _page: True)
+
+    def sync_error(call):
+        with pytest.raises(Exception) as error:
+            call()
+        return error.value
+
+    invalid_strict = object()
+    cases = [
+        (
+            lambda: sync_page.click(None, timeout=True),
+            lambda: async_page.click(None, timeout=True),
+        ),
+        (
+            lambda: sync_page.fill(None, None),
+            lambda: async_page.fill(None, None),
+        ),
+        (
+            lambda: sync_page.click(None, strict=invalid_strict),
+            lambda: async_page.click(None, strict=invalid_strict),
+        ),
+        (
+            lambda: sync_page.click("#x", timeout=True, strict=invalid_strict),
+            lambda: async_page.click("#x", timeout=True, strict=invalid_strict),
+        ),
+        (
+            lambda: sync_page.fill(None, None, strict=invalid_strict),
+            lambda: async_page.fill(None, None, strict=invalid_strict),
+        ),
+        (
+            lambda: sync_page.fill("#x", 5, strict=invalid_strict),
+            lambda: async_page.fill("#x", 5, strict=invalid_strict),
+        ),
+    ]
+    expected_errors = [(sync_error(sync_call), async_call) for sync_call, async_call in cases]
+
+    async def run() -> None:
+        for expected_error, async_call in expected_errors:
+            with pytest.raises(Exception) as async_error:
+                await async_call()
+            assert type(async_error.value) is type(expected_error)
+            assert str(async_error.value) == str(expected_error)
 
     asyncio.run(run())
 
