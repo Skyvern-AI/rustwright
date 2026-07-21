@@ -128,7 +128,8 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server (a separate,
 opt-in package under [`mcp/`](mcp/)) exposing browser tools — `browser_navigate`,
 `browser_snapshot`, `browser_click`, `browser_type`, … — over stdio, so
 MCP-compatible agents (Claude Code, Claude Desktop, and others) can browse with
-Rustwright. Register it with Claude Code, no clone required:
+Rustwright. After installing both packages, start the stdio server with `rustwright mcp`.
+Register it with Claude Code, no clone required:
 
 ```bash
 claude mcp add rustwright \
