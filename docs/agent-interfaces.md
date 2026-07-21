@@ -11,6 +11,12 @@ It is Chromium-only (Rustwright automates Chromium over CDP).
 > (`rustwright-mcp`) rather than part of the core wheel. This document covers the
 > CLI.
 
+## MCP stdio server
+
+Install both `rustwright` and `rustwright-mcp`, then start the server with
+`rustwright mcp`. Any arguments after `mcp`, including `--caps=...`, pass through
+to the MCP entry point unchanged.
+
 ## The accessibility snapshot and element refs
 
 The CLI works from a compact accessibility snapshot rather than raw HTML or
