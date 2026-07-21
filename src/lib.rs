@@ -279,6 +279,254 @@ impl Drop for SpawnedTaskAbortGuard {
 
 const CDP_EVENT_LOG_LIMIT: usize = 8192;
 const FRAME_UTILITY_WORLD_NAME: &str = "__utility_world__";
+const ACTION_TIMEOUT_MARKER: &str = "__rustwright_action_timeout__:";
+const LOCATOR_TARGET_STATE_TEMPLATE: &str = r#"
+if (el && __SCROLL__) el.scrollIntoView({ block: 'center', inline: 'center' });
+const ownerDocument = el ? (el.ownerDocument || document) : document;
+const ownerWindow = ownerDocument.defaultView || window;
+const actionPosition = __ACTION_POSITION__;
+const needsReceivesEvents = __RECEIVES_EVENTS__;
+const deepElementFromPoint = (x, y) => {
+  let hit = ownerDocument.elementFromPoint(x, y);
+  while (hit && hit.shadowRoot) {
+    const nested = hit.shadowRoot.elementFromPoint(x, y);
+    if (!nested || nested === hit) break;
+    hit = nested;
+  }
+  return hit;
+};
+const targetContains = (node) => {
+  let current = node;
+  while (current) {
+    if (current === el) return true;
+    const root = current.getRootNode ? current.getRootNode() : null;
+    current = current.parentElement || (root && root.host) || null;
+  }
+  return false;
+};
+const snapshot = () => {
+  const attached = !!el;
+  const rect = el ? el.getBoundingClientRect() : null;
+  const point = needsReceivesEvents && rect ? {
+    x: Math.min(Math.max(rect.left + (actionPosition ? Number(actionPosition.x || 0) : rect.width / 2), 0), Math.max(ownerWindow.innerWidth - 1, 0)),
+    y: Math.min(Math.max(rect.top + (actionPosition ? Number(actionPosition.y || 0) : rect.height / 2), 0), Math.max(ownerWindow.innerHeight - 1, 0)),
+  } : null;
+  const hit = needsReceivesEvents && el && point ? deepElementFromPoint(point.x, point.y) : null;
+  const tagName = el ? String(el.tagName || '').toUpperCase() : '';
+  const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
+  const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
+  const fillableForFill = !!el && (
+    (tagName === 'INPUT' && !nonFillableInputTypes.has(inputType)) ||
+    tagName === 'TEXTAREA' ||
+    el.isContentEditable
+  );
+  const checkedState = (() => {
+    if (!el) return { valid: false, checked: false, indeterminate: false, native_input: false, native_radio: false };
+    const checkedRoles = new Set(['checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem']);
+    const role = typeof locatorRoleOf === 'function' ? locatorRoleOf(el) : '';
+    const aria = String(el.getAttribute ? el.getAttribute('aria-checked') || '' : '').toLowerCase();
+    if (tagName === 'INPUT' && (inputType === 'checkbox' || inputType === 'radio')) {
+      const checked = !!el.checked;
+      return {
+        valid: true,
+        checked,
+        indeterminate: !!(el.indeterminate && !checked),
+        native_input: true,
+        native_radio: inputType === 'radio',
+      };
+    }
+    if (!checkedRoles.has(role)) {
+      return { valid: false, checked: false, indeterminate: false, native_input: false, native_radio: false };
+    }
+    if (aria === 'true') return { valid: true, checked: true, indeterminate: false, native_input: false, native_radio: false };
+    if (aria === 'false') return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
+    if (aria === 'mixed') return { valid: true, checked: false, indeterminate: true, native_input: false, native_radio: false };
+    return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
+  })();
+  const visibleState = (() => {
+    if (!attached || !el.isConnected) return false;
+    if (tagName === 'OPTION') return visible(el);
+    const computedStyle = ownerWindow.getComputedStyle(el);
+    if (!computedStyle || computedStyle.visibility === 'hidden' || computedStyle.display === 'none') return false;
+    return !!rect && rect.width > 0 && rect.height > 0;
+  })();
+  const disabled = attached && disabledState(el);
+  const hasLayout = attached && el.getClientRects().length > 0;
+  return {
+    count: matches.length,
+    frame_strict_violation: strictFrameViolation,
+    attached,
+    visible: visibleState,
+    enabled: attached && !disabled,
+    editable: attached && !disabled && !el.readOnly &&
+      (el.isContentEditable || /^(INPUT|TEXTAREA)$/.test(el.tagName)),
+    tag_name: tagName,
+    input_type: inputType,
+    is_select: tagName === 'SELECT',
+    non_fillable_input: tagName === 'INPUT' && nonFillableInputTypes.has(inputType),
+    fillable_for_fill: fillableForFill,
+    editable_for_fill: fillableForFill && !disabled && !el.readOnly,
+    has_layout: hasLayout,
+    checked_valid: checkedState.valid,
+    checked: checkedState.checked,
+    indeterminate: checkedState.indeterminate,
+    native_input: checkedState.native_input,
+    native_radio: checkedState.native_radio,
+    receives_events: needsReceivesEvents && attached && !!rect && rect.width > 0 && rect.height > 0 && targetContains(hit),
+    rect: rect ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height } : null,
+  };
+};
+const first = snapshot();
+if (!__STABLE__ || !first.attached) return first;
+const style = ownerWindow.getComputedStyle(el);
+const zeroTime = value => String(value || '').split(',').every(part => {
+  const text = part.trim();
+  if (!text) return true;
+  if (text.endsWith('ms')) return Number.parseFloat(text) === 0;
+  if (text.endsWith('s')) return Number.parseFloat(text) === 0;
+  return Number.parseFloat(text) === 0;
+});
+const hasNoCssMotion = style &&
+  (!__STABLE_POSITION_REQUIRED__ || String(style.position || 'static') === 'static') &&
+  (String(style.animationName || 'none') === 'none' || zeroTime(style.animationDuration)) &&
+  zeroTime(style.animationDelay) &&
+  zeroTime(style.transitionDuration) &&
+  zeroTime(style.transitionDelay);
+if (hasNoCssMotion) {
+  first.stable = true;
+  return first;
+}
+return new Promise(resolve => {
+  const finish = () => {
+    const second = snapshot();
+    const left = first.rect;
+    const right = second.rect;
+    second.stable = !!left && !!right && ["x", "y", "width", "height"].every(
+      key => Math.abs(Number(left[key] || 0) - Number(right[key] || 0)) <= 0.5
+    );
+    resolve(second);
+  };
+  ownerWindow.setTimeout(finish, 20);
+});
+"#;
+const LOCATOR_FILL_TEMPLATE: &str = r#"
+const info = {
+  count: matches.length,
+  frame_strict_violation: strictFrameViolation,
+  attached: !!el,
+};
+const strict = __STRICT__;
+if (strict && (strictFrameViolation || matches.length > 1)) {
+  return { ok: false, type: 'strict', info };
+}
+if (!el) return { ok: false, type: 'pending', info };
+const value = __VALUE__;
+const forced = __FORCED__;
+const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
+const tagName = String(el.tagName || '').toUpperCase();
+const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
+info.visible = visible(el);
+info.enabled = !disabledState(el);
+info.tag_name = tagName;
+info.input_type = inputType;
+info.non_fillable_input = tagName === 'INPUT' && nonFillableInputTypes.has(inputType);
+info.is_select = tagName === 'SELECT';
+info.fillable_for_fill = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
+info.editable_for_fill = info.fillable_for_fill && !disabledState(el) && !el.readOnly;
+if (tagName === 'INPUT' && nonFillableInputTypes.has(inputType)) {
+  return { ok: false, type: 'input-type', inputType, info };
+}
+if (tagName === 'SELECT') {
+  return { ok: false, type: forced ? 'force-non-fillable' : 'select', info };
+}
+const isFillable = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
+if (!isFillable) {
+  return { ok: false, type: forced ? 'force-non-fillable' : 'non-fillable', info };
+}
+if (forced && (!visible(el) || disabledState(el) || el.readOnly)) return { ok: true, info };
+if (!forced && (!visible(el) || disabledState(el) || el.readOnly)) {
+  return { ok: false, type: 'pending', info };
+}
+if ('value' in el) {
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+  el.value = value;
+  if (value !== '' && el.value !== value) {
+    return {
+      ok: false,
+      type: inputType === 'number' ? 'number-text' : 'malformed',
+      value: el.value,
+      info,
+    };
+  }
+} else {
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+  el.textContent = value;
+}
+el.dispatchEvent(new Event('input', { bubbles: true }));
+el.dispatchEvent(new Event('change', { bubbles: true }));
+return { ok: true, info };
+"#;
+
+#[derive(Debug)]
+pub struct ActionTimeoutError {
+    state: &'static str,
+    action: &'static str,
+    count: u64,
+    last_info_json: String,
+    last_info_key: Option<&'static str>,
+}
+
+impl ActionTimeoutError {
+    fn from_raw_json(
+        state: &'static str,
+        action: &'static str,
+        raw_json: String,
+        info: &Value,
+        info_key: Option<&'static str>,
+    ) -> Self {
+        let count = info.get("count").and_then(Value::as_u64).unwrap_or(0);
+        Self {
+            state,
+            action,
+            count,
+            last_info_json: raw_json,
+            last_info_key: info_key,
+        }
+    }
+
+    fn wire_message(&self) -> String {
+        format!(
+            "{ACTION_TIMEOUT_MARKER}{}",
+            json!({
+                "state": self.state,
+                "action": self.action,
+                "last_info_json": self.last_info_json,
+                "last_info_key": self.last_info_key,
+            })
+        )
+    }
+}
+
+impl std::fmt::Display for ActionTimeoutError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.count == 0 {
+            return write!(
+                formatter,
+                "timed out waiting for locator to be {} while trying to {}; no element matched",
+                self.state, self.action
+            );
+        }
+        write!(
+            formatter,
+            "timed out waiting for locator to be {} while trying to {}; last state was {}",
+            self.state, self.action, self.last_info_json
+        )
+    }
+}
+
+impl std::error::Error for ActionTimeoutError {}
 const MAX_FRAME_TREE_DEPTH: usize = 256;
 
 #[derive(Debug, Error)]
@@ -298,6 +546,8 @@ pub enum RwError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
     #[error(transparent)]
+    ActionTimeout(#[from] ActionTimeoutError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -313,6 +563,7 @@ fn py_err(error: RwError) -> PyErr {
         RwError::Message(message) => PyRuntimeError::new_err(message),
         RwError::InvalidInput(message) => PyValueError::new_err(message),
         RwError::Timeout(ms) => PyRuntimeError::new_err(format!("timed out after {ms} ms")),
+        RwError::ActionTimeout(error) => PyRuntimeError::new_err(error.wire_message()),
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }
@@ -708,6 +959,60 @@ fn mouse_event_payload_json(
         click_count,
         modifiers
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mouse_click_batch_json(
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+    step_count: u32,
+    button: &str,
+    button_mask: i64,
+    click_count: i64,
+    initial_buttons: i64,
+    modifiers: i64,
+) -> RwResult<Vec<String>> {
+    let steps = step_count.max(1);
+    let mut events = Vec::with_capacity(steps as usize + click_count.max(0) as usize * 2);
+    for index in 1..=steps {
+        let fraction = index as f64 / steps as f64;
+        let x = start_x + (target_x - start_x) * fraction;
+        let y = start_y + (target_y - start_y) * fraction;
+        events.push(mouse_event_payload_json(
+            "mouseMoved",
+            x,
+            y,
+            "none",
+            initial_buttons,
+            0,
+            modifiers,
+        )?);
+    }
+    if click_count > 0 {
+        for count in 1..=click_count {
+            events.push(mouse_event_payload_json(
+                "mousePressed",
+                target_x,
+                target_y,
+                button,
+                initial_buttons | button_mask,
+                count,
+                modifiers,
+            )?);
+            events.push(mouse_event_payload_json(
+                "mouseReleased",
+                target_x,
+                target_y,
+                button,
+                initial_buttons & !button_mask,
+                count,
+                modifiers,
+            )?);
+        }
+    }
+    Ok(events)
 }
 
 fn chromium_permission_mapping(
@@ -1139,6 +1444,266 @@ mod tests {
     }
 
     #[test]
+    fn native_actionability_success_requires_every_click_state() {
+        let actionable = json!({
+            "attached": true,
+            "visible": true,
+            "enabled": true,
+            "receives_events": true,
+            "stable": true,
+        });
+        assert!(actionability_state_succeeds(&actionable));
+        for field in [
+            "attached",
+            "visible",
+            "enabled",
+            "receives_events",
+            "stable",
+        ] {
+            let mut pending = actionable.clone();
+            pending[field] = Value::Bool(false);
+            assert!(!actionability_state_succeeds(&pending));
+        }
+    }
+
+    #[test]
+    fn native_action_timeout_formats_sync_messages_and_structured_payload() {
+        let missing_json = r#"{"count":0,"attached":false}"#.to_string();
+        let missing_info = serde_json::from_str::<Value>(&missing_json).unwrap();
+        let missing = ActionTimeoutError::from_raw_json(
+            "actionable",
+            "click",
+            missing_json,
+            &missing_info,
+            None,
+        );
+        assert_eq!(
+            missing.to_string(),
+            "timed out waiting for locator to be actionable while trying to click; no element matched"
+        );
+        assert!(missing.wire_message().starts_with(ACTION_TIMEOUT_MARKER));
+
+        let pending_json = r#"{"count":1,"attached":true,"visible":false}"#.to_string();
+        let pending_info = serde_json::from_str::<Value>(&pending_json).unwrap();
+        let pending = ActionTimeoutError::from_raw_json(
+            "editable",
+            "fill",
+            pending_json.clone(),
+            &pending_info,
+            None,
+        );
+        assert_eq!(
+            pending.to_string(),
+            format!(
+                "timed out waiting for locator to be editable while trying to fill; last state was {pending_json}"
+            )
+        );
+    }
+
+    #[test]
+    fn native_fill_result_discriminators_match_sync_errors() {
+        assert_eq!(
+            classify_fill_attempt(&json!({ "ok": true })).unwrap(),
+            FillAttempt::Success
+        );
+        assert_eq!(
+            classify_fill_attempt(&json!({ "ok": false, "type": "pending" })).unwrap(),
+            FillAttempt::Pending
+        );
+        assert_eq!(
+            classify_fill_attempt(&json!({
+                "ok": false,
+                "type": "input-type",
+                "inputType": "checkbox",
+            }))
+            .unwrap_err()
+            .to_string(),
+            "Locator.fill: Error: Input of type \"checkbox\" cannot be filled"
+        );
+        assert_eq!(
+            classify_fill_attempt(&json!({ "ok": false, "type": "number-text" }))
+                .unwrap_err()
+                .to_string(),
+            "Locator.fill: Error: Cannot type text into input[type=number]"
+        );
+        assert_eq!(
+            classify_fill_attempt(&json!({ "ok": false, "type": "malformed" }))
+                .unwrap_err()
+                .to_string(),
+            "Locator.fill: Error: Malformed value"
+        );
+        assert_eq!(
+            classify_fill_attempt(&json!({ "ok": false, "type": "select" }))
+                .unwrap_err()
+                .to_string(),
+            "Locator.fill: Error: Element is not an <input>, <textarea> or [contenteditable] element"
+        );
+    }
+
+    #[test]
+    fn native_action_results_decode_runtime_serializer_envelopes() {
+        let decoded = decode_runtime_serialized_value(json!({
+            "__rustwright_cdp_object__": 1,
+            "entries": {
+                "ok": false,
+                "type": "pending",
+                "info": {
+                    "__rustwright_cdp_object__": 2,
+                    "entries": { "count": 1, "attached": true },
+                },
+            },
+        }));
+        assert_eq!(decoded["type"], "pending");
+        assert_eq!(decoded["info"]["count"], 1);
+        assert_eq!(decoded["info"]["attached"], true);
+    }
+
+    #[test]
+    fn default_native_mouse_batch_matches_sync_sequence() {
+        let events = mouse_click_batch_json(5.0, 6.0, 25.0, 30.0, 1, "left", 1, 1, 2, 8)
+            .unwrap()
+            .into_iter()
+            .map(|event| serde_json::from_str::<Value>(&event).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.get("type").and_then(Value::as_str).unwrap())
+                .collect::<Vec<_>>(),
+            ["mouseMoved", "mousePressed", "mouseReleased"]
+        );
+        assert_eq!(events[0]["button"], "none");
+        assert_eq!(events[0]["buttons"], 2);
+        assert_eq!(events[0]["clickCount"], 0);
+        assert_eq!(events[1]["button"], "left");
+        assert_eq!(events[1]["buttons"], 3);
+        assert_eq!(events[1]["clickCount"], 1);
+        assert_eq!(events[2]["button"], "left");
+        assert_eq!(events[2]["buttons"], 2);
+        assert_eq!(events[2]["clickCount"], 1);
+        assert!(events.iter().all(|event| event["x"] == 25.0));
+        assert!(events.iter().all(|event| event["y"] == 30.0));
+        assert!(events.iter().all(|event| event["modifiers"] == 8));
+    }
+
+    #[test]
+    fn native_frame_owner_specs_and_offsets_accumulate_in_order() {
+        let spec = json!({
+            "kind": "frame",
+            "frame_selector": "iframe.outer",
+            "frame_index": 1,
+            "inner": {
+                "kind": "frame",
+                "frame_selector": "iframe.inner",
+                "frame_index": 2,
+                "inner": { "kind": "css", "selector": "button" },
+            },
+        });
+        let owners = frame_owner_specs_for_point_translation(&spec, None);
+        assert_eq!(owners.len(), 2);
+        assert_eq!(owners[0].1, 1);
+        assert_eq!(owners[0].0["selector"], "iframe.outer");
+        assert_eq!(owners[1].1, 2);
+        assert_eq!(owners[1].0["kind"], "frame");
+
+        let mut offset = (0.0, 0.0);
+        assert!(accumulate_frame_offset(
+            &mut offset,
+            &json!({ "x": 10.5, "y": 20.25 })
+        ));
+        assert!(accumulate_frame_offset(
+            &mut offset,
+            &json!({ "x": 3.0, "y": 4.75 })
+        ));
+        assert_eq!(offset, (13.5, 25.0));
+    }
+
+    #[test]
+    fn native_action_timeout_zero_is_path_specific() {
+        assert_eq!(
+            action_timeout_duration(Some(0.0), true),
+            Duration::from_secs(24 * 60 * 60)
+        );
+        assert_eq!(action_timeout_duration(Some(0.0), false), Duration::ZERO);
+        assert_eq!(
+            action_poll_timeout(Some(0.0), true, Duration::from_secs(60)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            action_poll_timeout(Some(0.0), false, Duration::ZERO),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn native_action_timeouts_sanitize_non_finite_and_huge_values() {
+        let disabled = Duration::from_secs(24 * 60 * 60);
+        for timeout_ms in [f64::NAN, f64::INFINITY, 1e300, -5.0, 0.0] {
+            let click = std::panic::catch_unwind(|| {
+                (
+                    action_timeout_duration(Some(timeout_ms), true),
+                    action_poll_timeout(Some(timeout_ms), true, disabled),
+                )
+            });
+            let (click_window, click_poll) =
+                click.unwrap_or_else(|_| panic!("click timeout {timeout_ms:?} panicked"));
+            assert_eq!(click_window, disabled);
+            assert!((Duration::from_millis(1)..=Duration::from_secs(1)).contains(&click_poll));
+
+            let fill = std::panic::catch_unwind(|| {
+                let window = action_timeout_duration(Some(timeout_ms), false);
+                let poll = action_poll_timeout(Some(timeout_ms), false, window);
+                (window, poll)
+            });
+            let (fill_window, fill_poll) =
+                fill.unwrap_or_else(|_| panic!("fill timeout {timeout_ms:?} panicked"));
+            let expected_fill = if timeout_ms.is_finite() && timeout_ms <= 0.0 {
+                Duration::ZERO
+            } else {
+                disabled
+            };
+            assert_eq!(fill_window, expected_fill);
+            if fill_window.is_zero() {
+                assert_eq!(fill_poll, Duration::from_millis(1));
+            } else {
+                assert!((Duration::from_millis(1)..=Duration::from_secs(1)).contains(&fill_poll));
+            }
+        }
+    }
+
+    #[test]
+    fn native_action_probe_uses_full_remaining_finite_budget() {
+        assert_eq!(
+            action_poll_timeout(Some(30_000.0), true, Duration::from_secs(17)),
+            Duration::from_secs(17)
+        );
+        assert_eq!(
+            action_poll_timeout(Some(30_000.0), false, Duration::from_millis(12_345)),
+            Duration::from_millis(12_345)
+        );
+    }
+
+    #[test]
+    fn native_frame_strict_violation_uses_raw_selector_quoting() {
+        let error = strict_violation_error(
+            &json!({
+                "frame_strict_violation": {
+                    "count": 2,
+                    "selector": "iframe[title=\"quoted\"]",
+                },
+            }),
+            true,
+            "click",
+        )
+        .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "strict mode violation: locator(\"iframe[title=\"quoted\"]\") resolved to 2 elements"
+        );
+    }
+
+    #[test]
     fn device_screen_orientation_matches_playwright_chromium_metrics() {
         assert_eq!(
             device_screen_orientation(390, 844, true),
@@ -1556,6 +2121,7 @@ mod tests {
                 event_stream_start_cursor: 0,
                 background_override_active: Arc::new(AtomicBool::new(false)),
                 screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+                mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
                 lifecycle: Arc::new(CloseLifecycle::new()),
                 target_closed: AtomicBool::new(false),
                 crashed: AtomicBool::new(false),
@@ -2471,35 +3037,112 @@ mod tests {
         assert_eq!(batch[1]["payload"]["url"], "https://example.test/b");
         assert_eq!(batch[2]["kind"], "console");
     }
+
+    #[test]
+    fn launch_options_accept_equivalent_snake_case_and_camel_case_json() {
+        let snake_case: LaunchOptions = serde_json::from_value(json!({
+            "headless": false,
+            "executable_path": "/path/to/chromium",
+            "channel": "chromium",
+            "args": ["--disable-gpu"],
+            "ignore_all_default_args": true,
+            "ignore_default_args": ["--mute-audio"],
+            "timeout": 12_345.0,
+            "user_data_dir": "/path/to/profile",
+            "env": {"LANG": "en_CA.UTF-8"},
+            "chromium_sandbox": true,
+            "proxy": {
+                "server": "http://proxy.example:3128",
+                "bypass": "localhost",
+                "username": "user",
+                "password": "password"
+            }
+        }))
+        .unwrap();
+        let camel_case: LaunchOptions = serde_json::from_value(json!({
+            "headless": false,
+            "executablePath": "/path/to/chromium",
+            "channel": "chromium",
+            "args": ["--disable-gpu"],
+            "ignoreAllDefaultArgs": true,
+            "ignoreDefaultArgs": ["--mute-audio"],
+            "timeout": 12_345.0,
+            "userDataDir": "/path/to/profile",
+            "env": {"LANG": "en_CA.UTF-8"},
+            "chromiumSandbox": true,
+            "proxy": {
+                "server": "http://proxy.example:3128",
+                "bypass": "localhost",
+                "username": "user",
+                "password": "password"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(camel_case, snake_case);
+    }
+
+    #[test]
+    fn launch_options_default_headless_to_true_when_absent() {
+        let options: LaunchOptions = serde_json::from_str("{}").unwrap();
+
+        assert!(options.headless);
+    }
+
+    #[test]
+    fn omitted_launch_timeout_uses_the_existing_thirty_second_core_default() {
+        let options: LaunchOptions = serde_json::from_str("{}").unwrap();
+
+        assert_eq!(options.timeout, None);
+        assert_eq!(
+            BrowserInner::command_timeout(options.timeout),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            BrowserInner::command_timeout(LaunchOptions::default().timeout),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn launch_options_reject_duplicate_snake_case_and_camel_case_keys() {
+        let error = serde_json::from_value::<LaunchOptions>(json!({
+            "executable_path": "/first",
+            "executablePath": "/second"
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("duplicate field"));
+    }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 struct LaunchOptions {
     #[serde(default = "default_true")]
     headless: bool,
-    #[serde(default)]
+    #[serde(default, alias = "executablePath")]
     executable_path: Option<String>,
     #[serde(default)]
     channel: Option<String>,
     #[serde(default)]
     args: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "ignoreAllDefaultArgs")]
     ignore_all_default_args: bool,
-    #[serde(default)]
+    #[serde(default, alias = "ignoreDefaultArgs")]
     ignore_default_args: Vec<String>,
     #[serde(default)]
     timeout: Option<f64>,
-    #[serde(default)]
+    #[serde(default, alias = "userDataDir")]
     user_data_dir: Option<String>,
     #[serde(default)]
     env: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, alias = "chromiumSandbox")]
     chromium_sandbox: bool,
     #[serde(default)]
     proxy: Option<ProxyOptions>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 struct ProxyOptions {
     server: String,
     #[serde(default)]
@@ -3676,6 +4319,7 @@ struct PageInner {
     event_stream_start_cursor: u64,
     background_override_active: Arc<AtomicBool>,
     screenshot_lock: Arc<tokio::sync::Mutex<()>>,
+    mouse_dispatch_lock: Arc<tokio::sync::Mutex<()>>,
     lifecycle: Arc<CloseLifecycle>,
     target_closed: AtomicBool,
     crashed: AtomicBool,
@@ -6948,6 +7592,502 @@ async fn page_locator_action_async(
     Ok(())
 }
 
+fn native_action_body(template: &str) -> String {
+    template
+        .replace("__SCROLL__", "true")
+        .replace("__STABLE__", "true")
+        .replace("__RECEIVES_EVENTS__", "true")
+        .replace("__STABLE_POSITION_REQUIRED__", "true")
+        .replace("__ACTION_POSITION__", "null")
+}
+
+fn native_fill_body(value: &str, strict: bool) -> RwResult<String> {
+    let value_json = serde_json::to_string(value)?;
+    Ok(LOCATOR_FILL_TEMPLATE
+        .replace("__STRICT__", if strict { "true" } else { "false" })
+        .replace("__FORCED__", "false")
+        .replace("__VALUE__", &value_json))
+}
+
+fn decode_runtime_serialized_value(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(decode_runtime_serialized_value)
+                .collect(),
+        ),
+        Value::Object(mut object) => {
+            if object.contains_key("__rustwright_cdp_object__") {
+                return object
+                    .remove("entries")
+                    .map(decode_runtime_serialized_value)
+                    .unwrap_or_else(|| json!({}));
+            }
+            if object.contains_key("__rustwright_cdp_array__") {
+                return object
+                    .remove("items")
+                    .map(decode_runtime_serialized_value)
+                    .unwrap_or_else(|| json!([]));
+            }
+            if object.contains_key("__rustwright_cdp_undefined__") {
+                return Value::Null;
+            }
+            Value::Object(
+                object
+                    .into_iter()
+                    .map(|(key, value)| (key, decode_runtime_serialized_value(value)))
+                    .collect(),
+            )
+        }
+        value => value,
+    }
+}
+
+const DISABLED_ACTION_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const DISABLED_ACTION_TIMEOUT_MS: f64 = 24.0 * 60.0 * 60.0 * 1_000.0;
+
+fn sanitize_action_timeout_ms(timeout_ms: Option<f64>, nonpositive_is_disabled: bool) -> f64 {
+    let timeout_ms = timeout_ms.unwrap_or(30_000.0);
+    if !timeout_ms.is_finite() || timeout_ms > DISABLED_ACTION_TIMEOUT_MS {
+        DISABLED_ACTION_TIMEOUT_MS
+    } else if timeout_ms <= 0.0 && nonpositive_is_disabled {
+        DISABLED_ACTION_TIMEOUT_MS
+    } else {
+        timeout_ms.max(0.0)
+    }
+}
+
+fn action_timeout_duration(timeout_ms: Option<f64>, nonpositive_is_disabled: bool) -> Duration {
+    Duration::from_secs_f64(
+        sanitize_action_timeout_ms(timeout_ms, nonpositive_is_disabled) / 1_000.0,
+    )
+}
+
+fn action_deadline(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout)
+        .or_else(|| now.checked_add(DISABLED_ACTION_TIMEOUT))
+        .unwrap_or(now)
+}
+
+fn action_poll_timeout(
+    timeout_ms: Option<f64>,
+    nonpositive_is_disabled: bool,
+    remaining: Duration,
+) -> Duration {
+    let timeout_disabled = sanitize_action_timeout_ms(timeout_ms, nonpositive_is_disabled)
+        >= DISABLED_ACTION_TIMEOUT_MS;
+    let minimum = Duration::from_millis(1);
+    if timeout_disabled {
+        return remaining.min(Duration::from_secs(1)).max(minimum);
+    }
+    remaining.max(minimum)
+}
+
+fn ensure_native_action_owner_available(page: &PageInner, action: &str) -> RwResult<()> {
+    if page.crashed.load(Ordering::SeqCst) {
+        return Err(RwError::Message("Page crashed".to_string()));
+    }
+    if page.lifecycle.is_closing_or_closed()
+        || page.target_closed.load(Ordering::SeqCst)
+        || page.browser.lifecycle.is_closing_or_closed()
+        || !page.browser.client.is_connected()
+    {
+        return Err(RwError::Message(format!(
+            "Locator.{action}: Target page, context or browser has been closed"
+        )));
+    }
+    Ok(())
+}
+
+fn strict_violation_error(info: &Value, strict: bool, action: &str) -> Option<RwError> {
+    if !strict {
+        return None;
+    }
+    if let Some(violation) = info.get("frame_strict_violation") {
+        let count = violation.get("count").and_then(Value::as_u64).unwrap_or(0);
+        if count > 1 {
+            let selector = violation
+                .get("selector")
+                .and_then(Value::as_str)
+                .unwrap_or("iframe");
+            return Some(RwError::Message(format!(
+                "strict mode violation: locator(\"{selector}\") resolved to {count} elements"
+            )));
+        }
+    }
+    let count = info.get("count").and_then(Value::as_u64).unwrap_or(0);
+    (count > 1).then(|| {
+        RwError::Message(format!(
+            "strict mode violation: locator resolved to {count} elements while trying to {action}"
+        ))
+    })
+}
+
+fn actionability_state_succeeds(info: &Value) -> bool {
+    [
+        "attached",
+        "visible",
+        "enabled",
+        "receives_events",
+        "stable",
+    ]
+    .into_iter()
+    .all(|field| info.get(field).and_then(Value::as_bool).unwrap_or(false))
+}
+
+fn click_point_from_state(info: &Value) -> Option<(f64, f64)> {
+    let rect = info.get("rect")?;
+    let x = rect.get("x")?.as_f64()?;
+    let y = rect.get("y")?.as_f64()?;
+    let width = rect.get("width")?.as_f64()?;
+    let height = rect.get("height")?.as_f64()?;
+    (width > 0.0 && height > 0.0).then_some((x + width / 2.0, y + height / 2.0))
+}
+
+fn unwrap_nth_locator_spec(mut spec: &Value) -> &Value {
+    while spec.get("kind").and_then(Value::as_str) == Some("nth") {
+        let Some(base) = spec.get("base").filter(|base| base.is_object()) else {
+            break;
+        };
+        spec = base;
+    }
+    spec
+}
+
+fn leading_frame_spec_for_point_translation(spec: &Value) -> Option<Value> {
+    let current = unwrap_nth_locator_spec(spec);
+    match current.get("kind").and_then(Value::as_str) {
+        Some("frame") => Some(current.clone()),
+        Some("descendant" | "filtered") => current
+            .get("base")
+            .and_then(leading_frame_spec_for_point_translation),
+        _ => None,
+    }
+}
+
+fn frame_spec_with_inner(frame_spec: &Value, inner: Value) -> Value {
+    let mut result = frame_spec.clone();
+    let nested = result
+        .get("inner")
+        .filter(|value| value.get("kind").and_then(Value::as_str) == Some("frame"))
+        .cloned();
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "inner".to_string(),
+            nested.map_or(inner.clone(), |nested| {
+                frame_spec_with_inner(&nested, inner)
+            }),
+        );
+    }
+    result
+}
+
+fn frame_owner_specs_for_point_translation(
+    spec: &Value,
+    parent_scope: Option<&Value>,
+) -> Vec<(Value, i64)> {
+    let Some(current) = leading_frame_spec_for_point_translation(spec) else {
+        return Vec::new();
+    };
+    let mut owner_spec = frame_owner_selector_spec(&current);
+    if let Some(parent_scope) = parent_scope {
+        owner_spec = frame_spec_with_inner(parent_scope, owner_spec);
+    }
+    let owner_index = current
+        .get("frame_index")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+
+    let mut current_scope = current.clone();
+    if let Some(object) = current_scope.as_object_mut() {
+        object.insert(
+            "inner".to_string(),
+            json!({ "kind": "css", "selector": "*" }),
+        );
+    }
+    let full_scope = parent_scope.map_or(current_scope.clone(), |parent_scope| {
+        frame_spec_with_inner(parent_scope, current_scope)
+    });
+
+    let mut result = vec![(owner_spec, owner_index)];
+    if let Some(inner) = current.get("inner").filter(|value| value.is_object()) {
+        result.extend(frame_owner_specs_for_point_translation(
+            inner,
+            Some(&full_scope),
+        ));
+    }
+    result
+}
+
+fn accumulate_frame_offset(offset: &mut (f64, f64), value: &Value) -> bool {
+    let Some(owner_x) = value.get("x").and_then(Value::as_f64) else {
+        return false;
+    };
+    let Some(owner_y) = value.get("y").and_then(Value::as_f64) else {
+        return false;
+    };
+    offset.0 += owner_x;
+    offset.1 += owner_y;
+    true
+}
+
+async fn frame_viewport_offset_for_page(
+    page: Arc<PageInner>,
+    locator_json: &str,
+    deadline: Instant,
+) -> RwResult<(f64, f64)> {
+    let spec = serde_json::from_str::<Value>(locator_json)?;
+    let owner_specs = frame_owner_specs_for_point_translation(&spec, None);
+    let mut offset = (0.0, 0.0);
+    for (owner_spec, owner_index) in owner_specs {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return Err(RwError::Timeout(0));
+        }
+        let scoped_owner_spec = if owner_index == 0 {
+            owner_spec
+        } else {
+            json!({ "kind": "nth", "base": owner_spec, "index": owner_index })
+        };
+        let json = evaluate_locator_for_page(
+            Arc::clone(&page),
+            scoped_owner_spec.to_string(),
+            0,
+            r#"
+if (!el) return null;
+const rect = el.getBoundingClientRect();
+return {
+  x: rect.x + (Number(el.clientLeft) || 0),
+  y: rect.y + (Number(el.clientTop) || 0)
+};
+"#
+            .to_string(),
+            timeout,
+        )
+        .await?;
+        let value = decode_runtime_serialized_value(serde_json::from_str::<Value>(&json)?);
+        if !accumulate_frame_offset(&mut offset, &value) {
+            return Ok(offset);
+        }
+    }
+    Ok(offset)
+}
+
+async fn page_click_actionable_wait_async(
+    page: Arc<PageInner>,
+    locator_json: String,
+    index: usize,
+    timeout_ms: Option<f64>,
+    strict: bool,
+) -> RwResult<(f64, f64, f64)> {
+    let timeout_ms = Some(sanitize_action_timeout_ms(timeout_ms, true));
+    let deadline = action_deadline(action_timeout_duration(timeout_ms, true));
+    let body = native_action_body(LOCATOR_TARGET_STATE_TEMPLATE);
+    let mut last_info = json!({ "count": 0 });
+    let mut last_info_json = last_info.to_string();
+    let actionable_info = loop {
+        ensure_native_action_owner_available(&page, "click")?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let command_timeout = action_poll_timeout(timeout_ms, true, remaining);
+        let evaluation = evaluate_locator_for_page(
+            Arc::clone(&page),
+            locator_json.clone(),
+            index,
+            body.clone(),
+            command_timeout,
+        )
+        .await;
+        let json = match evaluation {
+            Ok(json) => json,
+            Err(RwError::Timeout(_)) => {
+                ensure_native_action_owner_available(&page, "click")?;
+                if Instant::now() >= deadline {
+                    return Err(ActionTimeoutError::from_raw_json(
+                        "actionable",
+                        "click",
+                        last_info_json,
+                        &last_info,
+                        None,
+                    )
+                    .into());
+                }
+                tokio::time::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(20)),
+                )
+                .await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let info = decode_runtime_serialized_value(serde_json::from_str::<Value>(&json)?);
+        if let Some(error) = strict_violation_error(&info, strict, "click") {
+            return Err(error);
+        }
+        if actionability_state_succeeds(&info) {
+            break info;
+        }
+        if Instant::now() >= deadline {
+            return Err(ActionTimeoutError::from_raw_json(
+                "actionable",
+                "click",
+                json,
+                &info,
+                None,
+            )
+            .into());
+        }
+        last_info = info;
+        last_info_json = json;
+        tokio::time::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(20)),
+        )
+        .await;
+    };
+
+    let (local_x, local_y) = click_point_from_state(&actionable_info)
+        .ok_or_else(|| RwError::Message("Locator.click: No element matches locator".to_string()))?;
+    ensure_native_action_owner_available(&page, "click")?;
+    let (offset_x, offset_y) =
+        frame_viewport_offset_for_page(Arc::clone(&page), &locator_json, deadline).await?;
+    let target_x = local_x + offset_x;
+    let target_y = local_y + offset_y;
+    let remaining_ms = deadline
+        .saturating_duration_since(Instant::now())
+        .as_secs_f64()
+        * 1_000.0;
+    Ok((target_x, target_y, remaining_ms))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FillAttempt {
+    Success,
+    Pending,
+}
+
+fn classify_fill_attempt(result: &Value) -> RwResult<FillAttempt> {
+    if result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(FillAttempt::Success);
+    }
+    match result.get("type").and_then(Value::as_str).unwrap_or("") {
+        "pending" => Ok(FillAttempt::Pending),
+        "input-type" => {
+            let input_type = result
+                .get("inputType")
+                .and_then(Value::as_str)
+                .or_else(|| result.pointer("/info/input_type").and_then(Value::as_str))
+                .unwrap_or("");
+            Err(RwError::Message(format!(
+                "Locator.fill: Error: Input of type {input_type:?} cannot be filled"
+            )))
+        }
+        "number-text" => Err(RwError::Message(
+            "Locator.fill: Error: Cannot type text into input[type=number]".to_string(),
+        )),
+        "malformed" => Err(RwError::Message(
+            "Locator.fill: Error: Malformed value".to_string(),
+        )),
+        "non-fillable" => Err(RwError::Message(
+            "Locator.fill: Error: Element is not an <input>, <textarea>, <select> or [contenteditable] and does not have a role allowing [aria-readonly]".to_string(),
+        )),
+        "select" | "force-non-fillable" => Err(RwError::Message(
+            "Locator.fill: Error: Element is not an <input>, <textarea> or [contenteditable] element"
+                .to_string(),
+        )),
+        result_type => Err(RwError::Message(format!(
+            "Locator.fill: unexpected native fill result {result_type:?}"
+        ))),
+    }
+}
+
+async fn page_fill_actionable_async(
+    page: Arc<PageInner>,
+    locator_json: String,
+    index: usize,
+    value: String,
+    timeout_ms: Option<f64>,
+    strict: bool,
+) -> RwResult<()> {
+    let timeout_ms = Some(sanitize_action_timeout_ms(timeout_ms, false));
+    let deadline = action_deadline(action_timeout_duration(timeout_ms, false));
+    let body = native_fill_body(&value, strict)?;
+    let mut last_info = json!({ "count": 0 });
+    let mut last_info_json = last_info.to_string();
+    let mut last_info_key = None;
+    loop {
+        ensure_native_action_owner_available(&page, "fill")?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let command_timeout = action_poll_timeout(timeout_ms, false, remaining);
+        // Sync #106 parity: a probe timeout is transient until the outer action deadline.
+        let evaluation = evaluate_locator_for_page(
+            Arc::clone(&page),
+            locator_json.clone(),
+            index,
+            body.clone(),
+            command_timeout,
+        )
+        .await;
+        let json = match evaluation {
+            Ok(json) => json,
+            Err(RwError::Timeout(_)) => {
+                ensure_native_action_owner_available(&page, "fill")?;
+                if Instant::now() >= deadline {
+                    return Err(ActionTimeoutError::from_raw_json(
+                        "editable",
+                        "fill",
+                        last_info_json,
+                        &last_info,
+                        last_info_key,
+                    )
+                    .into());
+                }
+                tokio::time::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(20)),
+                )
+                .await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let result = decode_runtime_serialized_value(serde_json::from_str::<Value>(&json)?);
+        let info = result.get("info").cloned().unwrap_or_else(|| json!({}));
+        if let Some(error) = strict_violation_error(&info, strict, "fill") {
+            return Err(error);
+        }
+        match classify_fill_attempt(&result)? {
+            FillAttempt::Success => return Ok(()),
+            FillAttempt::Pending if Instant::now() >= deadline => {
+                return Err(ActionTimeoutError::from_raw_json(
+                    "editable",
+                    "fill",
+                    json,
+                    &info,
+                    Some("info"),
+                )
+                .into());
+            }
+            FillAttempt::Pending => {
+                last_info = info;
+                last_info_json = json;
+                last_info_key = Some("info");
+                tokio::time::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(20)),
+                )
+                .await;
+            }
+        }
+    }
+}
+
 struct BackgroundOverrideGuard {
     browser: Arc<BrowserInner>,
     session_id: String,
@@ -7126,6 +8266,177 @@ async fn page_close_async(
     .await
 }
 
+async fn dispatch_mouse_click_sequence_locked_async(
+    page: Arc<PageInner>,
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+    step_count: u32,
+    button: String,
+    button_mask: i64,
+    click_count: i64,
+    delay_after_press: f64,
+    initial_buttons: i64,
+    modifiers: i64,
+    timeout: Duration,
+) -> RwResult<()> {
+    let client = Arc::clone(&page.browser.client);
+    let session_id = page.session_id.clone();
+    let steps = step_count.max(1);
+    if delay_after_press == 0.0 {
+        let events = mouse_click_batch_json(
+            start_x,
+            start_y,
+            target_x,
+            target_y,
+            steps,
+            button.as_str(),
+            button_mask,
+            click_count,
+            initial_buttons,
+            modifiers,
+        )?;
+        client
+            .send_batch_raw_params_json(
+                "Input.dispatchMouseEvent",
+                events,
+                Some(&session_id),
+                timeout,
+            )
+            .await?;
+        return Ok(());
+    }
+
+    for index in 1..=steps {
+        let fraction = index as f64 / steps as f64;
+        let x = start_x + (target_x - start_x) * fraction;
+        let y = start_y + (target_y - start_y) * fraction;
+        client
+            .send(
+                "Input.dispatchMouseEvent",
+                mouse_event_payload("mouseMoved", x, y, "none", initial_buttons, 0, modifiers),
+                Some(&session_id),
+                timeout,
+            )
+            .await?;
+    }
+
+    if click_count > 0 {
+        for count in 1..=click_count {
+            client
+                .send(
+                    "Input.dispatchMouseEvent",
+                    mouse_event_payload(
+                        "mousePressed",
+                        target_x,
+                        target_y,
+                        button.as_str(),
+                        initial_buttons | button_mask,
+                        count,
+                        modifiers,
+                    ),
+                    Some(&session_id),
+                    timeout,
+                )
+                .await?;
+            if delay_after_press > 0.0 {
+                tokio::time::sleep(Duration::from_secs_f64(delay_after_press / 1_000.0)).await;
+            }
+
+            client
+                .send(
+                    "Input.dispatchMouseEvent",
+                    mouse_event_payload(
+                        "mouseReleased",
+                        target_x,
+                        target_y,
+                        button.as_str(),
+                        initial_buttons & !button_mask,
+                        count,
+                        modifiers,
+                    ),
+                    Some(&session_id),
+                    timeout,
+                )
+                .await?;
+            if count < click_count && delay_after_press > 0.0 {
+                tokio::time::sleep(Duration::from_secs_f64(delay_after_press / 1_000.0)).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn dispatch_mouse_click_sequence_async(
+    page: Arc<PageInner>,
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+    step_count: u32,
+    button: String,
+    button_mask: i64,
+    click_count: i64,
+    delay_after_press: f64,
+    initial_buttons: i64,
+    modifiers: i64,
+    timeout: Duration,
+) -> RwResult<()> {
+    let _dispatch_guard = page.mouse_dispatch_lock.lock().await;
+    dispatch_mouse_click_sequence_locked_async(
+        Arc::clone(&page),
+        start_x,
+        start_y,
+        target_x,
+        target_y,
+        step_count,
+        button,
+        button_mask,
+        click_count,
+        delay_after_press,
+        initial_buttons,
+        modifiers,
+        timeout,
+    )
+    .await
+}
+
+async fn dispatch_mouse_click_async(
+    page: Arc<PageInner>,
+    target_x: f64,
+    target_y: f64,
+    start_x: f64,
+    start_y: f64,
+    initial_buttons: i64,
+    modifiers: i64,
+    remaining_ms: f64,
+) -> RwResult<()> {
+    let remaining = action_timeout_duration(Some(remaining_ms), false);
+    let deadline = action_deadline(remaining);
+    let _dispatch_guard = tokio::time::timeout(remaining, page.mouse_dispatch_lock.lock())
+        .await
+        .map_err(|_| RwError::Timeout(remaining.as_millis() as u64))?;
+    ensure_native_action_owner_available(&page, "click")?;
+    let timeout = deadline.saturating_duration_since(Instant::now());
+    dispatch_mouse_click_sequence_locked_async(
+        Arc::clone(&page),
+        start_x,
+        start_y,
+        target_x,
+        target_y,
+        1,
+        "left".to_string(),
+        1,
+        1,
+        0.0,
+        initial_buttons,
+        modifiers,
+        timeout,
+    )
+    .await
+}
+
 #[cfg(feature = "python")]
 #[pymethods]
 impl PyPage {
@@ -7210,6 +8521,61 @@ el.click();
         )
     }
 
+    #[pyo3(signature = (locator_json, index, timeout_ms=None, strict=false))]
+    fn click_actionable_wait_async(
+        &self,
+        py: Python<'_>,
+        locator_json: &str,
+        index: usize,
+        timeout_ms: Option<f64>,
+        strict: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let page = Arc::clone(&self.inner);
+        let runtime = page.browser.runtime.handle().clone();
+        python_future_on(
+            py,
+            runtime,
+            page_click_actionable_wait_async(
+                page,
+                locator_json.to_string(),
+                index,
+                timeout_ms,
+                strict,
+            ),
+            |py, value| Ok(value.into_pyobject(py)?.unbind().into_any()),
+        )
+    }
+
+    fn dispatch_mouse_click_async(
+        &self,
+        py: Python<'_>,
+        x: f64,
+        y: f64,
+        start_x: f64,
+        start_y: f64,
+        initial_buttons: i64,
+        modifiers: i64,
+        remaining_ms: f64,
+    ) -> PyResult<Py<PyAny>> {
+        let page = Arc::clone(&self.inner);
+        let runtime = page.browser.runtime.handle().clone();
+        python_future_on(
+            py,
+            runtime,
+            dispatch_mouse_click_async(
+                page,
+                x,
+                y,
+                start_x,
+                start_y,
+                initial_buttons,
+                modifiers,
+                remaining_ms,
+            ),
+            |py, ()| Ok(py.None()),
+        )
+    }
+
     #[pyo3(signature = (locator_json, index, value, timeout_ms=None, strict=false))]
     fn fill_async(
         &self,
@@ -7248,6 +8614,33 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                 timeout,
                 strict,
                 "fill",
+            ),
+            |py, ()| Ok(py.None()),
+        )
+    }
+
+    #[pyo3(signature = (locator_json, index, value, timeout_ms=None, strict=false))]
+    fn fill_actionable_async(
+        &self,
+        py: Python<'_>,
+        locator_json: &str,
+        index: usize,
+        value: &str,
+        timeout_ms: Option<f64>,
+        strict: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let page = Arc::clone(&self.inner);
+        let runtime = page.browser.runtime.handle().clone();
+        python_future_on(
+            py,
+            runtime,
+            page_fill_actionable_async(
+                page,
+                locator_json.to_string(),
+                index,
+                value.to_string(),
+                timeout_ms,
+                strict,
             ),
             |py, ()| Ok(py.None()),
         )
@@ -7917,134 +9310,26 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
     ) -> PyResult<()> {
         let page = Arc::clone(&self.inner);
         let browser = Arc::clone(&page.browser);
-        let client = Arc::clone(&browser.client);
-        let session_id = page.session_id.clone();
         let timeout = BrowserInner::command_timeout(timeout_ms);
-        let steps = step_count.max(1);
         let button = button.to_string();
         let delay_after_press = delay_ms.unwrap_or(0.0).max(0.0);
 
         py.detach(move || {
-            browser.block_on(async move {
-                if delay_after_press == 0.0 {
-                    let mut events =
-                        Vec::with_capacity(steps as usize + click_count.max(0) as usize * 2);
-                    for index in 1..=steps {
-                        let fraction = index as f64 / steps as f64;
-                        let x = start_x + (target_x - start_x) * fraction;
-                        let y = start_y + (target_y - start_y) * fraction;
-                        events.push(mouse_event_payload_json(
-                            "mouseMoved",
-                            x,
-                            y,
-                            "none",
-                            initial_buttons,
-                            0,
-                            modifiers,
-                        )?);
-                    }
-                    if click_count > 0 {
-                        for count in 1..=click_count {
-                            events.push(mouse_event_payload_json(
-                                "mousePressed",
-                                target_x,
-                                target_y,
-                                button.as_str(),
-                                initial_buttons | button_mask,
-                                count,
-                                modifiers,
-                            )?);
-                            events.push(mouse_event_payload_json(
-                                "mouseReleased",
-                                target_x,
-                                target_y,
-                                button.as_str(),
-                                initial_buttons & !button_mask,
-                                count,
-                                modifiers,
-                            )?);
-                        }
-                    }
-                    client
-                        .send_batch_raw_params_json(
-                            "Input.dispatchMouseEvent",
-                            events,
-                            Some(&session_id),
-                            timeout,
-                        )
-                        .await?;
-                    return Ok(());
-                }
-
-                for index in 1..=steps {
-                    let fraction = index as f64 / steps as f64;
-                    let x = start_x + (target_x - start_x) * fraction;
-                    let y = start_y + (target_y - start_y) * fraction;
-                    client
-                        .send(
-                            "Input.dispatchMouseEvent",
-                            mouse_event_payload(
-                                "mouseMoved",
-                                x,
-                                y,
-                                "none",
-                                initial_buttons,
-                                0,
-                                modifiers,
-                            ),
-                            Some(&session_id),
-                            timeout,
-                        )
-                        .await?;
-                }
-
-                if click_count > 0 {
-                    for count in 1..=click_count {
-                        client
-                            .send(
-                                "Input.dispatchMouseEvent",
-                                mouse_event_payload(
-                                    "mousePressed",
-                                    target_x,
-                                    target_y,
-                                    button.as_str(),
-                                    initial_buttons | button_mask,
-                                    count,
-                                    modifiers,
-                                ),
-                                Some(&session_id),
-                                timeout,
-                            )
-                            .await?;
-                        if delay_after_press > 0.0 {
-                            tokio::time::sleep(Duration::from_secs_f64(delay_after_press / 1000.0))
-                                .await;
-                        }
-
-                        client
-                            .send(
-                                "Input.dispatchMouseEvent",
-                                mouse_event_payload(
-                                    "mouseReleased",
-                                    target_x,
-                                    target_y,
-                                    button.as_str(),
-                                    initial_buttons & !button_mask,
-                                    count,
-                                    modifiers,
-                                ),
-                                Some(&session_id),
-                                timeout,
-                            )
-                            .await?;
-                        if count < click_count && delay_after_press > 0.0 {
-                            tokio::time::sleep(Duration::from_secs_f64(delay_after_press / 1000.0))
-                                .await;
-                        }
-                    }
-                }
-                Ok(())
-            })
+            browser.block_on(dispatch_mouse_click_sequence_async(
+                page,
+                start_x,
+                start_y,
+                target_x,
+                target_y,
+                step_count,
+                button,
+                button_mask,
+                click_count,
+                delay_after_press,
+                initial_buttons,
+                modifiers,
+                timeout,
+            ))
         })
         .map_err(py_err)
     }
@@ -13391,6 +14676,7 @@ async fn attach_existing_page_unregistered(
         event_stream_start_cursor,
         background_override_active: Arc::new(AtomicBool::new(false)),
         screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+        mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
         lifecycle: Arc::new(CloseLifecycle::new()),
         target_closed: AtomicBool::new(false),
         crashed: AtomicBool::new(false),
@@ -19790,5 +21076,10 @@ fn _rustwright(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(launch_chromium_async, module)?)?;
     module.add_function(wrap_pyfunction!(connect_over_cdp, module)?)?;
     module.add_function(wrap_pyfunction!(chromium_executable_path, module)?)?;
+    module.add(
+        "_LOCATOR_TARGET_STATE_TEMPLATE",
+        LOCATOR_TARGET_STATE_TEMPLATE,
+    )?;
+    module.add("_LOCATOR_FILL_TEMPLATE", LOCATOR_FILL_TEMPLATE)?;
     Ok(())
 }
