@@ -27,7 +27,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 #[cfg(feature = "python")]
 use pyo3::types::{PyAny, PyBytes, PyModule};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
@@ -279,7 +279,14 @@ impl Drop for SpawnedTaskAbortGuard {
 
 const CDP_EVENT_LOG_LIMIT: usize = 8192;
 const FRAME_UTILITY_WORLD_NAME: &str = "__utility_world__";
+// Closed set of structured errors carried across the Python FFI boundary. Each
+// marker prefixes exactly one JSON payload schema; user-visible prose is rebuilt
+// by the Python shim and never includes these private wire markers.
 const ACTION_TIMEOUT_MARKER: &str = "__rustwright_action_timeout__:";
+const TIMEOUT_MARKER: &str = "__rustwright_timeout__:";
+const TARGET_CLOSED_MARKER: &str = "__rustwright_target_closed__:";
+const PAGE_CRASHED_MARKER: &str = "__rustwright_page_crashed__:";
+const DISCONNECTED_MARKER: &str = "__rustwright_disconnected__:";
 const LOCATOR_TARGET_STATE_TEMPLATE: &str = r#"
 if (el && __SCROLL__) el.scrollIntoView({ block: 'center', inline: 'center' });
 const ownerDocument = el ? (el.ownerDocument || document) : document;
@@ -469,6 +476,96 @@ el.dispatchEvent(new Event('change', { bubbles: true }));
 return { ok: true, info };
 "#;
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TargetClosedKind {
+    Page,
+    Context,
+    Browser,
+    Target,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ActionTimeoutWirePayload {
+    state: String,
+    action: String,
+    last_info_json: String,
+    last_info_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TimeoutWirePayload {
+    ms: u64,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TargetClosedWirePayload {
+    kind: TargetClosedKind,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyWirePayload {}
+
+#[derive(Debug, Eq, PartialEq)]
+enum FfiWireError {
+    ActionTimeout(ActionTimeoutWirePayload),
+    Timeout(TimeoutWirePayload),
+    TargetClosed(TargetClosedWirePayload),
+    PageCrashed,
+    Disconnected,
+}
+
+impl FfiWireError {
+    fn marker(&self) -> &'static str {
+        match self {
+            Self::ActionTimeout(_) => ACTION_TIMEOUT_MARKER,
+            Self::Timeout(_) => TIMEOUT_MARKER,
+            Self::TargetClosed(_) => TARGET_CLOSED_MARKER,
+            Self::PageCrashed => PAGE_CRASHED_MARKER,
+            Self::Disconnected => DISCONNECTED_MARKER,
+        }
+    }
+
+    fn wire_message(&self) -> String {
+        let payload = match self {
+            Self::ActionTimeout(payload) => serde_json::to_string(payload),
+            Self::Timeout(payload) => serde_json::to_string(payload),
+            Self::TargetClosed(payload) => serde_json::to_string(payload),
+            Self::PageCrashed | Self::Disconnected => serde_json::to_string(&EmptyWirePayload {}),
+        }
+        .expect("FFI wire error payloads are always JSON-serializable");
+        format!("{}{payload}", self.marker())
+    }
+
+    #[cfg(test)]
+    fn parse(message: &str) -> Option<Self> {
+        if let Some(payload) = message.strip_prefix(ACTION_TIMEOUT_MARKER) {
+            return serde_json::from_str(payload).ok().map(Self::ActionTimeout);
+        }
+        if let Some(payload) = message.strip_prefix(TIMEOUT_MARKER) {
+            return serde_json::from_str(payload).ok().map(Self::Timeout);
+        }
+        if let Some(payload) = message.strip_prefix(TARGET_CLOSED_MARKER) {
+            return serde_json::from_str(payload).ok().map(Self::TargetClosed);
+        }
+        if let Some(payload) = message.strip_prefix(PAGE_CRASHED_MARKER) {
+            serde_json::from_str::<EmptyWirePayload>(payload)
+                .ok()
+                .map(|_| Self::PageCrashed)
+        } else if let Some(payload) = message.strip_prefix(DISCONNECTED_MARKER) {
+            serde_json::from_str::<EmptyWirePayload>(payload)
+                .ok()
+                .map(|_| Self::Disconnected)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ActionTimeoutError {
     state: &'static str,
@@ -497,15 +594,13 @@ impl ActionTimeoutError {
     }
 
     fn wire_message(&self) -> String {
-        format!(
-            "{ACTION_TIMEOUT_MARKER}{}",
-            json!({
-                "state": self.state,
-                "action": self.action,
-                "last_info_json": self.last_info_json,
-                "last_info_key": self.last_info_key,
-            })
-        )
+        FfiWireError::ActionTimeout(ActionTimeoutWirePayload {
+            state: self.state.to_string(),
+            action: self.action.to_string(),
+            last_info_json: self.last_info_json.clone(),
+            last_info_key: self.last_info_key.map(ToString::to_string),
+        })
+        .wire_message()
     }
 }
 
@@ -543,6 +638,12 @@ pub enum RwError {
     Cancelled,
     #[error("target or browser is closed")]
     Closed,
+    #[error("target or browser is closed")]
+    Disconnected,
+    #[error("Target page, context or browser has been closed")]
+    TargetClosed(TargetClosedKind),
+    #[error("Page crashed")]
+    PageCrashed,
     #[error("invalid input: {0}")]
     InvalidInput(String),
     #[error(transparent)]
@@ -562,7 +663,14 @@ fn py_err(error: RwError) -> PyErr {
     match error {
         RwError::Message(message) => PyRuntimeError::new_err(message),
         RwError::InvalidInput(message) => PyValueError::new_err(message),
-        RwError::Timeout(ms) => PyRuntimeError::new_err(format!("timed out after {ms} ms")),
+        RwError::Timeout(ms) => {
+            PyRuntimeError::new_err(FfiWireError::Timeout(TimeoutWirePayload { ms }).wire_message())
+        }
+        RwError::TargetClosed(kind) => PyRuntimeError::new_err(
+            FfiWireError::TargetClosed(TargetClosedWirePayload { kind }).wire_message(),
+        ),
+        RwError::PageCrashed => PyRuntimeError::new_err(FfiWireError::PageCrashed.wire_message()),
+        RwError::Disconnected => PyRuntimeError::new_err(FfiWireError::Disconnected.wire_message()),
         RwError::ActionTimeout(error) => PyRuntimeError::new_err(error.wire_message()),
         other => PyRuntimeError::new_err(other.to_string()),
     }
@@ -1498,6 +1606,97 @@ mod tests {
                 "timed out waiting for locator to be editable while trying to fill; last state was {pending_json}"
             )
         );
+    }
+
+    #[test]
+    fn ffi_wire_error_markers_round_trip_with_closed_payload_schemas() {
+        let cases = vec![
+            (
+                FfiWireError::ActionTimeout(ActionTimeoutWirePayload {
+                    state: "actionable".to_string(),
+                    action: "click".to_string(),
+                    last_info_json: r#"{"count":0}"#.to_string(),
+                    last_info_key: None,
+                }),
+                r#"__rustwright_action_timeout__:{"state":"actionable","action":"click","last_info_json":"{\"count\":0}","last_info_key":null}"#,
+            ),
+            (
+                FfiWireError::Timeout(TimeoutWirePayload { ms: 250 }),
+                r#"__rustwright_timeout__:{"ms":250}"#,
+            ),
+            (
+                FfiWireError::TargetClosed(TargetClosedWirePayload {
+                    kind: TargetClosedKind::Page,
+                }),
+                r#"__rustwright_target_closed__:{"kind":"page"}"#,
+            ),
+            (
+                FfiWireError::TargetClosed(TargetClosedWirePayload {
+                    kind: TargetClosedKind::Context,
+                }),
+                r#"__rustwright_target_closed__:{"kind":"context"}"#,
+            ),
+            (
+                FfiWireError::TargetClosed(TargetClosedWirePayload {
+                    kind: TargetClosedKind::Browser,
+                }),
+                r#"__rustwright_target_closed__:{"kind":"browser"}"#,
+            ),
+            (
+                FfiWireError::TargetClosed(TargetClosedWirePayload {
+                    kind: TargetClosedKind::Target,
+                }),
+                r#"__rustwright_target_closed__:{"kind":"target"}"#,
+            ),
+            (
+                FfiWireError::PageCrashed,
+                r#"__rustwright_page_crashed__:{}"#,
+            ),
+            (
+                FfiWireError::Disconnected,
+                r#"__rustwright_disconnected__:{}"#,
+            ),
+        ];
+        let markers = [
+            ACTION_TIMEOUT_MARKER,
+            TIMEOUT_MARKER,
+            TARGET_CLOSED_MARKER,
+            PAGE_CRASHED_MARKER,
+            DISCONNECTED_MARKER,
+        ];
+        assert_eq!(
+            markers.into_iter().collect::<HashSet<_>>().len(),
+            markers.len()
+        );
+
+        for (error, expected) in cases {
+            let marker = error.marker();
+            let message = error.wire_message();
+            assert_eq!(message, expected);
+            assert_eq!(FfiWireError::parse(&message), Some(error));
+            assert!(message.starts_with(marker));
+            assert_eq!(
+                markers
+                    .iter()
+                    .map(|item| message.matches(*item).count())
+                    .sum::<usize>(),
+                1
+            );
+        }
+
+        assert_eq!(
+            FfiWireError::parse(r#"__rustwright_timeout__:{"ms":1,"extra":true}"#),
+            None
+        );
+        assert_eq!(
+            FfiWireError::parse(r#"__rustwright_target_closed__:{"kind":"tab"}"#),
+            None
+        );
+        assert_eq!(
+            FfiWireError::parse(r#"__rustwright_page_crashed__:{"extra":true}"#),
+            None
+        );
+        assert_eq!(FfiWireError::parse("plain legacy error"), None);
     }
 
     #[test]
@@ -3376,7 +3575,7 @@ fn close_pending_cdp_commands(pending: CdpPendingMap) {
             .collect::<Vec<_>>()
     };
     for sender in senders {
-        let _ = sender.send(Err(RwError::Closed));
+        let _ = sender.send(Err(RwError::Disconnected));
     }
 }
 
@@ -3679,7 +3878,7 @@ impl CdpClient {
         timeout: Duration,
     ) -> RwResult<Value> {
         if !self.is_connected() {
-            return Err(RwError::Closed);
+            return Err(RwError::Disconnected);
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
@@ -3703,7 +3902,7 @@ impl CdpClient {
             .is_err()
         {
             self.mark_closed();
-            return Err(RwError::Closed);
+            return Err(RwError::Disconnected);
         }
         self.record_sent_command(method);
 
@@ -3715,7 +3914,7 @@ impl CdpClient {
                 },
                 other => other,
             }),
-            Ok(Err(_)) => Err(RwError::Closed),
+            Ok(Err(_)) => Err(RwError::Disconnected),
             Err(_) => Err(RwError::Timeout(timeout.as_millis() as u64)),
         }
     }
@@ -3728,7 +3927,7 @@ impl CdpClient {
         timeout: Duration,
     ) -> RwResult<Value> {
         if !self.is_connected() {
-            return Err(RwError::Closed);
+            return Err(RwError::Disconnected);
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
@@ -3747,7 +3946,7 @@ impl CdpClient {
 
         if self.write_tx.send(CdpOutgoing::Text(payload)).is_err() {
             self.mark_closed();
-            return Err(RwError::Closed);
+            return Err(RwError::Disconnected);
         }
         self.record_sent_command(method);
 
@@ -3759,7 +3958,7 @@ impl CdpClient {
                 },
                 other => other,
             }),
-            Ok(Err(_)) => Err(RwError::Closed),
+            Ok(Err(_)) => Err(RwError::Disconnected),
             Err(_) => Err(RwError::Timeout(timeout.as_millis() as u64)),
         }
     }
@@ -3772,7 +3971,7 @@ impl CdpClient {
         timeout: Duration,
     ) -> RwResult<Vec<Value>> {
         if !self.is_connected() {
-            return Err(RwError::Closed);
+            return Err(RwError::Disconnected);
         }
         let method_json = serde_json::to_string(method)?;
         let session_id_json = match session_id {
@@ -3796,7 +3995,7 @@ impl CdpClient {
 
             if self.write_tx.send(CdpOutgoing::Text(payload)).is_err() {
                 self.mark_closed();
-                return Err(RwError::Closed);
+                return Err(RwError::Disconnected);
             }
             self.record_sent_command(method);
             receivers.push((id, rx, pending_guard));
@@ -3812,7 +4011,7 @@ impl CdpClient {
                     },
                     other => other,
                 })?),
-                Ok(Err(_)) => return Err(RwError::Closed),
+                Ok(Err(_)) => return Err(RwError::Disconnected),
                 Err(_) => return Err(RwError::Timeout(timeout.as_millis() as u64)),
             }
         }
@@ -7305,15 +7504,13 @@ fn is_locator_wait_context_loss(error: &RwError) -> bool {
 
 fn locator_wait_terminal_error(page: &PageInner) -> Option<RwError> {
     if page.crashed.load(Ordering::SeqCst) {
-        return Some(RwError::Message("Page crashed".to_string()));
+        return Some(RwError::PageCrashed);
     }
     if page.lifecycle.is_closing_or_closed()
         || page.target_closed.load(Ordering::SeqCst)
         || !page.browser.client.is_connected()
     {
-        return Some(RwError::Message(
-            "Target page, context or browser has been closed".to_string(),
-        ));
+        return Some(RwError::TargetClosed(TargetClosedKind::Page));
     }
     None
 }
@@ -7419,9 +7616,7 @@ async fn verify_locator_wait_target_liveness(
         Ok(_) => Ok(()),
         // Only a protocol rejection proves the target is gone; a probe timeout on a
         // slow or remote connection is inconclusive and must not abort the wait.
-        Err(RwError::Cdp { .. }) => Err(RwError::Message(
-            "Target page, context or browser has been closed".to_string(),
-        )),
+        Err(RwError::Cdp { .. }) => Err(RwError::TargetClosed(TargetClosedKind::Page)),
         Err(_) => Ok(()),
     }
 }
@@ -19118,6 +19313,283 @@ async fn wait_for_event(
             Ok(Err(_)) => return Err(RwError::Message("CDP event stream closed".to_string())),
             Err(_) => return Err(RwError::Timeout(timeout.as_millis() as u64)),
         }
+    }
+}
+
+const WIRE_ARRAY_TAG: &str = "__rustwright_cdp_array__";
+const WIRE_OBJECT_TAG: &str = "__rustwright_cdp_object__";
+const WIRE_REF_TAG: &str = "__rustwright_cdp_ref__";
+const WIRE_LEAF_TAGS: [&str; 9] = [
+    "__rustwright_cdp_unserializable_value__",
+    "__rustwright_cdp_bigint__",
+    "__rustwright_cdp_date__",
+    "__rustwright_cdp_regexp__",
+    "__rustwright_cdp_url__",
+    "__rustwright_cdp_error__",
+    "__rustwright_cdp_undefined__",
+    "__rustwright_cdp_symbol__",
+    "__rustwright_cdp_function__",
+];
+
+#[derive(Clone)]
+enum WireDefinition {
+    Array(Vec<Value>),
+    Object(serde_json::Map<String, Value>),
+}
+
+struct WireValueDecoder {
+    definitions: HashMap<String, WireDefinition>,
+    active: HashSet<String>,
+}
+
+impl WireValueDecoder {
+    fn new(wire: &Value) -> RwResult<Self> {
+        let mut decoder = Self {
+            definitions: HashMap::new(),
+            active: HashSet::new(),
+        };
+        decoder.collect_definitions(wire)?;
+        Ok(decoder)
+    }
+
+    fn collect_definitions(&mut self, value: &Value) -> RwResult<()> {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    self.collect_definitions(value)?;
+                }
+            }
+            Value::Object(object) => {
+                if object.contains_key(WIRE_REF_TAG) || is_wire_leaf(object) {
+                    return Ok(());
+                }
+                if let Some(id) = object.get(WIRE_ARRAY_TAG) {
+                    let key = wire_reference_key(id)?;
+                    let items = object
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            RwError::InvalidInput(
+                                "wire array wrapper must contain an items array".to_string(),
+                            )
+                        })?;
+                    self.insert_definition(key, WireDefinition::Array(items.clone()))?;
+                    for item in items {
+                        self.collect_definitions(item)?;
+                    }
+                    return Ok(());
+                }
+                if let Some(id) = object.get(WIRE_OBJECT_TAG) {
+                    let key = wire_reference_key(id)?;
+                    let entries = object
+                        .get("entries")
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| {
+                            RwError::InvalidInput(
+                                "wire object wrapper must contain an entries object".to_string(),
+                            )
+                        })?;
+                    self.insert_definition(key, WireDefinition::Object(entries.clone()))?;
+                    for entry in entries.values() {
+                        self.collect_definitions(entry)?;
+                    }
+                    return Ok(());
+                }
+                for value in object.values() {
+                    self.collect_definitions(value)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn insert_definition(&mut self, key: String, definition: WireDefinition) -> RwResult<()> {
+        if self.definitions.insert(key.clone(), definition).is_some() {
+            return Err(RwError::InvalidInput(format!(
+                "wire reference id is defined more than once: {key}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn decode(&mut self, value: Value) -> RwResult<Value> {
+        match value {
+            Value::Array(values) => values
+                .into_iter()
+                .map(|value| self.decode(value))
+                .collect::<RwResult<Vec<_>>>()
+                .map(Value::Array),
+            Value::Object(object) => {
+                if let Some(id) = object.get(WIRE_REF_TAG) {
+                    return self.resolve(&wire_reference_key(id)?);
+                }
+                if let Some(id) = object.get(WIRE_ARRAY_TAG) {
+                    return self.resolve(&wire_reference_key(id)?);
+                }
+                if let Some(id) = object.get(WIRE_OBJECT_TAG) {
+                    return self.resolve(&wire_reference_key(id)?);
+                }
+                if is_wire_leaf(&object) {
+                    return Ok(Value::Object(object));
+                }
+                object
+                    .into_iter()
+                    .map(|(key, value)| self.decode(value).map(|value| (key, value)))
+                    .collect::<RwResult<serde_json::Map<_, _>>>()
+                    .map(Value::Object)
+            }
+            value => Ok(value),
+        }
+    }
+
+    fn resolve(&mut self, key: &str) -> RwResult<Value> {
+        if self.active.contains(key) {
+            return Ok(json!({"__rustwright_cdp_cycle__": true}));
+        }
+        let definition = self.definitions.get(key).cloned().ok_or_else(|| {
+            RwError::InvalidInput(format!("wire reference points to unknown id: {key}"))
+        })?;
+        self.active.insert(key.to_string());
+        let result = match definition {
+            WireDefinition::Array(items) => self.decode(Value::Array(items)),
+            WireDefinition::Object(entries) => self.decode(Value::Object(entries)),
+        };
+        self.active.remove(key);
+        result
+    }
+}
+
+fn wire_reference_key(value: &Value) -> RwResult<String> {
+    if !matches!(value, Value::Number(_) | Value::String(_)) {
+        return Err(RwError::InvalidInput(
+            "wire reference id must be a number or string".to_string(),
+        ));
+    }
+    serde_json::to_string(value).map_err(RwError::from)
+}
+
+fn is_wire_leaf(object: &serde_json::Map<String, Value>) -> bool {
+    WIRE_LEAF_TAGS.iter().any(|tag| object.contains_key(*tag))
+}
+
+/// Decode the core evaluate wire format into a plain JSON tree.
+///
+/// Array and object wrappers are removed and references are expanded. Repeated
+/// non-cyclic references are duplicated in the output. Because JSON cannot
+/// represent object identity, a reference to an active ancestor (a true cycle)
+/// is replaced with `{"__rustwright_cdp_cycle__": true}`. Leaf scalar tags are
+/// preserved verbatim for language bindings to map to native values.
+pub fn decode_wire_value(json: &str) -> Result<String, RwError> {
+    let wire = serde_json::from_str::<Value>(json)?;
+    let mut decoder = WireValueDecoder::new(&wire)?;
+    let decoded = decoder.decode(wire)?;
+    serde_json::to_string(&decoded).map_err(RwError::from)
+}
+
+#[cfg(test)]
+mod wire_decode_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_nested_arrays_and_objects() {
+        let decoded = decode_wire_value(
+            r#"{
+                "__rustwright_cdp_object__": 1,
+                "entries": {
+                    "nested": {
+                        "__rustwright_cdp_array__": 2,
+                        "items": [1, {
+                            "__rustwright_cdp_object__": 3,
+                            "entries": {"ok": true}
+                        }]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&decoded).unwrap(),
+            json!({"nested": [1, {"ok": true}]})
+        );
+    }
+
+    #[test]
+    fn duplicates_repeated_references() {
+        let decoded = decode_wire_value(
+            r#"{
+                "__rustwright_cdp_array__": 1,
+                "items": [
+                    {
+                        "__rustwright_cdp_object__": 2,
+                        "entries": {"value": [1, 2, 3]}
+                    },
+                    {"__rustwright_cdp_ref__": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&decoded).unwrap(),
+            json!([
+                {"value": [1, 2, 3]},
+                {"value": [1, 2, 3]},
+            ])
+        );
+    }
+
+    #[test]
+    fn marks_true_cycles() {
+        let decoded = decode_wire_value(
+            r#"{
+                "__rustwright_cdp_object__": 1,
+                "entries": {
+                    "name": "root",
+                    "self": {"__rustwright_cdp_ref__": 1}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&decoded).unwrap(),
+            json!({
+                "name": "root",
+                "self": {"__rustwright_cdp_cycle__": true},
+            })
+        );
+    }
+
+    #[test]
+    fn preserves_every_leaf_tag_verbatim() {
+        let wire = json!([
+            {"__rustwright_cdp_unserializable_value__": "NaN"},
+            {"__rustwright_cdp_bigint__": "123"},
+            {"__rustwright_cdp_date__": "2026-07-21T12:34:56.789Z"},
+            {"__rustwright_cdp_regexp__": {"p": "a+b", "f": "gi"}},
+            {"__rustwright_cdp_url__": "https://example.com/path?q=1"},
+            {"__rustwright_cdp_error__": {
+                "name": "TypeError",
+                "message": "broken",
+                "stack": "TypeError: broken",
+            }},
+            {"__rustwright_cdp_undefined__": true},
+            {"__rustwright_cdp_symbol__": true},
+            {"__rustwright_cdp_function__": true},
+        ]);
+
+        let decoded = decode_wire_value(&wire.to_string()).unwrap();
+
+        assert_eq!(serde_json::from_str::<Value>(&decoded).unwrap(), wire);
+    }
+
+    #[test]
+    fn reports_malformed_json() {
+        let error = decode_wire_value(r#"{"unterminated": [1, 2}"#).unwrap_err();
+
+        assert!(matches!(error, RwError::Json(_)));
     }
 }
 
