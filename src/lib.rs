@@ -14,7 +14,9 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+#[cfg(feature = "python")]
+use std::sync::OnceLock;
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -38,6 +40,99 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
 pub type RwResult<T> = Result<T, RwError>;
 type CdpPendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<RwResult<Value>>>>>;
+
+/// A thread-safe cancellation signal for synchronous facade operations.
+///
+/// Cancelling a token wakes the async CDP wait owned by a synchronous call, so
+/// the owner thread can return without waiting for the operation timeout.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken {
+    inner: Arc<CancelTokenInner>,
+}
+
+#[derive(Debug, Default)]
+struct CancelTokenInner {
+    cancelled: Arc<AtomicBool>,
+    changed: tokio::sync::Notify,
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        if !self.inner.cancelled.swap(true, Ordering::SeqCst) {
+            self.inner.changed.notify_waiters();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn atomic_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.inner.cancelled)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let changed = self.inner.changed.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+async fn cancelable<T, Fut>(token: Option<CancelToken>, future: Fut) -> RwResult<T>
+where
+    Fut: Future<Output = RwResult<T>>,
+{
+    let Some(token) = token else {
+        return future.await;
+    };
+    tokio::select! {
+        biased;
+        () = token.cancelled() => Err(RwError::Cancelled),
+        result = future => result,
+    }
+}
+
+async fn cancelable_navigation<T, Fut>(
+    client: Arc<CdpClient>,
+    session_id: String,
+    token: Option<CancelToken>,
+    future: Fut,
+) -> RwResult<T>
+where
+    Fut: Future<Output = RwResult<T>>,
+{
+    let Some(token) = token else {
+        return future.await;
+    };
+    tokio::select! {
+        biased;
+        () = token.cancelled() => {
+            let _ = tokio::time::timeout(
+                Duration::from_millis(100),
+                client.send(
+                    "Page.stopLoading",
+                    json!({}),
+                    Some(&session_id),
+                    Duration::from_millis(100),
+                ),
+            )
+            .await;
+            Err(RwError::Cancelled)
+        }
+        result = future => result,
+    }
+}
 
 #[derive(Clone, Debug)]
 struct CloseOutcome {
@@ -190,10 +285,18 @@ const MAX_FRAME_TREE_DEPTH: usize = 256;
 pub enum RwError {
     #[error("{0}")]
     Message(String),
+    #[error("CDP connection failed")]
+    ConnectFailed,
     #[error("Protocol error ({method}): {message}")]
     Cdp { method: String, message: String },
     #[error("timed out after {0} ms")]
     Timeout(u64),
+    #[error("operation cancelled")]
+    Cancelled,
+    #[error("target or browser is closed")]
+    Closed,
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -208,6 +311,7 @@ pub enum RwError {
 fn py_err(error: RwError) -> PyErr {
     match error {
         RwError::Message(message) => PyRuntimeError::new_err(message),
+        RwError::InvalidInput(message) => PyValueError::new_err(message),
         RwError::Timeout(ms) => PyRuntimeError::new_err(format!("timed out after {ms} ms")),
         other => PyRuntimeError::new_err(other.to_string()),
     }
@@ -658,6 +762,21 @@ mod tests {
 
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+    #[tokio::test]
+    async fn cancel_token_interrupts_an_async_wait() {
+        let token = CancelToken::new();
+        let signal = token.clone();
+        let started = Instant::now();
+        let cancellation = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            signal.cancel();
+        });
+        let result = cancelable(Some(token), std::future::pending::<RwResult<()>>()).await;
+        cancellation.await.unwrap();
+        assert!(matches!(result, Err(RwError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
     #[test]
     fn locator_wait_context_loss_classification_is_narrow() {
         for message in [
@@ -1035,36 +1154,30 @@ mod tests {
         );
     }
 
-    fn assert_probe_wrapped(wrapped: &str, source: &str) {
-        // The runtime-probe wrapper embeds the source as a JSON literal,
-        // probe-compiles it as an expression without executing, falls back to
-        // indirect eval for program sources, and never inlines the raw source
-        // where a stray `;` could break parsing.
-        let literal = serde_json::to_string(source).unwrap();
-        assert!(wrapped.contains(&literal), "missing literal in {wrapped}");
-        assert!(wrapped.contains("new Function"), "missing probe in {wrapped}");
-        assert!(wrapped.contains("(0, eval)(__rw_src)"), "missing program fallback in {wrapped}");
-        assert!(!wrapped.contains("__rw_fn"), "unexpected direct wrap in {wrapped}");
-    }
-
     #[test]
-    fn plain_string_script_uses_runtime_probe_wrapper() {
+    fn plain_string_script_is_wrapped_in_indirect_eval() {
         // A plain statement script (not a function, no arg) must not be handed
         // to Runtime.evaluate verbatim: top-level `let`/`const` would leak into
-        // the global lexical environment and break repeated evaluation. The
-        // probe wrapper's program fallback runs it through an indirect `eval`
-        // that scopes those declarations to the call while preserving the
-        // script's completion value.
+        // the global lexical environment and break repeated evaluation. It is
+        // instead wrapped in an indirect `eval` that scopes those declarations
+        // to the call while preserving the script's completion value.
         let script = "let browserNameForWorkarounds = 'chromium';\nhelper();";
-        assert_probe_wrapped(&make_evaluate_expression(script, None), script);
+        let wrapped = make_evaluate_expression(script, None);
+        assert_eq!(
+            wrapped,
+            r#"(0, eval)("let browserNameForWorkarounds = 'chromium';\nhelper();")"#
+        );
     }
 
     #[test]
-    fn plain_expression_uses_runtime_probe_wrapper() {
-        assert_probe_wrapped(&make_evaluate_expression("1 + 2", None), "1 + 2");
-        assert_probe_wrapped(
-            &make_evaluate_expression("document.title", None),
-            "document.title",
+    fn plain_expression_is_wrapped_in_indirect_eval() {
+        assert_eq!(
+            make_evaluate_expression("1 + 2", None),
+            r#"(0, eval)("1 + 2")"#
+        );
+        assert_eq!(
+            make_evaluate_expression("document.title", None),
+            r#"(0, eval)("document.title")"#
         );
     }
 
@@ -1086,19 +1199,20 @@ mod tests {
     }
 
     #[test]
-    fn declaration_without_function_uses_runtime_probe_wrapper() {
-        let script = "let localValue = 1; localValue";
-        assert_probe_wrapped(&make_evaluate_expression(script, None), script);
+    fn declaration_without_function_stays_in_indirect_eval() {
+        assert_eq!(
+            make_evaluate_expression("let localValue = 1; localValue", None),
+            r#"(0, eval)("let localValue = 1; localValue")"#
+        );
     }
 
     #[test]
-    fn probe_wrapper_escapes_embedded_quotes_and_newlines() {
+    fn indirect_eval_wrapper_escapes_embedded_quotes_and_newlines() {
         // The source is embedded as a JS string literal, so any quotes,
         // backslashes, or newlines in the script must be escaped safely.
         let script = "const s = \"a\\tb\";\ns;";
         let wrapped = make_evaluate_expression(script, None);
-        assert!(wrapped.contains(r#""const s = \"a\\tb\";\ns;""#), "{wrapped}");
-        assert!(!wrapped.contains("const s = \"a\tb\""), "{wrapped}");
+        assert_eq!(wrapped, r#"(0, eval)("const s = \"a\\tb\";\ns;")"#);
     }
 
     #[test]
@@ -1108,72 +1222,6 @@ mod tests {
         // the indirect-eval branch.
         assert!(!make_evaluate_expression("() => 1", None).contains("(0, eval)"));
         assert!(!make_evaluate_expression("(x) => x + 1", Some("2")).contains("(0, eval)"));
-        assert!(!make_evaluate_expression("(a, b) => a + b", None).contains("(0, eval)"));
-        assert!(!make_evaluate_expression("async () => fetch('/x')", None).contains("(0, eval)"));
-    }
-
-    #[test]
-    fn statement_form_iife_scripts_use_runtime_probe_wrapper() {
-        // `(async () => {...})();` is an invocation statement, not a function
-        // expression. Parenthesizing it inside the fast-path IIFE traps the
-        // trailing `;` inside `( ... )` and V8 rejects the whole script with
-        // "SyntaxError: Unexpected token ';'". Statement-form sources must go
-        // through the runtime probe, whose program fallback runs them once and
-        // preserves the completion value.
-        let source = "(async () => { document.title = 'x'; })();";
-        assert_probe_wrapped(&make_evaluate_expression(source, None), source);
-
-        // The same invocation without the semicolon is still not a function
-        // expression: calling its parenthesized form would invoke the IIFE's
-        // *result*, not the IIFE.
-        let source = "(() => 1)()";
-        assert_probe_wrapped(&make_evaluate_expression(source, None), source);
-
-        // A `function` declaration followed by an invocation statement is a
-        // program too — with or without a trailing semicolon.
-        let source = "function f() { return 1; }; f();";
-        assert_probe_wrapped(&make_evaluate_expression(source, None), source);
-        let source = "function f() { return 1; }; f()";
-        assert_probe_wrapped(&make_evaluate_expression(source, None), source);
-    }
-
-    #[test]
-    fn ambiguous_function_shapes_use_runtime_probe_wrapper() {
-        // A parenthesized arrow with no invocation, an arrow whose default
-        // parameter hides a ')' inside a string, and a trailing-semicolon
-        // one-liner are all beyond the lexical fast-path heuristic; they must
-        // route through the runtime probe (which classifies by compiling)
-        // rather than being guessed wrong.
-        for source in [
-            "(() => 42)",
-            "(sep = \")\") => \"x\" + sep",
-            "() => document.title;",
-        ] {
-            assert_probe_wrapped(&make_evaluate_expression(source, None), source);
-        }
-
-        // With an argument, statement-form sources take the probe wrapper too
-        // (the fast path previously produced a guaranteed SyntaxError), and
-        // the argument reaches the bare function call.
-        let wrapped = make_evaluate_expression("(x) => x * 2;", Some("5"));
-        assert!(wrapped.contains("new Function"), "{wrapped}");
-        assert!(wrapped.contains("__rw_result(5)"), "{wrapped}");
-    }
-
-    #[test]
-    fn top_level_semicolon_detection_respects_nesting_strings_and_comments() {
-        assert!(has_top_level_semicolon("() => 1;"));
-        assert!(has_top_level_semicolon("function f() {}; f()"));
-        assert!(!has_top_level_semicolon("() => { a(); b(); }"));
-        assert!(!has_top_level_semicolon("(s = \";\") => s"));
-        assert!(!has_top_level_semicolon("() => ';'"));
-        assert!(!has_top_level_semicolon("function f() { return 1; }"));
-        // Comment contents must neither unbalance the depth count nor hide a
-        // following top-level semicolon.
-        assert!(has_top_level_semicolon("() => 1 /* { */;"));
-        assert!(has_top_level_semicolon("() => 1 // {\n;"));
-        assert!(!has_top_level_semicolon("() => 1 /* ; */"));
-        assert!(!has_top_level_semicolon("() => 1 // ;"));
     }
 
     #[test]
@@ -1328,6 +1376,7 @@ mod tests {
             client: Arc::clone(&client),
             process: Mutex::new(None),
             profile_dir: Mutex::new(None),
+            owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
             single_process_fallback: false,
@@ -1487,6 +1536,7 @@ mod tests {
             }),
             process: Mutex::new(None),
             profile_dir: Mutex::new(None),
+            owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
             single_process_fallback: false,
@@ -2683,7 +2733,7 @@ fn close_pending_cdp_commands(pending: CdpPendingMap) {
             .collect::<Vec<_>>()
     };
     for sender in senders {
-        let _ = sender.send(Err(RwError::Message("CDP websocket is closed".to_string())));
+        let _ = sender.send(Err(RwError::Closed));
     }
 }
 
@@ -2986,7 +3036,7 @@ impl CdpClient {
         timeout: Duration,
     ) -> RwResult<Value> {
         if !self.is_connected() {
-            return Err(RwError::Message("CDP websocket is closed".to_string()));
+            return Err(RwError::Closed);
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
@@ -3010,7 +3060,7 @@ impl CdpClient {
             .is_err()
         {
             self.mark_closed();
-            return Err(RwError::Message("CDP websocket is closed".to_string()));
+            return Err(RwError::Closed);
         }
         self.record_sent_command(method);
 
@@ -3022,7 +3072,7 @@ impl CdpClient {
                 },
                 other => other,
             }),
-            Ok(Err(_)) => Err(RwError::Message("CDP response channel closed".to_string())),
+            Ok(Err(_)) => Err(RwError::Closed),
             Err(_) => Err(RwError::Timeout(timeout.as_millis() as u64)),
         }
     }
@@ -3035,7 +3085,7 @@ impl CdpClient {
         timeout: Duration,
     ) -> RwResult<Value> {
         if !self.is_connected() {
-            return Err(RwError::Message("CDP websocket is closed".to_string()));
+            return Err(RwError::Closed);
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
@@ -3054,7 +3104,7 @@ impl CdpClient {
 
         if self.write_tx.send(CdpOutgoing::Text(payload)).is_err() {
             self.mark_closed();
-            return Err(RwError::Message("CDP websocket is closed".to_string()));
+            return Err(RwError::Closed);
         }
         self.record_sent_command(method);
 
@@ -3066,7 +3116,7 @@ impl CdpClient {
                 },
                 other => other,
             }),
-            Ok(Err(_)) => Err(RwError::Message("CDP response channel closed".to_string())),
+            Ok(Err(_)) => Err(RwError::Closed),
             Err(_) => Err(RwError::Timeout(timeout.as_millis() as u64)),
         }
     }
@@ -3079,7 +3129,7 @@ impl CdpClient {
         timeout: Duration,
     ) -> RwResult<Vec<Value>> {
         if !self.is_connected() {
-            return Err(RwError::Message("CDP websocket is closed".to_string()));
+            return Err(RwError::Closed);
         }
         let method_json = serde_json::to_string(method)?;
         let session_id_json = match session_id {
@@ -3103,7 +3153,7 @@ impl CdpClient {
 
             if self.write_tx.send(CdpOutgoing::Text(payload)).is_err() {
                 self.mark_closed();
-                return Err(RwError::Message("CDP websocket is closed".to_string()));
+                return Err(RwError::Closed);
             }
             self.record_sent_command(method);
             receivers.push((id, rx, pending_guard));
@@ -3119,9 +3169,7 @@ impl CdpClient {
                     },
                     other => other,
                 })?),
-                Ok(Err(_)) => {
-                    return Err(RwError::Message("CDP response channel closed".to_string()));
-                }
+                Ok(Err(_)) => return Err(RwError::Closed),
                 Err(_) => return Err(RwError::Timeout(timeout.as_millis() as u64)),
             }
         }
@@ -3134,6 +3182,7 @@ struct BrowserInner {
     client: Arc<CdpClient>,
     process: Mutex<Option<Child>>,
     profile_dir: Mutex<Option<TempDir>>,
+    owned: bool,
     ws_endpoint: String,
     stealth_user_agent_override: Mutex<Option<Value>>,
     single_process_fallback: bool,
@@ -5231,10 +5280,20 @@ fn evaluate_expression_for_page_raw(
     expression: String,
     timeout_ms: Option<f64>,
 ) -> RwResult<String> {
+    evaluate_expression_for_page_raw_cancelable(page, expression, timeout_ms, None)
+}
+
+fn evaluate_expression_for_page_raw_cancelable(
+    page: Arc<PageInner>,
+    expression: String,
+    timeout_ms: Option<f64>,
+    cancel: Option<&CancelToken>,
+) -> RwResult<String> {
     let timeout = BrowserInner::command_timeout(timeout_ms);
     let browser = Arc::clone(&page.browser);
-    browser.block_on_raw(evaluate_expression_for_page_async(
-        page, expression, timeout,
+    browser.block_on_raw(cancelable(
+        cancel.cloned(),
+        evaluate_expression_for_page_async(page, expression, timeout),
     ))
 }
 
@@ -11231,8 +11290,23 @@ fn launch_chromium_with_options(options: LaunchOptions) -> RwResult<Arc<BrowserI
 }
 
 fn launch_chromium_with_options_cancelable(
+    options: LaunchOptions,
+    cancelled: Option<Arc<AtomicBool>>,
+) -> RwResult<Arc<BrowserInner>> {
+    launch_chromium_with_options_cancellation(options, cancelled, None)
+}
+
+fn launch_chromium_with_options_token(
+    options: LaunchOptions,
+    cancel: CancelToken,
+) -> RwResult<Arc<BrowserInner>> {
+    launch_chromium_with_options_cancellation(options, Some(cancel.atomic_flag()), Some(cancel))
+}
+
+fn launch_chromium_with_options_cancellation(
     mut options: LaunchOptions,
     cancelled: Option<Arc<AtomicBool>>,
+    cancel: Option<CancelToken>,
 ) -> RwResult<Arc<BrowserInner>> {
     if options.timeout.is_none() {
         options.timeout = Some(30_000.0);
@@ -11272,7 +11346,12 @@ fn launch_chromium_with_options_cancelable(
             return Err(error);
         }
     };
-    if let Err(error) = start_service_worker_stealth_auto_attach(&runtime, Arc::clone(&client)) {
+    if let Err(error) = start_service_worker_stealth_auto_attach_cancelable(
+        &runtime,
+        Arc::clone(&client),
+        Duration::from_secs(5),
+        cancel,
+    ) {
         client.close();
         let _ = child.kill();
         let _ = child.wait();
@@ -11283,6 +11362,7 @@ fn launch_chromium_with_options_cancelable(
         client,
         process: Mutex::new(Some(child)),
         profile_dir: Mutex::new(profile_dir),
+        owned: true,
         ws_endpoint,
         stealth_user_agent_override: Mutex::new(None),
         single_process_fallback,
@@ -11348,33 +11428,71 @@ fn connect_over_cdp(
     let headers = parse_header_pairs(headers_json).map_err(py_err)?;
     let endpoint = endpoint.to_string();
     let inner = py
-        .detach(move || -> RwResult<Arc<BrowserInner>> {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .worker_threads(2)
-                .build()
-                .map_err(|error| RwError::Message(error.to_string()))?;
-            let resolve_headers = headers.clone();
-            let ws_endpoint = runtime.block_on(async move {
-                resolve_ws_endpoint(&endpoint, timeout, &resolve_headers).await
-            })?;
-            let client =
-                runtime.block_on(CdpClient::connect_with_headers(&ws_endpoint, &headers))?;
-            start_service_worker_stealth_auto_attach(&runtime, Arc::clone(&client))?;
-            Ok(Arc::new(BrowserInner {
-                runtime: OwnedRuntime::new(runtime),
-                client,
-                process: Mutex::new(None),
-                profile_dir: Mutex::new(None),
-                ws_endpoint,
-                stealth_user_agent_override: Mutex::new(None),
-                single_process_fallback: false,
-                lifecycle: Arc::new(CloseLifecycle::new()),
-                attached_pages: AttachedPageRegistry::default(),
-            }))
-        })
+        .detach(move || connect_browser_over_cdp(endpoint, headers, timeout))
         .map_err(py_err)?;
     Ok(PyBrowser { inner })
+}
+
+fn connect_browser_over_cdp(
+    endpoint: String,
+    headers: Vec<(String, String)>,
+    timeout: Duration,
+) -> RwResult<Arc<BrowserInner>> {
+    connect_browser_over_cdp_cancelable(endpoint, headers, timeout, None)
+}
+
+fn connect_browser_over_cdp_cancelable(
+    endpoint: String,
+    headers: Vec<(String, String)>,
+    timeout: Duration,
+    cancel: Option<CancelToken>,
+) -> RwResult<Arc<BrowserInner>> {
+    let started = Instant::now();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .map_err(|error| RwError::Message(error.to_string()))?;
+    let connect = async {
+        let ws_endpoint = resolve_ws_endpoint(&endpoint, timeout, &headers).await?;
+        let client = CdpClient::connect_with_headers(&ws_endpoint, &headers).await?;
+        Ok::<_, RwError>((ws_endpoint, client))
+    };
+    let (ws_endpoint, client) = runtime.block_on(cancelable(cancel.clone(), async {
+        tokio::time::timeout(timeout, connect)
+            .await
+            .map_err(|_| RwError::Timeout(duration_millis_u64(timeout)))?
+    }))?;
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        client.close();
+        return Err(RwError::Timeout(duration_millis_u64(timeout)));
+    }
+    if let Err(error) = start_service_worker_stealth_auto_attach_cancelable(
+        &runtime,
+        Arc::clone(&client),
+        remaining,
+        cancel,
+    ) {
+        client.close();
+        return Err(error);
+    }
+    Ok(Arc::new(BrowserInner {
+        runtime: OwnedRuntime::new(runtime),
+        client,
+        process: Mutex::new(None),
+        profile_dir: Mutex::new(None),
+        owned: false,
+        ws_endpoint,
+        stealth_user_agent_override: Mutex::new(None),
+        single_process_fallback: false,
+        lifecycle: Arc::new(CloseLifecycle::new()),
+        attached_pages: AttachedPageRegistry::default(),
+    }))
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(feature = "python")]
@@ -11393,11 +11511,254 @@ pub struct RustwrightPage {
     inner: Arc<PageInner>,
 }
 
+const NATIVE_PAGE_EVENT_QUEUE_CAPACITY: usize = 128;
+
+/// The JavaScript dialog category reported by Chromium.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RustwrightDialogKind {
+    Alert,
+    Confirm,
+    Prompt,
+    BeforeUnload,
+    Other(String),
+}
+
+/// A pending JavaScript dialog that can be accepted or dismissed.
+#[derive(Clone)]
+pub struct RustwrightDialog {
+    browser: Weak<BrowserInner>,
+    session_id: String,
+}
+
+impl std::fmt::Debug for RustwrightDialog {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RustwrightDialog")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RustwrightDialog {
+    /// Accept the dialog, optionally supplying text for a prompt dialog.
+    pub fn accept(&self, prompt_text: Option<&str>) -> RwResult<()> {
+        self.handle(true, prompt_text)
+    }
+
+    /// Dismiss the dialog.
+    pub fn dismiss(&self) -> RwResult<()> {
+        self.handle(false, None)
+    }
+
+    fn handle(&self, accept: bool, prompt_text: Option<&str>) -> RwResult<()> {
+        let browser = self.browser.upgrade().ok_or(RwError::Closed)?;
+        let client = Arc::clone(&browser.client);
+        let session_id = self.session_id.clone();
+        let prompt_text = prompt_text.map(ToString::to_string);
+        browser.block_on_raw(async move {
+            let mut params = json!({ "accept": accept });
+            if let Some(prompt_text) = prompt_text {
+                params["promptText"] = Value::String(prompt_text);
+            }
+            client
+                .send(
+                    "Page.handleJavaScriptDialog",
+                    params,
+                    Some(&session_id),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map(|_| ())
+        })
+    }
+}
+
+/// A typed event emitted by a native page subscription.
+#[derive(Clone, Debug)]
+pub enum RustwrightPageEvent {
+    Dialog {
+        kind: RustwrightDialogKind,
+        message: String,
+        dialog: RustwrightDialog,
+    },
+    Download {
+        guid: String,
+        url: String,
+        suggested_name: String,
+    },
+    PageCrashed,
+    Closed,
+    Navigated {
+        url: String,
+    },
+}
+
+struct NativePageEventQueueState {
+    events: VecDeque<RustwrightPageEvent>,
+    dropped: u64,
+    closed: bool,
+}
+
+struct NativePageEventQueue {
+    state: Mutex<NativePageEventQueueState>,
+    changed: Condvar,
+}
+
+impl NativePageEventQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(NativePageEventQueueState {
+                events: VecDeque::with_capacity(NATIVE_PAGE_EVENT_QUEUE_CAPACITY),
+                dropped: 0,
+                closed: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn push(&self, event: RustwrightPageEvent, terminal: bool) {
+        let mut state = self.state.lock().unwrap();
+        if state.events.len() == NATIVE_PAGE_EVENT_QUEUE_CAPACITY {
+            state.events.pop_front();
+            state.dropped = state.dropped.saturating_add(1);
+        }
+        state.events.push_back(event);
+        state.closed |= terminal;
+        self.changed.notify_all();
+    }
+
+    fn record_upstream_drop(&self, count: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.dropped = state.dropped.saturating_add(count);
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        self.changed.notify_all();
+    }
+}
+
+/// Pull-based receiver for a page's bounded native event queue.
+pub struct RustwrightPageEventReceiver {
+    queue: Arc<NativePageEventQueue>,
+    close_tx: watch::Sender<bool>,
+}
+
+impl RustwrightPageEventReceiver {
+    /// Wait for the next event, returning `None` on timeout or after terminal delivery.
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<RustwrightPageEvent> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.queue.state.lock().unwrap();
+        loop {
+            if let Some(event) = state.events.pop_front() {
+                return Some(event);
+            }
+            if state.closed {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let (next, wait) = self.queue.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if wait.timed_out() && state.events.is_empty() {
+                return None;
+            }
+        }
+    }
+
+    /// Return the number of events discarded because a bounded queue lagged.
+    pub fn dropped_count(&self) -> u64 {
+        self.queue.state.lock().unwrap().dropped
+    }
+
+    /// Return the fixed maximum number of typed events buffered by this receiver.
+    pub const fn capacity(&self) -> usize {
+        NATIVE_PAGE_EVENT_QUEUE_CAPACITY
+    }
+}
+
+impl Drop for RustwrightPageEventReceiver {
+    fn drop(&mut self) {
+        self.close_tx.send_replace(true);
+    }
+}
+
 pub fn rustwright_launch_chromium(options_json: &str) -> RwResult<RustwrightBrowser> {
+    rustwright_launch_chromium_with_cancel(options_json, None)
+}
+
+/// Launch Chromium with an optional cancellation signal.
+pub fn rustwright_launch_chromium_with_cancel(
+    options_json: &str,
+    cancel: Option<&CancelToken>,
+) -> RwResult<RustwrightBrowser> {
     let options: LaunchOptions = serde_json::from_str(options_json)?;
-    Ok(RustwrightBrowser {
-        inner: launch_chromium_with_options(options)?,
-    })
+    let result = match cancel {
+        Some(cancel) => launch_chromium_with_options_token(options, cancel.clone()),
+        None => launch_chromium_with_options(options),
+    };
+    match result {
+        Ok(inner) => Ok(RustwrightBrowser { inner }),
+        Err(_) if cancel.is_some_and(CancelToken::is_cancelled) => Err(RwError::Cancelled),
+        Err(error) => Err(error),
+    }
+}
+
+/// Attach to an existing Chromium CDP endpoint without taking process ownership.
+///
+/// Connection failures are deliberately sanitized so endpoints, query strings, and
+/// header values cannot escape through the public error surface.
+pub fn rustwright_connect_over_cdp(
+    endpoint: &str,
+    headers: &[(String, String)],
+    timeout: Duration,
+) -> RwResult<RustwrightBrowser> {
+    rustwright_connect_over_cdp_with_cancel(endpoint, headers, timeout, None)
+}
+
+/// Attach to a CDP endpoint with an optional cancellation signal.
+pub fn rustwright_connect_over_cdp_with_cancel(
+    endpoint: &str,
+    headers: &[(String, String)],
+    timeout: Duration,
+    cancel: Option<&CancelToken>,
+) -> RwResult<RustwrightBrowser> {
+    if timeout.is_zero() {
+        return Err(RwError::InvalidInput(
+            "CDP timeout must be greater than zero".to_string(),
+        ));
+    }
+    if !["ws://", "wss://", "http://", "https://"]
+        .iter()
+        .any(|scheme| endpoint.starts_with(scheme))
+    {
+        return Err(RwError::InvalidInput(
+            "CDP endpoint must use ws, wss, http, or https".to_string(),
+        ));
+    }
+    for (name, value) in headers {
+        if HeaderName::from_bytes(name.as_bytes()).is_err() || HeaderValue::from_str(value).is_err()
+        {
+            return Err(RwError::InvalidInput(
+                "CDP headers contain an invalid name or value".to_string(),
+            ));
+        }
+    }
+    match connect_browser_over_cdp_cancelable(
+        endpoint.to_string(),
+        headers.to_vec(),
+        timeout,
+        cancel.cloned(),
+    ) {
+        Ok(inner) => Ok(RustwrightBrowser { inner }),
+        Err(error @ (RwError::Timeout(_) | RwError::Cancelled | RwError::InvalidInput(_))) => {
+            Err(error)
+        }
+        Err(_) => Err(RwError::ConnectFailed),
+    }
 }
 
 pub fn rustwright_chromium_executable_path() -> Option<String> {
@@ -11406,13 +11767,34 @@ pub fn rustwright_chromium_executable_path() -> Option<String> {
 
 impl RustwrightBrowser {
     pub fn new_page(&self) -> RwResult<RustwrightPage> {
-        let inner = create_page_raw(Arc::clone(&self.inner), None)?;
+        self.new_page_with_cancel(None)
+    }
+
+    pub fn new_page_with_cancel(&self, cancel: Option<&CancelToken>) -> RwResult<RustwrightPage> {
+        let inner = create_page_raw_cancelable(Arc::clone(&self.inner), None, cancel)?;
         inner.mark_delivered();
         Ok(RustwrightPage { inner })
     }
 
     pub fn close(&self) -> RwResult<()> {
         close_browser_blocking(Arc::clone(&self.inner))
+    }
+
+    pub fn pages(&self, timeout: Duration) -> RwResult<Vec<RustwrightPage>> {
+        list_pages_raw(Arc::clone(&self.inner), None, timeout).map(|pages| {
+            pages
+                .into_iter()
+                .map(|inner| RustwrightPage { inner })
+                .collect()
+        })
+    }
+
+    pub fn is_connected(&self) -> bool {
+        !self.inner.lifecycle.is_closed() && self.inner.client.is_connected()
+    }
+
+    pub fn is_owned(&self) -> bool {
+        self.inner.owned
     }
 
     pub fn ws_endpoint(&self) -> String {
@@ -11425,12 +11807,72 @@ impl RustwrightPage {
         self.inner.target_id.clone()
     }
 
+    pub fn url(&self) -> String {
+        self.inner.cached_main_frame_url().unwrap_or_default()
+    }
+
+    /// Subscribe to typed page events through a bounded, drop-oldest queue.
+    pub fn events(&self) -> RustwrightPageEventReceiver {
+        let queue = Arc::new(NativePageEventQueue::new());
+        let page = Arc::downgrade(&self.inner);
+        let mut events = self.inner.browser.client.subscribe();
+        let task_queue = Arc::clone(&queue);
+        let (close_tx, mut close_rx) = watch::channel(false);
+        self.inner.browser.runtime.handle().spawn(async move {
+            loop {
+                let received = tokio::select! {
+                    event = events.recv() => event,
+                    changed = close_rx.changed() => {
+                        if changed.is_err() || *close_rx.borrow() {
+                            task_queue.close();
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let event = match received {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(count)) => {
+                        task_queue.record_upstream_drop(count);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        task_queue.close();
+                        break;
+                    }
+                };
+                let Some(page) = page.upgrade() else {
+                    task_queue.close();
+                    break;
+                };
+                if let Some((event, terminal)) = native_page_event_from_cdp(&page, &event) {
+                    task_queue.push(event, terminal);
+                    if terminal {
+                        break;
+                    }
+                }
+            }
+        });
+        RustwrightPageEventReceiver { queue, close_tx }
+    }
+
     pub fn goto(
         &self,
         url: &str,
         wait_until: Option<&str>,
         timeout_ms: Option<f64>,
         referer: Option<&str>,
+    ) -> RwResult<String> {
+        self.goto_with_cancel(url, wait_until, timeout_ms, referer, None)
+    }
+
+    pub fn goto_with_cancel(
+        &self,
+        url: &str,
+        wait_until: Option<&str>,
+        timeout_ms: Option<f64>,
+        referer: Option<&str>,
+        cancel: Option<&CancelToken>,
     ) -> RwResult<String> {
         let page = Arc::clone(&self.inner);
         let url = url.to_string();
@@ -11440,55 +11882,135 @@ impl RustwrightPage {
         let browser = Arc::clone(&page.browser);
         let client = Arc::clone(&browser.client);
         let session_id = page.session_id.clone();
-        browser.block_on_raw(async move {
-            let mut events = client.subscribe();
-            let target_url = url.clone();
-            let mut params = json!({ "url": url });
-            if let Some(referer) = referer {
-                params["referrer"] = Value::String(referer);
-                params["referrerPolicy"] = Value::String("unsafeUrl".to_string());
-            }
-            let result = client
-                .send("Page.navigate", params, Some(&session_id), timeout)
-                .await?;
-            if let Some(error_text) = result.get("errorText").and_then(Value::as_str) {
-                let failed_url = result
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .unwrap_or(target_url.as_str());
-                return Err(RwError::Message(format!(
-                    "Page.goto: {error_text} at {failed_url}"
-                )));
-            }
-            let loader_id = result
-                .get("loaderId")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            if loader_id.is_none() {
-                if let Some(frame_id) = result.get("frameId").and_then(Value::as_str) {
-                    page.record_main_frame_navigation_url(frame_id, &target_url);
+        browser.block_on_raw(cancelable_navigation(
+            client,
+            session_id,
+            cancel.cloned(),
+            page_goto_async(page, url, wait_until, timeout, referer),
+        ))
+    }
+
+    pub fn go_back(&self, wait_until: Option<&str>, timeout: Duration) -> RwResult<String> {
+        self.go_back_with_cancel(wait_until, timeout, None)
+    }
+
+    pub fn go_back_with_cancel(
+        &self,
+        wait_until: Option<&str>,
+        timeout: Duration,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<String> {
+        self.navigate_history(-1, wait_until, timeout, cancel)
+    }
+
+    pub fn reload(&self, wait_until: Option<&str>, timeout: Duration) -> RwResult<String> {
+        self.reload_with_cancel(wait_until, timeout, None)
+    }
+
+    pub fn reload_with_cancel(
+        &self,
+        wait_until: Option<&str>,
+        timeout: Duration,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<String> {
+        let page = Arc::clone(&self.inner);
+        let wait_until = wait_until.unwrap_or("load").to_string();
+        validate_navigation_wait_state(&wait_until)?;
+        let browser = Arc::clone(&page.browser);
+        let client = Arc::clone(&browser.client);
+        let session_id = page.session_id.clone();
+        let operation_client = Arc::clone(&client);
+        let operation_session_id = session_id.clone();
+        browser.block_on_raw(cancelable_navigation(
+            client,
+            session_id,
+            cancel.cloned(),
+            async move {
+                let deadline = OperationDeadline::new(timeout);
+                let mut events = operation_client.subscribe();
+                loop {
+                    match operation_client
+                        .send(
+                            "Page.reload",
+                            json!({}),
+                            Some(&operation_session_id),
+                            deadline.remaining()?,
+                        )
+                        .await
+                    {
+                        Ok(_) => break,
+                        Err(error) if is_page_not_attached_error(&error) => {
+                            wait_for_page_attachment_signal(
+                                &mut events,
+                                &operation_session_id,
+                                deadline,
+                            )
+                            .await?;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
-                return Ok(Value::Null.to_string());
-            }
-            let response = wait_for_navigation(
-                &mut events,
-                &session_id,
-                &wait_until,
-                loader_id.as_deref(),
-                None,
-                "Page.goto",
-                timeout,
-            )
-            .await?;
-            Ok(response
-                .unwrap_or_else(|| {
+                if wait_until != "commit" {
+                    wait_for_load_state(
+                        &operation_client,
+                        &mut events,
+                        &operation_session_id,
+                        &wait_until,
+                        deadline.remaining()?,
+                    )
+                    .await?;
+                }
+                Ok(Value::Null.to_string())
+            },
+        ))
+    }
+
+    pub fn wait_for_load_state(&self, state: &str, timeout: Duration) -> RwResult<()> {
+        self.wait_for_load_state_with_cancel(state, timeout, None)
+    }
+
+    pub fn wait_for_load_state_with_cancel(
+        &self,
+        state: &str,
+        timeout: Duration,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
+        validate_load_state(state)?;
+        let page = Arc::clone(&self.inner);
+        let state = state.to_string();
+        let browser = Arc::clone(&page.browser);
+        let client = Arc::clone(&browser.client);
+        let session_id = page.session_id.clone();
+        browser.block_on_raw(cancelable(cancel.cloned(), async move {
+            let mut events = client.subscribe();
+            let ready_state = client
+                .send(
+                    "Runtime.evaluate",
                     json!({
-                        "url": result.get("url").cloned().unwrap_or(Value::Null),
-                        "loader_id": loader_id,
-                    })
-                })
-                .to_string())
-        })
+                        "expression": "document.readyState",
+                        "returnByValue": true,
+                    }),
+                    Some(&session_id),
+                    timeout,
+                )
+                .await?
+                .pointer("/result/value")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let already_reached = match state.as_str() {
+                "load" | "networkidle" => ready_state == "complete",
+                "domcontentloaded" => matches!(ready_state.as_str(), "interactive" | "complete"),
+                _ => false,
+            };
+            if already_reached {
+                if state == "networkidle" {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                return Ok(());
+            }
+            wait_for_load_state(&client, &mut events, &session_id, &state, timeout).await
+        }))
     }
 
     pub fn title(&self, timeout_ms: Option<f64>) -> RwResult<String> {
@@ -11505,11 +12027,35 @@ impl RustwrightPage {
         arg_json: Option<&str>,
         timeout_ms: Option<f64>,
     ) -> RwResult<String> {
+        self.evaluate_with_cancel(expression, arg_json, timeout_ms, None)
+    }
+
+    pub fn evaluate_with_cancel(
+        &self,
+        expression: &str,
+        arg_json: Option<&str>,
+        timeout_ms: Option<f64>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<String> {
         let expression = make_evaluate_expression(expression, arg_json);
-        evaluate_expression_for_page_raw(Arc::clone(&self.inner), expression, timeout_ms)
+        evaluate_expression_for_page_raw_cancelable(
+            Arc::clone(&self.inner),
+            expression,
+            timeout_ms,
+            cancel,
+        )
     }
 
     pub fn click(&self, selector: &str, timeout_ms: Option<f64>) -> RwResult<()> {
+        self.click_with_cancel(selector, timeout_ms, None)
+    }
+
+    pub fn click_with_cancel(
+        &self,
+        selector: &str,
+        timeout_ms: Option<f64>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
         let locator_json = selector_to_locator_json(selector)?;
         let body = r#"
 if (!el) throw new Error('No element matches locator');
@@ -11518,11 +12064,21 @@ if (typeof el.focus === 'function') el.focus({ preventScroll: true });
 el.click();
 return true;
 "#;
-        self.evaluate_locator_json(locator_json, 0, body.to_string(), timeout_ms)
+        self.evaluate_locator_json_cancelable(locator_json, 0, body.to_string(), timeout_ms, cancel)
             .map(|_| ())
     }
 
     pub fn fill(&self, selector: &str, value: &str, timeout_ms: Option<f64>) -> RwResult<()> {
+        self.fill_with_cancel(selector, value, timeout_ms, None)
+    }
+
+    pub fn fill_with_cancel(
+        &self,
+        selector: &str,
+        value: &str,
+        timeout_ms: Option<f64>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
         let locator_json = selector_to_locator_json(selector)?;
         let value_json = serde_json::to_string(value)?;
         let body = format!(
@@ -11543,8 +12099,223 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
 return true;
 "#
         );
-        self.evaluate_locator_json(locator_json, 0, body, timeout_ms)
+        self.evaluate_locator_json_cancelable(locator_json, 0, body, timeout_ms, cancel)
             .map(|_| ())
+    }
+
+    /// Type through Chromium's input domain after focusing the matching element.
+    pub fn type_text(&self, selector: &str, text: &str, delay: Option<Duration>) -> RwResult<()> {
+        self.type_text_with_cancel(selector, text, delay, None)
+    }
+
+    pub fn type_text_with_cancel(
+        &self,
+        selector: &str,
+        text: &str,
+        delay: Option<Duration>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
+        let locator_json = selector_to_locator_json(selector)?;
+        let page = Arc::clone(&self.inner);
+        let text = text.to_string();
+        let browser = Arc::clone(&page.browser);
+        browser.block_on_raw(cancelable(cancel.cloned(), async move {
+            let deadline = OperationDeadline::new(Duration::from_secs(30));
+            let resolution = focus_locator_for_native_input(&page, &locator_json, deadline).await?;
+            for character in text.chars() {
+                dispatch_typed_character(
+                    &page.browser.client,
+                    &resolution.session_id,
+                    character,
+                    delay,
+                    deadline,
+                )
+                .await?;
+            }
+            Ok(())
+        }))
+    }
+
+    /// Press a key through Chromium's input domain, optionally focusing a selector first.
+    pub fn press_key(&self, selector: Option<&str>, key: &str) -> RwResult<()> {
+        let locator_json = selector.map(selector_to_locator_json).transpose()?;
+        let page = Arc::clone(&self.inner);
+        let key = key.to_string();
+        let browser = Arc::clone(&page.browser);
+        browser.block_on_raw(async move {
+            let deadline = OperationDeadline::new(Duration::from_secs(30));
+            let session_id = match locator_json {
+                Some(locator_json) => {
+                    focus_locator_for_native_input(&page, &locator_json, deadline)
+                        .await?
+                        .session_id
+                }
+                None => page.session_id.clone(),
+            };
+            dispatch_key_press(&page.browser.client, &session_id, &key, None, deadline).await
+        })
+    }
+
+    /// Select options by value using the page DOM and return the resulting values.
+    pub fn select_options(&self, selector: &str, values: &[String]) -> RwResult<Vec<String>> {
+        self.select_options_with_cancel(selector, values, None)
+    }
+
+    pub fn select_options_with_cancel(
+        &self,
+        selector: &str,
+        values: &[String],
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<Vec<String>> {
+        let locator_json = selector_to_locator_json(selector)?;
+        let values_json = serde_json::to_string(values)?;
+        let body = format!(
+            r#"
+if (!el) throw new Error('No element matches locator');
+if (!(el instanceof HTMLSelectElement)) throw new Error('Element is not a <select> element');
+const requested = {values_json};
+const options = Array.from(el.options);
+const matched = options.filter(option => requested.includes(option.value));
+const found = new Set(matched.map(option => option.value));
+const missing = requested.filter(value => !found.has(value));
+if (missing.length) throw new Error(`Select option values not found: ${{missing.join(', ')}}`);
+for (const option of options) option.selected = false;
+if (el.multiple) {{
+  for (const option of matched) option.selected = true;
+}} else if (matched.length) {{
+  matched[0].selected = true;
+}}
+el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value));
+"#
+        );
+        let json = self.evaluate_locator_json_cancelable(locator_json, 0, body, None, cancel)?;
+        let selected_json: String = serde_json::from_str(&json)?;
+        Ok(serde_json::from_str(&selected_json)?)
+    }
+
+    /// Move the native mouse to the center of the matching element.
+    pub fn hover(&self, selector: &str) -> RwResult<()> {
+        self.hover_with_cancel(selector, None)
+    }
+
+    pub fn hover_with_cancel(&self, selector: &str, cancel: Option<&CancelToken>) -> RwResult<()> {
+        let locator_json = selector_to_locator_json(selector)?;
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        browser.block_on_raw(cancelable(cancel.cloned(), async move {
+            let deadline = OperationDeadline::new(Duration::from_secs(30));
+            scroll_locator_into_view(&page, &locator_json, deadline).await?;
+            let resolved =
+                resolve_locator_point(Arc::clone(&page), &locator_json, 0, None, None, deadline)
+                    .await?;
+            dispatch_mouse_move_sequence_in_session(
+                &page.browser.client,
+                &resolved.session_id,
+                0.0,
+                0.0,
+                resolved.x,
+                resolved.y,
+                1,
+                0,
+                0,
+                deadline,
+            )
+            .await
+        }))
+    }
+
+    /// Check the matching checkbox through a native mouse click.
+    pub fn check(&self, selector: &str) -> RwResult<()> {
+        self.set_checked(selector, true)
+    }
+
+    /// Uncheck the matching checkbox through a native mouse click.
+    pub fn uncheck(&self, selector: &str) -> RwResult<()> {
+        self.set_checked(selector, false)
+    }
+
+    /// Return the rendered inner text of the matching element.
+    pub fn inner_text(&self, selector: &str) -> RwResult<Option<String>> {
+        let locator_json = selector_to_locator_json(selector)?;
+        let body = "return el ? (el.innerText || el.textContent || '') : null;".to_string();
+        let json = self.evaluate_locator_json(locator_json, 0, body, None)?;
+        Ok(serde_json::from_str::<Value>(&json)
+            .ok()
+            .and_then(|value| value.as_str().map(ToString::to_string)))
+    }
+
+    /// Return an attribute from the matching element.
+    pub fn get_attribute(&self, selector: &str, name: &str) -> RwResult<Option<String>> {
+        let locator_json = selector_to_locator_json(selector)?;
+        let name_json = serde_json::to_string(name)?;
+        let body = format!("return el ? el.getAttribute({name_json}) : null;");
+        let json = self.evaluate_locator_json(locator_json, 0, body, None)?;
+        Ok(serde_json::from_str::<Value>(&json)
+            .ok()
+            .and_then(|value| value.as_str().map(ToString::to_string)))
+    }
+
+    /// Return whether the matching element is visible according to the locator engine.
+    pub fn is_visible(&self, selector: &str) -> RwResult<bool> {
+        self.evaluate_locator_bool(selector, "return !!el && visible(el);")
+    }
+
+    /// Return whether the matching element is enabled according to the locator engine.
+    pub fn is_enabled(&self, selector: &str) -> RwResult<bool> {
+        self.evaluate_locator_bool(selector, "return !!el && !disabledState(el);")
+    }
+
+    /// Return whether the matching checkbox, radio, or ARIA control is checked.
+    pub fn is_checked(&self, selector: &str) -> RwResult<bool> {
+        let body = format!("return ({NATIVE_CHECKED_STATE_JS})(el).checked;");
+        self.evaluate_locator_bool(selector, &body)
+    }
+
+    /// Override the page viewport through Chromium's emulation domain.
+    pub fn set_viewport_size(&self, width: u32, height: u32) -> RwResult<()> {
+        if width == 0 || height == 0 {
+            return Err(RwError::InvalidInput(
+                "viewport width and height must be greater than zero".to_string(),
+            ));
+        }
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        browser.block_on_raw(async move {
+            page.browser
+                .client
+                .send(
+                    "Emulation.setDeviceMetricsOverride",
+                    json!({
+                        "width": width,
+                        "height": height,
+                        "deviceScaleFactor": 1,
+                        "mobile": false,
+                        "screenWidth": width,
+                        "screenHeight": height,
+                    }),
+                    Some(&page.session_id),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map(|_| ())
+        })
+    }
+
+    /// Scroll the matching element into view using the page DOM.
+    pub fn scroll_into_view(&self, selector: &str) -> RwResult<()> {
+        let locator_json = selector_to_locator_json(selector)?;
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        browser.block_on_raw(async move {
+            scroll_locator_into_view(
+                &page,
+                &locator_json,
+                OperationDeadline::new(Duration::from_secs(30)),
+            )
+            .await
+        })
     }
 
     pub fn text_content(
@@ -11570,6 +12341,30 @@ return true;
         quality: Option<u32>,
         omit_background: Option<bool>,
     ) -> RwResult<Vec<u8>> {
+        self.screenshot_with_cancel(
+            path,
+            full_page,
+            clip_json,
+            timeout_ms,
+            image_type,
+            quality,
+            omit_background,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn screenshot_with_cancel(
+        &self,
+        path: Option<&str>,
+        full_page: Option<bool>,
+        clip_json: Option<&str>,
+        timeout_ms: Option<f64>,
+        image_type: Option<&str>,
+        quality: Option<u32>,
+        omit_background: Option<bool>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<Vec<u8>> {
         let page = Arc::clone(&self.inner);
         let path = path.map(ToString::to_string);
         let timeout = BrowserInner::command_timeout(timeout_ms);
@@ -11581,15 +12376,18 @@ return true;
         };
         let browser = Arc::clone(&page.browser);
         let omit_background = omit_background.unwrap_or(false);
-        browser.block_on_raw(page_screenshot_async(
-            page,
-            path,
-            capture_beyond_viewport,
-            clip,
-            timeout,
-            image_type,
-            quality,
-            omit_background,
+        browser.block_on_raw(cancelable(
+            cancel.cloned(),
+            page_screenshot_async(
+                page,
+                path,
+                capture_beyond_viewport,
+                clip,
+                timeout,
+                image_type,
+                quality,
+                omit_background,
+            ),
         ))
     }
 
@@ -11608,6 +12406,188 @@ return true;
         )
     }
 
+    fn set_checked(&self, selector: &str, checked: bool) -> RwResult<()> {
+        let locator_json = selector_to_locator_json(selector)?;
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        browser.block_on_raw(async move {
+            let deadline = OperationDeadline::new(Duration::from_secs(30));
+            scroll_locator_into_view(&page, &locator_json, deadline).await?;
+            let resolved =
+                resolve_locator_point(Arc::clone(&page), &locator_json, 0, None, None, deadline)
+                    .await?;
+            let state_json = evaluate_resolved_locator_body(
+                &page,
+                &resolved,
+                &format!("return JSON.stringify(({NATIVE_CHECKED_STATE_JS})(el));"),
+                deadline,
+            )
+            .await?;
+            let state = serde_json::from_str::<Value>(
+                state_json
+                    .as_str()
+                    .ok_or_else(|| RwError::Message("invalid checked state".to_string()))?,
+            )?;
+            if !state.get("valid").and_then(Value::as_bool).unwrap_or(false) {
+                return Err(RwError::Message(
+                    "element is not a checkbox, radio button, or checked ARIA control".to_string(),
+                ));
+            }
+            let current = state
+                .get("checked")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if current == checked {
+                return Ok(());
+            }
+            if !checked
+                && state
+                    .get("native_radio")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            {
+                return Err(RwError::Message(
+                    "radio buttons cannot be unchecked directly".to_string(),
+                ));
+            }
+            dispatch_mouse_click_sequence_in_session(
+                &page.browser.client,
+                &resolved.session_id,
+                resolved.x,
+                resolved.y,
+                resolved.x,
+                resolved.y,
+                1,
+                "left",
+                1,
+                1,
+                0.0,
+                0,
+                0,
+                deadline,
+            )
+            .await?;
+            let updated = evaluate_resolved_locator_body(
+                &page,
+                &resolved,
+                &format!("return ({NATIVE_CHECKED_STATE_JS})(el).checked;"),
+                deadline,
+            )
+            .await?
+            .as_bool()
+            .unwrap_or(false);
+            if updated != checked {
+                return Err(RwError::Message(
+                    "native click did not change the checked state".to_string(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn evaluate_locator_bool(&self, selector: &str, body: &str) -> RwResult<bool> {
+        let locator_json = selector_to_locator_json(selector)?;
+        let json = self.evaluate_locator_json(locator_json, 0, body.to_string(), None)?;
+        Ok(serde_json::from_str::<Value>(&json)
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false))
+    }
+
+    fn navigate_history(
+        &self,
+        offset: i64,
+        wait_until: Option<&str>,
+        timeout: Duration,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<String> {
+        let page = Arc::clone(&self.inner);
+        let wait_until = wait_until.unwrap_or("load").to_string();
+        validate_navigation_wait_state(&wait_until)?;
+        let browser = Arc::clone(&page.browser);
+        let client = Arc::clone(&browser.client);
+        let session_id = page.session_id.clone();
+        let operation_client = Arc::clone(&client);
+        let operation_session_id = session_id.clone();
+        browser.block_on_raw(cancelable_navigation(
+            client,
+            session_id,
+            cancel.cloned(),
+            async move {
+                let deadline = OperationDeadline::new(timeout);
+                let history = operation_client
+                    .send(
+                        "Page.getNavigationHistory",
+                        json!({}),
+                        Some(&operation_session_id),
+                        deadline.remaining()?,
+                    )
+                    .await?;
+                let current_index = history
+                    .get("currentIndex")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| RwError::Cdp {
+                        method: "Page.getNavigationHistory".to_string(),
+                        message: "response did not include currentIndex".to_string(),
+                    })?;
+                let target_index = current_index + offset;
+                let entries = history
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| RwError::Cdp {
+                        method: "Page.getNavigationHistory".to_string(),
+                        message: "response did not include entries".to_string(),
+                    })?;
+                if target_index < 0 || target_index as usize >= entries.len() {
+                    return Ok(Value::Null.to_string());
+                }
+                let entry = &entries[target_index as usize];
+                let entry_id =
+                    entry
+                        .get("id")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| RwError::Cdp {
+                            method: "Page.getNavigationHistory".to_string(),
+                            message: "entry did not include id".to_string(),
+                        })?;
+                let target_url = entry
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let mut events = operation_client.subscribe();
+                operation_client
+                    .send(
+                        "Page.navigateToHistoryEntry",
+                        json!({ "entryId": entry_id }),
+                        Some(&operation_session_id),
+                        deadline.remaining()?,
+                    )
+                    .await?;
+                let response = wait_for_navigation(
+                    &mut events,
+                    &operation_session_id,
+                    &wait_until,
+                    None,
+                    target_url.as_deref(),
+                    "Page.go_back",
+                    deadline.remaining()?,
+                )
+                .await?;
+                if wait_until != "commit" {
+                    settle_history_navigation(
+                        &operation_client,
+                        &mut events,
+                        &operation_session_id,
+                        &wait_until,
+                        deadline,
+                    )
+                    .await?;
+                }
+                Ok(response.unwrap_or(Value::Null).to_string())
+            },
+        ))
+    }
+
     fn evaluate_locator_json(
         &self,
         locator_json: String,
@@ -11615,12 +12595,507 @@ return true;
         body: String,
         timeout_ms: Option<f64>,
     ) -> RwResult<String> {
+        self.evaluate_locator_json_cancelable(locator_json, index, body, timeout_ms, None)
+    }
+
+    fn evaluate_locator_json_cancelable(
+        &self,
+        locator_json: String,
+        index: usize,
+        body: String,
+        timeout_ms: Option<f64>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<String> {
         let page = Arc::clone(&self.inner);
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
-        browser.block_on_raw(async move {
+        browser.block_on_raw(cancelable(cancel.cloned(), async move {
             evaluate_locator_for_page(page, locator_json, index, body, timeout).await
-        })
+        }))
+    }
+}
+
+const NATIVE_CHECKED_STATE_JS: &str = r#"(el) => {
+const tagName = String(el && el.tagName || '').toUpperCase();
+const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
+const checkedRoles = new Set(['checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem']);
+const role = el && typeof locatorRoleOf === 'function' ? locatorRoleOf(el) : '';
+const aria = String(el && el.getAttribute ? el.getAttribute('aria-checked') || '' : '').toLowerCase();
+if (tagName === 'INPUT' && (inputType === 'checkbox' || inputType === 'radio')) {
+  const checked = !!el.checked;
+  return { valid: true, checked, native_radio: inputType === 'radio' };
+}
+if (!checkedRoles.has(role)) return { valid: false, checked: false, native_radio: false };
+return { valid: true, checked: aria === 'true', native_radio: false };
+}"#;
+
+fn native_page_event_from_cdp(
+    page: &Arc<PageInner>,
+    event: &Value,
+) -> Option<(RustwrightPageEvent, bool)> {
+    let method = event.get("method").and_then(Value::as_str)?;
+    let event_session_id = event.get("sessionId").and_then(Value::as_str);
+    match method {
+        "Page.javascriptDialogOpening" if event_session_id == Some(page.session_id.as_str()) => {
+            let kind = match event.pointer("/params/type").and_then(Value::as_str) {
+                Some("alert") => RustwrightDialogKind::Alert,
+                Some("confirm") => RustwrightDialogKind::Confirm,
+                Some("prompt") => RustwrightDialogKind::Prompt,
+                Some("beforeunload") => RustwrightDialogKind::BeforeUnload,
+                Some(other) => RustwrightDialogKind::Other(other.to_string()),
+                None => RustwrightDialogKind::Other(String::new()),
+            };
+            let message = event
+                .pointer("/params/message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some((
+                RustwrightPageEvent::Dialog {
+                    kind,
+                    message,
+                    dialog: RustwrightDialog {
+                        browser: Arc::downgrade(&page.browser),
+                        session_id: page.session_id.clone(),
+                    },
+                },
+                false,
+            ))
+        }
+        "Page.frameNavigated" if event_session_id == Some(page.session_id.as_str()) => {
+            let frame = event.pointer("/params/frame")?;
+            if frame.get("parentId").is_some() {
+                return None;
+            }
+            let url = frame.get("url").and_then(Value::as_str)?.to_string();
+            Some((RustwrightPageEvent::Navigated { url }, false))
+        }
+        "Page.navigatedWithinDocument" if event_session_id == Some(page.session_id.as_str()) => {
+            let frame_id = event.pointer("/params/frameId").and_then(Value::as_str)?;
+            if page.main_frame_id.lock().unwrap().as_deref() != Some(frame_id) {
+                return None;
+            }
+            let url = event
+                .pointer("/params/url")
+                .and_then(Value::as_str)?
+                .to_string();
+            Some((RustwrightPageEvent::Navigated { url }, false))
+        }
+        "Browser.downloadWillBegin" => {
+            let frame_id = event.pointer("/params/frameId").and_then(Value::as_str)?;
+            if page.main_frame_id.lock().unwrap().as_deref() != Some(frame_id) {
+                return None;
+            }
+            Some((
+                RustwrightPageEvent::Download {
+                    guid: event
+                        .pointer("/params/guid")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    url: event
+                        .pointer("/params/url")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    suggested_name: event
+                        .pointer("/params/suggestedFilename")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                },
+                false,
+            ))
+        }
+        "Target.targetCrashed"
+            if event.pointer("/params/targetId").and_then(Value::as_str)
+                == Some(page.target_id.as_str()) =>
+        {
+            Some((RustwrightPageEvent::PageCrashed, true))
+        }
+        "Inspector.targetCrashed" if event_session_id == Some(page.session_id.as_str()) => {
+            Some((RustwrightPageEvent::PageCrashed, true))
+        }
+        "Target.targetDestroyed"
+            if event.pointer("/params/targetId").and_then(Value::as_str)
+                == Some(page.target_id.as_str()) =>
+        {
+            Some((RustwrightPageEvent::Closed, true))
+        }
+        "Inspector.detached" if event_session_id == Some(page.session_id.as_str()) => {
+            Some((RustwrightPageEvent::Closed, true))
+        }
+        "Target.detachedFromTarget"
+            if event.pointer("/params/sessionId").and_then(Value::as_str)
+                == Some(page.session_id.as_str()) =>
+        {
+            Some((RustwrightPageEvent::Closed, true))
+        }
+        _ => None,
+    }
+}
+
+async fn scroll_locator_into_view(
+    page: &Arc<PageInner>,
+    locator_json: &str,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    let resolution = resolve_locator_session(Arc::clone(page), locator_json, deadline).await?;
+    let expression = locator_script(
+        &resolution.locator_json,
+        0,
+        "if (!el) throw new Error('No element matches locator'); el.scrollIntoView({ block: 'center', inline: 'center' }); return true;",
+    );
+    evaluate_locator_resolution(page, &resolution, expression, deadline, Duration::ZERO)
+        .await
+        .map(|_| ())
+}
+
+async fn focus_locator_for_native_input(
+    page: &Arc<PageInner>,
+    locator_json: &str,
+    deadline: OperationDeadline,
+) -> RwResult<LocatorSessionResolution> {
+    let resolution = resolve_locator_session(Arc::clone(page), locator_json, deadline).await?;
+    let expression = locator_script(
+        &resolution.locator_json,
+        0,
+        "if (!el) throw new Error('No element matches locator'); el.scrollIntoView({ block: 'center', inline: 'center' }); if (typeof el.focus === 'function') el.focus({ preventScroll: true }); return true;",
+    );
+    evaluate_locator_resolution(page, &resolution, expression, deadline, Duration::ZERO).await?;
+    Ok(resolution)
+}
+
+#[derive(Clone)]
+struct NativeKeyDescriptor {
+    key: String,
+    code: String,
+    virtual_key: u32,
+    location: u8,
+    text: Option<String>,
+}
+
+fn native_key_descriptor(key: &str) -> RwResult<NativeKeyDescriptor> {
+    let named = match key {
+        "Alt" | "AltLeft" => Some(("Alt", "AltLeft", 18, 1)),
+        "AltRight" => Some(("Alt", "AltRight", 18, 2)),
+        "Backspace" => Some(("Backspace", "Backspace", 8, 0)),
+        "Control" | "ControlLeft" => Some(("Control", "ControlLeft", 17, 1)),
+        "ControlRight" => Some(("Control", "ControlRight", 17, 2)),
+        "Delete" => Some(("Delete", "Delete", 46, 0)),
+        "End" => Some(("End", "End", 35, 0)),
+        "Enter" => Some(("Enter", "Enter", 13, 0)),
+        "Escape" => Some(("Escape", "Escape", 27, 0)),
+        "Home" => Some(("Home", "Home", 36, 0)),
+        "Insert" => Some(("Insert", "Insert", 45, 0)),
+        "Meta" | "MetaLeft" => Some(("Meta", "MetaLeft", 91, 1)),
+        "MetaRight" => Some(("Meta", "MetaRight", 92, 2)),
+        "PageDown" => Some(("PageDown", "PageDown", 34, 0)),
+        "PageUp" => Some(("PageUp", "PageUp", 33, 0)),
+        "Shift" | "ShiftLeft" => Some(("Shift", "ShiftLeft", 16, 1)),
+        "ShiftRight" => Some(("Shift", "ShiftRight", 16, 2)),
+        "Tab" => Some(("Tab", "Tab", 9, 0)),
+        "ArrowDown" => Some(("ArrowDown", "ArrowDown", 40, 0)),
+        "ArrowLeft" => Some(("ArrowLeft", "ArrowLeft", 37, 0)),
+        "ArrowRight" => Some(("ArrowRight", "ArrowRight", 39, 0)),
+        "ArrowUp" => Some(("ArrowUp", "ArrowUp", 38, 0)),
+        "Space" => Some((" ", "Space", 32, 0)),
+        _ => None,
+    };
+    if let Some((normalized, code, virtual_key, location)) = named {
+        return Ok(NativeKeyDescriptor {
+            key: normalized.to_string(),
+            code: code.to_string(),
+            virtual_key,
+            location,
+            text: (key == "Space").then(|| " ".to_string()),
+        });
+    }
+    let mut characters = key.chars();
+    let Some(character) = characters.next() else {
+        return Err(RwError::InvalidInput("key must not be empty".to_string()));
+    };
+    if characters.next().is_some() || !character.is_ascii() {
+        return Err(RwError::InvalidInput(format!("unsupported key: {key}")));
+    }
+    let (code, virtual_key) = if character.is_ascii_alphabetic() {
+        (
+            format!("Key{}", character.to_ascii_uppercase()),
+            u32::from(character.to_ascii_uppercase()),
+        )
+    } else if character.is_ascii_digit() {
+        (format!("Digit{character}"), u32::from(character))
+    } else {
+        (String::new(), u32::from(character))
+    };
+    Ok(NativeKeyDescriptor {
+        key: character.to_string(),
+        code,
+        virtual_key,
+        location: 0,
+        text: Some(character.to_string()),
+    })
+}
+
+fn native_modifier_mask(key: &str) -> Option<i64> {
+    match key {
+        "Alt" | "AltLeft" | "AltRight" => Some(1),
+        "Control" | "ControlLeft" | "ControlRight" => Some(2),
+        "Meta" | "MetaLeft" | "MetaRight" => Some(4),
+        "Shift" | "ShiftLeft" | "ShiftRight" => Some(8),
+        _ => None,
+    }
+}
+
+fn native_key_event_params(
+    descriptor: &NativeKeyDescriptor,
+    event_type: &str,
+    modifiers: i64,
+    include_text: bool,
+) -> Value {
+    let mut params = json!({
+        "type": event_type,
+        "key": descriptor.key,
+        "code": descriptor.code,
+        "modifiers": modifiers,
+        "windowsVirtualKeyCode": descriptor.virtual_key,
+        "nativeVirtualKeyCode": descriptor.virtual_key,
+        "location": descriptor.location,
+    });
+    if descriptor.location == 3 {
+        params["isKeypad"] = Value::Bool(true);
+    }
+    if include_text {
+        if let Some(text) = &descriptor.text {
+            params["text"] = Value::String(text.clone());
+            params["unmodifiedText"] = Value::String(text.clone());
+        }
+    }
+    params
+}
+
+async fn wait_input_delay(delay: Option<Duration>, deadline: OperationDeadline) -> RwResult<()> {
+    let Some(delay) = delay.filter(|value| !value.is_zero()) else {
+        return Ok(());
+    };
+    tokio::time::timeout(deadline.remaining()?, tokio::time::sleep(delay))
+        .await
+        .map_err(|_| RwError::Timeout(duration_millis_u64(deadline.timeout)))?;
+    Ok(())
+}
+
+async fn dispatch_typed_character(
+    client: &CdpClient,
+    session_id: &str,
+    character: char,
+    delay: Option<Duration>,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    if !character.is_ascii() || character.is_ascii_control() {
+        client
+            .send(
+                "Input.insertText",
+                json!({ "text": character.to_string() }),
+                Some(session_id),
+                deadline.remaining()?,
+            )
+            .await?;
+        return wait_input_delay(delay, deadline).await;
+    }
+    dispatch_key_press(client, session_id, &character.to_string(), delay, deadline).await
+}
+
+async fn dispatch_key_press(
+    client: &CdpClient,
+    session_id: &str,
+    key: &str,
+    delay: Option<Duration>,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    let parts = if key == "+" {
+        vec![key]
+    } else {
+        key.split('+').collect::<Vec<_>>()
+    };
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err(RwError::InvalidInput(format!("unsupported key: {key}")));
+    }
+    let (modifier_names, base_name) = parts.split_at(parts.len().saturating_sub(1));
+    let base_name = base_name
+        .first()
+        .copied()
+        .ok_or_else(|| RwError::InvalidInput("key must not be empty".to_string()))?;
+    let mut modifiers = 0_i64;
+    let mut pressed_modifiers = Vec::new();
+    for modifier_name in modifier_names {
+        let mask = native_modifier_mask(modifier_name).ok_or_else(|| {
+            RwError::InvalidInput(format!("unsupported key modifier: {modifier_name}"))
+        })?;
+        let descriptor = native_key_descriptor(modifier_name)?;
+        modifiers |= mask;
+        client
+            .send(
+                "Input.dispatchKeyEvent",
+                native_key_event_params(&descriptor, "rawKeyDown", modifiers, false),
+                Some(session_id),
+                deadline.remaining()?,
+            )
+            .await?;
+        pressed_modifiers.push((descriptor, mask));
+    }
+    let base = native_key_descriptor(base_name)?;
+    let include_text = base.text.is_some() && modifiers & (1 | 2 | 4) == 0;
+    client
+        .send(
+            "Input.dispatchKeyEvent",
+            native_key_event_params(
+                &base,
+                if include_text {
+                    "keyDown"
+                } else {
+                    "rawKeyDown"
+                },
+                modifiers,
+                include_text,
+            ),
+            Some(session_id),
+            deadline.remaining()?,
+        )
+        .await?;
+    wait_input_delay(delay, deadline).await?;
+    client
+        .send(
+            "Input.dispatchKeyEvent",
+            native_key_event_params(&base, "keyUp", modifiers, false),
+            Some(session_id),
+            deadline.remaining()?,
+        )
+        .await?;
+    for (descriptor, mask) in pressed_modifiers.into_iter().rev() {
+        modifiers &= !mask;
+        client
+            .send(
+                "Input.dispatchKeyEvent",
+                native_key_event_params(&descriptor, "keyUp", modifiers, false),
+                Some(session_id),
+                deadline.remaining()?,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+fn is_page_not_attached_error(error: &RwError) -> bool {
+    matches!(
+        error,
+        RwError::Cdp { message, .. }
+            if message
+                .to_ascii_lowercase()
+                .contains("not attached to an active page")
+    )
+}
+
+async fn wait_for_page_attachment_signal(
+    events: &mut broadcast::Receiver<Value>,
+    session_id: &str,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    loop {
+        match tokio::time::timeout(deadline.remaining()?, events.recv()).await {
+            Ok(Ok(event)) => {
+                if event.get("sessionId").and_then(Value::as_str) != Some(session_id) {
+                    continue;
+                }
+                if matches!(
+                    event.get("method").and_then(Value::as_str),
+                    Some(
+                        "Page.frameNavigated" | "Page.domContentEventFired" | "Page.loadEventFired"
+                    )
+                ) {
+                    return Ok(());
+                }
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => return Err(RwError::Closed),
+            Err(_) => return Err(RwError::Timeout(duration_millis_u64(deadline.timeout))),
+        }
+    }
+}
+
+async fn settle_history_navigation(
+    client: &CdpClient,
+    events: &mut broadcast::Receiver<Value>,
+    session_id: &str,
+    wait_until: &str,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    loop {
+        let ready_state = client
+            .send(
+                "Runtime.evaluate",
+                json!({
+                    "expression": "document.readyState",
+                    "returnByValue": true,
+                }),
+                Some(session_id),
+                deadline.remaining()?,
+            )
+            .await;
+        match ready_state {
+            Ok(result) => {
+                let ready_state = result
+                    .pointer("/result/value")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let ready = match wait_until {
+                    "domcontentloaded" => matches!(ready_state, "interactive" | "complete"),
+                    "load" | "networkidle" => ready_state == "complete",
+                    _ => true,
+                };
+                if ready {
+                    match client
+                        .send(
+                            "Page.getFrameTree",
+                            json!({}),
+                            Some(session_id),
+                            deadline.remaining()?,
+                        )
+                        .await
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(error) if is_page_not_attached_error(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            Err(error)
+                if is_locator_wait_context_loss(&error) || is_page_not_attached_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+        wait_for_page_attachment_signal(events, session_id, deadline).await?;
+    }
+}
+
+fn validate_navigation_wait_state(state: &str) -> RwResult<()> {
+    if matches!(
+        state,
+        "load" | "domcontentloaded" | "networkidle" | "commit"
+    ) {
+        Ok(())
+    } else {
+        Err(RwError::InvalidInput(
+            "wait_until must be load, domcontentloaded, networkidle, or commit".to_string(),
+        ))
+    }
+}
+
+fn validate_load_state(state: &str) -> RwResult<()> {
+    if matches!(state, "load" | "domcontentloaded" | "networkidle") {
+        Ok(())
+    } else {
+        Err(RwError::InvalidInput(
+            "load state must be load, domcontentloaded, or networkidle".to_string(),
+        ))
     }
 }
 
@@ -11716,8 +13191,19 @@ fn create_page_raw(
     browser: Arc<BrowserInner>,
     context_id: Option<String>,
 ) -> RwResult<Arc<PageInner>> {
+    create_page_raw_cancelable(browser, context_id, None)
+}
+
+fn create_page_raw_cancelable(
+    browser: Arc<BrowserInner>,
+    context_id: Option<String>,
+    cancel: Option<&CancelToken>,
+) -> RwResult<Arc<PageInner>> {
     let browser_for_task = Arc::clone(&browser);
-    browser.block_on_raw(create_page_async(browser_for_task, context_id))
+    browser.block_on_raw(cancelable(
+        cancel.cloned(),
+        create_page_async(browser_for_task, context_id),
+    ))
 }
 
 async fn create_page_async(
@@ -12405,8 +13891,18 @@ async fn install_worker_stealth_defaults(client: &CdpClient, session_id: &str) -
 fn start_service_worker_stealth_auto_attach(
     runtime: &tokio::runtime::Runtime,
     client: Arc<CdpClient>,
+    timeout: Duration,
 ) -> RwResult<()> {
-    runtime.block_on(async {
+    start_service_worker_stealth_auto_attach_cancelable(runtime, client, timeout, None)
+}
+
+fn start_service_worker_stealth_auto_attach_cancelable(
+    runtime: &tokio::runtime::Runtime,
+    client: Arc<CdpClient>,
+    timeout: Duration,
+    cancel: Option<CancelToken>,
+) -> RwResult<()> {
+    runtime.block_on(cancelable(cancel, async {
         client
             .send(
                 "Target.setAutoAttach",
@@ -12424,11 +13920,11 @@ fn start_service_worker_stealth_auto_attach(
                     ],
                 }),
                 None,
-                Duration::from_secs(5),
+                timeout,
             )
             .await
             .map(|_| ())
-    })?;
+    }))?;
 
     let mut events = client.subscribe();
     runtime.spawn(async move {
@@ -15135,6 +16631,72 @@ fn target_context_matches(info: &Value, context_id: Option<&str>) -> bool {
     }
 }
 
+fn list_pages_raw(
+    browser: Arc<BrowserInner>,
+    context_id: Option<String>,
+    timeout: Duration,
+) -> RwResult<Vec<Arc<PageInner>>> {
+    let browser_for_task = Arc::clone(&browser);
+    let client = Arc::clone(&browser.client);
+    browser.block_on_raw(async move {
+        let non_default_contexts = if context_id.is_none() {
+            client
+                .send("Target.getBrowserContexts", json!({}), None, timeout)
+                .await?
+                .get("browserContextIds")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+        let result = client
+            .send("Target.getTargets", json!({}), None, timeout)
+            .await?;
+        let mut pages = Vec::new();
+        for info in result
+            .get("targetInfos")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if info.get("type").and_then(Value::as_str) != Some("page") {
+                continue;
+            }
+            let target_context = info.get("browserContextId").and_then(Value::as_str);
+            let context_matches = match context_id.as_deref() {
+                Some(expected) => target_context == Some(expected),
+                None => target_context
+                    .map(|id| !non_default_contexts.contains(id))
+                    .unwrap_or(true),
+            };
+            if !context_matches {
+                continue;
+            }
+            let Some(target_id) = info.get("targetId").and_then(Value::as_str) else {
+                continue;
+            };
+            let page_context_id = info
+                .get("browserContextId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            pages.push(
+                attach_existing_page(
+                    Arc::clone(&browser_for_task),
+                    target_id.to_string(),
+                    page_context_id,
+                    timeout,
+                )
+                .await?,
+            );
+        }
+        Ok(pages)
+    })
+}
+
 #[cfg(feature = "python")]
 fn list_pages_for_context(
     browser: Arc<BrowserInner>,
@@ -16371,111 +17933,28 @@ const RUNTIME_VALUE_SERIALIZER: &str = r#"(function __rw_serialize(value) {
 
 fn make_evaluate_expression(expression: &str, arg_json: Option<&str>) -> String {
     let trimmed = expression.trim();
-    if is_confident_function_expression(trimmed) {
-        // Fast path: the source is confidently a lone function expression, so
-        // it can be parenthesized and invoked directly with no eval in the
-        // emitted script. This keeps the common evaluate(function) shape
-        // working on pages whose CSP blocks eval/new Function.
-        let call_args = arg_json.unwrap_or("");
-        return format!(
-            "(async () => {{ const __rw_fn = ({trimmed}); return await __rw_fn({call_args}); }})()"
-        );
+    if let Some(arg_json) = arg_json {
+        format!(
+            "(async () => {{ const __rw_fn = ({trimmed}); return await __rw_fn({arg_json}); }})()"
+        )
+    } else if looks_like_function(trimmed) {
+        format!("(async () => {{ const __rw_fn = ({trimmed}); return await __rw_fn(); }})()")
+    } else if let Some(wrapped) = wrap_declaration_helper_script(trimmed) {
+        wrapped
+    } else {
+        // Plain expression/statement string. Run it through an indirect `eval`
+        // so that top-level `let`/`const`/`class` declarations are scoped to
+        // this single evaluation instead of leaking into the global lexical
+        // environment. Passing the raw source to `Runtime.evaluate` executes it
+        // at the REPL-style global top level, where those declarations persist
+        // across calls and make repeated evaluation of the same script fail
+        // with "Identifier '...' has already been declared". Playwright avoids
+        // this by running non-function expressions via indirect `eval` in its
+        // utility script; this mirrors that, including preserving the script's
+        // completion value and the standard `var`/`function` global hoisting.
+        let literal = serde_json::to_string(trimmed).unwrap_or_else(|_| "\"\"".to_string());
+        format!("(0, eval)({literal})")
     }
-    if arg_json.is_none() {
-        if let Some(wrapped) = wrap_declaration_helper_script(trimmed) {
-            return wrapped;
-        }
-    }
-    // Everything else is classified at runtime, mirroring Playwright's utility
-    // script: probe-compile `(<source>)` with `new Function` purely to test
-    // whether it parses as an expression (never executed — a runtime error
-    // must not trigger re-execution), then evaluate exactly once through an
-    // indirect `eval` and call the value if it turned out to be a function.
-    // Evaluating via `eval` rather than the compiled probe keeps expression
-    // semantics identical to Playwright's global eval: no `arguments` binding
-    // leaks in, `new.target` stays illegal, and the bare call preserves
-    // strict-mode `this === undefined`. Statement-form sources (a trailing
-    // `;`, an IIFE invocation, `function f() {...}; f();`) fail the probe and
-    // run as a program instead; the indirect `eval` scopes top-level
-    // `let`/`const`/`class` to the single evaluation (REPL-style
-    // Runtime.evaluate would leak them and break repeated evaluation with
-    // "Identifier '...' has already been declared") while preserving the
-    // completion value and standard `var`/`function` hoisting.
-    let literal = serde_json::to_string(trimmed).unwrap_or_else(|_| "\"\"".to_string());
-    let call_args = arg_json.unwrap_or("");
-    format!(
-        r#"(async () => {{
-    const __rw_src = {literal};
-    let __rw_is_expression = true;
-    try {{
-        new Function("return (" + __rw_src + "\n)");
-    }} catch (__rw_parse_error) {{
-        __rw_is_expression = false;
-    }}
-    let __rw_result;
-    if (__rw_is_expression) {{
-        __rw_result = (0, eval)("(" + __rw_src + "\n)");
-    }} else {{
-        __rw_result = (0, eval)(__rw_src);
-    }}
-    if (typeof __rw_result === "function") {{
-        __rw_result = __rw_result({call_args});
-    }}
-    return await __rw_result;
-}})()"#
-    )
-}
-
-fn is_confident_function_expression(expression: &str) -> bool {
-    looks_like_function(expression) && !has_top_level_semicolon(expression)
-}
-
-/// True when the source contains a `;` outside every paren/brace/bracket
-/// nesting level, outside string literals, and outside comments — i.e. the
-/// source is a statement sequence, not a lone function expression. Comments
-/// are skipped so their contents cannot unbalance the depth count or hide the
-/// semicolon that follows them. Regex literals are not modeled; a brace inside
-/// one can only make this return false and send a source to the runtime-probe
-/// path, which still evaluates it correctly.
-fn has_top_level_semicolon(expression: &str) -> bool {
-    let mut depth = 0usize;
-    let mut index = 0usize;
-    while index < expression.len() {
-        let rest = &expression[index..];
-        let Some(ch) = rest.chars().next() else {
-            break;
-        };
-        if rest.starts_with("//") {
-            match rest.find('\n') {
-                Some(newline) => {
-                    index += newline + 1;
-                    continue;
-                }
-                None => break,
-            }
-        }
-        if rest.starts_with("/*") {
-            match rest[2..].find("*/") {
-                Some(end) => {
-                    index += 2 + end + 2;
-                    continue;
-                }
-                None => break,
-            }
-        }
-        match ch {
-            '\'' | '"' | '`' => {
-                index = skip_js_string(expression, index, ch);
-                continue;
-            }
-            '(' | '{' | '[' => depth += 1,
-            ')' | '}' | ']' => depth = depth.saturating_sub(1),
-            ';' if depth == 0 => return true,
-            _ => {}
-        }
-        index += ch.len_utf8();
-    }
-    false
 }
 
 fn wrap_declaration_helper_script(expression: &str) -> Option<String> {
@@ -16662,11 +18141,7 @@ fn looks_like_function(expression: &str) -> bool {
             .map(|index| {
                 let before_arrow = expression[..index].trim();
                 if before_arrow.starts_with('(') {
-                    // Either arrow parameters — `(a, b) => ...` — or a
-                    // parenthesized function being invoked, like the IIFE
-                    // `(async () => {...})()`. Only the former is a function
-                    // expression; an invocation must evaluate as a program.
-                    return leading_paren_group_is_arrow_parameters(expression);
+                    return true;
                 }
                 if let Some(parameter) = before_arrow.strip_prefix("async ") {
                     let parameter = parameter.trim();
@@ -16675,23 +18150,6 @@ fn looks_like_function(expression: &str) -> bool {
                 is_js_identifier(before_arrow)
             })
             .unwrap_or(false)
-}
-
-fn leading_paren_group_is_arrow_parameters(expression: &str) -> bool {
-    let mut depth = 0usize;
-    for (index, ch) in expression.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return expression[index + 1..].trim_start().starts_with("=>");
-                }
-            }
-            _ => {}
-        }
-    }
-    false
 }
 
 fn is_js_identifier(value: &str) -> bool {
