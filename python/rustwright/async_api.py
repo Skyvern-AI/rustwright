@@ -196,6 +196,35 @@ async def _await_native_method(method: str, awaitable: Any) -> Any:
         raise error_type(f"{method}: {message}") from None
 
 
+async def _await_native_action(method: str, awaitable: Any) -> Any:
+    try:
+        return await _await_native(awaitable)
+    except Error as exc:
+        message = str(exc)
+        marker = "__rustwright_action_timeout__:"
+        if message.startswith(marker):
+            try:
+                payload = json.loads(message[len(marker) :])
+                info = _decode_json_result(json.loads(str(payload["last_info_json"])))
+                info_key = payload.get("last_info_key")
+                if info_key is not None:
+                    info = info[info_key]
+                count = int(info.get("count") or 0) if isinstance(info, dict) else 0
+                detail = "no element matched" if count == 0 else f"last state was {info}"
+                raise TimeoutError(
+                    f"timed out waiting for locator to be {payload['state']} "
+                    f"while trying to {payload['action']}; {detail}"
+                ) from None
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        if message.startswith(("Locator.", "strict mode violation:", "Page crashed")):
+            raise
+        if message.startswith(f"{method}:"):
+            raise
+        error_type = TargetClosedError if isinstance(exc, TargetClosedError) else type(exc)
+        raise error_type(f"{method}: {message}") from None
+
+
 async def _await_cleanup_completion(awaitable: Any) -> Any:
     """Finish lifecycle cleanup before propagating cancellation to the caller."""
     cleanup_task = asyncio.ensure_future(awaitable)
@@ -246,17 +275,31 @@ async def _single_flight_close(sync_obj: Any, cleanup: Callable[[], Any]) -> Non
         sync_obj._rustwright_async_close_task = None
 
 
-def _native_locator(sync_page: SyncPage, selector: str, strict: Optional[bool], *, method: str) -> Any:
+def _native_normalize_selector(selector: str, *, method: str) -> str:
     missing_method = "_click" if method == "Page.click" else method.rsplit(".", 1)[-1]
-    normalized = _normalize_selector_option(
+    return _normalize_selector_option(
         selector,
         method=method,
         missing_type_error=f"Frame.{missing_method}() missing 1 required positional argument: 'selector'",
     )
+
+
+def _native_selector_locator(
+    sync_page: SyncPage,
+    normalized_selector: str,
+    strict: Optional[bool],
+    *,
+    method: str,
+) -> Any:
     return sync_page._selector_locator(
-        normalized,
+        normalized_selector,
         {"strict": strict, "strict_method": method},
     )
+
+
+def _native_locator(sync_page: SyncPage, selector: str, strict: Optional[bool], *, method: str) -> Any:
+    normalized_selector = _native_normalize_selector(selector, method=method)
+    return _native_selector_locator(sync_page, normalized_selector, strict, method=method)
 
 
 def _native_page_options_supported(context: SyncBrowserContext) -> bool:
@@ -3225,7 +3268,6 @@ class AsyncPage(_AsyncWrapper):
     ) -> None:
         if (
             not _native_page_hot_path_supported(self._sync)
-            or not _unsafe_dom_fastpath_enabled()
             or getattr(self._sync, "_active_page_cdp_event_contexts", 0) > 0
             or any(
                 value is not None
@@ -3248,16 +3290,50 @@ class AsyncPage(_AsyncWrapper):
                 strict=strict,
             )
             return
+        normalized_selector = _native_normalize_selector(selector, method="Page.click")
         timeout_ms = _default_timeout_for_method(self._sync, timeout, method="Page.click")
-        locator = _native_locator(self._sync, selector, strict, method="Page.click")
-        await _await_native_method(
+        locator = _native_selector_locator(self._sync, normalized_selector, strict, method="Page.click")
+        if _unsafe_dom_fastpath_enabled():
+            await _await_native_method(
+                "Page.click",
+                self._sync._core.click_async(
+                    _json(locator._spec),
+                    locator._index,
+                    timeout_ms,
+                    locator._strict,
+                ),
+            )
+            return
+        point_info = await _await_native_action(
             "Page.click",
-            self._sync._core.click_async(
+            self._sync._core.click_actionable_wait_async(
                 _json(locator._spec),
                 locator._index,
                 timeout_ms,
                 locator._strict,
-            )
+            ),
+        )
+        mouse = self._sync.mouse
+        initial_buttons = mouse._buttons
+        start_x = mouse._x
+        start_y = mouse._y
+        modifiers = self._sync.keyboard._modifiers_mask()
+        target_x = float(point_info[0])
+        target_y = float(point_info[1])
+        mouse._x = target_x
+        mouse._y = target_y
+        mouse._buttons &= ~1
+        await _await_native_action(
+            "Page.click",
+            self._sync._core.dispatch_mouse_click_async(
+                target_x,
+                target_y,
+                start_x,
+                start_y,
+                initial_buttons,
+                modifiers,
+                float(point_info[2]),
+            ),
         )
 
     async def dblclick(
@@ -3301,7 +3377,6 @@ class AsyncPage(_AsyncWrapper):
     ) -> None:
         if (
             not _native_page_hot_path_supported(self._sync)
-            or not _unsafe_dom_fastpath_enabled()
             or getattr(self._sync, "_active_page_cdp_event_contexts", 0) > 0
             or no_wait_after is not None
             or force is not None
@@ -3317,6 +3392,7 @@ class AsyncPage(_AsyncWrapper):
                 force=force,
             )
             return
+        normalized_selector = _native_normalize_selector(selector, method="Page.fill")
         normalized_value = _normalize_required_string_argument(
             value,
             method="Page.fill",
@@ -3324,16 +3400,28 @@ class AsyncPage(_AsyncWrapper):
             missing_type_error="Frame.fill() missing 1 required positional argument: 'value'",
         )
         timeout_ms = _default_timeout_for_method(self._sync, timeout, method="Page.fill")
-        locator = _native_locator(self._sync, selector, strict, method="Page.fill")
-        await _await_native_method(
+        locator = _native_selector_locator(self._sync, normalized_selector, strict, method="Page.fill")
+        if _unsafe_dom_fastpath_enabled():
+            await _await_native_method(
+                "Page.fill",
+                self._sync._core.fill_async(
+                    _json(locator._spec),
+                    locator._index,
+                    normalized_value,
+                    timeout_ms,
+                    locator._strict,
+                ),
+            )
+            return
+        await _await_native_action(
             "Page.fill",
-            self._sync._core.fill_async(
+            self._sync._core.fill_actionable_async(
                 _json(locator._spec),
                 locator._index,
                 normalized_value,
                 timeout_ms,
                 locator._strict,
-            )
+            ),
         )
 
     async def type(

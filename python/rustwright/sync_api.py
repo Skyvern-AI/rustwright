@@ -50,6 +50,194 @@ _CONSOLE_HISTORY_SETTLE_TIMEOUT_SECONDS = 0.001
 _CONSOLE_HISTORY_BUFFER = "__console_history__"
 _PAGE_ERROR_HISTORY_BUFFER = "__page_error_history__"
 _UNSAFE_DOM_FASTPATH_ENV = "RUSTWRIGHT_UNSAFE_DOM_FASTPATH"
+_LOCATOR_TARGET_STATE_TEMPLATE = """
+if (el && __SCROLL__) el.scrollIntoView({ block: 'center', inline: 'center' });
+const ownerDocument = el ? (el.ownerDocument || document) : document;
+const ownerWindow = ownerDocument.defaultView || window;
+const actionPosition = __ACTION_POSITION__;
+const needsReceivesEvents = __RECEIVES_EVENTS__;
+const deepElementFromPoint = (x, y) => {
+  let hit = ownerDocument.elementFromPoint(x, y);
+  while (hit && hit.shadowRoot) {
+    const nested = hit.shadowRoot.elementFromPoint(x, y);
+    if (!nested || nested === hit) break;
+    hit = nested;
+  }
+  return hit;
+};
+const targetContains = (node) => {
+  let current = node;
+  while (current) {
+    if (current === el) return true;
+    const root = current.getRootNode ? current.getRootNode() : null;
+    current = current.parentElement || (root && root.host) || null;
+  }
+  return false;
+};
+const snapshot = () => {
+  const attached = !!el;
+  const rect = el ? el.getBoundingClientRect() : null;
+  const point = needsReceivesEvents && rect ? {
+    x: Math.min(Math.max(rect.left + (actionPosition ? Number(actionPosition.x || 0) : rect.width / 2), 0), Math.max(ownerWindow.innerWidth - 1, 0)),
+    y: Math.min(Math.max(rect.top + (actionPosition ? Number(actionPosition.y || 0) : rect.height / 2), 0), Math.max(ownerWindow.innerHeight - 1, 0)),
+  } : null;
+  const hit = needsReceivesEvents && el && point ? deepElementFromPoint(point.x, point.y) : null;
+  const tagName = el ? String(el.tagName || '').toUpperCase() : '';
+  const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
+  const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
+  const fillableForFill = !!el && (
+    (tagName === 'INPUT' && !nonFillableInputTypes.has(inputType)) ||
+    tagName === 'TEXTAREA' ||
+    el.isContentEditable
+  );
+  const checkedState = (() => {
+    if (!el) return { valid: false, checked: false, indeterminate: false, native_input: false, native_radio: false };
+    const checkedRoles = new Set(['checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem']);
+    const role = typeof locatorRoleOf === 'function' ? locatorRoleOf(el) : '';
+    const aria = String(el.getAttribute ? el.getAttribute('aria-checked') || '' : '').toLowerCase();
+    if (tagName === 'INPUT' && (inputType === 'checkbox' || inputType === 'radio')) {
+      const checked = !!el.checked;
+      return {
+        valid: true,
+        checked,
+        indeterminate: !!(el.indeterminate && !checked),
+        native_input: true,
+        native_radio: inputType === 'radio',
+      };
+    }
+    if (!checkedRoles.has(role)) {
+      return { valid: false, checked: false, indeterminate: false, native_input: false, native_radio: false };
+    }
+    if (aria === 'true') return { valid: true, checked: true, indeterminate: false, native_input: false, native_radio: false };
+    if (aria === 'false') return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
+    if (aria === 'mixed') return { valid: true, checked: false, indeterminate: true, native_input: false, native_radio: false };
+    return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
+  })();
+  const visibleState = (() => {
+    if (!attached || !el.isConnected) return false;
+    if (tagName === 'OPTION') return visible(el);
+    const computedStyle = ownerWindow.getComputedStyle(el);
+    if (!computedStyle || computedStyle.visibility === 'hidden' || computedStyle.display === 'none') return false;
+    return !!rect && rect.width > 0 && rect.height > 0;
+  })();
+  const disabled = attached && disabledState(el);
+  const hasLayout = attached && el.getClientRects().length > 0;
+  return {
+    count: matches.length,
+    frame_strict_violation: strictFrameViolation,
+    attached,
+    visible: visibleState,
+    enabled: attached && !disabled,
+    editable: attached && !disabled && !el.readOnly &&
+      (el.isContentEditable || /^(INPUT|TEXTAREA)$/.test(el.tagName)),
+    tag_name: tagName,
+    input_type: inputType,
+    is_select: tagName === 'SELECT',
+    non_fillable_input: tagName === 'INPUT' && nonFillableInputTypes.has(inputType),
+    fillable_for_fill: fillableForFill,
+    editable_for_fill: fillableForFill && !disabled && !el.readOnly,
+    has_layout: hasLayout,
+    checked_valid: checkedState.valid,
+    checked: checkedState.checked,
+    indeterminate: checkedState.indeterminate,
+    native_input: checkedState.native_input,
+    native_radio: checkedState.native_radio,
+    receives_events: needsReceivesEvents && attached && !!rect && rect.width > 0 && rect.height > 0 && targetContains(hit),
+    rect: rect ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height } : null,
+  };
+};
+const first = snapshot();
+if (!__STABLE__ || !first.attached) return first;
+const style = ownerWindow.getComputedStyle(el);
+const zeroTime = value => String(value || '').split(',').every(part => {
+  const text = part.trim();
+  if (!text) return true;
+  if (text.endsWith('ms')) return Number.parseFloat(text) === 0;
+  if (text.endsWith('s')) return Number.parseFloat(text) === 0;
+  return Number.parseFloat(text) === 0;
+});
+const hasNoCssMotion = style &&
+  (!__STABLE_POSITION_REQUIRED__ || String(style.position || 'static') === 'static') &&
+  (String(style.animationName || 'none') === 'none' || zeroTime(style.animationDuration)) &&
+  zeroTime(style.animationDelay) &&
+  zeroTime(style.transitionDuration) &&
+  zeroTime(style.transitionDelay);
+if (hasNoCssMotion) {
+  first.stable = true;
+  return first;
+}
+return new Promise(resolve => {
+  const finish = () => {
+    const second = snapshot();
+    const left = first.rect;
+    const right = second.rect;
+    second.stable = !!left && !!right && ["x", "y", "width", "height"].every(
+      key => Math.abs(Number(left[key] || 0) - Number(right[key] || 0)) <= 0.5
+    );
+    resolve(second);
+  };
+  ownerWindow.setTimeout(finish, 20);
+});
+"""
+_LOCATOR_FILL_TEMPLATE = """
+const info = {
+  count: matches.length,
+  frame_strict_violation: strictFrameViolation,
+  attached: !!el,
+};
+const strict = __STRICT__;
+if (strict && (strictFrameViolation || matches.length > 1)) {
+  return { ok: false, type: 'strict', info };
+}
+if (!el) return { ok: false, type: 'pending', info };
+const value = __VALUE__;
+const forced = __FORCED__;
+const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
+const tagName = String(el.tagName || '').toUpperCase();
+const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
+info.visible = visible(el);
+info.enabled = !disabledState(el);
+info.tag_name = tagName;
+info.input_type = inputType;
+info.non_fillable_input = tagName === 'INPUT' && nonFillableInputTypes.has(inputType);
+info.is_select = tagName === 'SELECT';
+info.fillable_for_fill = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
+info.editable_for_fill = info.fillable_for_fill && !disabledState(el) && !el.readOnly;
+if (tagName === 'INPUT' && nonFillableInputTypes.has(inputType)) {
+  return { ok: false, type: 'input-type', inputType, info };
+}
+if (tagName === 'SELECT') {
+  return { ok: false, type: forced ? 'force-non-fillable' : 'select', info };
+}
+const isFillable = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
+if (!isFillable) {
+  return { ok: false, type: forced ? 'force-non-fillable' : 'non-fillable', info };
+}
+if (forced && (!visible(el) || disabledState(el) || el.readOnly)) return { ok: true, info };
+if (!forced && (!visible(el) || disabledState(el) || el.readOnly)) {
+  return { ok: false, type: 'pending', info };
+}
+if ('value' in el) {
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+  el.value = value;
+  if (value !== '' && el.value !== value) {
+    return {
+      ok: false,
+      type: inputType === 'number' ? 'number-text' : 'malformed',
+      value: el.value,
+      info,
+    };
+  }
+} else {
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+  el.textContent = value;
+}
+el.dispatchEvent(new Event('input', { bubbles: true }));
+el.dispatchEvent(new Event('change', { bubbles: true }));
+return { ok: true, info };
+"""
 _MULTIPART_BOUNDARY_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB"
 _CHECKED_STATE_JS = """(el) => {
 const tagName = String(el && el.tagName || '').toUpperCase();
@@ -21602,135 +21790,7 @@ return null;
                 }
             )
         return self._eval(
-            """
-if (el && __SCROLL__) el.scrollIntoView({ block: 'center', inline: 'center' });
-const ownerDocument = el ? (el.ownerDocument || document) : document;
-const ownerWindow = ownerDocument.defaultView || window;
-const actionPosition = __ACTION_POSITION__;
-const needsReceivesEvents = __RECEIVES_EVENTS__;
-const deepElementFromPoint = (x, y) => {
-  let hit = ownerDocument.elementFromPoint(x, y);
-  while (hit && hit.shadowRoot) {
-    const nested = hit.shadowRoot.elementFromPoint(x, y);
-    if (!nested || nested === hit) break;
-    hit = nested;
-  }
-  return hit;
-};
-const targetContains = (node) => {
-  let current = node;
-  while (current) {
-    if (current === el) return true;
-    const root = current.getRootNode ? current.getRootNode() : null;
-    current = current.parentElement || (root && root.host) || null;
-  }
-  return false;
-};
-const snapshot = () => {
-  const attached = !!el;
-  const rect = el ? el.getBoundingClientRect() : null;
-  const point = needsReceivesEvents && rect ? {
-    x: Math.min(Math.max(rect.left + (actionPosition ? Number(actionPosition.x || 0) : rect.width / 2), 0), Math.max(ownerWindow.innerWidth - 1, 0)),
-    y: Math.min(Math.max(rect.top + (actionPosition ? Number(actionPosition.y || 0) : rect.height / 2), 0), Math.max(ownerWindow.innerHeight - 1, 0)),
-  } : null;
-  const hit = needsReceivesEvents && el && point ? deepElementFromPoint(point.x, point.y) : null;
-  const tagName = el ? String(el.tagName || '').toUpperCase() : '';
-  const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
-  const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
-  const fillableForFill = !!el && (
-    (tagName === 'INPUT' && !nonFillableInputTypes.has(inputType)) ||
-    tagName === 'TEXTAREA' ||
-    el.isContentEditable
-  );
-  const checkedState = (() => {
-    if (!el) return { valid: false, checked: false, indeterminate: false, native_input: false, native_radio: false };
-    const checkedRoles = new Set(['checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem']);
-    const role = typeof locatorRoleOf === 'function' ? locatorRoleOf(el) : '';
-    const aria = String(el.getAttribute ? el.getAttribute('aria-checked') || '' : '').toLowerCase();
-    if (tagName === 'INPUT' && (inputType === 'checkbox' || inputType === 'radio')) {
-      const checked = !!el.checked;
-      return {
-        valid: true,
-        checked,
-        indeterminate: !!(el.indeterminate && !checked),
-        native_input: true,
-        native_radio: inputType === 'radio',
-      };
-    }
-    if (!checkedRoles.has(role)) {
-      return { valid: false, checked: false, indeterminate: false, native_input: false, native_radio: false };
-    }
-    if (aria === 'true') return { valid: true, checked: true, indeterminate: false, native_input: false, native_radio: false };
-    if (aria === 'false') return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
-    if (aria === 'mixed') return { valid: true, checked: false, indeterminate: true, native_input: false, native_radio: false };
-    return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
-  })();
-  const visibleState = (() => {
-    if (!attached || !el.isConnected) return false;
-    if (tagName === 'OPTION') return visible(el);
-    const computedStyle = ownerWindow.getComputedStyle(el);
-    if (!computedStyle || computedStyle.visibility === 'hidden' || computedStyle.display === 'none') return false;
-    return !!rect && rect.width > 0 && rect.height > 0;
-  })();
-  const disabled = attached && disabledState(el);
-  const hasLayout = attached && el.getClientRects().length > 0;
-  return {
-    count: matches.length,
-    frame_strict_violation: strictFrameViolation,
-    attached,
-    visible: visibleState,
-    enabled: attached && !disabled,
-    editable: attached && !disabled && !el.readOnly &&
-      (el.isContentEditable || /^(INPUT|TEXTAREA)$/.test(el.tagName)),
-    tag_name: tagName,
-    input_type: inputType,
-    is_select: tagName === 'SELECT',
-    non_fillable_input: tagName === 'INPUT' && nonFillableInputTypes.has(inputType),
-    fillable_for_fill: fillableForFill,
-    editable_for_fill: fillableForFill && !disabled && !el.readOnly,
-    has_layout: hasLayout,
-    checked_valid: checkedState.valid,
-    checked: checkedState.checked,
-    indeterminate: checkedState.indeterminate,
-    native_input: checkedState.native_input,
-    native_radio: checkedState.native_radio,
-    receives_events: needsReceivesEvents && attached && !!rect && rect.width > 0 && rect.height > 0 && targetContains(hit),
-    rect: rect ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height } : null,
-  };
-};
-const first = snapshot();
-if (!__STABLE__ || !first.attached) return first;
-const style = ownerWindow.getComputedStyle(el);
-const zeroTime = value => String(value || '').split(',').every(part => {
-  const text = part.trim();
-  if (!text) return true;
-  if (text.endsWith('ms')) return Number.parseFloat(text) === 0;
-  if (text.endsWith('s')) return Number.parseFloat(text) === 0;
-  return Number.parseFloat(text) === 0;
-});
-const hasNoCssMotion = style &&
-  (!__STABLE_POSITION_REQUIRED__ || String(style.position || 'static') === 'static') &&
-  (String(style.animationName || 'none') === 'none' || zeroTime(style.animationDuration)) &&
-  zeroTime(style.animationDelay) &&
-  zeroTime(style.transitionDuration) &&
-  zeroTime(style.transitionDelay);
-if (hasNoCssMotion) {
-  first.stable = true;
-  return first;
-}
-return new Promise(resolve => {
-  const finish = () => {
-    const second = snapshot();
-    const left = first.rect;
-    const right = second.rect;
-    second.stable = !!left && !!right && ["x", "y", "width", "height"].every(
-      key => Math.abs(Number(left[key] || 0) - Number(right[key] || 0)) <= 0.5
-    );
-    resolve(second);
-  };
-  ownerWindow.setTimeout(finish, 20);
-});
-"""
+            _LOCATOR_TARGET_STATE_TEMPLATE
             .replace("__SCROLL__", scroll_literal)
             .replace("__STABLE__", stable_literal)
             .replace("__RECEIVES_EVENTS__", receives_events_literal)
@@ -23593,65 +23653,11 @@ return { ok: true };
         value_json = json.dumps(str(value))
         force_literal = "true" if force else "false"
         strict_literal = "true" if self._strict and not self._explicit_index else "false"
-        fill_script = f"""
-const info = {{
-  count: matches.length,
-  frame_strict_violation: strictFrameViolation,
-  attached: !!el,
-}};
-const strict = {strict_literal};
-if (strict && (strictFrameViolation || matches.length > 1)) {{
-  return {{ ok: false, type: 'strict', info }};
-}}
-if (!el) return {{ ok: false, type: 'pending', info }};
-const value = {value_json};
-const forced = {force_literal};
-const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
-const tagName = String(el.tagName || '').toUpperCase();
-const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
-info.visible = visible(el);
-info.enabled = !disabledState(el);
-info.tag_name = tagName;
-info.input_type = inputType;
-info.non_fillable_input = tagName === 'INPUT' && nonFillableInputTypes.has(inputType);
-info.is_select = tagName === 'SELECT';
-info.fillable_for_fill = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
-info.editable_for_fill = info.fillable_for_fill && !disabledState(el) && !el.readOnly;
-if (tagName === 'INPUT' && nonFillableInputTypes.has(inputType)) {{
-  return {{ ok: false, type: 'input-type', inputType, info }};
-}}
-if (tagName === 'SELECT') {{
-  return {{ ok: false, type: forced ? 'force-non-fillable' : 'select', info }};
-}}
-const isFillable = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
-if (!isFillable) {{
-  return {{ ok: false, type: forced ? 'force-non-fillable' : 'non-fillable', info }};
-}}
-if (forced && (!visible(el) || disabledState(el) || el.readOnly)) return {{ ok: true, info }};
-if (!forced && (!visible(el) || disabledState(el) || el.readOnly)) {{
-  return {{ ok: false, type: 'pending', info }};
-}}
-if ('value' in el) {{
-  el.scrollIntoView({{ block: 'center', inline: 'center' }});
-  if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
-  el.value = value;
-  if (value !== '' && el.value !== value) {{
-    return {{
-      ok: false,
-      type: inputType === 'number' ? 'number-text' : 'malformed',
-      value: el.value,
-      info,
-    }};
-  }}
-}} else {{
-  el.scrollIntoView({{ block: 'center', inline: 'center' }});
-  if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
-  el.textContent = value;
-}}
-el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-return {{ ok: true, info }};
-"""
+        fill_script = (
+            _LOCATOR_FILL_TEMPLATE.replace("__STRICT__", strict_literal)
+            .replace("__FORCED__", force_literal)
+            .replace("__VALUE__", value_json)
+        )
         last_info: dict[str, Any] = {}
         while True:
             remaining_ms = max((deadline - time.monotonic()) * 1000, 1.0)
