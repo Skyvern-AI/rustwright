@@ -1476,6 +1476,29 @@ def _agent_main(argv: Sequence[str]) -> int:
     return agent_cli.main(list(argv))
 
 
+def _mcp_main(argv: Sequence[str], *, program: str) -> int:
+    try:
+        from rustwright_mcp import server
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"rustwright_mcp", "rustwright_mcp.server"}:
+            raise
+        print(
+            "rustwright mcp requires the separately installed rustwright-mcp package; "
+            "install it with: pip install rustwright-mcp\n"
+            "or uvx --from 'git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp' rustwright-mcp",
+            file=sys.stderr,
+        )
+        return 1
+
+    original_argv = sys.argv
+    sys.argv = [f"{program} mcp", *argv]
+    try:
+        exit_code = server.main()
+    finally:
+        sys.argv = original_argv
+    return 0 if exit_code is None else exit_code
+
+
 def _leading_agent_command_index(args: Sequence[str]) -> int | None:
     index = 0
     while index < len(args):
@@ -1537,6 +1560,14 @@ def _print_screenshot_help(program: str) -> None:
     )
 
 
+def _print_mcp_help(program: str) -> None:
+    print(
+        f"usage: {program} mcp [args...]\n\n"
+        "Run the MCP stdio server (requires rustwright-mcp).\n"
+        "Install with: pip install rustwright-mcp"
+    )
+
+
 def _unsupported_browser_alias(name: str) -> int:
     print(
         f"{name} is not implemented; Rustwright currently supports Chromium over direct CDP.",
@@ -1559,7 +1590,8 @@ def main(argv: Sequence[str] | None = None, *, program: Optional[str] = None) ->
             "  type / press / select / hover / wait / back / reload / eval\n"
             "  tabs [list|new|use|close]\n"
             "  screenshot [file]  screenshot the session's current page\n"
-            "  status / close     session lifecycle\n\n"
+            "  status / close     session lifecycle\n"
+            "  mcp                run the MCP server (requires rustwright-mcp)\n\n"
             "Playwright-compatible tools:\n"
             "  install / install-deps / uninstall / codegen\n"
             "  screenshot <url> <file>   one-shot capture (two-argument form)\n"
@@ -1631,6 +1663,9 @@ def main(argv: Sequence[str] | None = None, *, program: Optional[str] = None) ->
         if help_command == "screenshot":
             _print_screenshot_help(program)
             return 0
+        if help_command == "mcp":
+            _print_mcp_help(program)
+            return 0
         if help_command in AGENT_VERBS:
             return _agent_main([help_command, "--help"])
         return main([help_command, "--help"], program=program)
@@ -1644,6 +1679,8 @@ def main(argv: Sequence[str] | None = None, *, program: Optional[str] = None) ->
         return show_trace(rest, program=program)
     if command == "trace":
         return trace(rest, program=program)
+    if command == "mcp":
+        return _mcp_main(rest, program=program)
     if command in AGENT_VERBS - {"screenshot"}:
         return _agent_main(args)
     if command in {"cr", "chromium"}:
