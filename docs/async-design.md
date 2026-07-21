@@ -62,6 +62,24 @@ as do `connect`/`connect_over_cdp`, `wait_for_event`, and waits such as
 delivery normally uses a single asyncio task over the combined Rust event
 stream, with no per-page pump thread on these native paths.
 
+Optionless `AsyncPage.click` and `AsyncPage.fill` now keep their complete
+actionability waits on the Tokio side. Click polls the same visibility,
+role-aware disabled state, CSS-motion stability, and deep hit-target checks as
+the sync locator path, then emits the trusted CDP mouse move/press/release
+sequence at the translated frame coordinate. Fill polls the sync path's
+fillability and editability matrix, then commits the value and bubbling
+`input`/`change` events in one renderer evaluation. These waits use timed Tokio
+sleeps and do not occupy a Python executor worker or hold the GIL. As on the
+sync path, per-poll renderer evaluation timeouts propagate; only successful
+pending actionability results are polled again.
+
+The native action gate currently applies to page-level click/fill with their
+default option set. Option combinations such as positioned, forced, delayed,
+multi-click, or trial clicks and forced fills still use the off-loop sync path;
+locator, frame, and element-handle actions are follow-up scope. Setting
+`RUSTWRIGHT_UNSAFE_DOM_FASTPATH` retains the explicitly opted-in synthetic DOM
+click/fill behavior rather than selecting trusted actionability.
+
 Re-measurement on the same benchmark (macOS arm64, 10 cores, Python 3.13.5),
 `benchmarks/async_concurrency_load.py --concurrency 100`, all scenarios
 passing with zero task errors:
