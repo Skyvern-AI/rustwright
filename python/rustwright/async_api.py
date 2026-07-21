@@ -90,6 +90,40 @@ from .sync_api import (
     _validate_timeout_value,
 )
 from .sync_api import sync_playwright as _sync_playwright
+from ._async_generated import (
+    _AsyncAPIRequestContextGeneratedMixin,
+    _AsyncAPIRequestGeneratedMixin,
+    _AsyncAPIResponseGeneratedMixin,
+    _AsyncAccessibilityGeneratedMixin,
+    _AsyncBrowserContextGeneratedMixin,
+    _AsyncBrowserGeneratedMixin,
+    _AsyncBrowserTypeGeneratedMixin,
+    _AsyncCDPSessionGeneratedMixin,
+    _AsyncClockGeneratedMixin,
+    _AsyncDebuggerGeneratedMixin,
+    _AsyncDialogGeneratedMixin,
+    _AsyncDownloadGeneratedMixin,
+    _AsyncElementHandleGeneratedMixin,
+    _AsyncFileChooserGeneratedMixin,
+    _AsyncFrameGeneratedMixin,
+    _AsyncJSHandleGeneratedMixin,
+    _AsyncKeyboardGeneratedMixin,
+    _AsyncLocatorGeneratedMixin,
+    _AsyncMouseGeneratedMixin,
+    _AsyncPageGeneratedMixin,
+    _AsyncPlaywrightGeneratedMixin,
+    _AsyncRequestGeneratedMixin,
+    _AsyncResponseGeneratedMixin,
+    _AsyncRouteGeneratedMixin,
+    _AsyncScreencastFrameGeneratedMixin,
+    _AsyncScreencastGeneratedMixin,
+    _AsyncSelectorsGeneratedMixin,
+    _AsyncTouchscreenGeneratedMixin,
+    _AsyncTracingGeneratedMixin,
+    _AsyncVideoGeneratedMixin,
+    _AsyncWebSocketRouteGeneratedMixin,
+    _AsyncWorkerGeneratedMixin,
+)
 
 
 if hasattr(asyncio, "to_thread"):
@@ -577,48 +611,17 @@ async def _run_sync_wait_sliced(
             await asyncio.sleep(min(0.01, max(deadline - loop.time(), 0.0)))
 
 
-class AsyncClock(_AsyncWrapper):
-    async def install(self, **kwargs: Any) -> None:
-        await _run_sync_call(self._sync.install, **kwargs)
-
-    async def set_fixed_time(self, time: Any) -> None:
-        await _run_sync_call(self._sync.set_fixed_time, time)
-
-    async def set_system_time(self, time: Any) -> None:
-        await _run_sync_call(self._sync.set_system_time, time)
-
-    async def pause_at(self, time: Any) -> None:
-        await _run_sync_call(self._sync.pause_at, time)
-
-    async def resume(self) -> None:
-        await _run_sync_call(self._sync.resume)
-
-    async def fast_forward(self, ticks: Any) -> None:
-        await _run_sync_call(self._sync.fast_forward, ticks)
-
-    async def run_for(self, ticks: Any) -> None:
-        await _run_sync_call(self._sync.run_for, ticks)
+class AsyncClock(_AsyncClockGeneratedMixin, _AsyncWrapper):
+    pass
 
 
-class AsyncDebugger(_AsyncWrapper):
+class AsyncDebugger(_AsyncDebuggerGeneratedMixin, _AsyncWrapper):
     @property
     def paused_details(self) -> Optional[DebuggerPausedDetails]:
         return self._sync.paused_details
 
-    async def request_pause(self) -> None:
-        await _run_sync_call(self._sync.request_pause)
 
-    async def resume(self) -> None:
-        await _run_sync_call(self._sync.resume)
-
-    async def next(self) -> None:
-        await _run_sync_call(self._sync.next)
-
-    async def run_to(self, location: DebuggerLocation) -> None:
-        await _run_sync_call(self._sync.run_to, location)
-
-
-class AsyncScreencastFrame(_AsyncWrapper):
+class AsyncScreencastFrame(_AsyncScreencastFrameGeneratedMixin, _AsyncWrapper):
     @property
     def data(self) -> bytes:
         return self._sync.data
@@ -639,11 +642,8 @@ class AsyncScreencastFrame(_AsyncWrapper):
     def height(self) -> int:
         return self._sync.height
 
-    async def save_as(self, path: Any) -> None:
-        await _run_sync_call(self._sync.save_as, path)
 
-
-class AsyncScreencast(_AsyncWrapper):
+class AsyncScreencast(_AsyncScreencastGeneratedMixin, _AsyncWrapper):
     async def start(self, **kwargs: Any) -> None:
         options = dict(kwargs)
         on_frame = options.get("on_frame")
@@ -654,40 +654,13 @@ class AsyncScreencast(_AsyncWrapper):
             options["on_frame"] = wrapper
         await _run_sync_call(self._sync.start, **options)
 
-    async def stop(self) -> None:
-        await _run_sync_call(self._sync.stop)
 
-    async def show_overlay(self, html: str, **kwargs: Any) -> None:
-        await _run_sync_call(self._sync.show_overlay, html, **kwargs)
-
-    async def hide_overlays(self) -> None:
-        await _run_sync_call(self._sync.hide_overlays)
-
-    async def show_overlays(self) -> None:
-        await _run_sync_call(self._sync.show_overlays)
-
-    async def show_actions(self, **kwargs: Any) -> None:
-        await _run_sync_call(self._sync.show_actions, **kwargs)
-
-    async def hide_actions(self) -> None:
-        await _run_sync_call(self._sync.hide_actions)
-
-    async def show_chapter(self, title: str, **kwargs: Any) -> None:
-        await _run_sync_call(self._sync.show_chapter, title, **kwargs)
-
-
-class AsyncVideo(_AsyncWrapper):
-    async def path(self) -> str:
-        return await _run_sync_call(self._sync.path)
-
+class AsyncVideo(_AsyncVideoGeneratedMixin, _AsyncWrapper):
     async def save_as(self, path: Any) -> None:
         await _run_sync_call(self._sync._save_as, path, allow_before_close=True)
 
-    async def delete(self) -> None:
-        await _run_sync_call(self._sync.delete)
 
-
-class AsyncBrowserType(_AsyncWrapper):
+class AsyncBrowserType(_AsyncBrowserTypeGeneratedMixin, _AsyncWrapper):
     @property
     def name(self) -> str:
         return self._sync.name
@@ -769,175 +742,13 @@ class AsyncBrowserType(_AsyncWrapper):
         )
         return _wrap_async_browser(SyncBrowser(core, launch_options=launch_options))
 
-    async def launch_persistent_context(
-        self,
-        user_data_dir: Any,
-        *,
-        channel: Optional[str] = None,
-        executable_path: Optional[Any] = None,
-        args: Optional[Any] = None,
-        ignore_default_args: Optional[Any] = None,
-        handle_sigint: Optional[bool] = None,
-        handle_sigterm: Optional[bool] = None,
-        handle_sighup: Optional[bool] = None,
-        timeout: Optional[float] = None,
-        env: Optional[dict[str, Any]] = None,
-        headless: Optional[bool] = None,
-        proxy: Optional[dict[str, Any]] = None,
-        downloads_path: Optional[Any] = None,
-        slow_mo: Optional[float] = None,
-        viewport: Optional[dict[str, Any]] = None,
-        screen: Optional[dict[str, Any]] = None,
-        no_viewport: Optional[bool] = None,
-        ignore_https_errors: Optional[bool] = None,
-        java_script_enabled: Optional[bool] = None,
-        bypass_csp: Optional[bool] = None,
-        user_agent: Optional[str] = None,
-        locale: Optional[str] = None,
-        timezone_id: Optional[str] = None,
-        geolocation: Optional[dict[str, Any]] = None,
-        permissions: Optional[Any] = None,
-        extra_http_headers: Optional[dict[str, str]] = None,
-        offline: Optional[bool] = None,
-        http_credentials: Optional[dict[str, Any]] = None,
-        device_scale_factor: Optional[float] = None,
-        is_mobile: Optional[bool] = None,
-        has_touch: Optional[bool] = None,
-        color_scheme: Optional[str] = None,
-        reduced_motion: Optional[str] = None,
-        forced_colors: Optional[str] = None,
-        contrast: Optional[str] = None,
-        accept_downloads: Optional[bool] = None,
-        traces_dir: Optional[Any] = None,
-        artifacts_dir: Optional[Any] = None,
-        chromium_sandbox: Optional[bool] = None,
-        firefox_user_prefs: Optional[dict[str, Any]] = None,
-        record_har_path: Optional[Any] = None,
-        record_har_omit_content: Optional[bool] = None,
-        record_video_dir: Optional[Any] = None,
-        record_video_size: Optional[dict[str, Any]] = None,
-        base_url: Optional[str] = None,
-        strict_selectors: Optional[bool] = None,
-        service_workers: Optional[str] = None,
-        record_har_url_filter: Optional[Any] = None,
-        record_har_mode: Optional[str] = None,
-        record_har_content: Optional[str] = None,
-        client_certificates: Optional[list[Any]] = None,
-    ) -> "AsyncBrowserContext":
-        return _wrap_async_browser_context(
-            await _run_sync_call(
-                self._sync.launch_persistent_context,
-                user_data_dir,
-                channel=channel,
-                executable_path=executable_path,
-                args=args,
-                ignore_default_args=ignore_default_args,
-                handle_sigint=handle_sigint,
-                handle_sigterm=handle_sigterm,
-                handle_sighup=handle_sighup,
-                timeout=timeout,
-                env=env,
-                headless=headless,
-                proxy=proxy,
-                downloads_path=downloads_path,
-                slow_mo=slow_mo,
-                viewport=viewport,
-                screen=screen,
-                no_viewport=no_viewport,
-                ignore_https_errors=ignore_https_errors,
-                java_script_enabled=java_script_enabled,
-                bypass_csp=bypass_csp,
-                user_agent=user_agent,
-                locale=locale,
-                timezone_id=timezone_id,
-                geolocation=geolocation,
-                permissions=permissions,
-                extra_http_headers=extra_http_headers,
-                offline=offline,
-                http_credentials=http_credentials,
-                device_scale_factor=device_scale_factor,
-                is_mobile=is_mobile,
-                has_touch=has_touch,
-                color_scheme=color_scheme,
-                reduced_motion=reduced_motion,
-                forced_colors=forced_colors,
-                contrast=contrast,
-                accept_downloads=accept_downloads,
-                traces_dir=traces_dir,
-                artifacts_dir=artifacts_dir,
-                chromium_sandbox=chromium_sandbox,
-                firefox_user_prefs=firefox_user_prefs,
-                record_har_path=record_har_path,
-                record_har_omit_content=record_har_omit_content,
-                record_video_dir=record_video_dir,
-                record_video_size=record_video_size,
-                base_url=base_url,
-                strict_selectors=strict_selectors,
-                service_workers=service_workers,
-                record_har_url_filter=record_har_url_filter,
-                record_har_mode=record_har_mode,
-                record_har_content=record_har_content,
-                client_certificates=client_certificates,
-            )
-        )
 
-    async def connect_over_cdp(
-        self,
-        endpoint_url: str,
-        *,
-        timeout: Optional[float] = None,
-        slow_mo: Optional[float] = None,
-        headers: Optional[dict[str, str]] = None,
-        is_local: Optional[bool] = None,
-    ) -> "AsyncBrowser":
-        return _wrap_async_browser(
-            await _run_sync_call(
-                self._sync.connect_over_cdp,
-                endpoint_url,
-                timeout=timeout,
-                slow_mo=slow_mo,
-                headers=headers,
-                is_local=is_local,
-            )
-        )
-
-    async def connect(
-        self,
-        endpoint: str,
-        *,
-        timeout: Optional[float] = None,
-        slow_mo: Optional[float] = None,
-        headers: Optional[dict[str, str]] = None,
-        expose_network: Optional[str] = None,
-    ) -> "AsyncBrowser":
-        return _wrap_async_browser(
-            await _run_sync_call(
-                self._sync.connect,
-                endpoint,
-                timeout=timeout,
-                slow_mo=slow_mo,
-                headers=headers,
-                expose_network=expose_network,
-            )
-        )
-
-
-class AsyncSelectors(_AsyncWrapper):
+class AsyncSelectors(_AsyncSelectorsGeneratedMixin, _AsyncWrapper):
     def set_test_id_attribute(self, attribute_name: str) -> None:
         self._sync.set_test_id_attribute(attribute_name)
 
-    async def register(
-        self,
-        name: str,
-        script: Optional[str] = None,
-        *,
-        path: Any = None,
-        content_script: Optional[bool] = None,
-    ) -> None:
-        await _run_sync_call(self._sync.register, name, script=script, path=path, content_script=content_script)
 
-
-class AsyncPlaywright(_AsyncWrapper):
+class AsyncPlaywright(_AsyncPlaywrightGeneratedMixin, _AsyncWrapper):
     def __init__(self, sync_obj: Any):
         super().__init__(sync_obj)
         sync_obj = self._sync
@@ -970,9 +781,6 @@ class AsyncPlaywright(_AsyncWrapper):
     @property
     def devices(self) -> dict[str, dict[str, Any]]:
         return self._sync.devices
-
-    async def stop(self) -> None:
-        await _run_sync_call(self._sync.stop)
 
 
 class _AsyncPlaywrightContextManager:
@@ -1590,7 +1398,7 @@ def _forget_all_async_route_handlers(owner: Any) -> None:
     setattr(owner, "_route_handler_wrappers", [])
 
 
-class AsyncRequest(_AsyncWrapper):
+class AsyncRequest(_AsyncRequestGeneratedMixin, _AsyncWrapper):
     @property
     def url(self) -> str:
         return self._sync.url
@@ -1602,15 +1410,6 @@ class AsyncRequest(_AsyncWrapper):
     @property
     def headers(self) -> dict[str, str]:
         return dict(self._sync.headers or {})
-
-    async def all_headers(self) -> dict[str, str]:
-        return await _run_sync_call(self._sync.all_headers)
-
-    async def header_value(self, name: str) -> Optional[str]:
-        return await _run_sync_call(self._sync.header_value, name)
-
-    async def headers_array(self) -> list[dict[str, str]]:
-        return await _run_sync_call(self._sync.headers_array)
 
     @property
     def post_data(self) -> Optional[str]:
@@ -1660,14 +1459,8 @@ class AsyncRequest(_AsyncWrapper):
     def is_navigation_request(self) -> bool:
         return self._sync.is_navigation_request()
 
-    async def response(self) -> Optional["AsyncResponse"]:
-        return _wrap_async_response(await _run_sync_call(self._sync.response))
 
-    async def sizes(self) -> dict[str, int]:
-        return await _run_sync_call(self._sync.sizes)
-
-
-class AsyncResponse(_AsyncWrapper):
+class AsyncResponse(_AsyncResponseGeneratedMixin, _AsyncWrapper):
     @property
     def url(self) -> str:
         return self._sync.url
@@ -1701,41 +1494,8 @@ class AsyncResponse(_AsyncWrapper):
     def from_service_worker(self) -> bool:
         return self._sync.from_service_worker
 
-    async def all_headers(self) -> dict[str, str]:
-        return await _run_sync_call(self._sync.all_headers)
 
-    async def body(self) -> bytes:
-        return await _run_sync_call(self._sync.body)
-
-    async def finished(self) -> None:
-        await _run_sync_call(self._sync.finished)
-
-    async def header_value(self, name: str) -> Optional[str]:
-        return await _run_sync_call(self._sync.header_value, name)
-
-    async def header_values(self, name: str) -> list[str]:
-        return await _run_sync_call(self._sync.header_values, name)
-
-    async def headers_array(self) -> list[dict[str, str]]:
-        return await _run_sync_call(self._sync.headers_array)
-
-    async def http_version(self) -> str:
-        return await _run_sync_call(self._sync.http_version)
-
-    async def json(self) -> Any:
-        return await _run_sync_call(self._sync.json)
-
-    async def security_details(self) -> Optional[dict[str, Any]]:
-        return await _run_sync_call(self._sync.security_details)
-
-    async def server_addr(self) -> Optional[dict[str, Any]]:
-        return await _run_sync_call(self._sync.server_addr)
-
-    async def text(self) -> str:
-        return await _run_sync_call(self._sync.text)
-
-
-class AsyncDialog(_AsyncWrapper):
+class AsyncDialog(_AsyncDialogGeneratedMixin, _AsyncWrapper):
     @property
     def type(self) -> str:
         return self._sync.type
@@ -1752,14 +1512,8 @@ class AsyncDialog(_AsyncWrapper):
     def page(self) -> "AsyncPage":
         return _wrap_async_page(self._sync.page)
 
-    async def accept(self, prompt_text: Optional[str] = None) -> None:
-        await _run_sync_call(self._sync.accept, prompt_text)
 
-    async def dismiss(self) -> None:
-        await _run_sync_call(self._sync.dismiss)
-
-
-class AsyncDownload(_AsyncWrapper):
+class AsyncDownload(_AsyncDownloadGeneratedMixin, _AsyncWrapper):
     @property
     def url(self) -> str:
         return self._sync.url
@@ -1772,23 +1526,8 @@ class AsyncDownload(_AsyncWrapper):
     def page(self) -> "AsyncPage":
         return _wrap_async_page(self._sync.page)
 
-    async def path(self) -> Path:
-        return await _run_sync_call(self._sync.path)
 
-    async def save_as(self, path: Any) -> None:
-        await _run_sync_call(self._sync.save_as, path)
-
-    async def failure(self) -> Optional[str]:
-        return await _run_sync_call(self._sync.failure)
-
-    async def delete(self) -> None:
-        await _run_sync_call(self._sync.delete)
-
-    async def cancel(self) -> None:
-        await _run_sync_call(self._sync.cancel)
-
-
-class AsyncFileChooser(_AsyncWrapper):
+class AsyncFileChooser(_AsyncFileChooserGeneratedMixin, _AsyncWrapper):
     @property
     def page(self) -> "AsyncPage":
         return _wrap_async_page(self._sync.page)
@@ -1799,9 +1538,6 @@ class AsyncFileChooser(_AsyncWrapper):
 
     def is_multiple(self) -> bool:
         return self._sync.is_multiple()
-
-    async def set_files(self, files: Any, *, timeout: Optional[float] = None, no_wait_after: Optional[bool] = None) -> None:
-        await _run_sync_call(self._sync.set_files, files, timeout=timeout, no_wait_after=no_wait_after)
 
 
 class AsyncConsoleMessage(_AsyncWrapper):
@@ -2254,67 +1990,19 @@ class AsyncExpect:
             self._timeout = timeout
 
 
-class AsyncCDPSession(_AsyncWrapper):
-    async def send(self, method: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        return await _run_sync_call(self._sync.send, method, params)
-
-    async def detach(self) -> None:
-        await _run_sync_call(self._sync.detach)
+class AsyncCDPSession(_AsyncCDPSessionGeneratedMixin, _AsyncWrapper):
+    pass
 
 
-class AsyncAccessibility(_AsyncWrapper):
-    async def snapshot(
-        self,
-        *,
-        interesting_only: Optional[bool] = None,
-        root: Any = None,
-    ) -> Optional[dict[str, Any]]:
-        sync_root = root._sync if isinstance(root, AsyncElementHandle) else root
-        return await _run_sync_call(
-            self._sync.snapshot,
-            interesting_only=interesting_only,
-            root=sync_root,
-        )
+class AsyncAccessibility(_AsyncAccessibilityGeneratedMixin, _AsyncWrapper):
+    pass
 
 
-class AsyncTracing(_AsyncWrapper):
-    async def start(
-        self,
-        *,
-        name: Optional[str] = None,
-        title: Optional[str] = None,
-        snapshots: Optional[bool] = None,
-        screenshots: Optional[bool] = None,
-        sources: Optional[bool] = None,
-        live: Optional[bool] = None,
-    ) -> None:
-        await _run_sync_call(
-            self._sync.start,
-            name=name,
-            title=title,
-            snapshots=snapshots,
-            screenshots=screenshots,
-            sources=sources,
-            live=live,
-        )
-
-    async def stop(self, *, path: Optional[Union[str, Path]] = None) -> None:
-        await _run_sync_call(self._sync.stop, path=path)
-
-    async def start_chunk(self, *, title: Optional[str] = None, name: Optional[str] = None) -> None:
-        await _run_sync_call(self._sync.start_chunk, title=title, name=name)
-
-    async def stop_chunk(self, *, path: Optional[Union[str, Path]] = None) -> None:
-        await _run_sync_call(self._sync.stop_chunk, path=path)
-
-    async def group(self, name: str, *, location: Optional[dict[str, Any]] = None) -> None:
-        await _run_sync_call(self._sync.group, name, location=location)
-
-    async def group_end(self) -> None:
-        await _run_sync_call(self._sync.group_end)
+class AsyncTracing(_AsyncTracingGeneratedMixin, _AsyncWrapper):
+    pass
 
 
-class AsyncBrowser(_AsyncWrapper):
+class AsyncBrowser(_AsyncBrowserGeneratedMixin, _AsyncWrapper):
     async def __aenter__(self) -> "AsyncBrowser":
         return self
 
@@ -2493,44 +2181,8 @@ class AsyncBrowser(_AsyncWrapper):
     def browser_type(self) -> AsyncBrowserType:
         return AsyncBrowserType(self._sync.browser_type)
 
-    async def new_browser_cdp_session(self) -> "AsyncCDPSession":
-        return _wrap_async_cdp_session(await _run_sync_call(self._sync.new_browser_cdp_session))
 
-    async def start_tracing(
-        self,
-        *,
-        page: Optional["AsyncPage"] = None,
-        path: Any = None,
-        screenshots: Optional[bool] = None,
-        categories: Any = None,
-    ) -> None:
-        sync_page = None if page is None else page._sync
-        await _run_sync_call(
-            self._sync.start_tracing,
-            page=sync_page,
-            path=path,
-            screenshots=screenshots,
-            categories=categories,
-        )
-
-    async def stop_tracing(self) -> bytes:
-        return await _run_sync_call(self._sync.stop_tracing)
-
-    async def bind(
-        self,
-        title: str,
-        *,
-        workspace_dir: Optional[str] = None,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-    ) -> Any:
-        return await _run_sync_call(self._sync.bind, title, workspace_dir=workspace_dir, host=host, port=port)
-
-    async def unbind(self) -> None:
-        await _run_sync_call(self._sync.unbind)
-
-
-class AsyncBrowserContext(_AsyncWrapper):
+class AsyncBrowserContext(_AsyncBrowserContextGeneratedMixin, _AsyncWrapper):
     async def __aenter__(self) -> "AsyncBrowserContext":
         return self
 
@@ -2635,68 +2287,15 @@ class AsyncBrowserContext(_AsyncWrapper):
     def set_default_navigation_timeout(self, timeout: float) -> None:
         self._sync.set_default_navigation_timeout(timeout)
 
-    async def add_init_script(self, script: Optional[str] = None, *, path: Any = None) -> None:
-        await _run_sync_call(self._sync.add_init_script, script, path=path)
-
     async def expose_function(self, name: str, callback: Any) -> None:
         await _run_sync_call(self._sync.expose_function, name, _wrap_async_binding_callback(callback))
 
     async def expose_binding(self, name: str, callback: Any, *, handle: Optional[bool] = None) -> None:
         await _run_sync_call(self._sync.expose_binding, name, _wrap_async_binding_callback(callback), handle=handle)
 
-    async def cookies(self, urls: Any = None) -> list[dict[str, Any]]:
-        return await _run_sync_call(self._sync.cookies, urls)
-
-    async def add_cookies(self, cookies: list[dict[str, Any]]) -> None:
-        await _run_sync_call(self._sync.add_cookies, cookies)
-
-    async def clear_cookies(self, *, name: Any = None, domain: Any = None, path: Any = None) -> None:
-        await _run_sync_call(self._sync.clear_cookies, name=name, domain=domain, path=path)
-
-    async def storage_state(self, *, path: Any = None, indexed_db: Optional[bool] = None) -> dict[str, Any]:
-        return await _run_sync_call(self._sync.storage_state, path=path, indexed_db=indexed_db)
-
-    async def set_storage_state(self, storage_state: Any) -> None:
-        await _run_sync_call(self._sync.set_storage_state, storage_state)
-
-    async def set_extra_http_headers(self, headers: dict[str, str]) -> None:
-        await _run_sync_call(self._sync.set_extra_http_headers, headers)
-
-    async def grant_permissions(self, permissions: list[str], *, origin: Optional[str] = None) -> None:
-        await _run_sync_call(self._sync.grant_permissions, permissions, origin=origin)
-
-    async def clear_permissions(self) -> None:
-        await _run_sync_call(self._sync.clear_permissions)
-
-    async def set_geolocation(self, geolocation: Optional[dict[str, Any]] = None) -> None:
-        await _run_sync_call(self._sync.set_geolocation, geolocation)
-
-    async def set_offline(self, offline: bool) -> None:
-        await _run_sync_call(self._sync.set_offline, offline)
-
     async def route(self, url: Any, handler: Any, *, times: Optional[int] = None) -> None:
         wrapped_handler = _remember_async_route_handler(self, url, handler)
         await _run_sync_call(self._sync.route, url, wrapped_handler, times=times)
-
-    async def route_from_har(
-        self,
-        har: Any,
-        *,
-        url: Any = None,
-        not_found: Optional[str] = None,
-        update: Optional[bool] = None,
-        update_content: Optional[str] = None,
-        update_mode: Optional[str] = None,
-    ) -> None:
-        await _run_sync_call(
-            self._sync.route_from_har,
-            har,
-            url=url,
-            not_found=not_found,
-            update=update,
-            update_content=update_content,
-            update_mode=update_mode,
-        )
 
     async def unroute(self, url: Any, handler: Any = None) -> None:
         await _run_sync_call(self._sync.unroute, url, _forget_async_route_handler(self, url, handler))
@@ -2732,15 +2331,11 @@ class AsyncBrowserContext(_AsyncWrapper):
         )
         return _wrap_async_event_value(event, value)
 
-    async def new_cdp_session(self, page: Union["AsyncPage", "AsyncFrame"]) -> "AsyncCDPSession":
-        sync_page = page._sync
-        return _wrap_async_cdp_session(await _run_sync_call(self._sync.new_cdp_session, sync_page))
-
     async def route_web_socket(self, url: Any, handler: Any) -> None:
         await _run_sync_call(self._sync.route_web_socket, url, _wrap_async_websocket_route_handler(handler, self))
 
 
-class AsyncPage(_AsyncWrapper):
+class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
     def __init__(self, sync_obj: Any):
         super().__init__(sync_obj)
         sync_obj = self._sync
@@ -3023,32 +2618,11 @@ class AsyncPage(_AsyncWrapper):
         self._sync._slow_mo()
         return _wrap_async_response(response)
 
-    async def reload(self, *, timeout: Optional[float] = None, wait_until: Optional[str] = None) -> Optional["AsyncResponse"]:
-        response = await _run_sync_call(self._sync.reload, timeout=timeout, wait_until=wait_until)
-        return _wrap_async_response(response)
-
-    async def go_back(self, *, timeout: Optional[float] = None, wait_until: Optional[str] = None) -> Optional["AsyncResponse"]:
-        response = await _run_sync_call(self._sync.go_back, timeout=timeout, wait_until=wait_until)
-        return _wrap_async_response(response)
-
-    async def go_forward(self, *, timeout: Optional[float] = None, wait_until: Optional[str] = None) -> Optional["AsyncResponse"]:
-        response = await _run_sync_call(self._sync.go_forward, timeout=timeout, wait_until=wait_until)
-        return _wrap_async_response(response)
-
     async def wait_for_url(self, url: Any, *, wait_until: Optional[str] = None, timeout: Optional[float] = None) -> None:
         await _run_sync_wait_sliced(self._sync, self._sync.wait_for_url, url, wait_until=wait_until, timeout=timeout)
 
     async def wait_for_load_state(self, state: Optional[str] = None, *, timeout: Optional[float] = None) -> None:
         await _run_sync_wait_sliced(self._sync, self._sync.wait_for_load_state, "load" if state is None else state, timeout=timeout)
-
-    async def wait_for_timeout(self, timeout: float) -> None:
-        await _run_sync_call(self._sync.wait_for_timeout, timeout)
-
-    async def set_content(self, html: str, *, timeout: Optional[float] = None, wait_until: Optional[str] = None) -> None:
-        await _run_sync_call(self._sync.set_content, html, timeout=timeout, wait_until=wait_until)
-
-    async def add_init_script(self, script: Optional[str] = None, *, path: Any = None) -> None:
-        await _run_sync_call(self._sync.add_init_script, script, path=path)
 
     async def evaluate(self, expression: str, arg: Any = None) -> Any:
         if not _native_page_hot_path_supported(self._sync):
@@ -3075,9 +2649,6 @@ class AsyncPage(_AsyncWrapper):
             )
         )
         return _decode_json_result(json.loads(result))
-
-    async def evaluate_handle(self, expression: str, arg: Any = None) -> "AsyncJSHandle":
-        return _wrap_async_js_handle(await _run_sync_call(self._sync.evaluate_handle, expression, _unwrap_async_arg(arg)))
 
     async def wait_for_function(
         self,
@@ -3122,49 +2693,11 @@ class AsyncPage(_AsyncWrapper):
     async def expose_binding(self, name: str, callback: Any, *, handle: Optional[bool] = None) -> None:
         await _run_sync_call(self._sync.expose_binding, name, _wrap_async_binding_callback(callback), handle=handle)
 
-    async def set_extra_http_headers(self, headers: dict[str, str]) -> None:
-        await _run_sync_call(self._sync.set_extra_http_headers, headers)
-
-    async def set_viewport_size(self, viewport_size: dict[str, int]) -> None:
-        await _run_sync_call(self._sync.set_viewport_size, viewport_size)
-
     def set_default_timeout(self, timeout: float) -> None:
         self._sync.set_default_timeout(timeout)
 
     def set_default_navigation_timeout(self, timeout: float) -> None:
         self._sync.set_default_navigation_timeout(timeout)
-
-    async def emulate_media(
-        self,
-        *,
-        media: Optional[str] = None,
-        color_scheme: Optional[str] = None,
-        reduced_motion: Optional[str] = None,
-        forced_colors: Optional[str] = None,
-        contrast: Optional[str] = None,
-    ) -> None:
-        await _run_sync_call(
-            self._sync.emulate_media,
-            media=media,
-            color_scheme=color_scheme,
-            reduced_motion=reduced_motion,
-            forced_colors=forced_colors,
-            contrast=contrast,
-        )
-
-    async def title(self) -> str:
-        return await _run_sync_call(self._sync.title)
-
-    async def content(self) -> str:
-        return await _run_sync_call(self._sync.content)
-
-    async def query_selector(self, selector: str, *, strict: Optional[bool] = None) -> Optional["AsyncElementHandle"]:
-        handle = await _run_sync_call(self._sync.query_selector, selector, strict=strict)
-        return _wrap_async_element_handle(handle)
-
-    async def query_selector_all(self, selector: str) -> list["AsyncElementHandle"]:
-        handles = await _run_sync_call(self._sync.query_selector_all, selector)
-        return [_wrap_async_element_handle(handle) for handle in handles]
 
     async def wait_for_selector(
         self,
@@ -3201,55 +2734,6 @@ class AsyncPage(_AsyncWrapper):
         if attached and normalized_state in {"attached", "visible"}:
             handle = SyncElementHandle(locator.nth(0), handle=None)
         return _wrap_async_element_handle(handle)
-
-    async def eval_on_selector(self, selector: str, expression: str, arg: Any = None, *, strict: Optional[bool] = None) -> Any:
-        return await _run_sync_call(
-            self._sync.eval_on_selector,
-            selector,
-            expression,
-            _unwrap_async_arg(arg),
-            strict=strict,
-        )
-
-    async def eval_on_selector_all(self, selector: str, expression: str, arg: Any = None) -> Any:
-        return await _run_sync_call(self._sync.eval_on_selector_all, selector, expression, _unwrap_async_arg(arg))
-
-    async def dispatch_event(
-        self,
-        selector: str,
-        type: str,
-        event_init: Optional[dict[str, Any]] = None,
-        *,
-        timeout: Optional[float] = None,
-        strict: Optional[bool] = None,
-    ) -> None:
-        await _run_sync_call(
-            self._sync.dispatch_event,
-            selector,
-            type,
-            _unwrap_async_arg(event_init),
-            timeout=timeout,
-            strict=strict,
-        )
-
-    async def get_attribute(
-        self,
-        selector: str,
-        name: str,
-        *,
-        strict: Optional[bool] = None,
-        timeout: Optional[float] = None,
-    ) -> Optional[str]:
-        return await _run_sync_call(self._sync.get_attribute, selector, name, strict=strict, timeout=timeout)
-
-    async def inner_html(
-        self,
-        selector: str,
-        *,
-        strict: Optional[bool] = None,
-        timeout: Optional[float] = None,
-    ) -> Optional[str]:
-        return await _run_sync_call(self._sync.inner_html, selector, strict=strict, timeout=timeout)
 
     async def click(
         self,
@@ -3640,15 +3124,6 @@ class AsyncPage(_AsyncWrapper):
             no_wait_after=no_wait_after,
         )
 
-    async def text_content(
-        self,
-        selector: str,
-        *,
-        strict: Optional[bool] = None,
-        timeout: Optional[float] = None,
-    ) -> Optional[str]:
-        return await _run_sync_call(self._sync.text_content, selector, strict=strict, timeout=timeout)
-
     async def inner_text(
         self,
         selector: str,
@@ -3679,24 +3154,6 @@ class AsyncPage(_AsyncWrapper):
             )
         )
 
-    async def input_value(self, selector: str, *, strict: Optional[bool] = None, timeout: Optional[float] = None) -> str:
-        return await _run_sync_call(self._sync.input_value, selector, strict=strict, timeout=timeout)
-
-    async def is_visible(self, selector: str, *, strict: Optional[bool] = None, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_visible, selector, strict=strict, timeout=timeout)
-
-    async def is_hidden(self, selector: str, *, strict: Optional[bool] = None, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_hidden, selector, strict=strict, timeout=timeout)
-
-    async def is_enabled(self, selector: str, *, strict: Optional[bool] = None, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_enabled, selector, strict=strict, timeout=timeout)
-
-    async def is_disabled(self, selector: str, *, strict: Optional[bool] = None, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_disabled, selector, strict=strict, timeout=timeout)
-
-    async def is_checked(self, selector: str, *, strict: Optional[bool] = None, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_checked, selector, strict=strict, timeout=timeout)
-
     async def set_checked(
         self,
         selector: str,
@@ -3721,9 +3178,6 @@ class AsyncPage(_AsyncWrapper):
             strict=strict,
             trial=trial,
         )
-
-    async def is_editable(self, selector: str, *, strict: Optional[bool] = None, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_editable, selector, strict=strict, timeout=timeout)
 
     def expect_request(self, url_or_predicate: Any, *, timeout: Optional[float] = None) -> _AsyncEventContextManager:
         return _AsyncEventContextManager(
@@ -3818,26 +3272,6 @@ class AsyncPage(_AsyncWrapper):
     async def route(self, url: Any, handler: Any, *, times: Optional[int] = None) -> None:
         await _run_sync_call(self._sync.route, url, _remember_async_route_handler(self, url, handler), times=times)
 
-    async def route_from_har(
-        self,
-        har: Any,
-        *,
-        url: Any = None,
-        not_found: Optional[str] = None,
-        update: Optional[bool] = None,
-        update_content: Optional[str] = None,
-        update_mode: Optional[str] = None,
-    ) -> None:
-        await _run_sync_call(
-            self._sync.route_from_har,
-            har,
-            url=url,
-            not_found=not_found,
-            update=update,
-            update_content=update_content,
-            update_mode=update_mode,
-        )
-
     async def unroute(self, url: Any, handler: Any = None) -> None:
         await _run_sync_call(self._sync.unroute, url, _forget_async_route_handler(self, url, handler))
 
@@ -3930,49 +3364,8 @@ class AsyncPage(_AsyncWrapper):
             )
         )
 
-    async def pdf(
-        self,
-        *,
-        scale: Any = None,
-        display_header_footer: Optional[bool] = None,
-        header_template: Optional[str] = None,
-        footer_template: Optional[str] = None,
-        print_background: Optional[bool] = None,
-        landscape: Optional[bool] = None,
-        page_ranges: Optional[str] = None,
-        format: Optional[str] = None,
-        width: Any = None,
-        height: Any = None,
-        prefer_css_page_size: Optional[bool] = None,
-        margin: Optional[dict[str, Any]] = None,
-        path: Optional[str] = None,
-        outline: Optional[bool] = None,
-        tagged: Optional[bool] = None,
-    ) -> bytes:
-        return await _run_sync_call(
-            self._sync.pdf,
-            scale=scale,
-            display_header_footer=display_header_footer,
-            header_template=header_template,
-            footer_template=footer_template,
-            print_background=print_background,
-            landscape=landscape,
-            page_ranges=page_ranges,
-            format=format,
-            width=width,
-            height=height,
-            prefer_css_page_size=prefer_css_page_size,
-            margin=margin,
-            path=path,
-            outline=outline,
-            tagged=tagged,
-        )
-
     def is_closed(self) -> bool:
         return self._sync.is_closed()
-
-    async def bring_to_front(self) -> None:
-        await _run_sync_call(self._sync.bring_to_front)
 
     async def opener(self) -> Any:
         return _wrap_async_page(await _run_sync_call(self._sync.opener))
@@ -3980,29 +3373,6 @@ class AsyncPage(_AsyncWrapper):
     @property
     def workers(self) -> list["AsyncWorker"]:
         return [_wrap_async_worker(worker) for worker in self._sync.workers]
-
-    async def requests(self) -> list["AsyncRequest"]:
-        requests = await _run_sync_call(self._sync.requests)
-        return [_wrap_async_request(request) for request in requests]
-
-    async def console_messages(self, *, filter: Optional[str] = None) -> list["AsyncConsoleMessage"]:
-        messages = await _run_sync_call(self._sync.console_messages, filter=filter)
-        return [_wrap_async_console_message(message) for message in messages]
-
-    async def clear_console_messages(self) -> None:
-        await _run_sync_call(self._sync.clear_console_messages)
-
-    async def page_errors(self, *, filter: Optional[str] = None) -> list[Any]:
-        return await _run_sync_call(self._sync.page_errors, filter=filter)
-
-    async def clear_page_errors(self) -> None:
-        await _run_sync_call(self._sync.clear_page_errors)
-
-    async def request_gc(self) -> None:
-        await _run_sync_call(self._sync.request_gc)
-
-    async def pause(self) -> None:
-        await _run_sync_call(self._sync.pause)
 
     async def add_locator_handler(
         self,
@@ -4024,21 +3394,6 @@ class AsyncPage(_AsyncWrapper):
     async def remove_locator_handler(self, locator: Any) -> None:
         sync_locator = locator._sync if isinstance(locator, AsyncLocator) else locator
         await _run_sync_call(self._sync.remove_locator_handler, sync_locator)
-
-    async def pick_locator(self) -> "AsyncLocator":
-        return AsyncLocator(await _run_sync_call(self._sync.pick_locator))
-
-    async def cancel_pick_locator(self) -> None:
-        await _run_sync_call(self._sync.cancel_pick_locator)
-
-    async def aria_snapshot(
-        self,
-        *,
-        timeout: Optional[float] = None,
-        depth: Optional[int] = None,
-        mode: Optional[str] = None,
-    ) -> str:
-        return await _run_sync_call(self._sync.aria_snapshot, timeout=timeout, depth=depth, mode=mode)
 
     async def close(self, *, run_before_unload: Optional[bool] = None, reason: Optional[str] = None) -> None:
         if not isinstance(self._sync, SyncPage):
@@ -4125,38 +3480,19 @@ class AsyncPage(_AsyncWrapper):
             await _wrap_async_browser_context(self._sync._context).close()
 
 
-class AsyncJSHandle(_AsyncWrapper):
+class AsyncJSHandle(_AsyncJSHandleGeneratedMixin, _AsyncWrapper):
     def __str__(self) -> str:
         return str(self._sync)
 
     def __repr__(self) -> str:
         return repr(self._sync)
 
-    async def json_value(self) -> Any:
-        return await _run_sync_call(self._sync.json_value)
-
-    async def get_property(self, property_name: str) -> "AsyncJSHandle":
-        return _wrap_async_js_handle(await _run_sync_call(self._sync.get_property, property_name))
-
-    async def get_properties(self) -> dict[str, "AsyncJSHandle"]:
-        properties = await _run_sync_call(self._sync.get_properties)
-        return {name: _wrap_async_js_handle(handle) for name, handle in properties.items()}
-
     def as_element(self) -> Optional["AsyncElementHandle"]:
         handle = self._sync.as_element()
         return _wrap_async_element_handle(handle)
 
-    async def evaluate(self, expression: str, arg: Any = None) -> Any:
-        return await _run_sync_call(self._sync.evaluate, expression, _unwrap_async_arg(arg))
 
-    async def evaluate_handle(self, expression: str, arg: Any = None) -> "AsyncJSHandle":
-        return _wrap_async_js_handle(await _run_sync_call(self._sync.evaluate_handle, expression, _unwrap_async_arg(arg)))
-
-    async def dispose(self) -> None:
-        await _run_sync_call(self._sync.dispose)
-
-
-class AsyncFrame(_AsyncWrapper):
+class AsyncFrame(_AsyncFrameGeneratedMixin, _AsyncWrapper):
     @property
     def name(self) -> str:
         return self._sync.name
@@ -4249,14 +3585,6 @@ class AsyncFrame(_AsyncWrapper):
     def get_by_title(self, text: str, *, exact: Optional[bool] = None) -> "AsyncLocator":
         return AsyncLocator(self._sync.get_by_title(text, exact=bool(exact) if exact is not None else False))
 
-    async def query_selector(self, selector: str, *, strict: Optional[bool] = None) -> Optional["AsyncElementHandle"]:
-        handle = await _run_sync_call(self._sync.query_selector, selector, strict=strict)
-        return _wrap_async_element_handle(handle)
-
-    async def query_selector_all(self, selector: str) -> list["AsyncElementHandle"]:
-        handles = await _run_sync_call(self._sync.query_selector_all, selector)
-        return [_wrap_async_element_handle(handle) for handle in handles]
-
     async def wait_for_selector(
         self,
         selector: str,
@@ -4275,74 +3603,6 @@ class AsyncFrame(_AsyncWrapper):
         )
         return _wrap_async_element_handle(handle)
 
-    async def evaluate(self, expression: str, arg: Any = None) -> Any:
-        return await _run_sync_call(self._sync.evaluate, expression, _unwrap_async_arg(arg))
-
-    async def evaluate_handle(self, expression: str, arg: Any = None) -> AsyncJSHandle:
-        return _wrap_async_js_handle(await _run_sync_call(self._sync.evaluate_handle, expression, _unwrap_async_arg(arg)))
-
-    async def eval_on_selector(self, selector: str, expression: str, arg: Any = None, *, strict: Optional[bool] = None) -> Any:
-        return await _run_sync_call(
-            self._sync.eval_on_selector,
-            selector,
-            expression,
-            _unwrap_async_arg(arg),
-            strict=strict,
-        )
-
-    async def eval_on_selector_all(self, selector: str, expression: str, arg: Any = None) -> Any:
-        return await _run_sync_call(self._sync.eval_on_selector_all, selector, expression, _unwrap_async_arg(arg))
-
-    async def dispatch_event(
-        self,
-        selector: str,
-        type: str,
-        event_init: Optional[dict[str, Any]] = None,
-        *,
-        strict: Optional[bool] = None,
-        timeout: Optional[float] = None,
-    ) -> None:
-        await _run_sync_call(
-            self._sync.dispatch_event,
-            selector,
-            type,
-            _unwrap_async_arg(event_init),
-            strict=strict,
-            timeout=timeout,
-        )
-
-    async def content(self) -> str:
-        return await _run_sync_call(self._sync.content)
-
-    async def title(self) -> str:
-        return await _run_sync_call(self._sync.title)
-
-    async def set_content(
-        self,
-        html: str,
-        *,
-        timeout: Optional[float] = None,
-        wait_until: Optional[str] = None,
-    ) -> None:
-        await _run_sync_call(self._sync.set_content, html, timeout=timeout, wait_until=wait_until)
-
-    async def goto(
-        self,
-        url: str,
-        *,
-        timeout: Optional[float] = None,
-        wait_until: Optional[str] = None,
-        referer: Optional[str] = None,
-    ) -> Optional["AsyncResponse"]:
-        response = await _run_sync_call(
-            self._sync.goto,
-            url,
-            timeout=timeout,
-            wait_until=wait_until,
-            referer=referer,
-        )
-        return _wrap_async_response(response)
-
     async def wait_for_url(
         self,
         url: Any,
@@ -4354,9 +3614,6 @@ class AsyncFrame(_AsyncWrapper):
 
     async def wait_for_load_state(self, state: Optional[str] = None, *, timeout: Optional[float] = None) -> None:
         await _run_sync_wait_sliced(self._sync, self._sync.wait_for_load_state, "load" if state is None else state, timeout=timeout)
-
-    async def wait_for_timeout(self, timeout: float) -> None:
-        await _run_sync_call(self._sync.wait_for_timeout, timeout)
 
     async def wait_for_function(
         self,
@@ -4375,27 +3632,6 @@ class AsyncFrame(_AsyncWrapper):
             polling=polling,
         )
         return _wrap_async_js_handle(handle)
-
-    async def add_script_tag(
-        self,
-        *,
-        url: Optional[str] = None,
-        path: Any = None,
-        content: Optional[str] = None,
-        type: Optional[str] = None,
-    ) -> "AsyncElementHandle":
-        handle = await _run_sync_call(self._sync.add_script_tag, url=url, path=path, content=content, type=type)
-        return _wrap_async_element_handle(handle)
-
-    async def add_style_tag(
-        self,
-        *,
-        url: Optional[str] = None,
-        path: Any = None,
-        content: Optional[str] = None,
-    ) -> "AsyncElementHandle":
-        handle = await _run_sync_call(self._sync.add_style_tag, url=url, path=path, content=content)
-        return _wrap_async_element_handle(handle)
 
     async def click(
         self,
@@ -4724,67 +3960,6 @@ class AsyncFrame(_AsyncWrapper):
             steps=steps,
         )
 
-    async def text_content(
-        self,
-        selector: str,
-        *,
-        strict: Optional[bool] = None,
-        timeout: Optional[float] = None,
-    ) -> Optional[str]:
-        return await _run_sync_call(self._sync.text_content, selector, strict=strict, timeout=timeout)
-
-    async def inner_text(
-        self,
-        selector: str,
-        *,
-        strict: Optional[bool] = None,
-        timeout: Optional[float] = None,
-    ) -> Optional[str]:
-        return await _run_sync_call(self._sync.inner_text, selector, strict=strict, timeout=timeout)
-
-    async def inner_html(
-        self,
-        selector: str,
-        *,
-        strict: Optional[bool] = None,
-        timeout: Optional[float] = None,
-    ) -> Optional[str]:
-        return await _run_sync_call(self._sync.inner_html, selector, strict=strict, timeout=timeout)
-
-    async def get_attribute(
-        self,
-        selector: str,
-        name: str,
-        *,
-        strict: Optional[bool] = None,
-        timeout: Optional[float] = None,
-    ) -> Optional[str]:
-        return await _run_sync_call(self._sync.get_attribute, selector, name, strict=strict, timeout=timeout)
-
-    async def input_value(self, selector: str, *, strict: Optional[bool] = None, timeout: Optional[float] = None) -> str:
-        return await _run_sync_call(self._sync.input_value, selector, strict=strict, timeout=timeout)
-
-    async def is_visible(self, selector: str, *, strict: Optional[bool] = None) -> bool:
-        return await _run_sync_call(self._sync.is_visible, selector, strict=strict)
-
-    async def is_hidden(self, selector: str, *, strict: Optional[bool] = None) -> bool:
-        return await _run_sync_call(self._sync.is_hidden, selector, strict=strict)
-
-    async def is_enabled(self, selector: str, *, strict: Optional[bool] = None, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_enabled, selector, strict=strict, timeout=timeout)
-
-    async def is_disabled(self, selector: str, *, strict: Optional[bool] = None, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_disabled, selector, strict=strict, timeout=timeout)
-
-    async def is_checked(self, selector: str, *, strict: Optional[bool] = None, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_checked, selector, strict=strict, timeout=timeout)
-
-    async def is_editable(self, selector: str, *, strict: Optional[bool] = None, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_editable, selector, strict=strict, timeout=timeout)
-
-    async def frame_element(self) -> "AsyncElementHandle":
-        return _wrap_async_element_handle(await _run_sync_call(self._sync.frame_element))
-
     def is_detached(self) -> bool:
         return self._sync.is_detached()
 
@@ -4888,7 +4063,7 @@ class AsyncFrameLocator(_AsyncWrapper):
         return AsyncLocator(self._sync.get_by_title(text, exact=bool(exact) if exact is not None else False))
 
 
-class AsyncLocator(_AsyncWrapper):
+class AsyncLocator(_AsyncLocatorGeneratedMixin, _AsyncWrapper):
     @property
     def page(self) -> AsyncPage:
         return _wrap_async_page(self._sync.page)
@@ -5011,9 +4186,6 @@ class AsyncLocator(_AsyncWrapper):
 
     def get_by_title(self, text: Any, *, exact: Optional[bool] = None) -> "AsyncLocator":
         return AsyncLocator(self._sync.get_by_title(text, exact=bool(exact)))
-
-    async def count(self) -> int:
-        return await _run_sync_call(self._sync.count)
 
     async def click(
         self,
@@ -5299,65 +4471,6 @@ class AsyncLocator(_AsyncWrapper):
             force=force,
         )
 
-    async def evaluate(self, expression: str, arg: Any = None, *, timeout: Optional[float] = None) -> Any:
-        return await _run_sync_call(self._sync.evaluate, expression, _unwrap_async_arg(arg), timeout=timeout)
-
-    async def evaluate_handle(
-        self,
-        expression: str,
-        arg: Any = None,
-        *,
-        timeout: Optional[float] = None,
-    ) -> AsyncJSHandle:
-        return _wrap_async_js_handle(
-            await _run_sync_call(self._sync.evaluate_handle, expression, _unwrap_async_arg(arg), timeout=timeout)
-        )
-
-    async def evaluate_all(self, expression: str, arg: Any = None) -> Any:
-        return await _run_sync_call(self._sync.evaluate_all, expression, _unwrap_async_arg(arg))
-
-    async def dispatch_event(
-        self,
-        type: str,
-        event_init: Optional[dict[str, Any]] = None,
-        *,
-        timeout: Optional[float] = None,
-    ) -> None:
-        await _run_sync_call(self._sync.dispatch_event, type, _unwrap_async_arg(event_init), timeout=timeout)
-
-    async def inner_text(self, *, timeout: Optional[float] = None) -> Optional[str]:
-        return await _run_sync_call(self._sync.inner_text, timeout=timeout)
-
-    async def inner_html(self, *, timeout: Optional[float] = None) -> Optional[str]:
-        return await _run_sync_call(self._sync.inner_html, timeout=timeout)
-
-    async def text_content(self, *, timeout: Optional[float] = None) -> Optional[str]:
-        return await _run_sync_call(self._sync.text_content, timeout=timeout)
-
-    async def get_attribute(self, name: str, *, timeout: Optional[float] = None) -> Optional[str]:
-        return await _run_sync_call(self._sync.get_attribute, name, timeout=timeout)
-
-    async def is_visible(self, *, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_visible, timeout=timeout)
-
-    async def is_hidden(self, *, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_hidden, timeout=timeout)
-
-    async def is_enabled(self, *, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_enabled, timeout=timeout)
-
-    async def is_disabled(self, *, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_disabled, timeout=timeout)
-
-    async def is_checked(self, *, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_checked, timeout=timeout)
-
-    async def is_editable(self, *, timeout: Optional[float] = None) -> bool:
-        return await _run_sync_call(self._sync.is_editable, timeout=timeout)
-
-    async def input_value(self, *, timeout: Optional[float] = None) -> str:
-        return await _run_sync_call(self._sync.input_value, timeout=timeout)
-
     async def set_input_files(
         self,
         files: Any,
@@ -5372,23 +4485,6 @@ class AsyncLocator(_AsyncWrapper):
             timeout=timeout,
             no_wait_after=no_wait_after,
         )
-
-    async def all_inner_texts(self) -> list[str]:
-        return await _run_sync_call(self._sync.all_inner_texts)
-
-    async def all_text_contents(self) -> list[Optional[str]]:
-        return await _run_sync_call(self._sync.all_text_contents)
-
-    async def all(self) -> list["AsyncLocator"]:
-        locators = await _run_sync_call(self._sync.all)
-        return [AsyncLocator(locator) for locator in locators]
-
-    async def element_handles(self) -> list["AsyncElementHandle"]:
-        handles = await _run_sync_call(self._sync.element_handles)
-        return [_wrap_async_element_handle(handle) for handle in handles]
-
-    async def bounding_box(self, *, timeout: Optional[float] = None) -> Optional[dict[str, float]]:
-        return await _run_sync_call(self._sync.bounding_box, timeout=timeout)
 
     async def scroll_into_view_if_needed(self, *, timeout: Optional[float] = None) -> None:
         await _run_sync_wait_sliced(self._sync, self._sync.scroll_into_view_if_needed, timeout=timeout)
@@ -5448,29 +4544,13 @@ class AsyncLocator(_AsyncWrapper):
             style=style,
         )
 
-    async def highlight(self) -> None:
-        await _run_sync_call(self._sync.highlight)
-
     @property
     def content_frame(self) -> Optional["AsyncFrameLocator"]:
         frame_locator = self._sync.content_frame
         return None if frame_locator is None else AsyncFrameLocator(frame_locator)
 
-    async def aria_snapshot(
-        self,
-        *,
-        timeout: Optional[float] = None,
-        depth: Optional[int] = None,
-        mode: Optional[str] = None,
-    ) -> str:
-        return await _run_sync_call(self._sync.aria_snapshot, timeout=timeout, depth=depth, mode=mode)
-
     async def wait_for(self, *, timeout: Optional[float] = None, state: Optional[str] = None) -> None:
         await _run_sync_wait_sliced(self._sync, self._sync.wait_for, timeout=timeout, state=state)
-
-    async def element_handle(self, *, timeout: Optional[float] = None) -> Optional["AsyncElementHandle"]:
-        handle = await _run_sync_call(self._sync.element_handle, timeout=timeout)
-        return _wrap_async_element_handle(handle)
 
     def describe(self, description: str) -> "AsyncLocator":
         return AsyncLocator(self._sync.describe(description))
@@ -5479,11 +4559,8 @@ class AsyncLocator(_AsyncWrapper):
     def description(self) -> Optional[str]:
         return self._sync.description
 
-    async def normalize(self) -> "AsyncLocator":
-        return AsyncLocator(await _run_sync_call(self._sync.normalize))
 
-
-class AsyncElementHandle(_AsyncWrapper):
+class AsyncElementHandle(_AsyncElementHandleGeneratedMixin, _AsyncWrapper):
     def __str__(self) -> str:
         return str(self._sync)
 
@@ -5642,29 +4719,6 @@ class AsyncElementHandle(_AsyncWrapper):
             trial=trial,
         )
 
-    async def dispatch_event(self, type: str, event_init: Optional[dict[str, Any]] = None) -> None:
-        await _run_sync_call(self._sync.dispatch_event, type, _unwrap_async_arg(event_init))
-
-    async def evaluate(self, expression: str, arg: Any = None) -> Any:
-        return await _run_sync_call(self._sync.evaluate, expression, _unwrap_async_arg(arg))
-
-    async def evaluate_handle(self, expression: str, arg: Any = None) -> AsyncJSHandle:
-        return _wrap_async_js_handle(await _run_sync_call(self._sync.evaluate_handle, expression, _unwrap_async_arg(arg)))
-
-    async def eval_on_selector(self, selector: str, expression: str, arg: Any = None) -> Any:
-        return await _run_sync_call(self._sync.eval_on_selector, selector, expression, _unwrap_async_arg(arg))
-
-    async def eval_on_selector_all(self, selector: str, expression: str, arg: Any = None) -> Any:
-        return await _run_sync_call(self._sync.eval_on_selector_all, selector, expression, _unwrap_async_arg(arg))
-
-    async def query_selector(self, selector: str) -> Optional["AsyncElementHandle"]:
-        handle = await _run_sync_call(self._sync.query_selector, selector)
-        return _wrap_async_element_handle(handle)
-
-    async def query_selector_all(self, selector: str) -> list["AsyncElementHandle"]:
-        handles = await _run_sync_call(self._sync.query_selector_all, selector)
-        return [_wrap_async_element_handle(handle) for handle in handles]
-
     async def wait_for_selector(
         self,
         selector: str,
@@ -5682,9 +4736,6 @@ class AsyncElementHandle(_AsyncWrapper):
             strict=strict,
         )
         return _wrap_async_element_handle(handle)
-
-    async def focus(self) -> None:
-        await _run_sync_call(self._sync.focus)
 
     async def check(
         self,
@@ -5788,42 +4839,6 @@ class AsyncElementHandle(_AsyncWrapper):
             no_wait_after=no_wait_after,
         )
 
-    async def text_content(self) -> Optional[str]:
-        return await _run_sync_call(self._sync.text_content)
-
-    async def inner_text(self) -> Optional[str]:
-        return await _run_sync_call(self._sync.inner_text)
-
-    async def inner_html(self) -> Optional[str]:
-        return await _run_sync_call(self._sync.inner_html)
-
-    async def get_attribute(self, name: str) -> Optional[str]:
-        return await _run_sync_call(self._sync.get_attribute, name)
-
-    async def is_visible(self) -> bool:
-        return await _run_sync_call(self._sync.is_visible)
-
-    async def is_hidden(self) -> bool:
-        return await _run_sync_call(self._sync.is_hidden)
-
-    async def is_enabled(self) -> bool:
-        return await _run_sync_call(self._sync.is_enabled)
-
-    async def is_disabled(self) -> bool:
-        return await _run_sync_call(self._sync.is_disabled)
-
-    async def is_editable(self) -> bool:
-        return await _run_sync_call(self._sync.is_editable)
-
-    async def input_value(self, *, timeout: Optional[float] = None) -> str:
-        return await _run_sync_call(self._sync.input_value, timeout=timeout)
-
-    async def is_checked(self) -> bool:
-        return await _run_sync_call(self._sync.is_checked)
-
-    async def bounding_box(self) -> Optional[dict[str, float]]:
-        return await _run_sync_call(self._sync.bounding_box)
-
     async def scroll_into_view_if_needed(self, *, timeout: Optional[float] = None) -> None:
         await _run_sync_wait_sliced(self._sync, self._sync.scroll_into_view_if_needed, timeout=timeout)
 
@@ -5868,85 +4883,20 @@ class AsyncElementHandle(_AsyncWrapper):
             style=style,
         )
 
-    async def get_property(self, property_name: str) -> AsyncJSHandle:
-        return _wrap_async_js_handle(await _run_sync_call(self._sync.get_property, property_name))
 
-    async def get_properties(self) -> dict[str, AsyncJSHandle]:
-        properties = await _run_sync_call(self._sync.get_properties)
-        return {name: _wrap_async_js_handle(handle) for name, handle in properties.items()}
-
-    async def json_value(self) -> Any:
-        return await _run_sync_call(self._sync.json_value)
-
-    async def content_frame(self) -> Optional[AsyncFrame]:
-        frame = await _run_sync_call(self._sync.content_frame)
-        return _wrap_async_frame(frame)
-
-    async def owner_frame(self) -> AsyncFrame:
-        return _wrap_async_frame(await _run_sync_call(self._sync.owner_frame))
-
-    async def dispose(self) -> None:
-        await _run_sync_call(self._sync.dispose)
+class AsyncKeyboard(_AsyncKeyboardGeneratedMixin, _AsyncWrapper):
+    pass
 
 
-class AsyncKeyboard(_AsyncWrapper):
-    async def type(self, text: str, *, delay: Optional[float] = None) -> None:
-        await _run_sync_call(self._sync.type, text, delay=delay)
-
-    async def insert_text(self, text: str) -> None:
-        await _run_sync_call(self._sync.insert_text, text)
-
-    async def press(self, key: str, *, delay: Optional[float] = None) -> None:
-        await _run_sync_call(self._sync.press, key, delay=delay)
-
-    async def down(self, key: str) -> None:
-        await _run_sync_call(self._sync.down, key)
-
-    async def up(self, key: str) -> None:
-        await _run_sync_call(self._sync.up, key)
+class AsyncMouse(_AsyncMouseGeneratedMixin, _AsyncWrapper):
+    pass
 
 
-class AsyncMouse(_AsyncWrapper):
-    async def move(self, x: float, y: float, *, steps: Optional[int] = None) -> None:
-        await _run_sync_call(self._sync.move, x, y, steps=steps)
-
-    async def click(
-        self,
-        x: float,
-        y: float,
-        *,
-        delay: Optional[float] = None,
-        button: Optional[str] = None,
-        click_count: Optional[int] = None,
-    ) -> None:
-        await _run_sync_call(self._sync.click, x, y, delay=delay, button=button, click_count=click_count)
-
-    async def dblclick(
-        self,
-        x: float,
-        y: float,
-        *,
-        delay: Optional[float] = None,
-        button: Optional[str] = None,
-    ) -> None:
-        await _run_sync_call(self._sync.dblclick, x, y, delay=delay, button=button)
-
-    async def down(self, *, button: Optional[str] = None, click_count: Optional[int] = None) -> None:
-        await _run_sync_call(self._sync.down, button=button, click_count=click_count)
-
-    async def up(self, *, button: Optional[str] = None, click_count: Optional[int] = None) -> None:
-        await _run_sync_call(self._sync.up, button=button, click_count=click_count)
-
-    async def wheel(self, delta_x: float, delta_y: float) -> None:
-        await _run_sync_call(self._sync.wheel, delta_x, delta_y)
+class AsyncTouchscreen(_AsyncTouchscreenGeneratedMixin, _AsyncWrapper):
+    pass
 
 
-class AsyncTouchscreen(_AsyncWrapper):
-    async def tap(self, x: float, y: float) -> None:
-        await _run_sync_call(self._sync.tap, x, y)
-
-
-class AsyncAPIResponse(_AsyncWrapper):
+class AsyncAPIResponse(_AsyncAPIResponseGeneratedMixin, _AsyncWrapper):
     @property
     def url(self) -> str:
         return self._sync.url
@@ -5971,130 +4921,18 @@ class AsyncAPIResponse(_AsyncWrapper):
     def headers_array(self) -> list[dict[str, str]]:
         return self._sync.headers_array
 
-    async def body(self) -> bytes:
-        return await _run_sync_call(self._sync.body)
 
-    async def text(self) -> str:
-        return await _run_sync_call(self._sync.text)
-
-    async def json(self) -> Any:
-        return await _run_sync_call(self._sync.json)
-
-    async def dispose(self) -> None:
-        await _run_sync_call(self._sync.dispose)
-
-
-class AsyncRoute(_AsyncWrapper):
+class AsyncRoute(_AsyncRouteGeneratedMixin, _AsyncWrapper):
     @property
     def request(self) -> AsyncRequest:
         return _wrap_async_request(self._sync.request)
 
-    async def continue_(
-        self,
-        *,
-        url: Optional[str] = None,
-        method: Optional[str] = None,
-        headers: Optional[dict[str, str]] = None,
-        post_data: Any = None,
-    ) -> None:
-        await _run_sync_call(self._sync.continue_, url=url, method=method, headers=headers, post_data=post_data)
 
-    async def fallback(
-        self,
-        *,
-        url: Optional[str] = None,
-        method: Optional[str] = None,
-        headers: Optional[dict[str, str]] = None,
-        post_data: Any = None,
-    ) -> None:
-        await _run_sync_call(self._sync.fallback, url=url, method=method, headers=headers, post_data=post_data)
-
-    async def fetch(
-        self,
-        *,
-        url: Optional[str] = None,
-        method: Optional[str] = None,
-        headers: Optional[dict[str, str]] = None,
-        post_data: Any = None,
-        max_redirects: Optional[int] = None,
-        max_retries: Optional[int] = None,
-        timeout: Optional[float] = None,
-    ) -> "AsyncAPIResponse":
-        return AsyncAPIResponse(
-            await _run_sync_call(
-                self._sync.fetch,
-                url=url,
-                method=method,
-                headers=headers,
-                post_data=post_data,
-                max_redirects=max_redirects,
-                max_retries=max_retries,
-                timeout=timeout,
-            )
-        )
-
-    async def abort(self, error_code: Optional[str] = None) -> None:
-        await _run_sync_call(self._sync.abort, error_code)
-
-    async def fulfill(
-        self,
-        *,
-        status: Optional[int] = None,
-        headers: Optional[dict[str, str]] = None,
-        body: Any = None,
-        json: Any = None,
-        path: Any = None,
-        content_type: Optional[str] = None,
-        response: Optional[Any] = None,
-    ) -> None:
-        sync_response = response._sync if isinstance(response, _AsyncWrapper) else response
-        await _run_sync_call(
-            self._sync.fulfill,
-            status=status,
-            headers=headers,
-            body=body,
-            json=json,
-            path=path,
-            content_type=content_type,
-            response=sync_response,
-        )
+class AsyncAPIRequest(_AsyncAPIRequestGeneratedMixin, _AsyncWrapper):
+    pass
 
 
-class AsyncAPIRequest(_AsyncWrapper):
-    async def new_context(
-        self,
-        *,
-        base_url: Optional[str] = None,
-        extra_http_headers: Optional[dict[str, str]] = None,
-        http_credentials: Optional[dict[str, Any]] = None,
-        ignore_https_errors: Optional[bool] = None,
-        proxy: Optional[dict[str, Any]] = None,
-        user_agent: Optional[str] = None,
-        timeout: Optional[float] = None,
-        storage_state: Any = None,
-        client_certificates: Optional[list[Any]] = None,
-        fail_on_status_code: Optional[bool] = None,
-        max_redirects: Optional[int] = None,
-    ) -> "AsyncAPIRequestContext":
-        return _wrap_async_api_request_context(
-            await _run_sync_call(
-                self._sync.new_context,
-                base_url=base_url,
-                extra_http_headers=extra_http_headers,
-                http_credentials=http_credentials,
-                ignore_https_errors=ignore_https_errors,
-                proxy=proxy,
-                user_agent=user_agent,
-                timeout=timeout,
-                storage_state=storage_state,
-                client_certificates=client_certificates,
-                fail_on_status_code=fail_on_status_code,
-                max_redirects=max_redirects,
-            )
-        )
-
-
-class AsyncAPIRequestContext(_AsyncWrapper):
+class AsyncAPIRequestContext(_AsyncAPIRequestContextGeneratedMixin, _AsyncWrapper):
     def __init__(self, sync_obj: Any):
         super().__init__(sync_obj)
         self._request_lock = asyncio.Lock()
@@ -6322,12 +5160,6 @@ class AsyncAPIRequestContext(_AsyncWrapper):
                 max_retries=max_retries,
         )
 
-    async def storage_state(self, *, path: Any = None, indexed_db: Optional[bool] = None) -> dict[str, Any]:
-        return await _run_sync_call(self._sync.storage_state, path=path, indexed_db=indexed_db)
-
-    async def dispose(self, *, reason: Optional[str] = None) -> None:
-        await _run_sync_call(self._sync.dispose, reason=reason)
-
 
 class AsyncWebSocket(_AsyncWrapper):
     @property
@@ -6370,7 +5202,7 @@ class AsyncWebSocket(_AsyncWrapper):
         )
 
 
-class AsyncWebSocketRoute(_AsyncWrapper):
+class AsyncWebSocketRoute(_AsyncWebSocketRouteGeneratedMixin, _AsyncWrapper):
     @property
     def url(self) -> str:
         return self._sync.url
@@ -6380,9 +5212,6 @@ class AsyncWebSocketRoute(_AsyncWrapper):
 
     def send(self, message: str | bytes) -> None:
         self._sync.send(message)
-
-    async def close(self, *, code: Optional[int] = None, reason: Optional[str] = None) -> None:
-        await _run_sync_call(self._sync.close, code=code, reason=reason)
 
     def on_message(self, handler: Any) -> None:
         def wrapper(message: str | bytes) -> None:
@@ -6397,16 +5226,10 @@ class AsyncWebSocketRoute(_AsyncWrapper):
         self._sync.on_close(wrapper)
 
 
-class AsyncWorker(_AsyncWrapper):
+class AsyncWorker(_AsyncWorkerGeneratedMixin, _AsyncWrapper):
     @property
     def url(self) -> str:
         return self._sync.url
-
-    async def evaluate(self, expression: str, arg: Any = None) -> Any:
-        return await _run_sync_call(self._sync.evaluate, expression, _unwrap_async_arg(arg))
-
-    async def evaluate_handle(self, expression: str, arg: Any = None) -> AsyncJSHandle:
-        return _wrap_async_js_handle(await _run_sync_call(self._sync.evaluate_handle, expression, _unwrap_async_arg(arg)))
 
     def _event_predicate(self, event: str, predicate: Any = None) -> Any:
         if predicate is None:
