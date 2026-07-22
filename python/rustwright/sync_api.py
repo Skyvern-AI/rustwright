@@ -7861,40 +7861,563 @@ def _emit_event(handlers: dict[str, list[Callable[..., Any]]], event: str, *args
         handler(*_event_handler_positional_args(handler, args))
 
 
-class _EventContextManager:
-    def __init__(self, page: "Page", kind: str, matcher: Any, timeout: Optional[float]):
-        self._page = page
+_DEFAULT_EVENT_TIMEOUT_MESSAGE = 'Timeout {timeout}ms exceeded while waiting for event "{event}"'
+
+
+def _identity_event_payload(payload: Any) -> Any:
+    return payload
+
+
+def _json_event_payload(payload: Any) -> Any:
+    if isinstance(payload, (str, bytes, bytearray)):
+        return json.loads(payload)
+    return payload
+
+
+def _callable_event_matches(_target: Any, matcher: Any, value: Any) -> bool:
+    return matcher is None or bool(matcher(value))
+
+
+def _network_event_from_payload(page: "Page", payload: dict[str, Any], kind: str) -> Request | Response:
+    event: Request | Response
+    if kind == "request":
+        event = _request_from_payload(payload, page) or Request(url="", _page=page)
+        event = page._record_request(event)
+    elif kind == "response":
+        event = _response_from_payload(page, payload)
+        page._record_response(event)
+    elif kind in {"requestfinished", "requestfailed"}:
+        event = _request_from_payload(payload, page) or Request(url="", _page=page)
+        event = page._adopt_request(event)
+    else:
+        raise Error(f"unsupported network event kind: {kind}")
+    if isinstance(event, Request):
+        page._note_network_lifecycle_event(kind, event)
+    return event
+
+
+def _network_event_matches_descriptor(page: "Page", matcher: Any, event: Request | Response) -> bool:
+    return _network_event_matches(matcher, event, base_url=page._base_url)
+
+
+def _network_log_state(page: "Page", kind: str) -> dict[str, Any]:
+    if kind == "request":
+        return {"log_offset": len(page._request_log)}
+    if kind == "response":
+        return {"log_offset": len(page._response_log)}
+    return {}
+
+
+def _network_log_values(page: "Page", state: dict[str, Any], kind: str) -> Iterable[Request | Response]:
+    offset = state.get("log_offset")
+    if offset is None:
+        return ()
+    if kind == "request":
+        return page._request_log[offset:]
+    if kind == "response":
+        return page._response_log[offset:]
+    return ()
+
+
+def _page_console_waiter(page: "Page") -> Any:
+    waiter = page._core.console_event_waiter()
+    page._runtime_observation_enabled = True
+    return waiter
+
+
+def _page_console_from_payload(page: "Page", payload: dict[str, Any]) -> ConsoleMessage:
+    event = ConsoleMessage(page, payload)
+    page._record_console_message(event)
+    return event
+
+
+def _page_error_from_event_payload(page: "Page", payload: dict[str, Any]) -> Error:
+    event = _page_error_from_payload(payload)
+    page._record_page_error(event)
+    return event
+
+
+def _page_download_payload_matches(page: "Page", payload: Any) -> bool:
+    return isinstance(payload, dict) and page._download_payload_belongs_to_page(payload)
+
+
+def _page_popup_from_core(page: "Page", core: Any) -> "Page":
+    popup = Page(core, context=page._context)
+    popup._opener = page
+    if page._context is not None:
+        page._context._adopt_popup(popup)
+    return popup
+
+
+def _context_background_page_from_core(context: "BrowserContext", core: Any) -> "Page":
+    return context._background_page_from_core(core)
+
+
+def _context_service_worker_from_core(context: "BrowserContext", core: Any) -> "Worker":
+    return context._service_worker_from_core(core)
+
+
+def _emit_background_page(context: "BrowserContext", page: "Page") -> None:
+    _emit_event(context._event_handlers, "backgroundpage", page)
+
+
+def _emit_service_worker(context: "BrowserContext", worker: "Worker") -> None:
+    context._emit_service_worker_event(worker)
+
+
+def _mark_websocket_closed(websocket: "WebSocket") -> None:
+    if websocket._closed:
+        return
+    websocket._closed = True
+    websocket._emit_local_event("close", websocket)
+
+
+def _emit_websocket_value(websocket: "WebSocket", event: str, value: Any) -> None:
+    if event == "close":
+        websocket._closed = True
+    websocket._emit_local_event(event, value)
+
+
+def _mark_worker_closed(worker: "Worker") -> None:
+    if worker._closed:
+        return
+    worker._closed = True
+    _emit_event(worker._event_handlers_for_emitter(), "close", worker)
+
+
+def _emit_worker_value(worker: "Worker", event: str, value: Any) -> None:
+    if event == "close":
+        worker._closed = True
+    worker._emit_local_event(event, value)
+
+
+def _enter_page_cdp_event_context(page: "Page") -> None:
+    page._active_page_cdp_event_contexts = getattr(page, "_active_page_cdp_event_contexts", 0) + 1
+
+
+def _exit_page_cdp_event_context(page: "Page") -> None:
+    page._active_page_cdp_event_contexts = max(
+        getattr(page, "_active_page_cdp_event_contexts", 1) - 1,
+        0,
+    )
+
+
+@dataclass(frozen=True)
+class _EventWaiterDescriptor:
+    """Declarative Python boundary behavior for one typed native event stream."""
+
+    event: str
+    timeout_method: str
+    waiter_factory: Callable[[Any], Any]
+    payload_to_value: Callable[[Any, Any], Any]
+    matches: Callable[[Any, Any, Any], bool] = _callable_event_matches
+    decode_payload: Callable[[Any], Any] = _json_event_payload
+    payload_filter: Optional[Callable[[Any, Any], bool]] = None
+    on_match: Optional[Callable[[Any, Any], None]] = None
+    context_state_factory: Optional[Callable[[Any], dict[str, Any]]] = None
+    buffered_values: Optional[Callable[[Any, dict[str, Any]], Iterable[Any]]] = None
+    competing_waiter_factory: Optional[Callable[[Any], Any]] = None
+    competing_error: Optional[str] = None
+    on_competing_event: Optional[Callable[[Any], None]] = None
+    recreate_waiter_on_timeout: bool = False
+    recreate_waiter_on_rejection: bool = False
+    max_wait_ms: Optional[float] = None
+    apply_predicate: bool = True
+    check_owner_unavailability: bool = True
+    value_unavailable_returns_none: bool = False
+    local_context_if_owner_closed: bool = False
+    timeout_message: str = _DEFAULT_EVENT_TIMEOUT_MESSAGE
+    context_manager: str = "native"
+    on_context_enter: Optional[Callable[[Any], None]] = None
+    on_context_exit: Optional[Callable[[Any], None]] = None
+
+
+def _network_event_descriptor(kind: str) -> _EventWaiterDescriptor:
+    return _EventWaiterDescriptor(
+        event=kind,
+        timeout_method="Page.wait_for_event",
+        waiter_factory=lambda page: page._core.network_event_waiter(kind),
+        payload_to_value=lambda page, payload: _network_event_from_payload(page, payload, kind),
+        matches=_network_event_matches_descriptor,
+        context_state_factory=lambda page: _network_log_state(page, kind),
+        buffered_values=lambda page, state: _network_log_values(page, state, kind),
+    )
+
+
+_EVENT_WAITER_DESCRIPTORS: dict[str, _EventWaiterDescriptor] = {
+    "request": _network_event_descriptor("request"),
+    "response": _network_event_descriptor("response"),
+    "requestfinished": _network_event_descriptor("requestfinished"),
+    "requestfailed": _network_event_descriptor("requestfailed"),
+    "console": _EventWaiterDescriptor(
+        event="console",
+        timeout_method="Page.wait_for_event",
+        waiter_factory=_page_console_waiter,
+        payload_to_value=_page_console_from_payload,
+        matches=lambda _page, matcher, event: _console_event_matches(matcher, event),
+        context_manager="listener",
+    ),
+    "dialog": _EventWaiterDescriptor(
+        event="dialog",
+        timeout_method="Page.wait_for_event",
+        waiter_factory=lambda page: page._core.dialog_event_waiter(),
+        payload_to_value=lambda page, payload: Dialog(page, payload),
+        matches=lambda _page, matcher, event: _dialog_event_matches(matcher, event),
+        context_manager="listener",
+    ),
+    "pageerror": _EventWaiterDescriptor(
+        event="pageerror",
+        timeout_method="Page.wait_for_event",
+        waiter_factory=lambda page: page._page_error_event_waiter(),
+        payload_to_value=_page_error_from_event_payload,
+        matches=lambda _page, matcher, event: _page_error_event_matches(matcher, event),
+    ),
+    "download": _EventWaiterDescriptor(
+        event="download",
+        timeout_method="Page.wait_for_event",
+        waiter_factory=lambda page: page._download_event_waiter(),
+        payload_to_value=lambda page, payload: Download(page, payload, accepted=page._accept_downloads),
+        payload_filter=_page_download_payload_matches,
+    ),
+    "filechooser": _EventWaiterDescriptor(
+        event="filechooser",
+        timeout_method="Page.wait_for_event",
+        waiter_factory=lambda page: page._file_chooser_event_waiter(),
+        payload_to_value=lambda page, payload: FileChooser(page, payload),
+    ),
+    "popup": _EventWaiterDescriptor(
+        event="popup",
+        timeout_method="Page.wait_for_event",
+        waiter_factory=lambda page: page._popup_event_waiter(),
+        payload_to_value=_page_popup_from_core,
+        decode_payload=_identity_event_payload,
+        context_manager="threaded",
+    ),
+    "websocket": _EventWaiterDescriptor(
+        event="websocket",
+        timeout_method="Page.wait_for_event",
+        waiter_factory=lambda page: page._core.websocket_event_waiter("created"),
+        payload_to_value=lambda page, payload: _websocket_from_payload(page, payload),
+        matches=lambda _page, matcher, event: _websocket_event_matches(matcher, event),
+        recreate_waiter_on_rejection=True,
+    ),
+    "worker": _EventWaiterDescriptor(
+        event="worker",
+        timeout_method="Page.wait_for_event",
+        waiter_factory=lambda page: page._worker_event_waiter(),
+        payload_to_value=lambda page, core: page._worker_from_core(core),
+        matches=lambda _page, matcher, event: _worker_event_matches(matcher, event),
+        decode_payload=_identity_event_payload,
+    ),
+    "load": _EventWaiterDescriptor(
+        event="load",
+        timeout_method="Page.wait_for_event",
+        waiter_factory=lambda page: _call(page._core.cdp_session).event_waiter("Page.loadEventFired"),
+        payload_to_value=lambda page, _payload: page,
+        decode_payload=_identity_event_payload,
+        on_context_enter=_enter_page_cdp_event_context,
+        on_context_exit=_exit_page_cdp_event_context,
+    ),
+    "domcontentloaded": _EventWaiterDescriptor(
+        event="domcontentloaded",
+        timeout_method="Page.wait_for_event",
+        waiter_factory=lambda page: _call(page._core.cdp_session).event_waiter("Page.domContentEventFired"),
+        payload_to_value=lambda page, _payload: page,
+        decode_payload=_identity_event_payload,
+        on_context_enter=_enter_page_cdp_event_context,
+        on_context_exit=_exit_page_cdp_event_context,
+    ),
+    "frameattached": _EventWaiterDescriptor(
+        event="frameattached",
+        timeout_method="Page.wait_for_event",
+        waiter_factory=lambda page: _call(page._core.cdp_session).event_waiter("Page.frameAttached"),
+        payload_to_value=lambda page, payload: page._frame_from_attached_payload(payload),
+    ),
+    "framedetached": _EventWaiterDescriptor(
+        event="framedetached",
+        timeout_method="Page.wait_for_event",
+        waiter_factory=lambda page: _call(page._core.cdp_session).event_waiter("Page.frameDetached"),
+        payload_to_value=lambda page, payload: page._frame_from_detached_payload(payload),
+    ),
+    "backgroundpage": _EventWaiterDescriptor(
+        event="backgroundpage",
+        timeout_method="BrowserContext.wait_for_event",
+        waiter_factory=lambda context: context._background_page_event_waiter(),
+        payload_to_value=_context_background_page_from_core,
+        decode_payload=_identity_event_payload,
+        on_match=_emit_background_page,
+    ),
+    "serviceworker": _EventWaiterDescriptor(
+        event="serviceworker",
+        timeout_method="BrowserContext.wait_for_event",
+        waiter_factory=lambda context: context._service_worker_event_waiter(),
+        payload_to_value=_context_service_worker_from_core,
+        matches=lambda _context, matcher, event: _worker_event_matches(matcher, event),
+        decode_payload=_identity_event_payload,
+        on_match=_emit_service_worker,
+    ),
+    "websocket.close": _EventWaiterDescriptor(
+        event="close",
+        timeout_method="WebSocket.wait_for_event",
+        waiter_factory=lambda websocket: websocket._event_waiter("close"),
+        payload_to_value=lambda websocket, _payload: websocket,
+        decode_payload=_identity_event_payload,
+        on_match=lambda websocket, value: _emit_websocket_value(websocket, "close", value),
+        check_owner_unavailability=False,
+        value_unavailable_returns_none=True,
+    ),
+    "websocket.framesent": _EventWaiterDescriptor(
+        event="framesent",
+        timeout_method="WebSocket.wait_for_event",
+        waiter_factory=lambda websocket: websocket._event_waiter("framesent"),
+        payload_to_value=lambda _websocket, payload: _websocket_frame_value(payload),
+        competing_waiter_factory=lambda websocket: websocket._event_waiter("close"),
+        competing_error="Socket closed",
+        on_competing_event=_mark_websocket_closed,
+        recreate_waiter_on_timeout=True,
+        recreate_waiter_on_rejection=True,
+        max_wait_ms=50.0,
+        value_unavailable_returns_none=True,
+    ),
+    "websocket.framereceived": _EventWaiterDescriptor(
+        event="framereceived",
+        timeout_method="WebSocket.wait_for_event",
+        waiter_factory=lambda websocket: websocket._event_waiter("framereceived"),
+        payload_to_value=lambda _websocket, payload: _websocket_frame_value(payload),
+        competing_waiter_factory=lambda websocket: websocket._event_waiter("close"),
+        competing_error="Socket closed",
+        on_competing_event=_mark_websocket_closed,
+        recreate_waiter_on_timeout=True,
+        recreate_waiter_on_rejection=True,
+        max_wait_ms=50.0,
+        value_unavailable_returns_none=True,
+    ),
+    "websocket.socketerror": _EventWaiterDescriptor(
+        event="socketerror",
+        timeout_method="WebSocket.wait_for_event",
+        waiter_factory=lambda websocket: websocket._event_waiter("socketerror"),
+        payload_to_value=lambda _websocket, payload: "" if payload.get("error") is None else str(payload.get("error")),
+        competing_waiter_factory=lambda websocket: websocket._event_waiter("close"),
+        competing_error="Socket closed",
+        on_competing_event=_mark_websocket_closed,
+        recreate_waiter_on_timeout=True,
+        recreate_waiter_on_rejection=True,
+        max_wait_ms=50.0,
+        value_unavailable_returns_none=True,
+    ),
+    "worker.console": _EventWaiterDescriptor(
+        event="console",
+        timeout_method="Worker.wait_for_event",
+        waiter_factory=lambda worker: worker._event_waiter("console"),
+        payload_to_value=lambda worker, payload: ConsoleMessage(worker._page, payload, worker=worker),
+        matches=lambda _worker, matcher, event: _console_event_matches(matcher, event),
+        competing_waiter_factory=lambda worker: worker._event_waiter("close"),
+        competing_error=_TARGET_CLOSED_MESSAGE,
+        on_competing_event=_mark_worker_closed,
+        recreate_waiter_on_rejection=True,
+        max_wait_ms=50.0,
+        on_match=lambda worker, value: _emit_worker_value(worker, "console", value),
+        value_unavailable_returns_none=True,
+    ),
+    "worker.close": _EventWaiterDescriptor(
+        event="close",
+        timeout_method="Worker.wait_for_event",
+        waiter_factory=lambda worker: worker._event_waiter("close"),
+        payload_to_value=lambda worker, _payload: worker,
+        decode_payload=_identity_event_payload,
+        apply_predicate=False,
+        on_match=lambda worker, value: _emit_worker_value(worker, "close", value),
+        check_owner_unavailability=False,
+        value_unavailable_returns_none=True,
+        local_context_if_owner_closed=True,
+    ),
+}
+
+
+def _event_waiter_descriptor(kind: str) -> _EventWaiterDescriptor:
+    try:
+        return _EVENT_WAITER_DESCRIPTORS[kind]
+    except KeyError:
+        raise Error(f"unsupported event waiter kind: {kind}") from None
+
+
+def _descriptor_timeout_message(descriptor: _EventWaiterDescriptor, timeout_display: str) -> str:
+    return descriptor.timeout_message.format(timeout=timeout_display, event=descriptor.event)
+
+
+def _descriptor_remaining_ms(
+    descriptor: _EventWaiterDescriptor,
+    timeout_display: str,
+    deadline: Optional[float],
+) -> float:
+    if deadline is None:
+        return 1000.0
+    remaining = (deadline - time.monotonic()) * 1000
+    if remaining <= 0:
+        raise TimeoutError(_descriptor_timeout_message(descriptor, timeout_display))
+    return remaining
+
+
+def _wait_for_descriptor_event(
+    target: Any,
+    kind: str,
+    matcher: Any = None,
+    *,
+    timeout: Optional[float] = None,
+    waiter: Any = None,
+    competing_waiter: Any = None,
+    reject_on_close: bool = True,
+    method: Optional[str] = None,
+    state: Optional[dict[str, Any]] = None,
+) -> Any:
+    """Drive a typed native waiter without duplicating deadline or predicate policy."""
+
+    descriptor = _event_waiter_descriptor(kind)
+    deadline, timeout_display = _event_deadline_for_target(
+        target,
+        timeout,
+        method=method or descriptor.timeout_method,
+    )
+    waiter = waiter or descriptor.waiter_factory(target)
+    if descriptor.competing_waiter_factory is not None:
+        competing_waiter = competing_waiter or descriptor.competing_waiter_factory(target)
+    owner = (
+        target
+        if reject_on_close
+        and descriptor.check_owner_unavailability
+        and descriptor.competing_waiter_factory is None
+        else None
+    )
+    event_state = state or {}
+    while True:
+        if descriptor.buffered_values is not None:
+            for buffered_value in descriptor.buffered_values(target, event_state):
+                if not descriptor.apply_predicate or descriptor.matches(target, matcher, buffered_value):
+                    if descriptor.on_match is not None:
+                        descriptor.on_match(target, buffered_value)
+                    return buffered_value
+        remaining = _descriptor_remaining_ms(descriptor, timeout_display, deadline)
+        step = _event_wait_step(remaining, owner)
+        if descriptor.max_wait_ms is not None:
+            step = min(step, descriptor.max_wait_ms)
+        poll_started = time.monotonic()
+        try:
+            raw_payload = _call(waiter.wait, step)
+        except TimeoutError:
+            if competing_waiter is not None:
+                try:
+                    _call(competing_waiter.wait, 1.0)
+                except TimeoutError:
+                    if descriptor.recreate_waiter_on_timeout:
+                        waiter = descriptor.waiter_factory(target)
+                        competing_waiter = descriptor.competing_waiter_factory(target)
+                else:
+                    if descriptor.on_competing_event is not None:
+                        descriptor.on_competing_event(target)
+                    raise Error(descriptor.competing_error or _TARGET_CLOSED_MESSAGE) from None
+            if owner is not None:
+                _raise_if_owner_unavailable(owner, use_close_reason=True)
+            if deadline is not None and (deadline - time.monotonic()) <= 0:
+                raise TimeoutError(_descriptor_timeout_message(descriptor, timeout_display)) from None
+            poll_deadline = poll_started + 0.02
+            if deadline is not None:
+                poll_deadline = min(poll_deadline, deadline)
+            _sleep_until_next_poll(poll_deadline)
+            continue
+        payload = descriptor.decode_payload(raw_payload)
+        if descriptor.payload_filter is not None and not descriptor.payload_filter(target, payload):
+            continue
+        value = descriptor.payload_to_value(target, payload)
+        if not descriptor.apply_predicate or descriptor.matches(target, matcher, value):
+            if descriptor.on_match is not None:
+                descriptor.on_match(target, value)
+            return value
+        if descriptor.recreate_waiter_on_rejection:
+            waiter = descriptor.waiter_factory(target)
+
+
+class _NativeEventContextManager:
+    def __init__(self, target: Any, kind: str, matcher: Any, timeout: Optional[float]):
+        self._target = target
         self._kind = kind
         self._matcher = matcher
         self._timeout = timeout
         self._waiter: Any = None
-        self._value: Request | Response | None = None
-        self._log_offset: Optional[int] = None
+        self._competing_waiter: Any = None
+        self._state: dict[str, Any] = {}
+        self._defer_to_local_context = False
+        self._value: Any = None
+        self._complete = False
 
-    def __enter__(self) -> "_EventContextManager":
-        if self._kind == "request":
-            self._log_offset = len(self._page._request_log)
-        elif self._kind == "response":
-            self._log_offset = len(self._page._response_log)
-        self._waiter = self._page._core.network_event_waiter(self._kind)
+    def __enter__(self) -> "_NativeEventContextManager":
+        descriptor = _event_waiter_descriptor(self._kind)
+        if descriptor.local_context_if_owner_closed and _owner_is_closed(self._target):
+            self._defer_to_local_context = True
+            return self
+        if descriptor.on_context_enter is not None:
+            descriptor.on_context_enter(self._target)
+        if descriptor.context_state_factory is not None:
+            self._state = descriptor.context_state_factory(self._target)
+        self._waiter = descriptor.waiter_factory(self._target)
+        if descriptor.competing_waiter_factory is not None:
+            self._competing_waiter = descriptor.competing_waiter_factory(self._target)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        descriptor = _event_waiter_descriptor(self._kind)
+        if self._defer_to_local_context:
+            if exc_type is None:
+                local_context = _LocalEventContextManager(
+                    self._target,
+                    descriptor.event,
+                    self._matcher,
+                    self._timeout,
+                )
+                local_context.__enter__()
+                local_context.__exit__(exc_type, exc, tb)
+                self._value = local_context.value
+                self._complete = True
+            self._defer_to_local_context = False
+            return
+        if descriptor.on_context_exit is not None:
+            descriptor.on_context_exit(self._target)
         if exc_type is None:
-            self._value = self._page._wait_for_network_event(
+            self._value = _wait_for_descriptor_event(
+                self._target,
                 self._kind,
                 self._matcher,
                 timeout=self._timeout,
                 waiter=self._waiter,
-                log_offset=self._log_offset,
+                competing_waiter=self._competing_waiter,
+                state=self._state,
             )
+            self._complete = True
         self._waiter = None
+        self._competing_waiter = None
 
     @property
-    def value(self) -> Request | Response:
-        if self._value is None:
+    def value(self) -> Any:
+        if not self._complete:
+            if _event_waiter_descriptor(self._kind).value_unavailable_returns_none:
+                return None
             raise Error("event value is not available until the context manager exits")
         return self._value
+
+
+# Preserve the existing private return-annotation names while all of these
+# structurally identical context managers share one implementation.
+_EventContextManager = _NativeEventContextManager
+_PageCdpEventContextManager = _NativeEventContextManager
+_FrameLifecycleEventContextManager = _NativeEventContextManager
+_DownloadEventContextManager = _NativeEventContextManager
+_FileChooserEventContextManager = _NativeEventContextManager
+_PageErrorEventContextManager = _NativeEventContextManager
+_WebSocketEventContextManager = _NativeEventContextManager
+_WorkerEventContextManager = _NativeEventContextManager
+_ServiceWorkerEventContextManager = _NativeEventContextManager
+_BackgroundPageEventContextManager = _NativeEventContextManager
+_WebSocketObjectEventContextManager = _NativeEventContextManager
+_WorkerObjectEventContextManager = _NativeEventContextManager
 
 
 class _NavigationContextManager:
@@ -7928,43 +8451,6 @@ class _NavigationContextManager:
 
     @property
     def value(self) -> Optional["Response"]:
-        if not self._complete:
-            raise Error("event value is not available until the context manager exits")
-        return self._value
-
-
-class _PageCdpEventContextManager:
-    def __init__(self, page: "Page", method: str, predicate: Any, timeout: Optional[float]):
-        self._page = page
-        self._method = method
-        self._predicate = predicate
-        self._timeout = timeout
-        self._waiter: Any = None
-        self._value: Any = None
-        self._complete = False
-
-    def __enter__(self) -> "_PageCdpEventContextManager":
-        self._page._active_page_cdp_event_contexts = getattr(self._page, "_active_page_cdp_event_contexts", 0) + 1
-        self._waiter = _call(self._page._core.cdp_session).event_waiter(self._method)
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self._page._active_page_cdp_event_contexts = max(
-            getattr(self._page, "_active_page_cdp_event_contexts", 1) - 1,
-            0,
-        )
-        if exc_type is None:
-            self._value = self._page._wait_for_page_cdp_event(
-                self._method,
-                self._predicate,
-                timeout=self._timeout,
-                waiter=self._waiter,
-            )
-            self._complete = True
-        self._waiter = None
-
-    @property
-    def value(self) -> Any:
         if not self._complete:
             raise Error("event value is not available until the context manager exits")
         return self._value
@@ -8005,199 +8491,72 @@ class _FrameNavigatedEventContextManager:
         return self._value
 
 
-class _FrameLifecycleEventContextManager:
-    def __init__(self, page: "Page", event: str, method: str, predicate: Any, timeout: Optional[float]):
-        self._page = page
-        self._event = event
-        self._method = method
-        self._predicate = predicate
-        self._timeout = timeout
-        self._waiter: Any = None
-        self._value: Optional[Frame] = None
-        self._complete = False
-
-    def __enter__(self) -> "_FrameLifecycleEventContextManager":
-        self._waiter = _call(self._page._core.cdp_session).event_waiter(self._method)
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            self._value = self._page._wait_for_frame_lifecycle_event(
-                self._event,
-                self._method,
-                self._predicate,
-                timeout=self._timeout,
-                waiter=self._waiter,
-            )
-            self._complete = True
-        self._waiter = None
-
-    @property
-    def value(self) -> "Frame":
-        if not self._complete or self._value is None:
-            raise Error("event value is not available until the context manager exits")
-        return self._value
-
-
-class _ConsoleEventContextManager:
+class _ListenerEventContextManager:
     def __init__(
         self,
         page: "Page",
+        kind: str,
         matcher: Any,
         timeout: Optional[float],
         *,
         include_existing: bool = False,
     ):
         self._page = page
+        self._kind = kind
         self._matcher = matcher
         self._timeout = timeout
         self._include_existing = include_existing
-        self._value: ConsoleMessage | None = None
+        self._value: Any = None
         self._ready = threading.Event()
         self._handler: Optional[Callable[..., Any]] = None
 
-    def __enter__(self) -> "_ConsoleEventContextManager":
-        def handler(message: ConsoleMessage) -> None:
-            if self._value is None and _console_event_matches(self._matcher, message):
-                self._value = message
+    def __enter__(self) -> "_ListenerEventContextManager":
+        descriptor = _event_waiter_descriptor(self._kind)
+
+        def handler(value: Any) -> None:
+            if self._value is None and descriptor.matches(self._page, self._matcher, value):
+                self._value = value
                 self._ready.set()
 
         self._handler = handler
-        self._page.on("console", handler)
-        if self._include_existing:
-            for message in list(self._page._console_messages):
-                handler(message)
+        self._page.on(descriptor.event, handler)
+        if self._include_existing and self._kind == "console":
+            for value in list(self._page._console_messages):
+                handler(value)
                 if self._ready.is_set():
                     break
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        descriptor = _event_waiter_descriptor(self._kind)
         try:
             if exc_type is None:
                 timeout_ms, timeout_display = _event_timeout_for_target(
                     self._page,
                     self._timeout,
-                    method="Page.wait_for_event",
+                    method=descriptor.timeout_method,
                 )
                 _wait_for_ready_event_or_owner_close(
                     self._ready,
                     self._page,
-                    "console",
+                    descriptor.event,
                     timeout_ms,
                     timeout_display,
                 )
         finally:
             if self._handler is not None:
-                self._page.remove_listener("console", self._handler)
+                self._page.remove_listener(descriptor.event, self._handler)
             self._handler = None
 
     @property
-    def value(self) -> "ConsoleMessage":
+    def value(self) -> Any:
         if self._value is None:
             raise Error("event value is not available until the context manager exits")
         return self._value
 
 
-class _DialogEventContextManager:
-    def __init__(self, page: "Page", matcher: Any, timeout: Optional[float]):
-        self._page = page
-        self._matcher = matcher
-        self._timeout = timeout
-        self._value: Dialog | None = None
-        self._ready = threading.Event()
-        self._handler: Optional[Callable[..., Any]] = None
-
-    def __enter__(self) -> "_DialogEventContextManager":
-        def handler(dialog: Dialog) -> None:
-            if self._value is None and _dialog_event_matches(self._matcher, dialog):
-                self._value = dialog
-                self._ready.set()
-
-        self._handler = handler
-        self._page.on("dialog", handler)
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        try:
-            if exc_type is None:
-                timeout_ms, timeout_display = _event_timeout_for_target(
-                    self._page,
-                    self._timeout,
-                    method="Page.wait_for_event",
-                )
-                _wait_for_ready_event_or_owner_close(
-                    self._ready,
-                    self._page,
-                    "dialog",
-                    timeout_ms,
-                    timeout_display,
-                )
-        finally:
-            if self._handler is not None:
-                self._page.remove_listener("dialog", self._handler)
-            self._handler = None
-
-    @property
-    def value(self) -> "Dialog":
-        if self._value is None:
-            raise Error("event value is not available until the context manager exits")
-        return self._value
-
-
-class _DownloadEventContextManager:
-    def __init__(self, page: "Page", matcher: Any, timeout: Optional[float]):
-        self._page = page
-        self._matcher = matcher
-        self._timeout = timeout
-        self._waiter: Any = None
-        self._value: Download | None = None
-
-    def __enter__(self) -> "_DownloadEventContextManager":
-        self._waiter = self._page._download_event_waiter()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            self._value = self._page._wait_for_download_event(
-                self._matcher,
-                timeout=self._timeout,
-                waiter=self._waiter,
-            )
-        self._waiter = None
-
-    @property
-    def value(self) -> "Download":
-        if self._value is None:
-            raise Error("event value is not available until the context manager exits")
-        return self._value
-
-
-class _FileChooserEventContextManager:
-    def __init__(self, page: "Page", matcher: Any, timeout: Optional[float]):
-        self._page = page
-        self._matcher = matcher
-        self._timeout = timeout
-        self._waiter: Any = None
-        self._value: FileChooser | None = None
-
-    def __enter__(self) -> "_FileChooserEventContextManager":
-        self._waiter = self._page._file_chooser_event_waiter()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            self._value = self._page._wait_for_file_chooser_event(
-                self._matcher,
-                timeout=self._timeout,
-                waiter=self._waiter,
-            )
-        self._waiter = None
-
-    @property
-    def value(self) -> "FileChooser":
-        if self._value is None:
-            raise Error("event value is not available until the context manager exits")
-        return self._value
+_ConsoleEventContextManager = _ListenerEventContextManager
+_DialogEventContextManager = _ListenerEventContextManager
 
 
 class _PopupEventContextManager:
@@ -8212,7 +8571,7 @@ class _PopupEventContextManager:
 
     def __enter__(self) -> "_PopupEventContextManager":
         self._page._active_page_cdp_event_contexts = getattr(self._page, "_active_page_cdp_event_contexts", 0) + 1
-        self._waiter = self._page._popup_event_waiter()
+        self._waiter = _event_waiter_descriptor("popup").waiter_factory(self._page)
         self._thread = threading.Thread(target=self._wait_for_popup, daemon=True, name="rustwright-expect-popup")
         self._thread.start()
         return self
@@ -8246,213 +8605,20 @@ class _PopupEventContextManager:
         return self._value
 
 
-class _PageErrorEventContextManager:
-    def __init__(self, page: "Page", matcher: Any, timeout: Optional[float]):
-        self._page = page
-        self._matcher = matcher
-        self._timeout = timeout
-        self._waiter: Any = None
-        self._value: Optional[Error] = None
-
-    def __enter__(self) -> "_PageErrorEventContextManager":
-        self._waiter = self._page._page_error_event_waiter()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            self._value = self._page._wait_for_page_error_event(
-                self._matcher,
-                timeout=self._timeout,
-                waiter=self._waiter,
-            )
-        self._waiter = None
-
-    @property
-    def value(self) -> Error:
-        if self._value is None:
-            raise Error("event value is not available until the context manager exits")
-        return self._value
-
-
-class _WebSocketEventContextManager:
-    def __init__(self, page: "Page", matcher: Any, timeout: Optional[float]):
-        self._page = page
-        self._matcher = matcher
-        self._timeout = timeout
-        self._waiter: Any = None
-        self._value: WebSocket | None = None
-
-    def __enter__(self) -> "_WebSocketEventContextManager":
-        self._waiter = self._page._core.websocket_event_waiter("created")
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            self._value = self._page._wait_for_websocket_event(
-                self._matcher,
-                timeout=self._timeout,
-                waiter=self._waiter,
-            )
-        self._waiter = None
-
-    @property
-    def value(self) -> "WebSocket":
-        if self._value is None:
-            raise Error("event value is not available until the context manager exits")
-        return self._value
-
-
-class _WorkerEventContextManager:
-    def __init__(self, page: "Page", matcher: Any, timeout: Optional[float]):
-        self._page = page
-        self._matcher = matcher
-        self._timeout = timeout
-        self._waiter: Any = None
-        self._value: Worker | None = None
-
-    def __enter__(self) -> "_WorkerEventContextManager":
-        self._waiter = self._page._worker_event_waiter()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            self._value = self._page._wait_for_worker_event(
-                self._matcher,
-                timeout=self._timeout,
-                waiter=self._waiter,
-            )
-        self._waiter = None
-
-    @property
-    def value(self) -> "Worker":
-        if self._value is None:
-            raise Error("event value is not available until the context manager exits")
-        return self._value
-
-
-class _ServiceWorkerEventContextManager:
-    def __init__(self, context: "BrowserContext", matcher: Any, timeout: Optional[float]):
-        self._context = context
-        self._matcher = matcher
-        self._timeout = timeout
-        self._waiter: Any = None
-        self._value: Worker | None = None
-
-    def __enter__(self) -> "_ServiceWorkerEventContextManager":
-        self._waiter = self._context._service_worker_event_waiter()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            self._value = self._context._wait_for_service_worker_event(
-                self._matcher,
-                timeout=self._timeout,
-                waiter=self._waiter,
-            )
-        self._waiter = None
-
-    @property
-    def value(self) -> "Worker":
-        if self._value is None:
-            raise Error("event value is not available until the context manager exits")
-        return self._value
-
-
-class _BackgroundPageEventContextManager:
-    def __init__(self, context: "BrowserContext", matcher: Any, timeout: Optional[float]):
-        self._context = context
-        self._matcher = matcher
-        self._timeout = timeout
-        self._waiter: Any = None
-        self._value: Page | None = None
-
-    def __enter__(self) -> "_BackgroundPageEventContextManager":
-        self._waiter = self._context._background_page_event_waiter()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            self._value = self._context._wait_for_background_page_event(
-                self._matcher,
-                timeout=self._timeout,
-                waiter=self._waiter,
-            )
-        self._waiter = None
-
-    @property
-    def value(self) -> "Page":
-        if self._value is None:
-            raise Error("event value is not available until the context manager exits")
-        return self._value
-
-
-class _WebSocketObjectEventContextManager:
-    def __init__(self, websocket: "WebSocket", event: str, predicate: Any, timeout: Optional[float]):
-        self._websocket = websocket
-        self._event = event
-        self._predicate = predicate
-        self._timeout = timeout
-        self._waiter: Any = None
-        self._close_waiter: Any = None
-        self._value: Any = None
-
-    def __enter__(self) -> "_WebSocketObjectEventContextManager":
-        self._waiter = self._websocket._event_waiter(self._event)
-        if self._event != "close":
-            self._close_waiter = self._websocket._event_waiter("close")
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            self._value = self._websocket._wait_for_event(
-                self._event,
-                predicate=self._predicate,
-                timeout=self._timeout,
-                waiter=self._waiter,
-                close_waiter=self._close_waiter,
-            )
-        self._waiter = None
-        self._close_waiter = None
-
-    @property
-    def value(self) -> Any:
-        return self._value
-
-
-class _WorkerObjectEventContextManager:
-    def __init__(self, worker: "Worker", event: str, predicate: Any, timeout: Optional[float]):
-        self._worker = worker
-        self._event = event
-        self._predicate = predicate
-        self._timeout = timeout
-        self._waiter: Any = None
-        self._close_waiter: Any = None
-        self._value: Any = None
-
-    def __enter__(self) -> "_WorkerObjectEventContextManager":
-        if self._event == "close" and self._worker._closed:
-            self._waiter = None
-            return self
-        self._waiter = self._worker._event_waiter(self._event)
-        if self._event != "close":
-            self._close_waiter = self._worker._event_waiter("close")
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            self._value = self._worker._wait_for_event(
-                self._event,
-                predicate=self._predicate,
-                timeout=self._timeout,
-                waiter=self._waiter,
-                close_waiter=self._close_waiter,
-            )
-        self._waiter = None
-        self._close_waiter = None
-
-    @property
-    def value(self) -> Any:
-        return self._value
+def _event_context_manager(
+    target: Any,
+    kind: str,
+    matcher: Any,
+    timeout: Optional[float],
+) -> Any:
+    strategy = _event_waiter_descriptor(kind).context_manager
+    if strategy == "native":
+        return _NativeEventContextManager(target, kind, matcher, timeout)
+    if strategy == "listener":
+        return _ListenerEventContextManager(target, kind, matcher, timeout)
+    if strategy == "threaded" and kind == "popup":
+        return _PopupEventContextManager(target, matcher, timeout)
+    raise Error(f"unsupported event context manager strategy: {strategy}")
 
 
 class _ContextConsoleEventContextManager:
@@ -12826,31 +12992,13 @@ class BrowserContext:
         timeout: Optional[float] = None,
         waiter: Any = None,
     ) -> "Page":
-        timeout_ms, timeout_display = _event_timeout_for_target(
+        return _wait_for_descriptor_event(
             self,
-            timeout,
-            method="BrowserContext.wait_for_event",
+            "backgroundpage",
+            matcher,
+            timeout=timeout,
+            waiter=waiter,
         )
-        deadline = None if timeout_ms is None else time.monotonic() + (timeout_ms / 1000)
-        waiter = waiter or self._background_page_event_waiter()
-        while True:
-            if deadline is None:
-                remaining = 1000.0
-            else:
-                remaining = (deadline - time.monotonic()) * 1000
-                if remaining <= 0:
-                    raise TimeoutError(_event_timeout_message("backgroundpage", timeout_display))
-            try:
-                page = self._background_page_from_core(_call(waiter.wait, _event_wait_step(remaining, self)))
-            except TimeoutError:
-                try:
-                    _handle_event_wait_timeout(self, "backgroundpage", timeout_display, deadline)
-                except TimeoutError as exc:
-                    raise exc from None
-                continue
-            if matcher is None or matcher(page):
-                _emit_event(self._event_handlers, "backgroundpage", page)
-                return page
 
     def _service_worker_event_waiter(self) -> Any:
         if self._core is not None:
@@ -12881,31 +13029,13 @@ class BrowserContext:
         timeout: Optional[float] = None,
         waiter: Any = None,
     ) -> "Worker":
-        timeout_ms, timeout_display = _event_timeout_for_target(
+        return _wait_for_descriptor_event(
             self,
-            timeout,
-            method="BrowserContext.wait_for_event",
+            "serviceworker",
+            matcher,
+            timeout=timeout,
+            waiter=waiter,
         )
-        deadline = None if timeout_ms is None else time.monotonic() + (timeout_ms / 1000)
-        waiter = waiter or self._service_worker_event_waiter()
-        while True:
-            if deadline is None:
-                remaining = 1000.0
-            else:
-                remaining = (deadline - time.monotonic()) * 1000
-                if remaining <= 0:
-                    raise TimeoutError(_event_timeout_message("serviceworker", timeout_display))
-            try:
-                worker = self._service_worker_from_core(_call(waiter.wait, _event_wait_step(remaining, self)))
-            except TimeoutError:
-                try:
-                    _handle_event_wait_timeout(self, "serviceworker", timeout_display, deadline)
-                except TimeoutError as exc:
-                    raise exc from None
-                continue
-            if _worker_event_matches(matcher, worker):
-                self._emit_service_worker_event(worker)
-                return worker
 
     def _emit_service_worker_event(self, worker: "Worker") -> bool:
         key = worker._target_id or worker.url
@@ -12958,9 +13088,9 @@ class BrowserContext:
                 return _ContextDialogEventContextManager(self, predicate, timeout)
             return _LocalEventContextManager(self, event, predicate, timeout)
         if event == "backgroundpage":
-            return _BackgroundPageEventContextManager(self, predicate, timeout)
+            return _event_context_manager(self, "backgroundpage", predicate, timeout)
         if event == "serviceworker":
-            return _ServiceWorkerEventContextManager(self, predicate, timeout)
+            return _event_context_manager(self, "serviceworker", predicate, timeout)
         if event == "console":
             return self.expect_console_message(predicate, timeout=timeout)
         return _LocalEventContextManager(self, event, predicate, timeout)
@@ -15507,44 +15637,18 @@ class Page:
         reject_on_close: bool = True,
         log_offset: Optional[int] = None,
     ) -> Request | Response:
-        deadline, timeout_display = _event_deadline_for_target(self, timeout, method=method)
-        waiter = waiter or self._core.network_event_waiter(kind)
-        owner = self if reject_on_close else None
-        while True:
-            if log_offset is not None:
-                if kind == "request":
-                    for event in self._request_log[log_offset:]:
-                        if _network_event_matches(matcher, event, base_url=self._base_url):
-                            return event
-                elif kind == "response":
-                    for event in self._response_log[log_offset:]:
-                        if _network_event_matches(matcher, event, base_url=self._base_url):
-                            return event
-            remaining = _event_remaining_ms(kind, timeout_display, deadline)
-            try:
-                payload = json.loads(_call(waiter.wait, _event_wait_step(remaining, owner)))
-            except TimeoutError:
-                try:
-                    _handle_event_wait_timeout(owner, kind, timeout_display, deadline)
-                except TimeoutError as exc:
-                    raise exc from None
-                continue
-            event: Request | Response
-            if kind == "request":
-                event = _request_from_payload(payload, self) or Request(url="", _page=self)
-                event = self._record_request(event)
-            elif kind == "response":
-                event = _response_from_payload(self, payload)
-                self._record_response(event)
-            elif kind in {"requestfinished", "requestfailed"}:
-                event = _request_from_payload(payload, self) or Request(url="", _page=self)
-                event = self._adopt_request(event)
-            else:
-                raise Error(f"unsupported network event kind: {kind}")
-            if isinstance(event, Request):
-                self._note_network_lifecycle_event(kind, event)
-            if _network_event_matches(matcher, event, base_url=self._base_url):
-                return event
+        if kind not in {"request", "response", "requestfinished", "requestfailed"}:
+            raise Error(f"unsupported network event kind: {kind}")
+        return _wait_for_descriptor_event(
+            self,
+            kind,
+            matcher,
+            timeout=timeout,
+            waiter=waiter,
+            reject_on_close=reject_on_close,
+            method=method,
+            state={} if log_offset is None else {"log_offset": log_offset},
+        )
 
     def _wait_for_navigation_response(
         self,
@@ -15599,7 +15703,7 @@ class Page:
         *,
         timeout: Optional[float] = None,
     ) -> _EventContextManager:
-        return _EventContextManager(self, "request", url_or_predicate, timeout)
+        return _event_context_manager(self, "request", url_or_predicate, timeout)
 
     def expect_response(
         self,
@@ -15607,7 +15711,7 @@ class Page:
         *,
         timeout: Optional[float] = None,
     ) -> _EventContextManager:
-        return _EventContextManager(self, "response", url_or_predicate, timeout)
+        return _event_context_manager(self, "response", url_or_predicate, timeout)
 
     def _wait_for_console_event(
         self,
@@ -15617,25 +15721,14 @@ class Page:
         waiter: Any = None,
         reject_on_close: bool = True,
     ) -> ConsoleMessage:
-        deadline, timeout_display = _event_deadline_for_target(self, timeout, method="Page.wait_for_event")
-        if waiter is None:
-            waiter = self._core.console_event_waiter()
-            self._runtime_observation_enabled = True
-        owner = self if reject_on_close else None
-        while True:
-            remaining = _event_remaining_ms("console", timeout_display, deadline)
-            try:
-                payload = json.loads(_call(waiter.wait, _event_wait_step(remaining, owner)))
-            except TimeoutError:
-                try:
-                    _handle_event_wait_timeout(owner, "console", timeout_display, deadline)
-                except TimeoutError as exc:
-                    raise exc from None
-                continue
-            event = ConsoleMessage(self, payload)
-            self._record_console_message(event)
-            if _console_event_matches(matcher, event):
-                return event
+        return _wait_for_descriptor_event(
+            self,
+            "console",
+            matcher,
+            timeout=timeout,
+            waiter=waiter,
+            reject_on_close=reject_on_close,
+        )
 
     def expect_console_message(
         self,
@@ -15643,7 +15736,7 @@ class Page:
         *,
         timeout: Optional[float] = None,
     ) -> _ConsoleEventContextManager:
-        return _ConsoleEventContextManager(self, predicate, timeout)
+        return _event_context_manager(self, "console", predicate, timeout)
 
     def _wait_for_dialog_event(
         self,
@@ -15653,22 +15746,14 @@ class Page:
         waiter: Any = None,
         reject_on_close: bool = True,
     ) -> Dialog:
-        deadline, timeout_display = _event_deadline_for_target(self, timeout, method="Page.wait_for_event")
-        waiter = waiter or self._core.dialog_event_waiter()
-        owner = self if reject_on_close else None
-        while True:
-            remaining = _event_remaining_ms("dialog", timeout_display, deadline)
-            try:
-                payload = json.loads(_call(waiter.wait, _event_wait_step(remaining, owner)))
-            except TimeoutError:
-                try:
-                    _handle_event_wait_timeout(owner, "dialog", timeout_display, deadline)
-                except TimeoutError as exc:
-                    raise exc from None
-                continue
-            event = Dialog(self, payload)
-            if _dialog_event_matches(matcher, event):
-                return event
+        return _wait_for_descriptor_event(
+            self,
+            "dialog",
+            matcher,
+            timeout=timeout,
+            waiter=waiter,
+            reject_on_close=reject_on_close,
+        )
 
     def _page_error_event_waiter(self) -> Any:
         session = _call(self._core.cdp_session)
@@ -15684,23 +15769,14 @@ class Page:
         waiter: Any = None,
         reject_on_close: bool = True,
     ) -> Error:
-        deadline, timeout_display = _event_deadline_for_target(self, timeout, method="Page.wait_for_event")
-        waiter = waiter or self._page_error_event_waiter()
-        owner = self if reject_on_close else None
-        while True:
-            remaining = _event_remaining_ms("pageerror", timeout_display, deadline)
-            try:
-                payload = json.loads(_call(waiter.wait, _event_wait_step(remaining, owner)))
-            except TimeoutError:
-                try:
-                    _handle_event_wait_timeout(owner, "pageerror", timeout_display, deadline)
-                except TimeoutError as exc:
-                    raise exc from None
-                continue
-            event = _page_error_from_payload(payload)
-            self._record_page_error(event)
-            if _page_error_event_matches(matcher, event):
-                return event
+        return _wait_for_descriptor_event(
+            self,
+            "pageerror",
+            matcher,
+            timeout=timeout,
+            waiter=waiter,
+            reject_on_close=reject_on_close,
+        )
 
     def _ensure_downloads(self) -> str:
         if self._download_dir is None:
@@ -15752,24 +15828,14 @@ class Page:
         waiter: Any = None,
         reject_on_close: bool = True,
     ) -> Download:
-        deadline, timeout_display = _event_deadline_for_target(self, timeout, method="Page.wait_for_event")
-        waiter = waiter or self._download_event_waiter()
-        owner = self if reject_on_close else None
-        while True:
-            remaining = _event_remaining_ms("download", timeout_display, deadline)
-            try:
-                payload = json.loads(_call(waiter.wait, _event_wait_step(remaining, owner)))
-            except TimeoutError:
-                try:
-                    _handle_event_wait_timeout(owner, "download", timeout_display, deadline)
-                except TimeoutError as exc:
-                    raise exc from None
-                continue
-            if not isinstance(payload, dict) or not self._download_payload_belongs_to_page(payload):
-                continue
-            event = Download(self, payload, accepted=self._accept_downloads)
-            if matcher is None or matcher(event):
-                return event
+        return _wait_for_descriptor_event(
+            self,
+            "download",
+            matcher,
+            timeout=timeout,
+            waiter=waiter,
+            reject_on_close=reject_on_close,
+        )
 
     def expect_download(
         self,
@@ -15777,7 +15843,7 @@ class Page:
         *,
         timeout: Optional[float] = None,
     ) -> _DownloadEventContextManager:
-        return _DownloadEventContextManager(self, predicate, timeout)
+        return _event_context_manager(self, "download", predicate, timeout)
 
     def _file_chooser_event_waiter(self) -> Any:
         if not self._file_chooser_intercept_enabled:
@@ -15793,22 +15859,14 @@ class Page:
         waiter: Any = None,
         reject_on_close: bool = True,
     ) -> FileChooser:
-        deadline, timeout_display = _event_deadline_for_target(self, timeout, method="Page.wait_for_event")
-        waiter = waiter or self._file_chooser_event_waiter()
-        owner = self if reject_on_close else None
-        while True:
-            remaining = _event_remaining_ms("filechooser", timeout_display, deadline)
-            try:
-                payload = json.loads(_call(waiter.wait, _event_wait_step(remaining, owner)))
-            except TimeoutError:
-                try:
-                    _handle_event_wait_timeout(owner, "filechooser", timeout_display, deadline)
-                except TimeoutError as exc:
-                    raise exc from None
-                continue
-            event = FileChooser(self, payload)
-            if matcher is None or matcher(event):
-                return event
+        return _wait_for_descriptor_event(
+            self,
+            "filechooser",
+            matcher,
+            timeout=timeout,
+            waiter=waiter,
+            reject_on_close=reject_on_close,
+        )
 
     def expect_file_chooser(
         self,
@@ -15816,7 +15874,7 @@ class Page:
         *,
         timeout: Optional[float] = None,
     ) -> _FileChooserEventContextManager:
-        return _FileChooserEventContextManager(self, predicate, timeout)
+        return _event_context_manager(self, "filechooser", predicate, timeout)
 
     def _popup_event_waiter(self) -> Any:
         return self._core.popup_event_waiter(self._default_timeout)
@@ -15854,27 +15912,17 @@ class Page:
         waiter: Any = None,
         reject_on_close: bool = True,
     ) -> "Page":
-        deadline, timeout_display = _event_deadline_for_target(self, timeout, method="Page.wait_for_event")
-        waiter = waiter or self._popup_event_waiter()
-        owner = self if reject_on_close else None
-        while True:
-            remaining = _event_remaining_ms("popup", timeout_display, deadline)
-            try:
-                popup = Page(_call(waiter.wait, _event_wait_step(remaining, owner)), context=self._context)
-            except TimeoutError:
-                try:
-                    _handle_event_wait_timeout(owner, "popup", timeout_display, deadline)
-                except TimeoutError as exc:
-                    raise exc from None
-                continue
-            popup._opener = self
-            if self._context is not None:
-                self._context._adopt_popup(popup)
-            if matcher is None or matcher(popup):
-                return popup
+        return _wait_for_descriptor_event(
+            self,
+            "popup",
+            matcher,
+            timeout=timeout,
+            waiter=waiter,
+            reject_on_close=reject_on_close,
+        )
 
     def expect_popup(self, predicate: Any = None, *, timeout: Optional[float] = None) -> _PopupEventContextManager:
-        return _PopupEventContextManager(self, predicate, timeout)
+        return _event_context_manager(self, "popup", predicate, timeout)
 
     def _wait_for_websocket_event(
         self,
@@ -15884,26 +15932,17 @@ class Page:
         waiter: Any = None,
         reject_on_close: bool = True,
     ) -> "WebSocket":
-        deadline, timeout_display = _event_deadline_for_target(self, timeout, method="Page.wait_for_event")
-        waiter = waiter or self._core.websocket_event_waiter("created")
-        owner = self if reject_on_close else None
-        while True:
-            remaining = _event_remaining_ms("websocket", timeout_display, deadline)
-            try:
-                payload = json.loads(_call(waiter.wait, _event_wait_step(remaining, owner)))
-            except TimeoutError:
-                try:
-                    _handle_event_wait_timeout(owner, "websocket", timeout_display, deadline)
-                except TimeoutError as exc:
-                    raise exc from None
-                continue
-            event = _websocket_from_payload(self, payload)
-            if _websocket_event_matches(matcher, event):
-                return event
-            waiter = self._core.websocket_event_waiter("created")
+        return _wait_for_descriptor_event(
+            self,
+            "websocket",
+            matcher,
+            timeout=timeout,
+            waiter=waiter,
+            reject_on_close=reject_on_close,
+        )
 
     def expect_websocket(self, predicate: Any = None, *, timeout: Optional[float] = None) -> _WebSocketEventContextManager:
-        return _WebSocketEventContextManager(self, predicate, timeout)
+        return _event_context_manager(self, "websocket", predicate, timeout)
 
     def _worker_event_waiter(self) -> Any:
         return self._core.worker_event_waiter(self._default_timeout)
@@ -16026,24 +16065,17 @@ class Page:
         waiter: Any = None,
         reject_on_close: bool = True,
     ) -> "Worker":
-        deadline, timeout_display = _event_deadline_for_target(self, timeout, method="Page.wait_for_event")
-        waiter = waiter or self._worker_event_waiter()
-        owner = self if reject_on_close else None
-        while True:
-            remaining = _event_remaining_ms("worker", timeout_display, deadline)
-            try:
-                worker = self._worker_from_core(_call(waiter.wait, _event_wait_step(remaining, owner)))
-            except TimeoutError:
-                try:
-                    _handle_event_wait_timeout(owner, "worker", timeout_display, deadline)
-                except TimeoutError as exc:
-                    raise exc from None
-                continue
-            if _worker_event_matches(matcher, worker):
-                return worker
+        return _wait_for_descriptor_event(
+            self,
+            "worker",
+            matcher,
+            timeout=timeout,
+            waiter=waiter,
+            reject_on_close=reject_on_close,
+        )
 
     def expect_worker(self, predicate: Any = None, *, timeout: Optional[float] = None) -> _WorkerEventContextManager:
-        return _WorkerEventContextManager(self, predicate, timeout)
+        return _event_context_manager(self, "worker", predicate, timeout)
 
     def _wait_for_page_cdp_event(
         self,
@@ -16058,22 +16090,14 @@ class Page:
             "Page.loadEventFired": "load",
             "Page.domContentEventFired": "domcontentloaded",
         }.get(method, method)
-        deadline, timeout_display = _event_deadline_for_target(self, timeout, method="Page.wait_for_event")
-        waiter = waiter or _call(self._core.cdp_session).event_waiter(method)
-        owner = self if reject_on_close else None
-        while True:
-            remaining = _event_remaining_ms(event_name, timeout_display, deadline)
-            try:
-                _call(waiter.wait, _event_wait_step(remaining, owner))
-            except TimeoutError:
-                try:
-                    _handle_event_wait_timeout(owner, event_name, timeout_display, deadline)
-                except TimeoutError as exc:
-                    raise exc from None
-                continue
-            value = self
-            if predicate is None or predicate(value):
-                return value
+        return _wait_for_descriptor_event(
+            self,
+            event_name,
+            predicate,
+            timeout=timeout,
+            waiter=waiter,
+            reject_on_close=reject_on_close,
+        )
 
     def _frame_from_navigated_payload(self, payload: dict[str, Any], *, same_document: bool = False) -> Frame:
         params = payload.get("params", payload) if isinstance(payload, dict) else {}
@@ -16164,22 +16188,14 @@ class Page:
         waiter: Any = None,
         reject_on_close: bool = True,
     ) -> Frame:
-        deadline, timeout_display = _event_deadline_for_target(self, timeout, method="Page.wait_for_event")
-        waiter = waiter or _call(self._core.cdp_session).event_waiter(method)
-        owner = self if reject_on_close else None
-        while True:
-            remaining = _event_remaining_ms(event, timeout_display, deadline)
-            try:
-                payload = json.loads(_call(waiter.wait, _event_wait_step(remaining, owner)))
-            except TimeoutError:
-                try:
-                    _handle_event_wait_timeout(owner, event, timeout_display, deadline)
-                except TimeoutError as exc:
-                    raise exc from None
-                continue
-            frame = self._frame_from_attached_payload(payload) if event == "frameattached" else self._frame_from_detached_payload(payload)
-            if predicate is None or predicate(frame):
-                return frame
+        return _wait_for_descriptor_event(
+            self,
+            event,
+            predicate,
+            timeout=timeout,
+            waiter=waiter,
+            reject_on_close=reject_on_close,
+        )
 
     def _wait_for_frame_navigated_event(
         self,
@@ -16239,11 +16255,11 @@ class Page:
         if event == "console":
             if not self._event_handlers.get("console") and not self._workers:
                 return self._wait_for_console_event(predicate, timeout=timeout)
-            with _ConsoleEventContextManager(self, predicate, timeout) as event_info:
+            with _event_context_manager(self, "console", predicate, timeout) as event_info:
                 pass
             return event_info.value
         if event == "dialog":
-            with _DialogEventContextManager(self, predicate, timeout) as event_info:
+            with _event_context_manager(self, "dialog", predicate, timeout) as event_info:
                 pass
             return event_info.value
         if event == "pageerror":
@@ -16292,13 +16308,13 @@ class Page:
         if event == "response":
             return self.expect_response(predicate, timeout=timeout)
         if event in {"requestfinished", "requestfailed"}:
-            return _EventContextManager(self, event, predicate, timeout)
+            return _event_context_manager(self, event, predicate, timeout)
         if event == "console":
             return self.expect_console_message(predicate, timeout=timeout)
         if event == "dialog":
-            return _DialogEventContextManager(self, predicate, timeout)
+            return _event_context_manager(self, "dialog", predicate, timeout)
         if event == "pageerror":
-            return _PageErrorEventContextManager(self, predicate, timeout)
+            return _event_context_manager(self, "pageerror", predicate, timeout)
         if event == "download":
             return self.expect_download(predicate, timeout=timeout)
         if event == "filechooser":
@@ -16310,15 +16326,15 @@ class Page:
         if event == "worker":
             return self.expect_worker(predicate, timeout=timeout)
         if event == "load":
-            return _PageCdpEventContextManager(self, "Page.loadEventFired", predicate, timeout)
+            return _event_context_manager(self, "load", predicate, timeout)
         if event == "domcontentloaded":
-            return _PageCdpEventContextManager(self, "Page.domContentEventFired", predicate, timeout)
+            return _event_context_manager(self, "domcontentloaded", predicate, timeout)
         if event == "framenavigated":
             return _FrameNavigatedEventContextManager(self, predicate, timeout)
         if event == "frameattached":
-            return _FrameLifecycleEventContextManager(self, event, "Page.frameAttached", predicate, timeout)
+            return _event_context_manager(self, event, predicate, timeout)
         if event == "framedetached":
-            return _FrameLifecycleEventContextManager(self, event, "Page.frameDetached", predicate, timeout)
+            return _event_context_manager(self, event, predicate, timeout)
         if event == "close":
             return _LocalEventContextManager(self, event, predicate, timeout)
         if event == "crash":
@@ -18744,7 +18760,7 @@ class Page:
         return None
 
     def expect_request_finished(self, predicate: Any = None, *, timeout: Optional[float] = None) -> _EventContextManager:
-        return _EventContextManager(self, "requestfinished", predicate or "**/*", timeout)
+        return _event_context_manager(self, "requestfinished", predicate or "**/*", timeout)
 
     def expect_navigation(
         self,
@@ -26511,7 +26527,7 @@ class WebSocket(_EventEmitter):
         timeout: Optional[float] = None,
     ) -> _LocalEventContextManager | _WebSocketObjectEventContextManager:
         if event in self._CORE_EVENTS:
-            return _WebSocketObjectEventContextManager(self, event, predicate, timeout)
+            return _event_context_manager(self, f"websocket.{event}", predicate, timeout)
         return _LocalEventContextManager(self, event, predicate, timeout)
 
     def on(self, event: str, f: Callable[..., Any]) -> None:
@@ -26540,67 +26556,14 @@ class WebSocket(_EventEmitter):
             with _LocalEventContextManager(self, event, predicate, timeout) as event_info:
                 pass
             return event_info.value
-        waiter = waiter or self._event_waiter(event)
-        if event != "close":
-            close_waiter = close_waiter or self._event_waiter("close")
-        timeout_ms, timeout_display = _event_timeout_for_target(
+        return _wait_for_descriptor_event(
             self,
-            timeout,
-            method="WebSocket.wait_for_event",
+            f"websocket.{event}",
+            predicate,
+            timeout=timeout,
+            waiter=waiter,
+            competing_waiter=close_waiter,
         )
-        deadline = None if timeout_ms is None else time.monotonic() + (timeout_ms / 1000)
-        while True:
-            if deadline is None:
-                remaining = 1000.0
-            else:
-                remaining = (deadline - time.monotonic()) * 1000
-                if remaining <= 0:
-                    raise TimeoutError(_event_timeout_message(event, timeout_display))
-            step = remaining if close_waiter is None else min(remaining, 50.0)
-            try:
-                payload = json.loads(_call(waiter.wait, step))
-            except TimeoutError:
-                if close_waiter is None:
-                    raise TimeoutError(_event_timeout_message(event, timeout_display)) from None
-                if deadline is None:
-                    try:
-                        _call(close_waiter.wait, 1.0)
-                    except TimeoutError:
-                        waiter = self._event_waiter(event)
-                        close_waiter = self._event_waiter("close")
-                    else:
-                        if not self._closed:
-                            self._closed = True
-                            self._emit_local_event("close", self)
-                        raise Error("Socket closed") from None
-                    continue
-                try:
-                    _call(close_waiter.wait, 1.0)
-                except TimeoutError:
-                    waiter = self._event_waiter(event)
-                    close_waiter = self._event_waiter("close")
-                else:
-                    if not self._closed:
-                        self._closed = True
-                        self._emit_local_event("close", self)
-                    raise Error("Socket closed") from None
-                if (deadline - time.monotonic()) > 0:
-                    continue
-                raise TimeoutError(_event_timeout_message(event, timeout_display)) from None
-            if event == "close":
-                value: Any = self
-            elif event in {"framesent", "framereceived"}:
-                value = _websocket_frame_value(payload)
-            elif event == "socketerror":
-                value = "" if payload.get("error") is None else str(payload.get("error"))
-            else:
-                value = payload
-            if predicate is None or predicate(value):
-                if event == "close":
-                    self._closed = True
-                self._emit_local_event(event, value)
-                return value
-            waiter = self._event_waiter(event)
 
     def _ensure_event_thread(self, event: str) -> None:
         existing = self._event_threads.get(event)
@@ -26715,44 +26678,14 @@ class Worker(_EventEmitter):
         close_waiter: Any = None,
     ) -> Any:
         if event == "console":
-            waiter = waiter or self._event_waiter(event)
-            close_waiter = close_waiter or self._event_waiter("close")
-            timeout_ms, timeout_display = _event_timeout_for_target(
+            return _wait_for_descriptor_event(
                 self,
-                timeout,
-                method="Worker.wait_for_event",
+                "worker.console",
+                predicate,
+                timeout=timeout,
+                waiter=waiter,
+                competing_waiter=close_waiter,
             )
-            deadline = None if timeout_ms is None else time.monotonic() + (timeout_ms / 1000)
-            while True:
-                if deadline is None:
-                    remaining = 1000.0
-                else:
-                    remaining = (deadline - time.monotonic()) * 1000
-                    if remaining <= 0:
-                        raise TimeoutError(_event_timeout_message(event, timeout_display))
-                step = min(remaining, 50.0)
-                try:
-                    payload = json.loads(_call(waiter.wait, step))
-                except TimeoutError:
-                    try:
-                        _call(close_waiter.wait, 1.0)
-                    except TimeoutError:
-                        pass
-                    else:
-                        if not self._closed:
-                            self._closed = True
-                            _emit_event(self._event_handlers_for_emitter(), "close", self)
-                        raise Error(_TARGET_CLOSED_MESSAGE) from None
-                    if deadline is None:
-                        continue
-                    if (deadline - time.monotonic()) > 0:
-                        continue
-                    raise TimeoutError(_event_timeout_message(event, timeout_display)) from None
-                message = ConsoleMessage(self._page, payload, worker=self)
-                if _console_event_matches(predicate, message):
-                    self._emit_local_event("console", message)
-                    return message
-                waiter = self._event_waiter(event)
         if event != "close":
             with _LocalEventContextManager(self, event, predicate, timeout) as event_info:
                 pass
@@ -26761,24 +26694,13 @@ class Worker(_EventEmitter):
             with _LocalEventContextManager(self, event, predicate, timeout) as event_info:
                 pass
             return event_info.value
-        waiter = waiter or self._event_waiter(event)
-        timeout_ms, timeout_display = _event_timeout_for_target(
+        return _wait_for_descriptor_event(
             self,
-            timeout,
-            method="Worker.wait_for_event",
+            "worker.close",
+            predicate,
+            timeout=timeout,
+            waiter=waiter,
         )
-        wait_timeout = 1000.0 if timeout_ms is None else timeout_ms
-        while True:
-            try:
-                _call(waiter.wait, wait_timeout)
-                break
-            except TimeoutError:
-                if timeout_ms is None:
-                    continue
-                raise TimeoutError(_event_timeout_message(event, timeout_display)) from None
-        self._closed = True
-        _emit_event(self._event_handlers_for_emitter(), "close", self)
-        return self
 
     def expect_event(
         self,
@@ -26789,7 +26711,7 @@ class Worker(_EventEmitter):
     ) -> _WorkerObjectEventContextManager | _LocalEventContextManager:
         if event not in {"close", "console"}:
             return _LocalEventContextManager(self, event, predicate, timeout)
-        return _WorkerObjectEventContextManager(self, event, predicate, timeout)
+        return _event_context_manager(self, f"worker.{event}", predicate, timeout)
 
     def on(self, event: str, f: Callable[..., Any]) -> None:
         super().on(event, f)
@@ -26803,22 +26725,34 @@ class Worker(_EventEmitter):
         existing = self._event_threads.get(event)
         if existing is not None and existing.is_alive():
             return
+        descriptor = _event_waiter_descriptor(f"worker.{event}")
+        waiter = descriptor.waiter_factory(self)
+        close_waiter = (
+            descriptor.competing_waiter_factory(self)
+            if descriptor.competing_waiter_factory is not None
+            else None
+        )
         thread = threading.Thread(
             target=self._event_loop,
-            args=(event,),
+            args=(event, waiter, close_waiter),
             daemon=True,
             name=f"rustwright-worker-{event}-listener",
         )
         self._event_threads[event] = thread
         thread.start()
 
-    def _event_loop(self, event: str) -> None:
+    def _event_loop(self, event: str, waiter: Any, close_waiter: Any) -> None:
         while not self._closed:
             if not self._event_handlers_for_emitter().get(event):
                 time.sleep(0.05)
                 continue
             try:
-                self._wait_for_event(event, timeout=500.0)
+                self._wait_for_event(
+                    event,
+                    timeout=500.0,
+                    waiter=waiter,
+                    close_waiter=close_waiter,
+                )
             except TimeoutError:
                 continue
             except Error:
