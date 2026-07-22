@@ -50,194 +50,6 @@ _CONSOLE_HISTORY_SETTLE_TIMEOUT_SECONDS = 0.001
 _CONSOLE_HISTORY_BUFFER = "__console_history__"
 _PAGE_ERROR_HISTORY_BUFFER = "__page_error_history__"
 _UNSAFE_DOM_FASTPATH_ENV = "RUSTWRIGHT_UNSAFE_DOM_FASTPATH"
-_LOCATOR_TARGET_STATE_TEMPLATE = """
-if (el && __SCROLL__) el.scrollIntoView({ block: 'center', inline: 'center' });
-const ownerDocument = el ? (el.ownerDocument || document) : document;
-const ownerWindow = ownerDocument.defaultView || window;
-const actionPosition = __ACTION_POSITION__;
-const needsReceivesEvents = __RECEIVES_EVENTS__;
-const deepElementFromPoint = (x, y) => {
-  let hit = ownerDocument.elementFromPoint(x, y);
-  while (hit && hit.shadowRoot) {
-    const nested = hit.shadowRoot.elementFromPoint(x, y);
-    if (!nested || nested === hit) break;
-    hit = nested;
-  }
-  return hit;
-};
-const targetContains = (node) => {
-  let current = node;
-  while (current) {
-    if (current === el) return true;
-    const root = current.getRootNode ? current.getRootNode() : null;
-    current = current.parentElement || (root && root.host) || null;
-  }
-  return false;
-};
-const snapshot = () => {
-  const attached = !!el;
-  const rect = el ? el.getBoundingClientRect() : null;
-  const point = needsReceivesEvents && rect ? {
-    x: Math.min(Math.max(rect.left + (actionPosition ? Number(actionPosition.x || 0) : rect.width / 2), 0), Math.max(ownerWindow.innerWidth - 1, 0)),
-    y: Math.min(Math.max(rect.top + (actionPosition ? Number(actionPosition.y || 0) : rect.height / 2), 0), Math.max(ownerWindow.innerHeight - 1, 0)),
-  } : null;
-  const hit = needsReceivesEvents && el && point ? deepElementFromPoint(point.x, point.y) : null;
-  const tagName = el ? String(el.tagName || '').toUpperCase() : '';
-  const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
-  const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
-  const fillableForFill = !!el && (
-    (tagName === 'INPUT' && !nonFillableInputTypes.has(inputType)) ||
-    tagName === 'TEXTAREA' ||
-    el.isContentEditable
-  );
-  const checkedState = (() => {
-    if (!el) return { valid: false, checked: false, indeterminate: false, native_input: false, native_radio: false };
-    const checkedRoles = new Set(['checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem']);
-    const role = typeof locatorRoleOf === 'function' ? locatorRoleOf(el) : '';
-    const aria = String(el.getAttribute ? el.getAttribute('aria-checked') || '' : '').toLowerCase();
-    if (tagName === 'INPUT' && (inputType === 'checkbox' || inputType === 'radio')) {
-      const checked = !!el.checked;
-      return {
-        valid: true,
-        checked,
-        indeterminate: !!(el.indeterminate && !checked),
-        native_input: true,
-        native_radio: inputType === 'radio',
-      };
-    }
-    if (!checkedRoles.has(role)) {
-      return { valid: false, checked: false, indeterminate: false, native_input: false, native_radio: false };
-    }
-    if (aria === 'true') return { valid: true, checked: true, indeterminate: false, native_input: false, native_radio: false };
-    if (aria === 'false') return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
-    if (aria === 'mixed') return { valid: true, checked: false, indeterminate: true, native_input: false, native_radio: false };
-    return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
-  })();
-  const visibleState = (() => {
-    if (!attached || !el.isConnected) return false;
-    if (tagName === 'OPTION') return visible(el);
-    const computedStyle = ownerWindow.getComputedStyle(el);
-    if (!computedStyle || computedStyle.visibility === 'hidden' || computedStyle.display === 'none') return false;
-    return !!rect && rect.width > 0 && rect.height > 0;
-  })();
-  const disabled = attached && disabledState(el);
-  const hasLayout = attached && el.getClientRects().length > 0;
-  return {
-    count: matches.length,
-    frame_strict_violation: strictFrameViolation,
-    attached,
-    visible: visibleState,
-    enabled: attached && !disabled,
-    editable: attached && !disabled && !el.readOnly &&
-      (el.isContentEditable || /^(INPUT|TEXTAREA)$/.test(el.tagName)),
-    tag_name: tagName,
-    input_type: inputType,
-    is_select: tagName === 'SELECT',
-    non_fillable_input: tagName === 'INPUT' && nonFillableInputTypes.has(inputType),
-    fillable_for_fill: fillableForFill,
-    editable_for_fill: fillableForFill && !disabled && !el.readOnly,
-    has_layout: hasLayout,
-    checked_valid: checkedState.valid,
-    checked: checkedState.checked,
-    indeterminate: checkedState.indeterminate,
-    native_input: checkedState.native_input,
-    native_radio: checkedState.native_radio,
-    receives_events: needsReceivesEvents && attached && !!rect && rect.width > 0 && rect.height > 0 && targetContains(hit),
-    rect: rect ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height } : null,
-  };
-};
-const first = snapshot();
-if (!__STABLE__ || !first.attached) return first;
-const style = ownerWindow.getComputedStyle(el);
-const zeroTime = value => String(value || '').split(',').every(part => {
-  const text = part.trim();
-  if (!text) return true;
-  if (text.endsWith('ms')) return Number.parseFloat(text) === 0;
-  if (text.endsWith('s')) return Number.parseFloat(text) === 0;
-  return Number.parseFloat(text) === 0;
-});
-const hasNoCssMotion = style &&
-  (!__STABLE_POSITION_REQUIRED__ || String(style.position || 'static') === 'static') &&
-  (String(style.animationName || 'none') === 'none' || zeroTime(style.animationDuration)) &&
-  zeroTime(style.animationDelay) &&
-  zeroTime(style.transitionDuration) &&
-  zeroTime(style.transitionDelay);
-if (hasNoCssMotion) {
-  first.stable = true;
-  return first;
-}
-return new Promise(resolve => {
-  const finish = () => {
-    const second = snapshot();
-    const left = first.rect;
-    const right = second.rect;
-    second.stable = !!left && !!right && ["x", "y", "width", "height"].every(
-      key => Math.abs(Number(left[key] || 0) - Number(right[key] || 0)) <= 0.5
-    );
-    resolve(second);
-  };
-  ownerWindow.setTimeout(finish, 20);
-});
-"""
-_LOCATOR_FILL_TEMPLATE = """
-const info = {
-  count: matches.length,
-  frame_strict_violation: strictFrameViolation,
-  attached: !!el,
-};
-const strict = __STRICT__;
-if (strict && (strictFrameViolation || matches.length > 1)) {
-  return { ok: false, type: 'strict', info };
-}
-if (!el) return { ok: false, type: 'pending', info };
-const value = __VALUE__;
-const forced = __FORCED__;
-const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
-const tagName = String(el.tagName || '').toUpperCase();
-const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
-info.visible = visible(el);
-info.enabled = !disabledState(el);
-info.tag_name = tagName;
-info.input_type = inputType;
-info.non_fillable_input = tagName === 'INPUT' && nonFillableInputTypes.has(inputType);
-info.is_select = tagName === 'SELECT';
-info.fillable_for_fill = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
-info.editable_for_fill = info.fillable_for_fill && !disabledState(el) && !el.readOnly;
-if (tagName === 'INPUT' && nonFillableInputTypes.has(inputType)) {
-  return { ok: false, type: 'input-type', inputType, info };
-}
-if (tagName === 'SELECT') {
-  return { ok: false, type: forced ? 'force-non-fillable' : 'select', info };
-}
-const isFillable = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
-if (!isFillable) {
-  return { ok: false, type: forced ? 'force-non-fillable' : 'non-fillable', info };
-}
-if (forced && (!visible(el) || disabledState(el) || el.readOnly)) return { ok: true, info };
-if (!forced && (!visible(el) || disabledState(el) || el.readOnly)) {
-  return { ok: false, type: 'pending', info };
-}
-if ('value' in el) {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.value = value;
-  if (value !== '' && el.value !== value) {
-    return {
-      ok: false,
-      type: inputType === 'number' ? 'number-text' : 'malformed',
-      value: el.value,
-      info,
-    };
-  }
-} else {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.textContent = value;
-}
-el.dispatchEvent(new Event('input', { bubbles: true }));
-el.dispatchEvent(new Event('change', { bubbles: true }));
-return { ok: true, info };
-"""
 _MULTIPART_BOUNDARY_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB"
 _CHECKED_STATE_JS = """(el) => {
 const tagName = String(el && el.tagName || '').toUpperCase();
@@ -20281,6 +20093,31 @@ return true;
         )
         return _decode_json_result(json.loads(result))
 
+    def _native_locator_fast_path(
+        self,
+        operation: str,
+        *,
+        timeout: Optional[float],
+        method: str,
+        args: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        payload = {
+            "strict": bool(self._strict and not self._explicit_index),
+            "explicit_index": bool(self._explicit_index),
+            "has_handlers": bool(getattr(self._page, "_locator_handlers", None)),
+            **(args or {}),
+        }
+        result = _call_with_method_prefix(
+            method,
+            self._page._core.locator_fast_path,
+            _json(self._spec),
+            self._index,
+            operation,
+            _json(payload),
+            self._page._default_timeout if timeout is None else timeout,
+        )
+        return _decode_json_result(json.loads(result))
+
     def _simple_css_indexed_read_payload(self) -> Optional[dict[str, Any]]:
         if getattr(self._page, "_locator_handlers", None):
             return None
@@ -20309,47 +20146,6 @@ return true;
             "strict": bool(self._strict and not explicit_index),
         }
 
-    def _simple_css_text_read_payload(self) -> Optional[dict[str, Any]]:
-        return self._simple_css_indexed_read_payload()
-
-    def _simple_attribute_locator_payload(self) -> Optional[dict[str, Any]]:
-        if getattr(self._page, "_locator_handlers", None):
-            return None
-        spec = self._spec
-        index: Any = self._index
-        explicit_index = self._explicit_index
-        if spec.get("kind") == "nth":
-            base = spec.get("base")
-            if not isinstance(base, dict):
-                return None
-            spec = base
-            index = self._spec.get("index")
-            explicit_index = True
-        kind = spec.get("kind")
-        attribute = None
-        matcher = spec.get("value")
-        exact = bool(spec.get("exact"))
-        if kind == "test_id":
-            attribute = spec.get("attribute") or _TEST_ID_ATTRIBUTE
-            exact = True
-        elif kind == "alt":
-            attribute = "alt"
-        elif kind == "title":
-            attribute = "title"
-        elif kind == "placeholder":
-            attribute = "placeholder"
-        if not isinstance(attribute, str) or not isinstance(index, int):
-            return None
-        return {
-            "kind": kind,
-            "attribute": attribute,
-            "matcher": matcher,
-            "exact": exact,
-            "index": index,
-            "explicit_index": bool(explicit_index),
-            "strict": bool(self._strict and not explicit_index),
-        }
-
     def _try_fast_simple_attribute_text_read(
         self,
         *,
@@ -20358,46 +20154,11 @@ return true;
         method: str,
         action: str,
     ) -> Any:
-        payload = self._simple_attribute_locator_payload()
-        if payload is None:
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-try {
-  const allElements = Array.from(document.querySelectorAll('*'));
-  for (const el of allElements) {
-    if (el.shadowRoot) return { ok: false, type: 'fallback' };
-  }
-  const normalize = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
-  const matcher = payload.matcher;
-  let regex = null;
-  if (matcher && typeof matcher === 'object' && matcher.kind === 'regex') {
-    regex = new RegExp(String(matcher.pattern || ''), String(matcher.flags || ''));
-  }
-  const matchesAttribute = value => {
-    const raw = String(value ?? '');
-    if (regex) return regex.test(raw);
-    if (payload.kind === 'test_id') return raw === String(matcher ?? '');
-    const left = normalize(raw);
-    const right = normalize(matcher);
-    return payload.exact ? left === right : left.toLowerCase().includes(right.toLowerCase());
-  };
-  const attr = String(payload.attribute || '');
-  const matches = allElements.filter(el => el.hasAttribute(attr) && matchesAttribute(el.getAttribute(attr)));
-  if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-  let index = Number(payload.index || 0);
-  if (index < 0) index = matches.length + index;
-  const el = matches[index] || null;
-  if (!el) return { ok: false, type: 'fallback' };
-  if (payload.property === 'innerText') return { ok: true, value: el.innerText };
-  return { ok: true, value: el.textContent };
-} catch (_) {
-  return { ok: false, type: 'fallback' };
-}
-}""",
-            {**payload, "property": property_name},
+        result = self._native_locator_fast_path(
+            "attribute_text",
             timeout=timeout,
             method=method,
+            args={"property": property_name},
         )
         if not isinstance(result, dict):
             return _MISSING
@@ -20409,50 +20170,8 @@ try {
         return _MISSING
 
     def _try_fast_simple_attribute_visibility(self, *, timeout: Optional[float]) -> Any:
-        payload = self._simple_attribute_locator_payload()
-        if payload is None:
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-try {
-  const allElements = Array.from(document.querySelectorAll('*'));
-  for (const el of allElements) {
-    if (el.shadowRoot) return { ok: false, type: 'fallback' };
-  }
-  const normalize = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
-  const matcher = payload.matcher;
-  let regex = null;
-  if (matcher && typeof matcher === 'object' && matcher.kind === 'regex') {
-    regex = new RegExp(String(matcher.pattern || ''), String(matcher.flags || ''));
-  }
-  const matchesAttribute = value => {
-    const raw = String(value ?? '');
-    if (regex) return regex.test(raw);
-    if (payload.kind === 'test_id') return raw === String(matcher ?? '');
-    const left = normalize(raw);
-    const right = normalize(matcher);
-    return payload.exact ? left === right : left.toLowerCase().includes(right.toLowerCase());
-  };
-  const visible = el => {
-    if (!el || !el.isConnected) return false;
-    if ((el.tagName || '') === 'OPTION') return el.parentElement ? visible(el.parentElement) : false;
-    const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-    const style = view.getComputedStyle(el);
-    if (style.visibility === 'hidden' || style.display === 'none') return false;
-    const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  };
-  const attr = String(payload.attribute || '');
-  const matches = allElements.filter(el => el.hasAttribute(attr) && matchesAttribute(el.getAttribute(attr)));
-  if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-  let index = Number(payload.index || 0);
-  if (index < 0) index = matches.length + index;
-  return { ok: true, value: visible(matches[index] || null) };
-} catch (_) {
-  return { ok: false, type: 'fallback' };
-}
-}""",
-            payload,
+        result = self._native_locator_fast_path(
+            "attribute_visibility",
             timeout=timeout,
             method="Locator.is_visible",
         )
@@ -20466,24 +20185,8 @@ try {
         return _MISSING
 
     def _try_fast_simple_css_count(self, *, timeout: Optional[float]) -> Any:
-        payload = self._simple_css_indexed_read_payload()
-        if payload is None:
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-	const allElements = document.querySelectorAll('*');
-	for (let i = 0; i < allElements.length; i++) {
-	  if (allElements[i].shadowRoot) return { ok: false, type: 'fallback' };
-	}
-	const matches = Array.from(document.querySelectorAll(String(payload.selector || '')));
-	if (payload.explicit_index) {
-	  let index = Number(payload.index || 0);
-	  if (index < 0) index = matches.length + index;
-	  return { ok: true, count: matches[index] ? 1 : 0 };
-	}
-	return { ok: true, count: matches.length };
-	}""",
-            payload,
+        result = self._native_locator_fast_path(
+            "css_count",
             timeout=timeout,
             method="Locator.count",
         )
@@ -20499,27 +20202,11 @@ try {
         method: str,
         action: str,
     ) -> Any:
-        payload = self._simple_css_text_read_payload()
-        if payload is None:
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-const allElements = document.querySelectorAll('*');
-for (let i = 0; i < allElements.length; i++) {
-  if (allElements[i].shadowRoot) return { ok: false, type: 'fallback' };
-}
-const matches = Array.from(document.querySelectorAll(String(payload.selector || '')));
-if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-let index = Number(payload.index || 0);
-if (index < 0) index = matches.length + index;
-const el = matches[index] || null;
-if (!el) return { ok: false, type: 'fallback' };
-if (payload.property === 'innerText') return { ok: true, value: el.innerText };
-return { ok: true, value: el.textContent };
-}""",
-            {**payload, "property": property_name},
+        result = self._native_locator_fast_path(
+            "css_text",
             timeout=timeout,
             method=method,
+            args={"property": property_name},
         )
         if not isinstance(result, dict):
             return _MISSING
@@ -20537,35 +20224,11 @@ return { ok: true, value: el.textContent };
         timeout: Optional[float],
         method: str,
     ) -> Any:
-        payload = self._simple_css_text_read_payload()
-        if payload is None:
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-try {
-  const allElements = document.querySelectorAll('*');
-  for (let i = 0; i < allElements.length; i++) {
-    if (allElements[i].shadowRoot) return { ok: false, type: 'fallback' };
-  }
-  const matches = Array.from(document.querySelectorAll(String(payload.selector || '')));
-  let selected = matches;
-  if (payload.explicit_index) {
-    let index = Number(payload.index || 0);
-    if (index < 0) index = matches.length + index;
-    selected = matches[index] ? [matches[index]] : [];
-  }
-  const values = selected.map(el => {
-    if (payload.property === 'innerText') return el.innerText || el.textContent || '';
-    return el.textContent;
-  });
-  return { ok: true, values };
-} catch (_) {
-  return { ok: false, type: 'fallback' };
-}
-}""",
-            {**payload, "property": property_name},
+        result = self._native_locator_fast_path(
+            "css_all_texts",
             timeout=timeout,
             method=method,
+            args={"property": property_name},
         )
         if isinstance(result, dict) and result.get("ok"):
             values = result.get("values")
@@ -20573,26 +20236,11 @@ try {
         return _MISSING
 
     def _try_fast_simple_css_attribute(self, name: str, *, timeout: Optional[float]) -> Any:
-        payload = self._simple_css_indexed_read_payload()
-        if payload is None:
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-const allElements = document.querySelectorAll('*');
-for (let i = 0; i < allElements.length; i++) {
-  if (allElements[i].shadowRoot) return { ok: false, type: 'fallback' };
-}
-const matches = Array.from(document.querySelectorAll(String(payload.selector || '')));
-if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-let index = Number(payload.index || 0);
-if (index < 0) index = matches.length + index;
-const el = matches[index] || null;
-if (!el) return { ok: false, type: 'fallback' };
-return { ok: true, value: el.getAttribute(String(payload.name || '')) };
-}""",
-            {**payload, "name": name},
+        result = self._native_locator_fast_path(
+            "css_attribute",
             timeout=timeout,
             method="Locator.get_attribute",
+            args={"name": name},
         )
         if not isinstance(result, dict):
             return _MISSING
@@ -20605,24 +20253,8 @@ return { ok: true, value: el.getAttribute(String(payload.name || '')) };
         return _MISSING
 
     def _try_fast_simple_css_inner_html(self, *, timeout: Optional[float]) -> Any:
-        payload = self._simple_css_indexed_read_payload()
-        if payload is None:
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-	const allElements = document.querySelectorAll('*');
-	for (let i = 0; i < allElements.length; i++) {
-	  if (allElements[i].shadowRoot) return { ok: false, type: 'fallback' };
-	}
-	const matches = Array.from(document.querySelectorAll(String(payload.selector || '')));
-	if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-	let index = Number(payload.index || 0);
-	if (index < 0) index = matches.length + index;
-	const el = matches[index] || null;
-	if (!el) return { ok: false, type: 'fallback' };
-	return { ok: true, value: el.innerHTML };
-	}""",
-            payload,
+        result = self._native_locator_fast_path(
+            "css_inner_html",
             timeout=timeout,
             method="Locator.inner_html",
         )
@@ -20637,32 +20269,8 @@ return { ok: true, value: el.getAttribute(String(payload.name || '')) };
         return _MISSING
 
     def _try_fast_simple_css_visibility(self) -> Any:
-        payload = self._simple_css_indexed_read_payload()
-        if payload is None:
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-const allElements = document.querySelectorAll('*');
-for (let i = 0; i < allElements.length; i++) {
-  if (allElements[i].shadowRoot) return { ok: false, type: 'fallback' };
-}
-const visible = el => {
-  if (!el || !el.isConnected) return false;
-  if ((el.tagName || '') === 'OPTION') return el.parentElement ? visible(el.parentElement) : false;
-  const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-  const style = view.getComputedStyle(el);
-  if (style.visibility === 'hidden' || style.display === 'none') return false;
-  const rect = el.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
-};
-const matches = Array.from(document.querySelectorAll(String(payload.selector || '')));
-if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-let index = Number(payload.index || 0);
-if (index < 0) index = matches.length + index;
-const el = matches[index] || null;
-return { ok: true, value: visible(el) };
-}""",
-            payload,
+        result = self._native_locator_fast_path(
+            "css_visibility",
             timeout=None,
             method="Locator.is_visible",
         )
@@ -20676,94 +20284,8 @@ return { ok: true, value: visible(el) };
         return _MISSING
 
     def _try_fast_simple_css_enabled_state(self, *, timeout: Optional[float]) -> Any:
-        payload = self._simple_css_indexed_read_payload()
-        if payload is None:
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-	const allElements = document.querySelectorAll('*');
-	for (let i = 0; i < allElements.length; i++) {
-	  if (allElements[i].shadowRoot) return { ok: false, type: 'fallback' };
-	}
-	const knownRoles = new Set([
-	  'alert', 'alertdialog', 'application', 'article', 'banner', 'blockquote', 'button',
-	  'caption', 'cell', 'checkbox', 'code', 'columnheader', 'combobox', 'complementary',
-	  'contentinfo', 'definition', 'deletion', 'dialog', 'directory', 'document', 'emphasis',
-	  'feed', 'figure', 'form', 'generic', 'grid', 'gridcell', 'group', 'heading', 'img',
-	  'insertion', 'link', 'list', 'listbox', 'listitem', 'log', 'main', 'mark', 'marquee', 'math',
-	  'meter', 'menu', 'menubar', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'navigation',
-	  'none', 'note', 'option', 'paragraph', 'presentation', 'progressbar', 'radio',
-	  'radiogroup', 'region', 'row', 'rowgroup', 'rowheader', 'scrollbar', 'search',
-	  'searchbox', 'separator', 'slider', 'spinbutton', 'status', 'strong', 'subscript',
-	  'superscript', 'switch', 'tab', 'table', 'tablist', 'tabpanel', 'term', 'textbox',
-	  'time', 'timer', 'toolbar', 'tooltip', 'tree', 'treegrid', 'treeitem'
-	]);
-	const explicitRoleOf = el => {
-	  for (const token of String(el.getAttribute('role') || '').trim().split(/\\s+/).filter(Boolean)) {
-	    if (knownRoles.has(token)) return token;
-	  }
-	  return '';
-	};
-	const locatorRoleOf = el => {
-	  if (!el || el.nodeType !== 1) return '';
-	  const explicit = explicitRoleOf(el);
-	  if (explicit) return explicit;
-	  const tag = String(el.tagName || '').toUpperCase();
-	  const type = String(el.getAttribute('type') || 'text').toLowerCase();
-	  if (tag === 'HTML') return 'document';
-	  if (tag === 'BUTTON') return 'button';
-	  if (tag === 'A' && el.hasAttribute('href')) return 'link';
-	  if (/^H[1-6]$/.test(tag)) return 'heading';
-	  if (tag === 'IMG') {
-	    if (el.hasAttribute('alt') && el.getAttribute('alt') === '') {
-	      const nameSource = String(el.getAttribute('aria-label') || el.getAttribute('aria-labelledby') || el.getAttribute('title') || '').trim();
-	      if (!nameSource && !el.hasAttribute('tabindex')) return '';
-	    }
-	    return 'img';
-	  }
-	  if (String(tag).toLowerCase() === 'svg') return 'img';
-	  if (tag === 'FIGURE') return 'figure';
-	  if (tag === 'DFN' || tag === 'DT') return 'term';
-	  if (tag === 'DD') return 'definition';
-	  if (String(tag).toLowerCase() === 'math') return 'math';
-	  if (tag === 'MARK') return 'mark';
-	  if (tag === 'SELECT') return el.multiple || Number(el.getAttribute('size') || 0) > 1 ? 'listbox' : 'combobox';
-	  if (tag === 'TEXTAREA') return 'textbox';
-	  if (tag === 'OPTION') return 'option';
-	  if (tag === 'INPUT') {
-	    if (type === 'checkbox') return 'checkbox';
-	    if (type === 'radio') return 'radio';
-	    if (type === 'range') return 'slider';
-	    if (type === 'search') return 'searchbox';
-	    if (type === 'number') return 'spinbutton';
-	    if (['button', 'submit', 'reset', 'image', 'file'].includes(type)) return 'button';
-	    if (!['hidden', 'file', 'image'].includes(type)) return 'textbox';
-	  }
-	  return '';
-	};
-	const disabledState = el => {
-	  if (!el || el.nodeType !== 1) return false;
-	  const tag = String(el.tagName || '').toUpperCase();
-	  const nativeDisableable = ['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'OPTION', 'OPTGROUP'].includes(tag);
-	  if (nativeDisableable && typeof el.matches === 'function' && el.matches(':disabled')) return true;
-	  const role = locatorRoleOf(el);
-	  if (!role || role === 'none' || role === 'presentation') return false;
-	  let current = el;
-	  while (current && current.nodeType === 1) {
-	    if (String(current.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return true;
-	    current = current.parentElement;
-	  }
-	  return false;
-	};
-	const matches = Array.from(document.querySelectorAll(String(payload.selector || '')));
-	if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-	let index = Number(payload.index || 0);
-	if (index < 0) index = matches.length + index;
-	const el = matches[index] || null;
-	if (!el) return { ok: false, type: 'fallback' };
-	return { ok: true, value: !!el && !disabledState(el) };
-	}""",
-            payload,
+        result = self._native_locator_fast_path(
+            "css_enabled",
             timeout=timeout,
             method="Locator.is_enabled",
         )
@@ -20777,33 +20299,8 @@ return { ok: true, value: visible(el) };
         return _MISSING
 
     def _try_fast_simple_css_bounding_box(self, *, timeout: Optional[float]) -> Any:
-        payload = self._simple_css_indexed_read_payload()
-        if payload is None:
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-const allElements = document.querySelectorAll('*');
-for (let i = 0; i < allElements.length; i++) {
-  if (allElements[i].shadowRoot) return { ok: false, type: 'fallback' };
-}
-const matches = Array.from(document.querySelectorAll(String(payload.selector || '')));
-if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-let index = Number(payload.index || 0);
-if (index < 0) index = matches.length + index;
-const el = matches[index] || null;
-if (!el) return { ok: false, type: 'fallback' };
-const rect = el.getBoundingClientRect();
-return {
-  ok: true,
-  box: {
-    x: rect.x,
-    y: rect.y,
-    width: rect.width,
-    height: rect.height
-  }
-};
-}""",
-            payload,
+        result = self._native_locator_fast_path(
+            "css_bounding_box",
             timeout=timeout,
             method="Locator.bounding_box",
         )
@@ -21370,14 +20867,8 @@ return true;
         return True
 
     def _try_fast_simple_role_count(self, *, timeout: Optional[float]) -> Any:
-        payload = self._simple_role_fast_path_payload()
-        if payload is None:
-            return _MISSING
-        if not self._ensure_fast_simple_role_helper(timeout=timeout, method="Locator.count"):
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            self._fast_simple_role_action_script("return { ok: true, count: matches.length };"),
-            payload,
+        result = self._native_locator_fast_path(
+            "role_count",
             timeout=timeout,
             method="Locator.count",
         )
@@ -21386,24 +20877,11 @@ return true;
         return _MISSING
 
     def _try_fast_simple_role_attribute(self, name: str, *, timeout: Optional[float]) -> Any:
-        payload = self._simple_role_fast_path_payload()
-        if payload is None:
-            return _MISSING
-        if not self._ensure_fast_simple_role_helper(timeout=timeout, method="Locator.get_attribute"):
-            return _MISSING
-        payload = {**payload, "attribute": name}
-        result = self._evaluate_simple_css_fast_path(
-            self._fast_simple_role_action_script(
-                """
-if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-const el = matches[Number(payload.index || 0)] || null;
-if (!el) return { ok: false, type: 'fallback' };
-return { ok: true, value: el.getAttribute(String(payload.attribute || '')) };
-"""
-            ),
-            payload,
+        result = self._native_locator_fast_path(
+            "role_attribute",
             timeout=timeout,
             method="Locator.get_attribute",
+            args={"name": name},
         )
         if not isinstance(result, dict):
             return _MISSING
@@ -21415,21 +20893,8 @@ return { ok: true, value: el.getAttribute(String(payload.attribute || '')) };
         return _MISSING
 
     def _try_fast_simple_role_visibility(self, *, timeout: Optional[float]) -> Any:
-        payload = self._simple_role_fast_path_payload()
-        if payload is None:
-            return _MISSING
-        if not self._ensure_fast_simple_role_helper(timeout=timeout, method="Locator.is_visible"):
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            self._fast_simple_role_action_script(
-                """
-if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-let index = Number(payload.index || 0);
-if (index < 0) index = matches.length + index;
-return { ok: true, value: !!matches[index] };
-"""
-            ),
-            payload,
+        result = self._native_locator_fast_path(
+            "role_visibility",
             timeout=timeout,
             method="Locator.is_visible",
         )
@@ -21440,121 +20905,9 @@ return { ok: true, value: !!matches[index] };
             raise Error(f"strict mode violation: locator resolved to {count} elements while trying to check visibility")
         return _MISSING
 
-    @staticmethod
-    @functools.lru_cache(maxsize=1)
-    def _fast_simple_text_helper_install_script() -> str:
-        return """(() => {
-if (typeof window.__rustwrightSimpleTextHelperV1 === 'function') return true;
-Object.defineProperty(window, '__rustwrightSimpleTextHelperV1', {
-  value: (payload) => {
-try {
-  const allElements = Array.from(document.querySelectorAll('*'));
-  for (const el of allElements) {
-    if (el.shadowRoot) return { ok: false, type: 'fallback' };
-  }
-  const normalize = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
-  const elementText = node => {
-    if (!node) return '';
-    if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
-    if (node.nodeType !== Node.ELEMENT_NODE) return '';
-    const tag = node.tagName || '';
-    const type = String(node.getAttribute('type') || '').toLowerCase();
-    if (tag === 'INPUT') {
-      if (['button', 'submit', 'reset'].includes(type)) return node.value || (type === 'submit' ? 'Submit' : type === 'reset' ? 'Reset' : '');
-      if (type === 'image') return node.getAttribute('alt') || node.getAttribute('title') || node.value || '';
-      return '';
-    }
-    if (tag === 'TEXTAREA') return node.value || node.textContent || '';
-    let text = '';
-    for (const child of node.childNodes) text += elementText(child);
-    return text;
-  };
-  const matcher = payload.text;
-  let regex = null;
-  if (matcher && typeof matcher === 'object' && matcher.kind === 'regex') {
-    regex = new RegExp(String(matcher.pattern || ''), String(matcher.flags || ''));
-  }
-  const matchesText = text => {
-    const normalized = normalize(text);
-    if (regex) return regex.test(normalized);
-    const needle = normalize(matcher);
-    if (payload.exact) return normalized === needle;
-    return normalized.toLowerCase().includes(needle.toLowerCase());
-  };
-  const visible = el => {
-    if (!el || !el.isConnected) return false;
-    if ((el.tagName || '') === 'OPTION') return el.parentElement ? visible(el.parentElement) : false;
-    const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-    const style = view.getComputedStyle(el);
-    if (style.visibility === 'hidden' || style.display === 'none') return false;
-    const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  };
-  const textCandidate = el => ![
-    'HTML', 'HEAD', 'BODY', 'SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE',
-    'TITLE', 'META', 'LINK', 'BASE'
-  ].includes((el && el.tagName) || '');
-  const candidates = allElements.filter(el => textCandidate(el) && matchesText(elementText(el)));
-  const matches = candidates.filter(el => !Array.from(el.children || []).some(child => matchesText(elementText(child))));
-  return { ok: true, matches, visible };
-} catch (_) {
-  return { ok: false, type: 'fallback' };
-}
-  },
-  configurable: true
-});
-return true;
-})()"""
-
-    def _ensure_fast_simple_text_helper(self, *, timeout: Optional[float], method: str) -> bool:
-        if getattr(self._page, "_simple_text_helper_installed", False):
-            return True
-        try:
-            _call_with_method_prefix(
-                method,
-                self._page._core.add_init_script,
-                self._fast_simple_text_helper_install_script(),
-                self._page._default_timeout if timeout is None else timeout,
-                True,
-            )
-        except Exception:
-            return False
-        self._page._simple_text_helper_installed = True
-        return True
-
     def _try_fast_simple_text_visibility(self, *, timeout: Optional[float]) -> Any:
-        if getattr(self._page, "_locator_handlers", None):
-            return _MISSING
-        spec = self._spec
-        index = self._index
-        if spec.get("kind") == "nth":
-            index = int(spec.get("index") or 0)
-            spec = spec.get("base") or {}
-        if spec.get("kind") != "text":
-            return _MISSING
-        if not self._ensure_fast_simple_text_helper(timeout=timeout, method="Locator.is_visible"):
-            return _MISSING
-        payload = {
-            "text": spec.get("text"),
-            "exact": bool(spec.get("exact")),
-            "index": index,
-            "strict": bool(self._strict and not self._explicit_index),
-        }
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-const helper = window.__rustwrightSimpleTextHelperV1;
-if (typeof helper !== 'function') return { ok: false, type: 'fallback' };
-const helperResult = helper(payload);
-if (!helperResult || !helperResult.ok) return helperResult || { ok: false, type: 'fallback' };
-const matches = helperResult.matches || [];
-if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-let index = Number(payload.index || 0);
-if (index < 0) index = matches.length + index;
-const visible = helperResult.visible;
-if (typeof visible !== 'function') return { ok: false, type: 'fallback' };
-return { ok: true, value: visible(matches[index] || null) };
-}""",
-            payload,
+        result = self._native_locator_fast_path(
+            "text_visibility",
             timeout=timeout,
             method="Locator.is_visible",
         )
@@ -21568,41 +20921,11 @@ return { ok: true, value: visible(matches[index] || null) };
     def _try_fast_simple_css_immediate_hidden_or_detached(self, state: str, *, timeout: Optional[float], method: str) -> Any:
         if state not in {"hidden", "detached"}:
             return _MISSING
-        payload = self._simple_css_indexed_read_payload()
-        if payload is None:
-            return _MISSING
-        payload = {**payload, "state": state}
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-try {
-  const allElements = document.querySelectorAll('*');
-  for (let i = 0; i < allElements.length; i++) {
-    if (allElements[i].shadowRoot) return { ok: false, type: 'fallback' };
-  }
-  const visible = el => {
-    if (!el || !el.isConnected) return false;
-    if ((el.tagName || '') === 'OPTION') return el.parentElement ? visible(el.parentElement) : false;
-    const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-    const style = view.getComputedStyle(el);
-    if (style.visibility === 'hidden' || style.display === 'none') return false;
-    const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  };
-  const matches = Array.from(document.querySelectorAll(String(payload.selector || '')));
-  if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-  let index = Number(payload.index || 0);
-  if (index < 0) index = matches.length + index;
-  const el = matches[index] || null;
-  const satisfied = payload.state === 'detached' ? !el : (!el || !visible(el));
-  return { ok: true, satisfied };
-} catch (_) {
-  return { ok: false, type: 'fallback' };
-}
-}""",
-            payload,
+        result = self._native_locator_fast_path(
+            "css_immediate_state",
             timeout=timeout,
             method=method,
-            wait_probe=True,
+            args={"state": state},
         )
         if isinstance(result, dict) and result.get("ok"):
             return True if result.get("satisfied") else _MISSING
@@ -21866,27 +21189,61 @@ return null;
         stable_position_required: bool = True,
         action_position: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        scroll_literal = "true" if scroll else "false"
-        stable_literal = "true" if stable else "false"
-        receives_events_literal = "true" if receives_events else "false"
-        stable_position_required_literal = "true" if stable_position_required else "false"
-        action_position_json = "null"
-        if action_position is not None:
-            action_position_json = json.dumps(
-                {
-                    "x": float(action_position.get("x", 0)),
-                    "y": float(action_position.get("y", 0)),
-                }
-            )
-        return self._eval(
-            _LOCATOR_TARGET_STATE_TEMPLATE
-            .replace("__SCROLL__", scroll_literal)
-            .replace("__STABLE__", stable_literal)
-            .replace("__RECEIVES_EVENTS__", receives_events_literal)
-            .replace("__STABLE_POSITION_REQUIRED__", stable_position_required_literal)
-            .replace("__ACTION_POSITION__", action_position_json),
+        self._raise_if_invalid_selector_argument("Locator")
+        self._raise_if_frame_locator_in_composite("Locator")
+        options = {
+            "scroll": bool(scroll),
+            "stable": bool(stable),
+            "receives_events": bool(receives_events),
+            "stable_position_required": bool(stable_position_required),
+            "action_position": None
+            if action_position is None
+            else {
+                "x": float(action_position.get("x", 0)),
+                "y": float(action_position.get("y", 0)),
+            },
+        }
+        result = _call(
+            self._page._core.locator_probe_state,
+            _json(self._spec),
+            self._index,
+            _json(options),
+            self._page._default_timeout if timeout is None else timeout,
+        )
+        return _decode_json_result(json.loads(result))
+
+    def _fill_apply(self, value: str, *, strict: bool, forced: bool, timeout: float) -> dict[str, Any]:
+        result = _call(
+            self._page._core.locator_fill_apply,
+            _json(self._spec),
+            self._index,
+            value,
+            strict,
+            forced,
             timeout,
         )
+        return _decode_json_result(json.loads(result))
+
+    def _select_apply(
+        self,
+        values: list[str],
+        labels: list[str],
+        indexes: list[int],
+        *,
+        timeout: float,
+        method: str,
+    ) -> dict[str, Any]:
+        result = _call_with_method_prefix(
+            method,
+            self._page._core.locator_select_apply,
+            _json(self._spec),
+            self._index,
+            _json(values),
+            _json(labels),
+            _json(indexes),
+            timeout,
+        )
+        return _decode_json_result(json.loads(result))
 
     @staticmethod
     def _state_matches(info: dict[str, Any], state: str) -> bool:
@@ -23342,16 +22699,8 @@ if (!el && payload.needs_element !== false) return {{ ok: false, type: 'fallback
 }}"""
 
     def _try_fast_simple_label_count(self, *, timeout: Optional[float]) -> Any:
-        payload = self._label_fast_path_payload()
-        if payload is None:
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            self._fast_label_control_script(
-                """
-return { ok: true, count: matches.length };
-"""
-            ),
-            {**payload, "strict": False, "needs_element": False},
+        result = self._native_locator_fast_path(
+            "label_count",
             timeout=timeout,
             method="Locator.count",
         )
@@ -23360,18 +22709,11 @@ return { ok: true, count: matches.length };
         return _MISSING
 
     def _try_fast_simple_label_attribute(self, name: str, *, timeout: Optional[float]) -> Any:
-        payload = self._label_fast_path_payload()
-        if payload is None:
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            self._fast_label_control_script(
-                """
-return { ok: true, value: el.getAttribute(String(payload.name || '')) };
-"""
-            ),
-            {**payload, "name": name},
+        result = self._native_locator_fast_path(
+            "label_attribute",
             timeout=timeout,
             method="Locator.get_attribute",
+            args={"name": name},
         )
         if not isinstance(result, dict):
             return _MISSING
@@ -23739,21 +23081,18 @@ return { ok: true };
         if self._try_fast_simple_placeholder_fill(value, action=action, timeout=timeout_ms, force=force):
             return
         deadline = time.monotonic() + max(timeout_ms, 0.0) / 1000
-        value_json = json.dumps(str(value))
-        force_literal = "true" if force else "false"
-        strict_literal = "true" if self._strict and not self._explicit_index else "false"
-        fill_script = (
-            _LOCATOR_FILL_TEMPLATE.replace("__STRICT__", strict_literal)
-            .replace("__FORCED__", force_literal)
-            .replace("__VALUE__", value_json)
-        )
         last_info: dict[str, Any] = {}
         while True:
             remaining_ms = max((deadline - time.monotonic()) * 1000, 1.0)
             command_timeout = _actionability_probe_timeout(remaining_ms)
             self._page._run_locator_handlers(deadline)
             try:
-                result = self._eval(fill_script, command_timeout)
+                result = self._fill_apply(
+                    str(value),
+                    strict=bool(self._strict and not self._explicit_index),
+                    forced=bool(force),
+                    timeout=command_timeout,
+                )
             except TimeoutError:
                 # A single fill-apply probe timing out is transient over a slow remote-CDP
                 # transport: one probe's CDP round trips can outlast the per-probe budget.
@@ -24199,7 +23538,17 @@ return true;
         return state
 
     def _checked_state_now(self, method: str, *, timeout: Optional[float]) -> dict[str, Any]:
-        state = self._eval(f"return ({_CHECKED_STATE_JS})(el);", timeout, method=method)
+        state = _decode_json_result(
+            json.loads(
+                _call_with_method_prefix(
+                    method,
+                    self._page._core.locator_check_apply,
+                    _json(self._spec),
+                    self._index,
+                    self._page._default_timeout if timeout is None else timeout,
+                )
+            )
+        )
         if not isinstance(state, dict) or state.get("valid") is False:
             raise Error(f"{method}: Error: Not a checkbox or radio button")
         return state
@@ -24480,74 +23829,18 @@ return true;
             if not isinstance(elements, (list, tuple)):
                 elements = [elements]
             raw_values.extend(element.evaluate("(option) => option.value") for element in elements)
-        values_json = json.dumps(raw_values)
-        labels_json = json.dumps(raw_labels)
-        indexes_json = json.dumps(raw_indexes)
-        select_script = f"""
-if (!el) throw new Error('No element matches locator');
-if (!(el instanceof HTMLSelectElement)) throw new Error('Element is not a <select> element');
-const values = {values_json};
-const labels = {labels_json};
-const indexes = {indexes_json};
-const options = Array.from(el.options);
-const foundValues = new Set();
-const foundLabels = new Set();
-const foundIndexes = new Set();
-const selectedOptions = [];
-for (const option of options) {{
-  let matched = false;
-  for (const value of values) {{
-    if (option.value === value || option.label === value) {{
-      foundValues.add(value);
-      matched = true;
-    }}
-  }}
-  for (const label of labels) {{
-    if (option.label === label) {{
-      foundLabels.add(label);
-      matched = true;
-    }}
-  }}
-  for (const index of indexes) {{
-    if (option.index === index) {{
-      foundIndexes.add(index);
-      matched = true;
-    }}
-  }}
-  if (matched) selectedOptions.push(option);
-}}
-const hasRequests = values.length > 0 || labels.length > 0 || indexes.length > 0;
-const allRequestedFound =
-  values.every(value => foundValues.has(value)) &&
-  labels.every(label => foundLabels.has(label)) &&
-  indexes.every(index => foundIndexes.has(index));
-const ready = !hasRequests || (el.multiple ? allRequestedFound : selectedOptions.length > 0);
-if (!ready) {{
-  return {{
-    ok: false,
-    missing: [
-      ...values.filter(value => !foundValues.has(value)).map(value => `value=${{value}}`),
-      ...labels.filter(label => !foundLabels.has(label)).map(label => `label=${{label}}`),
-      ...indexes.filter(index => !foundIndexes.has(index)).map(index => `index=${{index}}`),
-    ],
-  }};
-}}
-for (const option of options) option.selected = false;
-if (el.multiple) {{
-  for (const option of selectedOptions) option.selected = true;
-}} else if (selectedOptions.length) {{
-  selectedOptions[0].selected = true;
-}}
-el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-return {{ ok: true, selected: Array.from(el.selectedOptions).map(option => option.value) }};
-"""
         deadline = started + max(timeout_ms, 0.0) / 1000
         while True:
             remaining_ms = max((deadline - time.monotonic()) * 1000, 1.0)
             command_timeout = _actionability_probe_timeout(remaining_ms)
             try:
-                result = self._eval(select_script, command_timeout, method=method)
+                result = self._select_apply(
+                    raw_values,
+                    raw_labels,
+                    raw_indexes,
+                    timeout=command_timeout,
+                    method=method,
+                )
             except TimeoutError:
                 # A transient select-apply probe timeout is retried until the outer deadline
                 # (see the fill-apply loop), but owner unavailability is surfaced immediately.
@@ -24845,28 +24138,8 @@ return { ok: false };
         raise Error("Locator.input_value: Error: Node is not an <input>, <textarea> or <select> element")
 
     def _try_fast_simple_css_input_value(self, *, timeout: Optional[float]) -> Any:
-        payload = self._simple_css_indexed_read_payload()
-        if payload is None:
-            return _MISSING
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-const allElements = document.querySelectorAll('*');
-for (let i = 0; i < allElements.length; i++) {
-  if (allElements[i].shadowRoot) return { ok: false, type: 'fallback' };
-}
-const matches = Array.from(document.querySelectorAll(String(payload.selector || '')));
-if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-let index = Number(payload.index || 0);
-if (index < 0) index = matches.length + index;
-const el = matches[index] || null;
-if (!el) return { ok: false, type: 'fallback' };
-const tagName = String(el.tagName || '').toUpperCase();
-if (tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT') {
-  return { ok: true, value: el.value };
-}
-return { ok: false, type: 'non-control' };
-}""",
-            payload,
+        result = self._native_locator_fast_path(
+            "css_input_value",
             timeout=timeout,
             method="Locator.input_value",
         )
@@ -24876,7 +24149,7 @@ return { ok: false, type: 'non-control' };
             value = result.get("value")
             return "" if value is None else str(value)
         result_type = result.get("type")
-        if result_type == "fallback":
+        if result_type in {"fallback", "not-applicable"}:
             return _MISSING
         if result_type == "strict":
             count = int(result.get("count") or 0)
