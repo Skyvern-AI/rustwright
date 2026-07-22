@@ -9265,6 +9265,146 @@ def test_expect_to_have_count_timeout_message_matches_playwright(page):
     expect_to_have_count_timeout_message_matches_playwright(page)
 
 
+def test_native_assert_locator_returns_final_actual_at_deadline(page):
+    page.set_content("<button>One</button><button>Two</button>")
+    locator = page.locator("button")
+
+    result = json.loads(
+        page._core.assert_locator(
+            json.dumps(locator._spec, separators=(",", ":")),
+            locator._index,
+            json.dumps({"kind": "count", "expected": 3, "negated": False}),
+            50.0,
+            10.0,
+        )
+    )
+
+    assert result == {"passed": False, "actual": 2, "log": ""}
+
+
+def test_expect_locator_polling_does_not_call_python_probe_methods(page, monkeypatch):
+    from rustwright.sync_api import Locator
+
+    page.set_content(
+        """
+        <div id="status">Loading</div>
+        <script>setTimeout(() => { document.querySelector('#status').textContent = 'Ready'; }, 50)</script>
+        """
+    )
+
+    def legacy_probe(*args, **kwargs):
+        raise AssertionError("legacy Python assertion probe was called")
+
+    for method_name in (
+        "all_inner_texts",
+        "all_text_contents",
+        "count",
+        "evaluate",
+        "evaluate_all",
+        "inner_text",
+        "is_disabled",
+        "is_editable",
+        "is_enabled",
+        "is_visible",
+    ):
+        monkeypatch.setattr(Locator, method_name, legacy_probe)
+
+    expect(page.locator("#status"), timeout=2_000).to_have_text("Ready")
+
+
+def test_expect_native_locator_failure_messages_match_legacy(page):
+    page.set_content(
+        "<div id='box' data-state='ready'>Actual</div><button>One</button><button>Two</button>"
+    )
+
+    cases = (
+        (
+            lambda: expect(page.locator("#box")).to_have_text("Expected", timeout=60),
+            "expected: text 'Expected'; text 'Expected', got 'Actual'",
+        ),
+        (
+            lambda: expect(page.locator("#box")).to_have_attribute("data-state", "done", timeout=60),
+            "expected: attribute 'data-state'; attribute 'data-state' 'done', got 'ready'",
+        ),
+        (
+            lambda: expect(page.locator("button")).to_have_count(3, timeout=60),
+            "Locator expected to have count '3'",
+        ),
+        (
+            lambda: expect(page.locator("#box")).not_to_be_visible(timeout=60),
+            "expected not: locator visible state to be True; visible state is True",
+        ),
+    )
+
+    for assertion, expected_message in cases:
+        with pytest.raises(AssertionError) as exc_info:
+            assertion()
+        assert str(exc_info.value) == expected_message
+
+
+def test_expect_negation_aliases_use_native_locator_polling(page):
+    page.set_content(
+        "<button id='go' class='primary' data-state='ready' aria-label='Save'>Go</button>"
+        "<div id='hidden' hidden>Hidden</div>"
+    )
+
+    expect(page.locator("#go")).not_to_have_text("Stop")
+    expect(page.locator("#go")).not_to_have_attribute("data-state", "pending")
+    expect(page.locator("#go")).not_to_have_count(2)
+    expect(page.locator("#go")).not_to_have_role("link")
+    expect(page.locator("#go")).not_to_have_accessible_name("Cancel")
+    expect(page.locator("#hidden")).not_to_be_visible()
+
+
+def test_expect_native_js_property_preserves_python_value_equivalence(page):
+    page.set_content("<div id='value'></div>")
+    page.evaluate(
+        """
+        const el = document.querySelector('#value');
+        el.nullValue = null;
+        el.bigintValue = 1n;
+        el.objectValue = {items: [1, true, null]};
+        el.dateValue = new Date('2026-07-21T12:34:56.000Z');
+        el.urlValue = new URL('https://example.test/path?q=1');
+        """
+    )
+    locator = page.locator("#value")
+
+    expect(locator).to_have_js_property("missingValue", None)
+    expect(locator).to_have_js_property("nullValue", None)
+    expect(locator).to_have_js_property("bigintValue", 1)
+    expect(locator).to_have_js_property("bigintValue", 1.0)
+    expect(locator).to_have_js_property("objectValue", {"items": (1, True, None)})
+    expect(locator).to_have_js_property("dateValue", datetime(2026, 7, 21, 12, 34, 56, tzinfo=timezone.utc))
+    expect(locator).to_have_js_property("urlValue", urlparse("https://example.test/path?q=1"))
+
+
+def test_expect_native_locator_timeout_classification_requires_structured_marker():
+    from rustwright.sync_api import Locator, Page
+
+    class FakeCore:
+        target_id = ""
+
+        def __init__(self, message):
+            self.message = message
+
+        def combined_event_stream(self):
+            return None
+
+        def assert_locator(self, *args):
+            raise RuntimeError(self.message)
+
+    def locator_for(message):
+        fake_page = Page(FakeCore(message), _start_event_pump=False)
+        return Locator(fake_page, {"kind": "css", "selector": "#status"})
+
+    with pytest.raises(AssertionError, match="Locator expected to have count '1'"):
+        expect(locator_for('__rustwright_timeout__:{"ms":25}')).to_have_count(1, timeout=25)
+
+    with pytest.raises(TimeoutError, match="timed out after 25 ms"):
+        expect(locator_for("timed out after 25 ms")).to_have_count(1, timeout=25)
+
+
 def test_expect_locator_assertion_strict_value_parity(page):
     from benchmarks.automation_cases import expect_locator_assertion_strict_value_parity
 
