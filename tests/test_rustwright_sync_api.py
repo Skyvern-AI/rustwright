@@ -9880,35 +9880,100 @@ def test_locator_click_unsafe_dom_fastpath_opt_in_restores_dom_click(page, monke
     assert page.evaluate("document.body.dataset.clicked") == "yes"
 
 
-def test_native_actionability_js_templates_match_sync_oracle():
+def test_native_actionability_templates_are_core_owned_and_structured_results_keep_shapes(page):
     from rustwright import _rustwright
     from rustwright import sync_api
 
-    assert _rustwright._LOCATOR_TARGET_STATE_TEMPLATE == sync_api._LOCATOR_TARGET_STATE_TEMPLATE
-    assert _rustwright._LOCATOR_FILL_TEMPLATE == sync_api._LOCATOR_FILL_TEMPLATE
+    assert "__SCROLL__" in _rustwright._LOCATOR_TARGET_STATE_TEMPLATE
+    assert "__VALUE__" in _rustwright._LOCATOR_FILL_TEMPLATE
+    assert not hasattr(sync_api, "_LOCATOR_TARGET_STATE_TEMPLATE")
+    assert not hasattr(sync_api, "_LOCATOR_FILL_TEMPLATE")
 
-    def click_body(template):
-        for placeholder, value in (
-            ("__SCROLL__", "true"),
-            ("__STABLE__", "true"),
-            ("__RECEIVES_EVENTS__", "true"),
-            ("__STABLE_POSITION_REQUIRED__", "true"),
-            ("__ACTION_POSITION__", "null"),
-        ):
-            template = template.replace(placeholder, value)
-        return template
-
-    def fill_body(template):
-        return (
-            template.replace("__STRICT__", "true")
-            .replace("__FORCED__", "false")
-            .replace("__VALUE__", '"value"')
-        )
-
-    assert click_body(_rustwright._LOCATOR_TARGET_STATE_TEMPLATE) == click_body(
-        sync_api._LOCATOR_TARGET_STATE_TEMPLATE
+    page.set_content(
+        """
+        <button id="go">Go</button>
+        <input id="name">
+        <select id="choice"><option value="a">A</option><option value="b">B</option></select>
+        <input id="checked" type="checkbox" checked>
+        """
     )
-    assert fill_body(_rustwright._LOCATOR_FILL_TEMPLATE) == fill_body(sync_api._LOCATOR_FILL_TEMPLATE)
+    state = page.locator("#go")._target_state(timeout=500)
+    assert set(state) == {
+        "count",
+        "frame_strict_violation",
+        "attached",
+        "visible",
+        "enabled",
+        "editable",
+        "tag_name",
+        "input_type",
+        "is_select",
+        "non_fillable_input",
+        "fillable_for_fill",
+        "editable_for_fill",
+        "has_layout",
+        "checked_valid",
+        "checked",
+        "indeterminate",
+        "native_input",
+        "native_radio",
+        "receives_events",
+        "rect",
+    }
+
+    fill_locator = page.locator("#name")
+    fill_result = sync_api._decode_json_result(
+        json.loads(
+            page._core.locator_fill_apply(
+                json.dumps(fill_locator._spec), fill_locator._index, "Ada", True, False, 500
+            )
+        )
+    )
+    assert fill_result["ok"] is True
+    assert set(fill_result["info"]) == {
+        "count",
+        "frame_strict_violation",
+        "attached",
+        "visible",
+        "enabled",
+        "tag_name",
+        "input_type",
+        "non_fillable_input",
+        "is_select",
+        "fillable_for_fill",
+        "editable_for_fill",
+    }
+
+    select_locator = page.locator("#choice")
+    select_result = sync_api._decode_json_result(
+        json.loads(
+            page._core.locator_select_apply(
+                json.dumps(select_locator._spec),
+                select_locator._index,
+                '["b"]',
+                "[]",
+                "[]",
+                500,
+            )
+        )
+    )
+    assert select_result == {"ok": True, "selected": ["b"]}
+
+    check_locator = page.locator("#checked")
+    check_result = sync_api._decode_json_result(
+        json.loads(
+            page._core.locator_check_apply(
+                json.dumps(check_locator._spec), check_locator._index, 500
+            )
+        )
+    )
+    assert check_result == {
+        "valid": True,
+        "checked": True,
+        "indeterminate": False,
+        "native_input": True,
+        "native_radio": False,
+    }
 
 
 def test_fill_sets_value_and_dispatches_events(page):
@@ -10394,25 +10459,24 @@ def test_wait_for_single_retries_transient_actionability_probe_timeout(page, mon
 
 
 def test_fill_apply_loop_retries_transient_probe_timeout(page, monkeypatch):
-    # The fill-apply loop performs the actual fill via _eval. A first probe whose CDP round
+    # The fill-apply loop performs the actual fill via the structured native entry point. A first probe whose CDP round
     # trips outlast the per-probe budget raises TimeoutError; the loop must retry until the
     # outer deadline instead of re-raising that transient timeout as a fatal error.
     from rustwright.sync_api import Locator
 
     page.set_content("<input id='name'>")
 
-    real_eval = Locator._eval
+    real_fill_apply = Locator._fill_apply
     probe = {"calls": 0, "timed_out": 0}
 
-    def flaky_eval(self, body, timeout=None, *, method=None):
-        if "nonFillableInputTypes" in body:
-            probe["calls"] += 1
-            if probe["timed_out"] == 0:
-                probe["timed_out"] += 1
-                raise TimeoutError(f"timed out after {int(timeout)} ms")
-        return real_eval(self, body, timeout, method=method)
+    def flaky_fill_apply(self, value, *, strict, forced, timeout):
+        probe["calls"] += 1
+        if probe["timed_out"] == 0:
+            probe["timed_out"] += 1
+            raise TimeoutError(f"timed out after {int(timeout)} ms")
+        return real_fill_apply(self, value, strict=strict, forced=forced, timeout=timeout)
 
-    monkeypatch.setattr(Locator, "_eval", flaky_eval)
+    monkeypatch.setattr(Locator, "_fill_apply", flaky_fill_apply)
 
     page.fill("#name", "Ada", timeout=30_000)
 
@@ -10422,7 +10486,7 @@ def test_fill_apply_loop_retries_transient_probe_timeout(page, monkeypatch):
 
 
 def test_select_apply_loop_retries_transient_probe_timeout(page, monkeypatch):
-    # The select-apply loop performs the final selection via _eval. A first transient probe
+    # The select-apply loop performs the final selection via the structured native entry point. A first transient probe
     # timeout must be retried until the outer deadline rather than aborting select_option.
     from rustwright.sync_api import Locator
 
@@ -10430,18 +10494,19 @@ def test_select_apply_loop_retries_transient_probe_timeout(page, monkeypatch):
         "<select id='sel'><option value='a'>A</option><option value='b'>B</option></select>"
     )
 
-    real_eval = Locator._eval
+    real_select_apply = Locator._select_apply
     probe = {"calls": 0, "timed_out": 0}
 
-    def flaky_eval(self, body, timeout=None, *, method=None):
-        if "foundValues" in body:
-            probe["calls"] += 1
-            if probe["timed_out"] == 0:
-                probe["timed_out"] += 1
-                raise TimeoutError(f"timed out after {int(timeout)} ms")
-        return real_eval(self, body, timeout, method=method)
+    def flaky_select_apply(self, values, labels, indexes, *, timeout, method):
+        probe["calls"] += 1
+        if probe["timed_out"] == 0:
+            probe["timed_out"] += 1
+            raise TimeoutError(f"timed out after {int(timeout)} ms")
+        return real_select_apply(
+            self, values, labels, indexes, timeout=timeout, method=method
+        )
 
-    monkeypatch.setattr(Locator, "_eval", flaky_eval)
+    monkeypatch.setattr(Locator, "_select_apply", flaky_select_apply)
 
     assert page.select_option("#sel", "b", timeout=30_000) == ["b"]
     assert probe["timed_out"] == 1
@@ -10456,14 +10521,10 @@ def test_fill_apply_loop_surfaces_outer_deadline_on_persistent_probe_timeout(pag
 
     page.set_content("<input id='name'>")
 
-    real_eval = Locator._eval
+    def always_timeout_fill_apply(self, value, *, strict, forced, timeout):
+        raise TimeoutError(f"timed out after {int(timeout)} ms")
 
-    def always_timeout_eval(self, body, timeout=None, *, method=None):
-        if "nonFillableInputTypes" in body:
-            raise TimeoutError(f"timed out after {int(timeout)} ms")
-        return real_eval(self, body, timeout, method=method)
-
-    monkeypatch.setattr(Locator, "_eval", always_timeout_eval)
+    monkeypatch.setattr(Locator, "_fill_apply", always_timeout_fill_apply)
 
     started = time.monotonic()
     with pytest.raises(TimeoutError, match="editable"):
@@ -10481,15 +10542,11 @@ def test_fill_apply_loop_propagates_owner_crash_on_probe_timeout(page, monkeypat
 
     page.set_content("<input id='name'>")
 
-    real_eval = Locator._eval
+    def crashing_fill_apply(self, value, *, strict, forced, timeout):
+        self._page._crashed = True
+        raise TimeoutError(f"timed out after {int(timeout)} ms")
 
-    def crashing_probe_eval(self, body, timeout=None, *, method=None):
-        if "nonFillableInputTypes" in body:
-            self._page._crashed = True
-            raise TimeoutError(f"timed out after {int(timeout)} ms")
-        return real_eval(self, body, timeout, method=method)
-
-    monkeypatch.setattr(Locator, "_eval", crashing_probe_eval)
+    monkeypatch.setattr(Locator, "_fill_apply", crashing_fill_apply)
 
     try:
         with pytest.raises(Error, match="Page crashed"):
