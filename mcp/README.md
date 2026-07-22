@@ -1,19 +1,19 @@
 # Rustwright MCP server
 
-Exposes Rustwright browser automation as [Model Context Protocol](https://modelcontextprotocol.io)
-tools, so MCP-compatible agents (Claude Code, Claude Desktop, others) can browse
-with Rustwright instead of Playwright.
+Give any MCP client `browser_*` tools over stdio with no clone or browser download.
 
-Tool names mirror the Playwright MCP server (`browser_navigate`,
-`browser_snapshot`, `browser_click`, ...) so agents can switch without
-re-learning the surface. `browser_snapshot` returns an accessibility-style
-outline where interactive elements carry `[ref=eN]` handles; pass a ref (or a
-raw CSS selector) to the action tools.
+## Install
 
-## Quick start (no clone needed)
+**Setting this up with an AI agent?** Tell your agent (Claude Code, Codex,
+Cursor, and others):
 
-With [uv](https://docs.astral.sh/uv/) installed, register the server with
-Claude Code in one command — `uvx` fetches and runs it straight from GitHub:
+> Fetch https://raw.githubusercontent.com/Skyvern-AI/rustwright/HEAD/mcp/AGENT_SETUP.md
+> and follow the instructions to set up the Rustwright MCP server.
+
+[AGENT_SETUP.md](AGENT_SETUP.md) contains agent-facing install steps for every
+major MCP client, a verification step, and troubleshooting.
+
+### Claude Code
 
 ```bash
 claude mcp add rustwright \
@@ -21,11 +21,11 @@ claude mcp add rustwright \
   -- uvx --from 'git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp' rustwright-mcp
 ```
 
-Note the `--` before the command: `--env` is variadic, so without the
-separator it swallows the command and `claude mcp add` fails with
-`missing required argument 'commandOrUrl'`.
+Uses the Chrome you already have — no browser download.
 
-Or add to any MCP client config (Claude Desktop, Cursor, etc.):
+### Claude Desktop
+
+Open `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS or `%APPDATA%\Claude\claude_desktop_config.json` on Windows, then use:
 
 ```json
 {
@@ -37,97 +37,66 @@ Or add to any MCP client config (Claude Desktop, Cursor, etc.):
         "git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp",
         "rustwright-mcp"
       ],
-      "env": { "RUSTWRIGHT_MCP_CHANNEL": "chrome" }
+      "env": {
+        "RUSTWRIGHT_MCP_CHANNEL": "chrome"
+      }
     }
   }
 }
 ```
 
-`RUSTWRIGHT_MCP_CHANNEL=chrome` uses your installed Google Chrome. Drop it
-to use rustwright's bundled Chromium instead (install once with
-`uvx --from 'git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp' python -m rustwright install chromium`).
+### Any MCP client
 
-Without uv, install into a plain venv from git:
-
-```bash
-python3 -m venv ~/.rustwright-mcp
-~/.rustwright-mcp/bin/pip install 'rustwright-mcp @ git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp'
+```json
+{
+  "mcpServers": {
+    "rustwright": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp",
+        "rustwright-mcp"
+      ],
+      "env": {
+        "RUSTWRIGHT_MCP_CHANNEL": "chrome"
+      }
+    }
+  }
+}
 ```
 
-## Install from a source checkout
+## Verify it works
 
-```bash
-cd mcp
-python3 -m venv .venv && .venv/bin/pip install -e .
-```
-
-Then either install the bundled Chromium
-(`.venv/bin/python -m rustwright install chromium`) or use
-`RUSTWRIGHT_MCP_CHANNEL=chrome`.
-
-## Register with Claude Code (installed binary)
-
-Use the **absolute path** to the `rustwright-mcp` binary — the server is
-spawned from arbitrary working directories, so relative paths break:
-
-```bash
-claude mcp add rustwright \
-  --env RUSTWRIGHT_MCP_CHANNEL=chrome \
-  -- "$HOME/.rustwright-mcp/bin/rustwright-mcp"
-```
-
-Example with a source checkout at `~/code/rustwright`:
-
-```bash
-claude mcp add rustwright \
-  --env RUSTWRIGHT_MCP_CHANNEL=chrome \
-  -- "$HOME/code/rustwright/mcp/.venv/bin/rustwright-mcp"
-```
-
-Verify with `claude mcp list` — the entry should show `✔ Connected`.
-
-## Example session
-
-What an agent sees. `browser_navigate` returns a snapshot; interactive
-elements carry `[ref=eN]` handles that later calls act on:
-
-```
-> browser_navigate(url="https://example.com")
-Page: Example Domain
-URL: https://example.com/
-
-- heading "Example Domain" [level=1]
-- text: This domain is for use in documentation examples...
-- link "Learn more" [href=https://iana.org/domains/example] [ref=e1]
-
-> browser_click(target="e1")
-Page: Example Domains
-URL: https://www.iana.org/help/example-domains
-...
-
-> browser_get_text(selector="h1")
-Example Domains
-```
+Ask your agent to “take a browser snapshot of example.com”.
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
 | `browser_navigate(url)` | Open a URL, returns snapshot |
-| `browser_snapshot()` | Outline of the page with `[ref=eN]` handles |
-| `browser_click(target)` | Click a ref or CSS selector |
-| `browser_type(target, text, submit?)` | Fill or type into an input |
-| `browser_select_option(target, value)` | Select a dropdown option |
+| `browser_resize(width, height)` | Change the page viewport and return a responsive snapshot |
+| `browser_snapshot(target?, filename?, depth?, boxes?)` | Full or targeted outline with `[ref=eN]` handles |
+| `browser_find(text?, regex?)` | Search one refreshed outline with paths, refs, and sibling context |
+| `browser_click(target, element?, doubleClick?, button?, modifiers?)` | Click a ref or unique CSS selector |
+| `browser_drag(startTarget, endTarget, startElement?, endElement?)` | Strict element-to-element drag with a fresh snapshot |
+| `browser_drop(target, element?, paths?, data?)` | Best-effort synthetic DataTransfer drop with files and/or MIME strings |
+| `browser_type(target, text, element?, submit?, slowly?, clear?)` | Fill or character-type into an input; `clear` is an extension |
+| `browser_select_option(target, values, element?)` | Select one or more dropdown options; legacy `value` is accepted |
+| `browser_fill_form(fields)` | Sequential, non-transactional typed form fill with one final snapshot |
 | `browser_hover(target)` | Hover an element |
 | `browser_press_key(key)` | Press a keyboard key |
 | `browser_navigate_back()` | History back |
 | `browser_reload()` | Reload the active page, returns snapshot |
 | `browser_tabs(action, index?, url?)` | List, open, select, or close tabs |
-| `browser_handle_dialog(accept, prompt_text?)` | Set a one-shot policy for the next dialog |
-| `browser_wait_for(text?, timeout_ms?)` | Wait for text or load state |
+| `browser_handle_dialog(accept, promptText?)` | Resolve the JavaScript dialog that is currently pending |
+| `browser_file_upload(paths?)` | Resolve or cancel the currently pending file chooser |
+| `browser_console_messages(level?, all?, filename?)` | Read thresholded console records inline or as an artifact |
+| `browser_network_requests(static?, filter?, filename?)` | List current-navigation requests by stable index |
+| `browser_network_request(index, part?, filename?)` | Read request/response details and lazy response bodies |
+| `browser_wait_for(time?, text?, textGone?, timeout_ms?)` | Wait up to 30 seconds and/or for visible/hidden text |
 | `browser_get_text(selector?)` | Visible text of a selector |
-| `browser_evaluate(expression)` | Run JavaScript in the page (opt-in) |
-| `browser_take_screenshot(path?)` | Save a PNG, returns the path |
+| `browser_evaluate(function, element?, target?, filename?)` | Run page-world JavaScript and return JSON plus a fresh snapshot |
+| `browser_take_screenshot(element?, target?, type?, filename?, fullPage?, scale?)` | Save a confined page or element image |
 | `browser_close()` | End the browser session |
 
 ## Configuration
@@ -137,7 +106,61 @@ Example Domains
 | `RUSTWRIGHT_MCP_HEADLESS` | `0` shows the browser window (default headless) |
 | `RUSTWRIGHT_MCP_CHANNEL` | Chromium channel, e.g. `chrome`, `chrome-beta` |
 | `RUSTWRIGHT_MCP_EXECUTABLE` | Explicit browser binary path (overrides channel) |
-| `RUSTWRIGHT_MCP_ALLOW_EVAL` | `1`, `true`, or `yes` exposes `browser_evaluate` (default off) |
+| `RUSTWRIGHT_MCP_CDP_ENDPOINT` | Remote browser CDP endpoint; enables remote mode when set |
+| `RUSTWRIGHT_MCP_CDP_HEADERS` | Optional JSON object of extra CDP connection headers |
+| `RUSTWRIGHT_MCP_CDP_TIMEOUT_MS` | Remote connection timeout in milliseconds (default `60000`) |
+| `RUSTWRIGHT_MCP_ALLOW_EVAL` | Page-world evaluation is on by default; accepts `1`, `true`, `yes`, `on` or `0`, `false`, `no`, `off`; any other value stops startup |
+| `RUSTWRIGHT_MCP_CAPS` | Comma-separated capability groups; unavailable groups warn and are ignored |
+| `RUSTWRIGHT_MCP_TOOLSET` | `mirror` (all 25 tools, default) or `lean` (core interaction loop, resize, and evaluate) |
+| `RUSTWRIGHT_MCP_OUTPUT_DIR` | Root for files written by tools |
+| `RUSTWRIGHT_MCP_OUTPUT_MAX_FILE_BYTES` | Shared per-file output and drop-input cap (default `20971520`, or 20 MiB) |
+| `RUSTWRIGHT_MCP_OUTPUT_MAX_TOTAL_BYTES` | Shared total output and per-drop input cap (default `209715200`, or 200 MiB) |
+| `RUSTWRIGHT_MCP_WORKSPACE` | Allowed absolute input root for file uploads and drops |
+
+### File outputs
+
+All tool-written files are confined to `RUSTWRIGHT_MCP_OUTPUT_DIR`. If that
+variable is unset, each server process creates a private session directory at
+`${XDG_CACHE_HOME:-~/.cache}/rustwright-mcp/output/<session-uuid>/`. Output
+directories created by the server use mode `0700`; files are created exclusively
+with mode `0600`. A pre-existing configured directory keeps its permissions, and
+only files reserved by the current server process are eligible for eviction.
+Artifact paths returned by tools are relative to the output root.
+
+Each output is limited to 20 MiB by default, and all retained outputs together
+are limited to 200 MiB. The byte-cap variables in the table above can override
+those values. When the total cap is crossed, the oldest files are evicted first.
+
+**Migration note:** screenshot `filename` values (and the legacy `path` alias) are interpreted inside the
+output root. An absolute path is accepted only when it is beneath that root.
+Paths outside it fail with `screenshot paths are confined to
+RUSTWRIGHT_MCP_OUTPUT_DIR (<root>); got <path>` instead of being written.
+Omitting `filename` still creates an image inside the output root.
+
+### Remote browsers over CDP
+
+Set `RUSTWRIGHT_MCP_CDP_ENDPOINT` to attach to an existing Chromium browser
+over CDP. `RUSTWRIGHT_MCP_CDP_HEADERS` accepts a JSON object of extra connection
+headers, and `RUSTWRIGHT_MCP_CDP_TIMEOUT_MS` controls the connection timeout.
+The server adopts the remote browser's default context and an existing page,
+creating a page only when the context has none.
+
+```bash
+RUSTWRIGHT_MCP_CDP_ENDPOINT='wss://browser.example.com/devtools/browser/<session-id>' \
+RUSTWRIGHT_MCP_CDP_HEADERS='{"Authorization":"Bearer <token>"}' \
+RUSTWRIGHT_MCP_CDP_TIMEOUT_MS=60000 \
+rustwright-mcp
+```
+
+In CDP mode, `RUSTWRIGHT_MCP_HEADLESS`, `RUSTWRIGHT_MCP_CHANNEL`, and
+`RUSTWRIGHT_MCP_EXECUTABLE` are ignored. If the initial connection fails or a
+remote session stops responding, the tool fails loudly; it never silently
+launches a local browser. `browser_close` detaches from the remote browser
+without terminating the remotely owned process.
+
+For example, a hosted browser provider such as Skyvern Browser Sessions exposes
+a CDP address plus an `x-api-key` header; configure the header with
+`RUSTWRIGHT_MCP_CDP_HEADERS='{"x-api-key":"<key>"}'`.
 
 ### Headless vs headed
 
@@ -159,19 +182,23 @@ restart the session).
 
 ## Security & scope
 
-- `browser_evaluate` is off by default because it runs arbitrary JavaScript
-  in the page. Set `RUSTWRIGHT_MCP_ALLOW_EVAL=1` and restart the server to
-  expose it.
+- **SECURITY:** `browser_evaluate` performs page-world evaluation and is on by
+  default for compatibility. Set `RUSTWRIGHT_MCP_ALLOW_EVAL=0` and restart the
+  server to disable and remove the tool from `tools/list`.
 - Snapshots reflect page state, including field values. Password input values
   are masked in snapshot output; other field values are included as-is.
 - Snapshot refs are best-effort handles for cooperative pages, not a security
   boundary. Refs increase for the browser session and stale refs fail fast.
-- Each server process controls a single local browser session, which may have
-  multiple tabs.
+- Each server process controls a single local or remote browser session, which
+  may have multiple tabs.
+- JavaScript dialogs and file choosers are pending modal state. Responses show
+  a `### Modal` section; use `browser_handle_dialog` or `browser_file_upload`
+  before another DOM-evaluating tool. Downloads are confined automatically and
+  reported once in `### Downloads`.
 
 ## Limitations
 
-- Single local browser session per server process.
+- Single browser session per server process.
 - Snapshot refs are regenerated on every snapshot; after a page mutation,
   take a new snapshot before acting on refs. Stale refs fail fast with a
   message asking for a fresh snapshot.

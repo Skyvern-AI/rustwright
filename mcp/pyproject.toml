@@ -12,6 +12,7 @@ requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.2",
     "rustwright>=0.1.1",
+    "typing-extensions>=4.0",
 ]
 
 [project.optional-dependencies]

@@ -68,11 +68,10 @@ type ProxyOptions struct {
 }
 
 func (o LaunchOptions) wireJSON() ([]byte, error) {
-	headless := true
+	wire := make(map[string]any)
 	if o.Headless != nil {
-		headless = *o.Headless
+		wire["headless"] = *o.Headless
 	}
-	wire := map[string]any{"headless": headless}
 	if o.ExecutablePath != "" {
 		wire["executable_path"] = o.ExecutablePath
 	}

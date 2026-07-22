@@ -71,6 +71,29 @@ def _run_subprocess(runtime, session, *command):
     return result.returncode, json.loads(lines[0]), result.stderr
 
 
+def _run_top_level_subprocess(runtime, session, *command):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "rustwright.cli",
+            "--json",
+            "--session",
+            session,
+        ]
+        + list(command),
+        env=_subprocess_env(runtime),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=45,
+        check=False,
+    )
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1, result
+    return result.returncode, json.loads(lines[0]), result.stderr
+
+
 @pytest.fixture
 def isolated_runtime(tmp_path, monkeypatch):
     runtime = tmp_path / "runtime"
@@ -138,6 +161,58 @@ def test_true_subprocess_open_snapshot_click_close(isolated_runtime):
     code, closed, stderr = _run_subprocess(runtime, name, "close")
     assert (code, stderr) == (0, "")
     assert closed["success"] is True
+
+
+def test_top_level_cli_open_snapshot_click_status_close(isolated_runtime):
+    runtime, register = isolated_runtime
+    name = register("top-level")
+
+    code, opened, stderr = _run_top_level_subprocess(runtime, name, "open", _url())
+    assert (code, stderr) == (0, "")
+    assert opened["data"]["title"] == "persistent"
+
+    code, snapped, stderr = _run_top_level_subprocess(runtime, name, "snapshot")
+    assert (code, stderr) == (0, "")
+    ref = _ref(snapped["data"]["snapshot"])
+
+    code, clicked, stderr = _run_top_level_subprocess(runtime, name, "click", ref)
+    assert (code, stderr) == (0, "")
+    assert clicked["data"]["title"] == "clicked"
+
+    code, status, stderr = _run_top_level_subprocess(runtime, name, "status")
+    assert (code, stderr) == (0, "")
+    assert status["data"]["running"] is True
+
+    code, closed, stderr = _run_top_level_subprocess(runtime, name, "close")
+    assert (code, stderr) == (0, "")
+    assert closed["data"]["running"] is False
+
+
+def test_agent_cli_uses_top_level_program_and_version(capsys):
+    assert cli.main(["--version"]) == 0
+    assert capsys.readouterr().out.strip() == cli._version()
+
+    assert cli.main(["open", "--help"]) == 0
+    output = capsys.readouterr().out
+    assert "usage: rustwright open" in output
+    assert "rustwright-agent" not in output
+
+
+@pytest.mark.parametrize("browser", ["ff", "firefox", "wk", "webkit"])
+def test_agent_cli_rejects_unsupported_browser_names(browser, capsys):
+    assert cli.main(["open", "--browser", browser]) == 2
+    assert capsys.readouterr().err == (
+        f"error[invalid_argument]: {browser} is not implemented; "
+        "Rustwright currently supports Chromium over direct CDP.\n"
+    )
+
+
+@pytest.mark.parametrize("browser", ["chrome", "msedge"])
+def test_agent_cli_requires_executable_path_for_branded_browser(browser, capsys):
+    assert cli.main(["open", "--browser", browser]) == 2
+    output = capsys.readouterr().err
+    assert "error[invalid_argument]" in output
+    assert "--executable-path" in output
 
 
 def test_dirty_state_rejects_old_ref_until_resnapshot(isolated_runtime, capsys):

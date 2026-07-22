@@ -1,0 +1,171 @@
+{
+  "browser_click": {
+    "params": [
+      {"name": "element", "type": "string", "required": false},
+      {"name": "target", "type": "string", "required": true},
+      {"name": "doubleClick", "type": "boolean", "required": false, "default": false},
+      {"name": "button", "type": "string", "required": false, "enum": ["left", "right", "middle"], "default": "left"},
+      {"name": "modifiers", "type": "array", "required": false, "items": {"type": "string", "enum": ["Alt", "Control", "ControlOrMeta", "Meta", "Shift"]}}
+    ]
+  },
+  "browser_close": {
+    "params": []
+  },
+  "browser_console_messages": {
+    "params": [
+      {"name": "level", "type": "string", "required": false, "enum": ["error", "warning", "info", "debug"], "default": "info"},
+      {"name": "all", "type": "boolean", "required": false, "default": false},
+      {"name": "filename", "type": "string", "required": false}
+    ]
+  },
+  "browser_drag": {
+    "params": [
+      {"name": "startElement", "type": "string", "required": false},
+      {"name": "startTarget", "type": "string", "required": true},
+      {"name": "endElement", "type": "string", "required": false},
+      {"name": "endTarget", "type": "string", "required": true}
+    ]
+  },
+  "browser_drop": {
+    "params": [
+      {"name": "element", "type": "string", "required": false},
+      {"name": "target", "type": "string", "required": true},
+      {"name": "paths", "type": "array", "required": false, "items": {"type": "string"}},
+      {"name": "data", "type": "object", "required": false, "additionalProperties": {"type": "string"}}
+    ]
+  },
+  "browser_evaluate": {
+    "params": [
+      {"name": "element", "type": "string", "required": false},
+      {"name": "target", "type": "string", "required": false},
+      {"name": "function", "type": "string", "required": true},
+      {"name": "filename", "type": "string", "required": false}
+    ]
+  },
+  "browser_file_upload": {
+    "params": [
+      {"name": "paths", "type": "array", "required": false, "items": {"type": "string"}}
+    ]
+  },
+  "browser_fill_form": {
+    "params": [
+      {"name": "fields", "type": "array", "required": true, "items": {"type": "object", "params": [
+        {"name": "element", "type": "string", "required": false},
+        {"name": "target", "type": "string", "required": true},
+        {"name": "name", "type": "string", "required": true},
+        {"name": "type", "type": "string", "required": true, "enum": ["textbox", "checkbox", "radio", "combobox", "slider"]},
+        {"name": "value", "type": "string", "required": true}
+      ]}}
+    ]
+  },
+  "browser_find": {
+    "params": [
+      {"name": "text", "type": "string", "required": false},
+      {"name": "regex", "type": "string", "required": false}
+    ]
+  },
+  "browser_handle_dialog": {
+    "params": [
+      {"name": "accept", "type": "boolean", "required": true},
+      {"name": "promptText", "type": "string", "required": false}
+    ]
+  },
+  "browser_get_text": {
+    "params": [
+      {"name": "selector", "type": "string", "required": false, "default": "body"},
+      {"name": "max_chars", "type": "integer", "required": false, "default": 20000}
+    ]
+  },
+  "browser_hover": {
+    "params": [
+      {"name": "element", "type": "string", "required": false},
+      {"name": "target", "type": "string", "required": true}
+    ]
+  },
+  "browser_navigate": {
+    "params": [
+      {"name": "url", "type": "string", "required": true}
+    ]
+  },
+  "browser_navigate_back": {
+    "params": []
+  },
+  "browser_reload": {
+    "params": []
+  },
+  "browser_network_request": {
+    "params": [
+      {"name": "index", "type": "integer", "required": true},
+      {"name": "part", "type": "string", "required": false, "enum": ["request-headers", "request-body", "response-headers", "response-body"]},
+      {"name": "filename", "type": "string", "required": false}
+    ]
+  },
+  "browser_network_requests": {
+    "params": [
+      {"name": "static", "type": "boolean", "required": false, "default": false},
+      {"name": "filter", "type": "string", "required": false},
+      {"name": "filename", "type": "string", "required": false}
+    ]
+  },
+  "browser_press_key": {
+    "params": [
+      {"name": "key", "type": "string", "required": true}
+    ]
+  },
+  "browser_resize": {
+    "params": [
+      {"name": "width", "type": "number", "required": true},
+      {"name": "height", "type": "number", "required": true}
+    ]
+  },
+  "browser_select_option": {
+    "params": [
+      {"name": "element", "type": "string", "required": false},
+      {"name": "target", "type": "string", "required": true},
+      {"name": "values", "type": "array", "required": true, "items": {"type": "string"}}
+    ]
+  },
+  "browser_snapshot": {
+    "params": [
+      {"name": "target", "type": "string", "required": false},
+      {"name": "filename", "type": "string", "required": false},
+      {"name": "depth", "type": "number", "required": false},
+      {"name": "boxes", "type": "boolean", "required": false, "default": false}
+    ]
+  },
+  "browser_tabs": {
+    "params": [
+      {"name": "action", "type": "string", "required": true, "enum": ["list", "new", "close", "select"]},
+      {"name": "index", "type": "integer", "required": false},
+      {"name": "url", "type": "string", "required": false}
+    ]
+  },
+  "browser_take_screenshot": {
+    "params": [
+      {"name": "element", "type": "string", "required": false},
+      {"name": "target", "type": "string", "required": false},
+      {"name": "type", "type": "string", "required": false, "enum": ["png", "jpeg"], "default": "png"},
+      {"name": "filename", "type": "string", "required": false},
+      {"name": "fullPage", "type": "boolean", "required": false, "default": false},
+      {"name": "scale", "type": "string", "required": false, "enum": ["css", "device"], "default": "css"}
+    ]
+  },
+  "browser_type": {
+    "params": [
+      {"name": "element", "type": "string", "required": false},
+      {"name": "target", "type": "string", "required": true},
+      {"name": "text", "type": "string", "required": true},
+      {"name": "submit", "type": "boolean", "required": false, "default": false},
+      {"name": "slowly", "type": "boolean", "required": false, "default": false},
+      {"name": "clear", "type": "boolean", "required": false, "default": true}
+    ]
+  },
+  "browser_wait_for": {
+    "params": [
+      {"name": "time", "type": "number", "required": false},
+      {"name": "text", "type": "string", "required": false},
+      {"name": "textGone", "type": "string", "required": false},
+      {"name": "timeout_ms", "type": "number", "required": false, "default": 10000}
+    ]
+  }
+}

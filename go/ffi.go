@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -17,6 +18,7 @@ type nativeAPI struct {
 	lastError              func() uintptr
 	stringFree             func(uintptr)
 	bytesFree              func(uintptr, uintptr)
+	decodeWire             func(*byte, *uintptr) int32
 	chromiumExecutablePath func(*uintptr) int32
 	chromiumLaunch         func(*byte, *uintptr) int32
 	browserNewPage         func(uintptr, *uintptr) int32
@@ -33,6 +35,11 @@ type nativeAPI struct {
 	pageScreenshot         func(uintptr, *byte, *uintptr, *uintptr) int32
 	pageClose              func(uintptr, float64, int32) int32
 	pageFree               func(uintptr)
+}
+
+var wireDecodeNative struct {
+	sync.RWMutex
+	native *nativeAPI
 }
 
 func loadNative(path string) (_ *nativeAPI, err error) {
@@ -55,6 +62,7 @@ func loadNative(path string) (_ *nativeAPI, err error) {
 	purego.RegisterLibFunc(&n.lastError, h, "rw_last_error")
 	purego.RegisterLibFunc(&n.stringFree, h, "rw_string_free")
 	purego.RegisterLibFunc(&n.bytesFree, h, "rw_bytes_free")
+	purego.RegisterLibFunc(&n.decodeWire, h, "rw_decode_wire")
 	purego.RegisterLibFunc(&n.chromiumExecutablePath, h, "rw_chromium_executable_path")
 	purego.RegisterLibFunc(&n.chromiumLaunch, h, "rw_chromium_launch")
 	purego.RegisterLibFunc(&n.browserNewPage, h, "rw_browser_new_page")
@@ -71,7 +79,41 @@ func loadNative(path string) (_ *nativeAPI, err error) {
 	purego.RegisterLibFunc(&n.pageScreenshot, h, "rw_page_screenshot")
 	purego.RegisterLibFunc(&n.pageClose, h, "rw_page_close")
 	purego.RegisterLibFunc(&n.pageFree, h, "rw_page_free")
+	wireDecodeNative.Lock()
+	wireDecodeNative.native = n
+	wireDecodeNative.Unlock()
 	return n, nil
+}
+
+func currentWireDecodeNative() (*nativeAPI, error) {
+	wireDecodeNative.RLock()
+	native := wireDecodeNative.native
+	wireDecodeNative.RUnlock()
+	if native == nil {
+		return nil, errors.New("rustwright: no native library is loaded for wire decoding")
+	}
+	return native, nil
+}
+
+func (n *nativeAPI) decodeWireJSON(data []byte) ([]byte, error) {
+	wireBuf, wirePtr, err := cString(string(data))
+	if err != nil {
+		return nil, err
+	}
+	var out uintptr
+	err = n.onOSThread(func() int32 {
+		return n.decodeWire(wirePtr, &out)
+	})
+	runtime.KeepAlive(wireBuf)
+	if err != nil {
+		return nil, fmt.Errorf("decode evaluate JSON: %w", err)
+	}
+	if out == 0 {
+		return nil, errors.New("decode evaluate JSON: native call returned a null string")
+	}
+	decoded := []byte(copyCString(out))
+	n.stringFree(out)
+	return decoded, nil
 }
 
 // onOSThread keeps a fallible ABI call and its immediate rw_last_error lookup

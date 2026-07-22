@@ -14,7 +14,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
 from typing import Sequence
 from urllib.parse import urlparse
 from urllib import request as url_request
@@ -26,6 +25,58 @@ from .sync_api import sync_playwright
 SUPPORTED_INSTALL_BROWSERS = {"chromium", "chrome", "msedge"}
 UNSUPPORTED_INSTALL_BROWSERS = {"firefox", "ff", "webkit", "wk"}
 BRANDED_INSTALL_BROWSERS = {"chrome": "Chrome", "msedge": "Microsoft Edge"}
+AGENT_VERBS = {
+    "open",
+    "navigate",
+    "back",
+    "reload",
+    "snapshot",
+    "click",
+    "fill",
+    "type",
+    "select",
+    "hover",
+    "press",
+    "wait",
+    "tabs",
+    "screenshot",
+    "eval",
+    "status",
+    "close",
+}
+_AGENT_GLOBAL_VALUE_FLAGS = {
+    "--session",
+    "--timeout-ms",
+    "--navigation-timeout-ms",
+    "--executable-path",
+    "--browser-arg",
+}
+_AGENT_GLOBAL_BOOLEAN_FLAGS = {"--json", "--headed", "--allow-eval"}
+_SCREENSHOT_VALUE_FLAGS = _AGENT_GLOBAL_VALUE_FLAGS | {
+    "-b",
+    "--browser",
+    "--channel",
+    "--color-scheme",
+    "--device",
+    "--geolocation",
+    "--load-storage",
+    "--lang",
+    "--proxy-server",
+    "--proxy-bypass",
+    "--save-har",
+    "--save-har-glob",
+    "--save-storage",
+    "--timezone",
+    "--timeout",
+    "--user-agent",
+    "--user-data-dir",
+    "--viewport-size",
+    "--wait-for-selector",
+    "--wait-for-timeout",
+    "--ref",
+    "--type",
+    "--quality",
+}
 CHROME_FOR_TESTING_URL = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
 LINUX_TOOLS_DEPS = [
     "xvfb",
@@ -186,12 +237,6 @@ def _add_open_options(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument("--user-data-dir", help="use the specified user data directory instead of a new context")
     parser.add_argument("--viewport-size", help='specify browser viewport size in pixels, for example "1280, 720"')
     return parser
-
-
-def _open_parser(program: str = "playwright") -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=f"{program} open", add_help=True)
-    parser.add_argument("url", nargs="?", help="URL or local file to open.")
-    return _add_open_options(parser)
 
 
 def _default_codegen_target() -> str:
@@ -632,32 +677,6 @@ def _close_open_browser(browser: object, context: object, *, save_storage: str |
     browser.close()
 
 
-def _wait_for_open_close(browser: object, context: object, *, save_storage: str | None, close_context: bool) -> None:
-    exit_after = os.environ.get("PWTEST_CLI_EXIT_AFTER_TIMEOUT")
-    if exit_after:
-        time.sleep(max(float(exit_after), 0) / 1000)
-        _close_open_browser(browser, context, save_storage=save_storage, close_context=close_context)
-        return
-    if os.environ.get("PWTEST_CLI_IS_UNDER_TEST"):
-        stdin = sys.stdin.read()
-        if not stdin or stdin.startswith("exit"):
-            _close_open_browser(browser, context, save_storage=save_storage, close_context=close_context)
-            return
-    try:
-        while True:
-            try:
-                connected = bool(browser.is_connected())
-            except Exception:
-                connected = False
-            if not connected or not getattr(context, "pages", []):
-                break
-            time.sleep(0.2)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        _close_open_browser(browser, context, save_storage=save_storage, close_context=close_context)
-
-
 def _launch_cli_context(args: argparse.Namespace, playwright: object, *, headless: bool | None) -> tuple[object, object]:
     launch_options, context_options, timeout = _open_launch_and_context_options(args, playwright, headless=headless)
     if args.user_data_dir:
@@ -966,26 +985,6 @@ def codegen(argv: Sequence[str], *, program: str = "playwright") -> int:
     else:
         print(source, end="")
     return 0
-
-
-def open(argv: Sequence[str], *, program: str = "playwright") -> int:
-    args = _open_parser(program).parse_args(list(argv))
-    try:
-        with sync_playwright() as playwright:
-            browser, context = _launch_cli_context(args, playwright, headless=None)
-            page = _open_page(context, args.url)
-            opened_url = getattr(page, "url", None) or _open_url(args.url) or "about:blank"
-            print(f"Rustwright opened {opened_url}")
-            _wait_for_open_close(
-                browser,
-                context,
-                save_storage=args.save_storage,
-                close_context=bool(args.save_har),
-            )
-        return 0
-    except Exception as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
 
 
 def screenshot(argv: Sequence[str], *, program: str = "playwright") -> int:
@@ -1470,41 +1469,205 @@ def unsupported_tool(command: str, *, program: str = "playwright") -> int:
     return 1
 
 
+def _agent_main(argv: Sequence[str]) -> int:
+    from rustwright import _agent
+
+    agent_cli = __import__(f"{_agent.__name__}.cli", fromlist=["main"])
+    return agent_cli.main(list(argv))
+
+
+def _mcp_main(argv: Sequence[str], *, program: str) -> int:
+    try:
+        from rustwright_mcp import server
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"rustwright_mcp", "rustwright_mcp.server"}:
+            raise
+        print(
+            "rustwright mcp requires the separately installed rustwright-mcp package; "
+            "install it with: pip install rustwright-mcp\n"
+            "or uvx --from 'git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp' rustwright-mcp",
+            file=sys.stderr,
+        )
+        return 1
+
+    original_argv = sys.argv
+    sys.argv = [f"{program} mcp", *argv]
+    try:
+        exit_code = server.main()
+    finally:
+        sys.argv = original_argv
+    return 0 if exit_code is None else exit_code
+
+
+def _leading_agent_command_index(args: Sequence[str]) -> int | None:
+    index = 0
+    while index < len(args):
+        value = args[index]
+        if value in _AGENT_GLOBAL_BOOLEAN_FLAGS:
+            index += 1
+            continue
+        if value in _AGENT_GLOBAL_VALUE_FLAGS:
+            if index + 1 >= len(args):
+                return len(args)
+            index += 2
+            continue
+        if any(value.startswith(flag + "=") for flag in _AGENT_GLOBAL_VALUE_FLAGS):
+            index += 1
+            continue
+        return index if index > 0 else None
+    return index if index > 0 else None
+
+
+def _screenshot_positional_count(args: Sequence[str]) -> int:
+    count = 0
+    index = 0
+    positional_only = False
+    while index < len(args):
+        value = args[index]
+        if positional_only:
+            count += 1
+            index += 1
+            continue
+        if value == "--":
+            positional_only = True
+            index += 1
+            continue
+        if value in _SCREENSHOT_VALUE_FLAGS:
+            index += 2
+            continue
+        if any(value.startswith(flag + "=") for flag in _SCREENSHOT_VALUE_FLAGS if flag.startswith("--")):
+            index += 1
+            continue
+        if value.startswith("-b") and value != "-b":
+            index += 1
+            continue
+        if value.startswith("-"):
+            index += 1
+            continue
+        count += 1
+        index += 1
+    return count
+
+
+def _print_screenshot_help(program: str) -> None:
+    print(
+        f"usage: {program} screenshot [file] [--full] [--ref REF]\n"
+        f"       {program} screenshot <url> <file> [options]\n\n"
+        "Session form:\n"
+        f"  {program} screenshot [file] [--full] [--ref REF]\n\n"
+        "Playwright-compatible one-shot form:\n"
+        f"  {program} screenshot <url> <file> [options]"
+    )
+
+
+def _print_mcp_help(program: str) -> None:
+    print(
+        f"usage: {program} mcp [args...]\n\n"
+        "Run the MCP stdio server (requires rustwright-mcp).\n"
+        "Install with: pip install rustwright-mcp"
+    )
+
+
+def _unsupported_browser_alias(name: str) -> int:
+    print(
+        f"{name} is not implemented; Rustwright currently supports Chromium over direct CDP.",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def main(argv: Sequence[str] | None = None, *, program: Optional[str] = None) -> int:
     program = program or _default_program_name()
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in {"-h", "--help"}:
         print(
             f"usage: {program} <command> [options]\n\n"
-            "Commands:\n"
-            "  install          Check for an existing Chromium executable.\n"
-            "  install-deps     Report Chromium dependency expectations.\n"
-            "  uninstall        Remove Rustwright-managed Chromium browser cache directories.\n"
-            "  codegen          Generate Python starter automation code.\n"
-            "  show-trace       Render a basic static Rustwright trace viewer.\n"
-            "  trace            Inspect local Rustwright trace files from the command line.\n"
-            "  open             Open a page through Rustwright's Chromium CDP runtime.\n"
-            "  cr/chromium      Alias for opening a Chromium page.\n"
-            "  ff/firefox       Explicit unsupported Firefox opener.\n"
-            "  wk/webkit        Explicit unsupported WebKit opener.\n"
-            "  screenshot       Capture a page screenshot.\n"
-            "  pdf              Save a Chromium page as PDF.\n"
+            "Browser session (persistent):\n"
+            "  open [url]         start or attach a session (--headed, --session NAME)\n"
+            "  snapshot           accessibility tree with refs (e1, e2, ...)\n"
+            "  click <ref>        click an element\n"
+            "  fill <ref> <text>  clear and type into an element\n"
+            "  type / press / select / hover / wait / back / reload / eval\n"
+            "  tabs [list|new|use|close]\n"
+            "  screenshot [file]  screenshot the session's current page\n"
+            "  status / close     session lifecycle\n"
+            "  mcp                run the MCP server (requires rustwright-mcp)\n\n"
+            "Playwright-compatible tools:\n"
+            "  install / install-deps / uninstall / codegen\n"
+            "  screenshot <url> <file>   one-shot capture (two-argument form)\n"
+            "  pdf <url> <file>          one-shot PDF\n"
+            "  trace / show-trace\n"
         )
         return 0
     if args[0] in {"-V", "--version"}:
         print(_version())
         return 0
+    if args[0].startswith("-"):
+        agent_command_index = _leading_agent_command_index(args)
+        if agent_command_index is not None:
+            agent_globals = args[:agent_command_index]
+            if agent_command_index == len(args):
+                return _agent_main(args)
+            agent_command = args[agent_command_index]
+            agent_rest = args[agent_command_index + 1 :]
+            if agent_command in {"-h", "--help"}:
+                return main(["--help"], program=program)
+            if agent_command == "help":
+                if not agent_rest:
+                    return main(["--help"], program=program)
+                help_command = agent_rest[0]
+                if help_command in {"open", "cr", "chromium"}:
+                    return _agent_main([*agent_globals, "open", "--help"])
+                if help_command in {"ff", "firefox", "wk", "webkit"}:
+                    if "--json" in agent_globals:
+                        return _agent_main([*agent_globals, "open", "--browser", help_command])
+                    return _unsupported_browser_alias(help_command)
+                if help_command == "screenshot":
+                    _print_screenshot_help(program)
+                    return 0
+                if help_command in AGENT_VERBS:
+                    return _agent_main([*agent_globals, help_command, "--help"])
+                if "--json" in agent_globals:
+                    return _agent_main([*agent_globals, help_command, "--help"])
+                return main([help_command, "--help"], program=program)
+            if agent_command in {"cr", "chromium"}:
+                return _agent_main(
+                    [*agent_globals, "open", "--browser", "chromium", *agent_rest]
+                )
+            if agent_command in {"ff", "firefox", "wk", "webkit"}:
+                if "--json" in agent_globals:
+                    return _agent_main(
+                        [*agent_globals, "open", "--browser", agent_command, *agent_rest]
+                    )
+                return _unsupported_browser_alias(agent_command)
+            if agent_command != "screenshot":
+                if agent_command in AGENT_VERBS or "--json" in agent_globals:
+                    return _agent_main(args)
+                print(f"Unknown Rustwright CLI command: {agent_command}", file=sys.stderr)
+                return 1
+            screenshot_args = agent_rest
+            if any(value in {"-h", "--help"} for value in screenshot_args):
+                _print_screenshot_help(program)
+                return 0
+            if _screenshot_positional_count(screenshot_args) < 2:
+                return _agent_main(args)
     command, rest = args[0], args[1:]
     if command == "help":
         if not rest:
             return main(["--help"], program=program)
         help_command = rest[0]
-        if help_command in {"cr", "chromium"}:
-            return open(["--browser", "chromium", "--help"], program=program)
-        if help_command in {"ff", "firefox"}:
-            return open(["--browser", "firefox", "--help"], program=program)
-        if help_command in {"wk", "webkit"}:
-            return open(["--browser", "webkit", "--help"], program=program)
+        if help_command in {"open", "cr", "chromium"}:
+            return _agent_main(["open", "--help"])
+        if help_command in {"ff", "firefox", "wk", "webkit"}:
+            return _unsupported_browser_alias(help_command)
+        if help_command == "screenshot":
+            _print_screenshot_help(program)
+            return 0
+        if help_command == "mcp":
+            _print_mcp_help(program)
+            return 0
+        if help_command in AGENT_VERBS:
+            return _agent_main([help_command, "--help"])
         return main([help_command, "--help"], program=program)
     if command == "install":
         return install(rest, program=program)
@@ -1516,16 +1679,21 @@ def main(argv: Sequence[str] | None = None, *, program: Optional[str] = None) ->
         return show_trace(rest, program=program)
     if command == "trace":
         return trace(rest, program=program)
-    if command == "open":
-        return open(rest, program=program)
+    if command == "mcp":
+        return _mcp_main(rest, program=program)
+    if command in AGENT_VERBS - {"screenshot"}:
+        return _agent_main(args)
     if command in {"cr", "chromium"}:
-        return open(["--browser", "chromium", *rest], program=program)
-    if command in {"ff", "firefox"}:
-        return open(["--browser", "firefox", *rest], program=program)
-    if command in {"wk", "webkit"}:
-        return open(["--browser", "webkit", *rest], program=program)
+        return _agent_main(["open", "--browser", "chromium", *rest])
+    if command in {"ff", "firefox", "wk", "webkit"}:
+        return _unsupported_browser_alias(command)
     if command == "screenshot":
-        return screenshot(rest, program=program)
+        if any(value in {"-h", "--help"} for value in rest):
+            _print_screenshot_help(program)
+            return 0
+        if _screenshot_positional_count(rest) >= 2:
+            return screenshot(rest, program=program)
+        return _agent_main(args)
     if command == "pdf":
         return pdf(rest, program=program)
     if command == "codegen":

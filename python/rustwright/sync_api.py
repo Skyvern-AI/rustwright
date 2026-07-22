@@ -50,6 +50,194 @@ _CONSOLE_HISTORY_SETTLE_TIMEOUT_SECONDS = 0.001
 _CONSOLE_HISTORY_BUFFER = "__console_history__"
 _PAGE_ERROR_HISTORY_BUFFER = "__page_error_history__"
 _UNSAFE_DOM_FASTPATH_ENV = "RUSTWRIGHT_UNSAFE_DOM_FASTPATH"
+_LOCATOR_TARGET_STATE_TEMPLATE = """
+if (el && __SCROLL__) el.scrollIntoView({ block: 'center', inline: 'center' });
+const ownerDocument = el ? (el.ownerDocument || document) : document;
+const ownerWindow = ownerDocument.defaultView || window;
+const actionPosition = __ACTION_POSITION__;
+const needsReceivesEvents = __RECEIVES_EVENTS__;
+const deepElementFromPoint = (x, y) => {
+  let hit = ownerDocument.elementFromPoint(x, y);
+  while (hit && hit.shadowRoot) {
+    const nested = hit.shadowRoot.elementFromPoint(x, y);
+    if (!nested || nested === hit) break;
+    hit = nested;
+  }
+  return hit;
+};
+const targetContains = (node) => {
+  let current = node;
+  while (current) {
+    if (current === el) return true;
+    const root = current.getRootNode ? current.getRootNode() : null;
+    current = current.parentElement || (root && root.host) || null;
+  }
+  return false;
+};
+const snapshot = () => {
+  const attached = !!el;
+  const rect = el ? el.getBoundingClientRect() : null;
+  const point = needsReceivesEvents && rect ? {
+    x: Math.min(Math.max(rect.left + (actionPosition ? Number(actionPosition.x || 0) : rect.width / 2), 0), Math.max(ownerWindow.innerWidth - 1, 0)),
+    y: Math.min(Math.max(rect.top + (actionPosition ? Number(actionPosition.y || 0) : rect.height / 2), 0), Math.max(ownerWindow.innerHeight - 1, 0)),
+  } : null;
+  const hit = needsReceivesEvents && el && point ? deepElementFromPoint(point.x, point.y) : null;
+  const tagName = el ? String(el.tagName || '').toUpperCase() : '';
+  const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
+  const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
+  const fillableForFill = !!el && (
+    (tagName === 'INPUT' && !nonFillableInputTypes.has(inputType)) ||
+    tagName === 'TEXTAREA' ||
+    el.isContentEditable
+  );
+  const checkedState = (() => {
+    if (!el) return { valid: false, checked: false, indeterminate: false, native_input: false, native_radio: false };
+    const checkedRoles = new Set(['checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem']);
+    const role = typeof locatorRoleOf === 'function' ? locatorRoleOf(el) : '';
+    const aria = String(el.getAttribute ? el.getAttribute('aria-checked') || '' : '').toLowerCase();
+    if (tagName === 'INPUT' && (inputType === 'checkbox' || inputType === 'radio')) {
+      const checked = !!el.checked;
+      return {
+        valid: true,
+        checked,
+        indeterminate: !!(el.indeterminate && !checked),
+        native_input: true,
+        native_radio: inputType === 'radio',
+      };
+    }
+    if (!checkedRoles.has(role)) {
+      return { valid: false, checked: false, indeterminate: false, native_input: false, native_radio: false };
+    }
+    if (aria === 'true') return { valid: true, checked: true, indeterminate: false, native_input: false, native_radio: false };
+    if (aria === 'false') return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
+    if (aria === 'mixed') return { valid: true, checked: false, indeterminate: true, native_input: false, native_radio: false };
+    return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
+  })();
+  const visibleState = (() => {
+    if (!attached || !el.isConnected) return false;
+    if (tagName === 'OPTION') return visible(el);
+    const computedStyle = ownerWindow.getComputedStyle(el);
+    if (!computedStyle || computedStyle.visibility === 'hidden' || computedStyle.display === 'none') return false;
+    return !!rect && rect.width > 0 && rect.height > 0;
+  })();
+  const disabled = attached && disabledState(el);
+  const hasLayout = attached && el.getClientRects().length > 0;
+  return {
+    count: matches.length,
+    frame_strict_violation: strictFrameViolation,
+    attached,
+    visible: visibleState,
+    enabled: attached && !disabled,
+    editable: attached && !disabled && !el.readOnly &&
+      (el.isContentEditable || /^(INPUT|TEXTAREA)$/.test(el.tagName)),
+    tag_name: tagName,
+    input_type: inputType,
+    is_select: tagName === 'SELECT',
+    non_fillable_input: tagName === 'INPUT' && nonFillableInputTypes.has(inputType),
+    fillable_for_fill: fillableForFill,
+    editable_for_fill: fillableForFill && !disabled && !el.readOnly,
+    has_layout: hasLayout,
+    checked_valid: checkedState.valid,
+    checked: checkedState.checked,
+    indeterminate: checkedState.indeterminate,
+    native_input: checkedState.native_input,
+    native_radio: checkedState.native_radio,
+    receives_events: needsReceivesEvents && attached && !!rect && rect.width > 0 && rect.height > 0 && targetContains(hit),
+    rect: rect ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height } : null,
+  };
+};
+const first = snapshot();
+if (!__STABLE__ || !first.attached) return first;
+const style = ownerWindow.getComputedStyle(el);
+const zeroTime = value => String(value || '').split(',').every(part => {
+  const text = part.trim();
+  if (!text) return true;
+  if (text.endsWith('ms')) return Number.parseFloat(text) === 0;
+  if (text.endsWith('s')) return Number.parseFloat(text) === 0;
+  return Number.parseFloat(text) === 0;
+});
+const hasNoCssMotion = style &&
+  (!__STABLE_POSITION_REQUIRED__ || String(style.position || 'static') === 'static') &&
+  (String(style.animationName || 'none') === 'none' || zeroTime(style.animationDuration)) &&
+  zeroTime(style.animationDelay) &&
+  zeroTime(style.transitionDuration) &&
+  zeroTime(style.transitionDelay);
+if (hasNoCssMotion) {
+  first.stable = true;
+  return first;
+}
+return new Promise(resolve => {
+  const finish = () => {
+    const second = snapshot();
+    const left = first.rect;
+    const right = second.rect;
+    second.stable = !!left && !!right && ["x", "y", "width", "height"].every(
+      key => Math.abs(Number(left[key] || 0) - Number(right[key] || 0)) <= 0.5
+    );
+    resolve(second);
+  };
+  ownerWindow.setTimeout(finish, 20);
+});
+"""
+_LOCATOR_FILL_TEMPLATE = """
+const info = {
+  count: matches.length,
+  frame_strict_violation: strictFrameViolation,
+  attached: !!el,
+};
+const strict = __STRICT__;
+if (strict && (strictFrameViolation || matches.length > 1)) {
+  return { ok: false, type: 'strict', info };
+}
+if (!el) return { ok: false, type: 'pending', info };
+const value = __VALUE__;
+const forced = __FORCED__;
+const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
+const tagName = String(el.tagName || '').toUpperCase();
+const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
+info.visible = visible(el);
+info.enabled = !disabledState(el);
+info.tag_name = tagName;
+info.input_type = inputType;
+info.non_fillable_input = tagName === 'INPUT' && nonFillableInputTypes.has(inputType);
+info.is_select = tagName === 'SELECT';
+info.fillable_for_fill = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
+info.editable_for_fill = info.fillable_for_fill && !disabledState(el) && !el.readOnly;
+if (tagName === 'INPUT' && nonFillableInputTypes.has(inputType)) {
+  return { ok: false, type: 'input-type', inputType, info };
+}
+if (tagName === 'SELECT') {
+  return { ok: false, type: forced ? 'force-non-fillable' : 'select', info };
+}
+const isFillable = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
+if (!isFillable) {
+  return { ok: false, type: forced ? 'force-non-fillable' : 'non-fillable', info };
+}
+if (forced && (!visible(el) || disabledState(el) || el.readOnly)) return { ok: true, info };
+if (!forced && (!visible(el) || disabledState(el) || el.readOnly)) {
+  return { ok: false, type: 'pending', info };
+}
+if ('value' in el) {
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+  el.value = value;
+  if (value !== '' && el.value !== value) {
+    return {
+      ok: false,
+      type: inputType === 'number' ? 'number-text' : 'malformed',
+      value: el.value,
+      info,
+    };
+  }
+} else {
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+  el.textContent = value;
+}
+el.dispatchEvent(new Event('input', { bubbles: true }));
+el.dispatchEvent(new Event('change', { bubbles: true }));
+return { ok: true, info };
+"""
 _MULTIPART_BOUNDARY_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB"
 _CHECKED_STATE_JS = """(el) => {
 const tagName = String(el && el.tagName || '').toUpperCase();
@@ -1422,9 +1610,79 @@ class TargetClosedError(Error):
 
 
 _TARGET_CLOSED_MESSAGE = "Target page, context or browser has been closed"
+_PAGE_CRASHED_MESSAGE = "Page crashed"
+_DISCONNECTED_MESSAGE = "target or browser is closed"
+_TIMEOUT_WIRE_MARKER = "__rustwright_timeout__:"
+_TARGET_CLOSED_WIRE_MARKER = "__rustwright_target_closed__:"
+_PAGE_CRASHED_WIRE_MARKER = "__rustwright_page_crashed__:"
+_DISCONNECTED_WIRE_MARKER = "__rustwright_disconnected__:"
+_WIRE_ERROR_KIND_ATTRIBUTE = "_rustwright_error_kind"
+_WIRE_ERROR_PAYLOAD_ATTRIBUTE = "_rustwright_error_payload"
+_TARGET_CLOSED_KINDS = frozenset({"page", "context", "browser", "target"})
+
+
+def _annotate_wire_error(error: Error, kind: str, payload: dict[str, Any]) -> Error:
+    setattr(error, _WIRE_ERROR_KIND_ATTRIBUTE, kind)
+    setattr(error, _WIRE_ERROR_PAYLOAD_ATTRIBUTE, dict(payload))
+    return error
+
+
+def _copy_wire_error_metadata(source: Error, target: Error) -> Error:
+    kind = getattr(source, _WIRE_ERROR_KIND_ATTRIBUTE, None)
+    payload = getattr(source, _WIRE_ERROR_PAYLOAD_ATTRIBUTE, None)
+    if isinstance(kind, str) and isinstance(payload, dict):
+        return _annotate_wire_error(target, kind, payload)
+    return target
+
+
+def _decode_wire_error(message: str) -> Optional[Error]:
+    if message.startswith(_TIMEOUT_WIRE_MARKER):
+        marker = _TIMEOUT_WIRE_MARKER
+        kind = "timeout"
+    elif message.startswith(_TARGET_CLOSED_WIRE_MARKER):
+        marker = _TARGET_CLOSED_WIRE_MARKER
+        kind = "target_closed"
+    elif message.startswith(_PAGE_CRASHED_WIRE_MARKER):
+        marker = _PAGE_CRASHED_WIRE_MARKER
+        kind = "page_crashed"
+    elif message.startswith(_DISCONNECTED_WIRE_MARKER):
+        marker = _DISCONNECTED_WIRE_MARKER
+        kind = "disconnected"
+    else:
+        return None
+
+    try:
+        payload = json.loads(message[len(marker) :])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    if kind == "timeout":
+        if set(payload) != {"ms"} or type(payload["ms"]) is not int or payload["ms"] < 0:
+            return None
+        error: Error = TimeoutError(f"timed out after {payload['ms']} ms")
+    elif kind == "target_closed":
+        if (
+            set(payload) != {"kind"}
+            or type(payload["kind"]) is not str
+            or payload["kind"] not in _TARGET_CLOSED_KINDS
+        ):
+            return None
+        error = TargetClosedError(_TARGET_CLOSED_MESSAGE)
+    elif kind == "page_crashed":
+        if payload:
+            return None
+        error = Error(_PAGE_CRASHED_MESSAGE)
+    else:
+        if payload:
+            return None
+        error = Error(_DISCONNECTED_MESSAGE)
+    return _annotate_wire_error(error, kind, payload)
 
 
 def _is_target_closed_message(message: str) -> bool:
+    # Legacy prose fallback for native and shim paths that do not emit a wire marker yet.
     return _TARGET_CLOSED_MESSAGE in message or any(
         fragment in message
         for fragment in (
@@ -1440,10 +1698,14 @@ def _is_target_closed_message(message: str) -> bool:
 
 def _translate_error(exc: RuntimeError) -> Error:
     message = str(exc)
+    wire_error = _decode_wire_error(message)
+    if wire_error is not None:
+        return wire_error
     if message.startswith("Error: InvalidSelectorError:"):
         message = message.removeprefix("Error: ")
     if _is_target_closed_message(message):
         return TargetClosedError(message)
+    # Legacy prose fallback for unconverted timeout producers.
     if "timed out" in message:
         return TimeoutError(message)
     return Error(message)
@@ -1467,7 +1729,7 @@ def _call_with_method_prefix(method: str, fn, *args, **kwargs):
             error_type = TargetClosedError
         else:
             error_type = TimeoutError if isinstance(exc, TimeoutError) else Error
-        raise error_type(f"{method}: {message}") from None
+        raise _copy_wire_error_metadata(exc, error_type(f"{method}: {message}")) from None
 
 
 def _is_nonserializable_evaluate_result(message: str) -> bool:
@@ -1483,6 +1745,12 @@ def _call_wait_with_playwright_timeout(method: str, fn, *args, **kwargs):
         return _call(fn, *args, **kwargs)
     except TimeoutError as exc:
         message = str(exc)
+        kind = getattr(exc, _WIRE_ERROR_KIND_ATTRIBUTE, None)
+        payload = getattr(exc, _WIRE_ERROR_PAYLOAD_ATTRIBUTE, None)
+        if kind == "timeout" and isinstance(payload, dict) and type(payload.get("ms")) is int:
+            error = TimeoutError(f"{method}: Timeout {payload['ms']}ms exceeded.")
+            raise _copy_wire_error_metadata(exc, error) from None
+        # Legacy prose fallback for timeout errors from unconverted paths.
         match = re.fullmatch(r"timed out after ([0-9]+(?:\.[0-9]+)?) ms", message)
         if match:
             raise TimeoutError(f"{method}: Timeout {match.group(1)}ms exceeded.") from None
@@ -1492,6 +1760,15 @@ def _call_wait_with_playwright_timeout(method: str, fn, *args, **kwargs):
 
 
 def _is_ignorable_close_error(error: Error) -> bool:
+    # Structured wire kinds first: a close racing owner or transport loss is
+    # benign, while a genuine close timeout must still surface.
+    if getattr(error, _WIRE_ERROR_KIND_ATTRIBUTE, None) in (
+        "disconnected",
+        "target_closed",
+        "page_crashed",
+    ):
+        return True
+    # Legacy cleanup-only prose emitted by unconverted CDP/session close paths.
     message = str(error)
     return any(
         fragment in message
@@ -4605,6 +4882,19 @@ def _sleep_until_next_poll(deadline: float, interval: float = 0.02) -> None:
     remaining = deadline - time.monotonic()
     if remaining > 0:
         time.sleep(min(interval, remaining))
+
+
+def _actionability_probe_timeout(remaining_ms: float, timeout_disabled: bool = False) -> float:
+    # Budget a single actionability/state probe with the full remaining action time rather
+    # than a small fixed cap. A cap shorter than one remote-CDP round trip made every probe
+    # time out and abort the action while the outer deadline was still far away (observed on
+    # click/select_option over connect_over_cdp attach). Polling cadence is driven by
+    # _sleep_until_next_poll, not this bound, so widening it does not busy-loop. For an
+    # infinite wait (timeout<=0) keep a bounded cadence so owner-availability and locator
+    # handlers are still re-checked periodically.
+    if timeout_disabled:
+        return min(remaining_ms, 1_000.0)
+    return max(remaining_ms, 1.0)
 
 
 def _handle_event_wait_timeout(owner: Any, event: str, timeout_display: str, deadline: Optional[float]) -> None:
@@ -21589,135 +21879,7 @@ return null;
                 }
             )
         return self._eval(
-            """
-if (el && __SCROLL__) el.scrollIntoView({ block: 'center', inline: 'center' });
-const ownerDocument = el ? (el.ownerDocument || document) : document;
-const ownerWindow = ownerDocument.defaultView || window;
-const actionPosition = __ACTION_POSITION__;
-const needsReceivesEvents = __RECEIVES_EVENTS__;
-const deepElementFromPoint = (x, y) => {
-  let hit = ownerDocument.elementFromPoint(x, y);
-  while (hit && hit.shadowRoot) {
-    const nested = hit.shadowRoot.elementFromPoint(x, y);
-    if (!nested || nested === hit) break;
-    hit = nested;
-  }
-  return hit;
-};
-const targetContains = (node) => {
-  let current = node;
-  while (current) {
-    if (current === el) return true;
-    const root = current.getRootNode ? current.getRootNode() : null;
-    current = current.parentElement || (root && root.host) || null;
-  }
-  return false;
-};
-const snapshot = () => {
-  const attached = !!el;
-  const rect = el ? el.getBoundingClientRect() : null;
-  const point = needsReceivesEvents && rect ? {
-    x: Math.min(Math.max(rect.left + (actionPosition ? Number(actionPosition.x || 0) : rect.width / 2), 0), Math.max(ownerWindow.innerWidth - 1, 0)),
-    y: Math.min(Math.max(rect.top + (actionPosition ? Number(actionPosition.y || 0) : rect.height / 2), 0), Math.max(ownerWindow.innerHeight - 1, 0)),
-  } : null;
-  const hit = needsReceivesEvents && el && point ? deepElementFromPoint(point.x, point.y) : null;
-  const tagName = el ? String(el.tagName || '').toUpperCase() : '';
-  const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
-  const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
-  const fillableForFill = !!el && (
-    (tagName === 'INPUT' && !nonFillableInputTypes.has(inputType)) ||
-    tagName === 'TEXTAREA' ||
-    el.isContentEditable
-  );
-  const checkedState = (() => {
-    if (!el) return { valid: false, checked: false, indeterminate: false, native_input: false, native_radio: false };
-    const checkedRoles = new Set(['checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem']);
-    const role = typeof locatorRoleOf === 'function' ? locatorRoleOf(el) : '';
-    const aria = String(el.getAttribute ? el.getAttribute('aria-checked') || '' : '').toLowerCase();
-    if (tagName === 'INPUT' && (inputType === 'checkbox' || inputType === 'radio')) {
-      const checked = !!el.checked;
-      return {
-        valid: true,
-        checked,
-        indeterminate: !!(el.indeterminate && !checked),
-        native_input: true,
-        native_radio: inputType === 'radio',
-      };
-    }
-    if (!checkedRoles.has(role)) {
-      return { valid: false, checked: false, indeterminate: false, native_input: false, native_radio: false };
-    }
-    if (aria === 'true') return { valid: true, checked: true, indeterminate: false, native_input: false, native_radio: false };
-    if (aria === 'false') return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
-    if (aria === 'mixed') return { valid: true, checked: false, indeterminate: true, native_input: false, native_radio: false };
-    return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
-  })();
-  const visibleState = (() => {
-    if (!attached || !el.isConnected) return false;
-    if (tagName === 'OPTION') return visible(el);
-    const computedStyle = ownerWindow.getComputedStyle(el);
-    if (!computedStyle || computedStyle.visibility === 'hidden' || computedStyle.display === 'none') return false;
-    return !!rect && rect.width > 0 && rect.height > 0;
-  })();
-  const disabled = attached && disabledState(el);
-  const hasLayout = attached && el.getClientRects().length > 0;
-  return {
-    count: matches.length,
-    frame_strict_violation: strictFrameViolation,
-    attached,
-    visible: visibleState,
-    enabled: attached && !disabled,
-    editable: attached && !disabled && !el.readOnly &&
-      (el.isContentEditable || /^(INPUT|TEXTAREA)$/.test(el.tagName)),
-    tag_name: tagName,
-    input_type: inputType,
-    is_select: tagName === 'SELECT',
-    non_fillable_input: tagName === 'INPUT' && nonFillableInputTypes.has(inputType),
-    fillable_for_fill: fillableForFill,
-    editable_for_fill: fillableForFill && !disabled && !el.readOnly,
-    has_layout: hasLayout,
-    checked_valid: checkedState.valid,
-    checked: checkedState.checked,
-    indeterminate: checkedState.indeterminate,
-    native_input: checkedState.native_input,
-    native_radio: checkedState.native_radio,
-    receives_events: needsReceivesEvents && attached && !!rect && rect.width > 0 && rect.height > 0 && targetContains(hit),
-    rect: rect ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height } : null,
-  };
-};
-const first = snapshot();
-if (!__STABLE__ || !first.attached) return first;
-const style = ownerWindow.getComputedStyle(el);
-const zeroTime = value => String(value || '').split(',').every(part => {
-  const text = part.trim();
-  if (!text) return true;
-  if (text.endsWith('ms')) return Number.parseFloat(text) === 0;
-  if (text.endsWith('s')) return Number.parseFloat(text) === 0;
-  return Number.parseFloat(text) === 0;
-});
-const hasNoCssMotion = style &&
-  (!__STABLE_POSITION_REQUIRED__ || String(style.position || 'static') === 'static') &&
-  (String(style.animationName || 'none') === 'none' || zeroTime(style.animationDuration)) &&
-  zeroTime(style.animationDelay) &&
-  zeroTime(style.transitionDuration) &&
-  zeroTime(style.transitionDelay);
-if (hasNoCssMotion) {
-  first.stable = true;
-  return first;
-}
-return new Promise(resolve => {
-  const finish = () => {
-    const second = snapshot();
-    const left = first.rect;
-    const right = second.rect;
-    second.stable = !!left && !!right && ["x", "y", "width", "height"].every(
-      key => Math.abs(Number(left[key] || 0) - Number(right[key] || 0)) <= 0.5
-    );
-    resolve(second);
-  };
-  ownerWindow.setTimeout(finish, 20);
-});
-"""
+            _LOCATOR_TARGET_STATE_TEMPLATE
             .replace("__SCROLL__", scroll_literal)
             .replace("__STABLE__", stable_literal)
             .replace("__RECEIVES_EVENTS__", receives_events_literal)
@@ -21785,16 +21947,31 @@ return new Promise(resolve => {
         while True:
             _raise_if_owner_unavailable(self._page, method=method)
             remaining_ms = max((deadline - time.monotonic()) * 1000, 1.0)
-            command_timeout = min(1_000.0 if timeout_disabled else max(timeout_ms, 1.0), remaining_ms, 1_000.0)
+            command_timeout = _actionability_probe_timeout(remaining_ms, timeout_disabled)
             self._page._run_locator_handlers(deadline)
-            last_info = self._target_state(
-                command_timeout,
-                scroll=scroll or state in {"actionable", "scrollable"},
-                stable=requires_stable,
-                receives_events=state == "actionable",
-                stable_position_required=stable_position_required,
-                action_position=action_position,
-            )
+            try:
+                last_info = self._target_state(
+                    command_timeout,
+                    scroll=scroll or state in {"actionable", "scrollable"},
+                    stable=requires_stable,
+                    receives_events=state == "actionable",
+                    stable_position_required=stable_position_required,
+                    action_position=action_position,
+                )
+            except TimeoutError:
+                # A single actionability probe that exceeds its own budget is transient,
+                # not fatal: over a high-latency remote-CDP transport one probe's round
+                # trips can outlast a small fixed cap. Surface owner unavailability
+                # immediately, otherwise keep polling until the outer deadline instead of
+                # aborting the whole action (matches Playwright and the fill/select-apply
+                # loops). Doing this before the deadline check means a page/context/browser
+                # that closed mid-probe raises the precise owner error rather than a
+                # generic timeout when the deadline coincides.
+                _raise_if_owner_unavailable(self._page, method=method)
+                if time.monotonic() >= deadline:
+                    break
+                _sleep_until_next_poll(deadline)
+                continue
             if self._strict and not self._explicit_index:
                 self._raise_frame_strict_violation(last_info.get("frame_strict_violation"))
             count = int(last_info.get("count") or 0)
@@ -21857,9 +22034,22 @@ return new Promise(resolve => {
         while True:
             _raise_if_owner_unavailable(self._page, method=method)
             remaining_ms = max((deadline - time.monotonic()) * 1000, 1.0)
-            command_timeout = min(max(timeout_ms, 1.0), remaining_ms, 1_000.0)
+            command_timeout = _actionability_probe_timeout(remaining_ms)
             self._page._run_locator_handlers(deadline)
-            last_info = self._target_state(command_timeout)
+            try:
+                last_info = self._target_state(command_timeout)
+            except TimeoutError:
+                # A single fill-readiness probe timing out is transient over a slow
+                # remote-CDP transport: surface owner unavailability immediately, otherwise
+                # keep polling until the outer deadline (matches the fill/select-apply
+                # loops). Checking the owner before the deadline break means a closed
+                # page/context/browser raises the precise owner error rather than a generic
+                # timeout when the deadline coincides.
+                _raise_if_owner_unavailable(self._page, method=method)
+                if time.monotonic() >= deadline:
+                    break
+                _sleep_until_next_poll(deadline)
+                continue
             if self._strict and not self._explicit_index:
                 self._raise_frame_strict_violation(last_info.get("frame_strict_violation"))
             count = int(last_info.get("count") or 0)
@@ -23552,72 +23742,30 @@ return { ok: true };
         value_json = json.dumps(str(value))
         force_literal = "true" if force else "false"
         strict_literal = "true" if self._strict and not self._explicit_index else "false"
-        fill_script = f"""
-const info = {{
-  count: matches.length,
-  frame_strict_violation: strictFrameViolation,
-  attached: !!el,
-}};
-const strict = {strict_literal};
-if (strict && (strictFrameViolation || matches.length > 1)) {{
-  return {{ ok: false, type: 'strict', info }};
-}}
-if (!el) return {{ ok: false, type: 'pending', info }};
-const value = {value_json};
-const forced = {force_literal};
-const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
-const tagName = String(el.tagName || '').toUpperCase();
-const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
-info.visible = visible(el);
-info.enabled = !disabledState(el);
-info.tag_name = tagName;
-info.input_type = inputType;
-info.non_fillable_input = tagName === 'INPUT' && nonFillableInputTypes.has(inputType);
-info.is_select = tagName === 'SELECT';
-info.fillable_for_fill = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
-info.editable_for_fill = info.fillable_for_fill && !disabledState(el) && !el.readOnly;
-if (tagName === 'INPUT' && nonFillableInputTypes.has(inputType)) {{
-  return {{ ok: false, type: 'input-type', inputType, info }};
-}}
-if (tagName === 'SELECT') {{
-  return {{ ok: false, type: forced ? 'force-non-fillable' : 'select', info }};
-}}
-const isFillable = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
-if (!isFillable) {{
-  return {{ ok: false, type: forced ? 'force-non-fillable' : 'non-fillable', info }};
-}}
-if (forced && (!visible(el) || disabledState(el) || el.readOnly)) return {{ ok: true, info }};
-if (!forced && (!visible(el) || disabledState(el) || el.readOnly)) {{
-  return {{ ok: false, type: 'pending', info }};
-}}
-if ('value' in el) {{
-  el.scrollIntoView({{ block: 'center', inline: 'center' }});
-  if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
-  el.value = value;
-  if (value !== '' && el.value !== value) {{
-    return {{
-      ok: false,
-      type: inputType === 'number' ? 'number-text' : 'malformed',
-      value: el.value,
-      info,
-    }};
-  }}
-}} else {{
-  el.scrollIntoView({{ block: 'center', inline: 'center' }});
-  if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
-  el.textContent = value;
-}}
-el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-return {{ ok: true, info }};
-"""
+        fill_script = (
+            _LOCATOR_FILL_TEMPLATE.replace("__STRICT__", strict_literal)
+            .replace("__FORCED__", force_literal)
+            .replace("__VALUE__", value_json)
+        )
         last_info: dict[str, Any] = {}
         while True:
             remaining_ms = max((deadline - time.monotonic()) * 1000, 1.0)
-            command_timeout = min(max(timeout_ms, 1.0), remaining_ms, 1_000.0)
+            command_timeout = _actionability_probe_timeout(remaining_ms)
             self._page._run_locator_handlers(deadline)
             try:
                 result = self._eval(fill_script, command_timeout)
+            except TimeoutError:
+                # A single fill-apply probe timing out is transient over a slow remote-CDP
+                # transport: one probe's CDP round trips can outlast the per-probe budget.
+                # Surface owner unavailability immediately, otherwise keep polling until the
+                # outer deadline instead of aborting the whole action (matches Playwright and
+                # the sibling wait/select loops). TimeoutError subclasses Error, so this must
+                # precede the generic Error handler below.
+                _raise_if_owner_unavailable(self._page, method=_locator_method_for_action(action))
+                if time.monotonic() >= deadline:
+                    break
+                _sleep_until_next_poll(deadline)
+                continue
             except Error as exc:
                 if "No element matches locator" not in str(exc):
                     raise
@@ -24397,10 +24545,13 @@ return {{ ok: true, selected: Array.from(el.selectedOptions).map(option => optio
         deadline = started + max(timeout_ms, 0.0) / 1000
         while True:
             remaining_ms = max((deadline - time.monotonic()) * 1000, 1.0)
-            command_timeout = min(max(timeout_ms, 1.0), remaining_ms, 1_000.0)
+            command_timeout = _actionability_probe_timeout(remaining_ms)
             try:
                 result = self._eval(select_script, command_timeout, method=method)
             except TimeoutError:
+                # A transient select-apply probe timeout is retried until the outer deadline
+                # (see the fill-apply loop), but owner unavailability is surfaced immediately.
+                _raise_if_owner_unavailable(self._page, method=method)
                 if time.monotonic() >= deadline:
                     break
                 _sleep_until_next_poll(deadline)

@@ -1,18 +1,17 @@
-"""In-page snapshot script.
+"""In-page snapshot scripts.
 
-Produces a compact accessibility-style outline of the page and tags every
-emitted element with a ``data-mcp-ref`` attribute so tools can act on it
-later via an attribute selector. Refs increase for the lifetime of a browser
-session and are regenerated on every snapshot; acting on a ref from an older
-snapshot raises a clear error in the server.
+The page and targeted variants share one implementation. They produce a
+compact accessibility-style outline, stamp current ``data-mcp-ref`` handles,
+optionally bound traversal depth, and optionally add viewport-relative boxes.
 """
 
-SNAPSHOT_JS = r"""
-(startRef) => {
+_SNAPSHOT_BODY = r"""
   const MAX_NAME = 120;
   const MAX_LINES = 1200;
+  const {startRef, maxDepth = null, boxes = false} = options;
   let refCounter = startRef;
   const lines = [];
+  const refs = [];
 
   for (const el of document.querySelectorAll('[data-mcp-ref]')) {
     el.removeAttribute('data-mcp-ref');
@@ -56,12 +55,11 @@ SNAPSHOT_JS = r"""
       const parts = labelled.split(/\s+/)
         .map((id) => document.getElementById(id))
         .filter(Boolean)
-        .map((n) => n.textContent.trim());
+        .map((node) => node.textContent.trim());
       if (parts.length) return parts.join(' ');
     }
     const ariaLabel = el.getAttribute('aria-label');
     if (ariaLabel) return ariaLabel;
-    // Associated <label> outranks placeholder/title in accessible-name order.
     if (el.labels && el.labels.length) return el.labels[0].textContent.trim();
     const direct = el.getAttribute('alt') || el.getAttribute('title')
       || el.getAttribute('placeholder');
@@ -77,24 +75,36 @@ SNAPSHOT_JS = r"""
      'slider', 'option', 'tab', 'menuitem', 'switch'].includes(role)
     || el.hasAttribute('onclick') || el.tabIndex >= 0;
 
-  const walk = (el, depth) => {
+  const enclosingBox = (rect) => {
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    // Enclose fractional CSS-pixel geometry: floor the origin and ceil the far
+    // edge. This produces integer viewport-relative bounds without shrinking
+    // the rendered area.
+    const left = Math.floor(rect.left);
+    const top = Math.floor(rect.top);
+    const right = Math.ceil(rect.right);
+    const bottom = Math.ceil(rect.bottom);
+    return [left, top, right - left, bottom - top];
+  };
+
+  const walk = (el, treeDepth) => {
     if (lines.length >= MAX_LINES) return;
-    // SVG element tagNames are not uppercased; normalize before lookups.
+    if (maxDepth !== null && treeDepth > maxDepth) return;
     const tag = String(el.tagName || '').toUpperCase();
     if (SKIP_TAGS.has(tag) || el.namespaceURI === 'http://www.w3.org/2000/svg') return;
     if (!isVisible(el)) return;
     if (tag === 'IFRAME' || tag === 'FRAME') {
       const label = el.getAttribute('title') || el.getAttribute('name') || el.getAttribute('src') || '';
-      lines.push(`${'  '.repeat(depth)}- iframe "${label.slice(0, MAX_NAME)}" (content not captured)`);
+      lines.push(`${'  '.repeat(treeDepth)}- iframe "${label.slice(0, MAX_NAME)}" (content not captured)`);
       return;
     }
 
     const role = roleOf(el);
-    let emittedDepth = depth;
+    let childDepth = treeDepth;
     if (role) {
       let name = nameOf(el);
       if (name.length > MAX_NAME) name = name.slice(0, MAX_NAME) + '…';
-      const parts = [`${'  '.repeat(depth)}- ${role}`];
+      const parts = [`${'  '.repeat(treeDepth)}- ${role}`];
       if (name) parts.push(`"${name}"`);
       if (/^H[1-6]$/.test(el.tagName)) parts.push(`[level=${el.tagName[1]}]`);
       if (el.tagName === 'A' && el.href) parts.push(`[href=${el.getAttribute('href')}]`);
@@ -111,33 +121,34 @@ SNAPSHOT_JS = r"""
         const ref = `e${refCounter}`;
         refCounter += 1;
         el.setAttribute('data-mcp-ref', ref);
+        refs.push(ref);
         parts.push(`[ref=${ref}]`);
       }
+      if (boxes) {
+        const box = enclosingBox(el.getBoundingClientRect());
+        if (box) parts.push(`[box=${box.join(',')}]`);
+      }
       lines.push(parts.join(' '));
-      emittedDepth = depth + 1;
-      // Named leaf: children's text is already in the name, skip descent.
+      childDepth = treeDepth + 1;
       const hasElementChildren = el.children.length > 0;
       if (!hasElementChildren || ['link', 'button', 'heading', 'option', 'label'].includes(role)) {
         return;
       }
-    } else {
-      // Text-bearing node with no element children becomes a text line.
-      if (el.children.length === 0) {
-        const text = (el.textContent || '').trim().replace(/\s+/g, ' ');
-        if (text) {
-          lines.push(`${'  '.repeat(depth)}- text: ${text.slice(0, MAX_NAME)}`);
-        }
-        return;
-      }
+    } else if (el.children.length === 0) {
+      const text = (el.textContent || '').trim().replace(/\s+/g, ' ');
+      if (text) lines.push(`${'  '.repeat(treeDepth)}- text: ${text.slice(0, MAX_NAME)}`);
+      return;
     }
-    for (const child of el.children) walk(child, emittedDepth);
+    for (const child of el.children) walk(child, childDepth);
   };
 
-  if (!document.body) {
-    return {outline: '- (page has no body yet)', nextRef: refCounter};
+  if (!root) {
+    return {outline: '- (page has no body yet)', nextRef: refCounter, refs};
   }
-  walk(document.body, 0);
+  walk(root, 0);
   if (lines.length >= MAX_LINES) lines.push('- … (snapshot truncated)');
-  return {outline: lines.join('\n'), nextRef: refCounter};
-}
+  return {outline: lines.join('\n'), nextRef: refCounter, refs};
 """
+
+SNAPSHOT_JS = "(options) => { const root = document.body;" + _SNAPSHOT_BODY + "}"
+TARGET_SNAPSHOT_JS = "(root, options) => {" + _SNAPSHOT_BODY + "}"

@@ -1,13 +1,13 @@
 """Durable, per-user state for persistent agent browser sessions."""
 
 import errno
-import fcntl
 import hashlib
 import json
 import os
 import re
 import secrets
 import stat
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
 from .errors import AgentError
+
+try:
+    import fcntl as _fcntl
+except ModuleNotFoundError:  # pragma: no cover - exercised by an import-hook regression test
+    _fcntl = None
 
 
 _SESSION_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -32,6 +37,10 @@ _STATE_FIELDS = {
     "dirty",
     "launch_config_hash",
 }
+
+
+def persistent_sessions_supported() -> bool:
+    return _fcntl is not None and (sys.platform == "darwin" or sys.platform.startswith("linux"))
 
 
 def validate_session_name(name: str) -> str:
@@ -359,7 +368,7 @@ def owner_lifetime_lock(name: str) -> Iterator[None]:
     acquired = False
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
             acquired = True
         except OSError as exc:
             if exc.errno in (errno.EACCES, errno.EAGAIN):
@@ -369,7 +378,7 @@ def owner_lifetime_lock(name: str) -> Iterator[None]:
     finally:
         if acquired:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
             except OSError:
                 pass
         os.close(fd)
@@ -383,7 +392,7 @@ def owner_lock_is_held(name: str) -> bool:
     acquired = False
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
             acquired = True
             return False
         except OSError as exc:
@@ -393,7 +402,7 @@ def owner_lock_is_held(name: str) -> bool:
     finally:
         if acquired:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
             except OSError:
                 pass
         os.close(fd)
@@ -421,7 +430,7 @@ def session_lock(name: str, timeout: float = 30.0) -> Iterator[None]:
     try:
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
                 acquired = True
                 break
             except OSError as exc:
@@ -434,7 +443,7 @@ def session_lock(name: str, timeout: float = 30.0) -> Iterator[None]:
     finally:
         if acquired:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
             except OSError:
                 pass
         os.close(fd)

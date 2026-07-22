@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>PR3 Compatibility</title>
+  <link rel="stylesheet" href="/static.css">
+</head>
+<body>
+  <main>
+    <h1>PR3 fixture</h1>
+    <p id="responsive">wide layout</p>
+
+    <form id="all-fields">
+      <label for="text-field">Text field</label>
+      <input id="text-field" type="text">
+      <label for="check-field">Check field</label>
+      <input id="check-field" type="checkbox">
+      <label for="radio-field">Radio field</label>
+      <input id="radio-field" name="choice" type="radio">
+      <label for="combo-field">Combo field</label>
+      <select id="combo-field">
+        <option value="small-value">Small label</option>
+        <option value="large-value">Large label</option>
+      </select>
+      <label for="slider-field">Slider field</label>
+      <input id="slider-field" type="range" min="0" max="100" value="10">
+    </form>
+
+    <section id="find-root">
+      <h2>Find region</h2>
+      <button id="find-before">Before match</button>
+      <button id="find-match">Unique Needle</button>
+      <button id="find-after">After match</button>
+    </section>
+
+    <div id="drag-source" draggable="true">Drag source</div>
+    <div id="drag-target">Drag target</div>
+    <p id="drag-result">not dropped</p>
+
+    <button id="alert" onclick="alert('alert message')">Open alert</button>
+    <button id="confirm" onclick="window.confirmResult = confirm('confirm message')">Open confirm</button>
+    <button id="prompt" onclick="window.promptResult = prompt('prompt message', 'default')">Open prompt</button>
+
+    <input id="upload" type="file">
+    <p id="upload-result">no upload</p>
+    <a id="download" href="/download" download>Download artifact</a>
+  </main>
+  <script>
+    console.error('console-error');
+    console.warn('console-warning');
+    console.info('console-info');
+    console.debug('console-debug');
+    fetch('/api/get');
+    fetch('/api/post', {method: 'POST', headers: {'Content-Type': 'text/plain'}, body: 'posted-body'});
+
+    document.getElementById('drag-source').addEventListener('dragstart', (event) => {
+      event.dataTransfer.setData('text/plain', 'dragged');
+    });
+    document.getElementById('drag-target').addEventListener('dragover', (event) => event.preventDefault());
+    document.getElementById('drag-target').addEventListener('drop', (event) => {
+      event.preventDefault();
+      document.getElementById('drag-result').textContent = event.dataTransfer.getData('text/plain');
+    });
+    document.getElementById('upload').addEventListener('change', (event) => {
+      document.getElementById('upload-result').textContent = event.target.files[0]?.name || 'cancelled';
+    });
+  </script>
+</body>
+</html>

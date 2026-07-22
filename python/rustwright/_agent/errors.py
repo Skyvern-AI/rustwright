@@ -22,7 +22,7 @@ class AgentError(Exception):
             return 4
         if self.code in {"session_busy", "session_lost", "session_not_found"}:
             return 3
-        if self.code in {"invalid_argument", "invalid_request", "invalid_ref"}:
+        if self.code in {"invalid_argument", "invalid_request", "invalid_ref", "unsupported_platform"}:
             return 2
         return 1
 

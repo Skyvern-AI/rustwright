@@ -30,7 +30,13 @@ async def _run_session(checks, env_overrides=None) -> None:
 
     command = _server_command()
     env = dict(os.environ)
-    env.pop("RUSTWRIGHT_MCP_ALLOW_EVAL", None)
+    for name in (
+        "RUSTWRIGHT_MCP_ALLOW_EVAL",
+        "RUSTWRIGHT_MCP_CDP_ENDPOINT",
+        "RUSTWRIGHT_MCP_CDP_HEADERS",
+        "RUSTWRIGHT_MCP_CDP_TIMEOUT_MS",
+    ):
+        env.pop(name, None)
     if env_overrides:
         env.update(env_overrides)
     params = StdioServerParameters(
@@ -52,6 +58,13 @@ async def _call(session, name, **kwargs) -> str:
     return text
 
 
+def _result_section(response: str) -> str:
+    marker = "### Result\n"
+    if marker not in response:
+        return ""
+    return response.split(marker, 1)[1].split("\n\n### ", 1)[0]
+
+
 def test_stdio_form_flow():
     async def checks(session):
         tools = {t.name for t in (await session.list_tools()).tools}
@@ -59,7 +72,9 @@ def test_stdio_form_flow():
                 "browser_type", "browser_close"} <= tools
 
         snap = await _call(session, "browser_navigate", url=FIXTURE.as_uri())
-        assert snap.startswith("Page: Form Test")
+        assert "### Page" in snap
+        assert "- Title: Form Test" in snap
+        assert "### Snapshot" in snap
         name_ref = re.search(r'textbox "Customer name"[^\[]*\[ref=(e\d+)\]', snap).group(1)
 
         snap = await _call(
@@ -75,9 +90,9 @@ def test_stdio_form_flow():
         await _call(session, "browser_click", target=btn_ref)
 
         out = await _call(session, "browser_get_text", selector="#out")
-        assert out == "name=Rustwright Test;size=l"
+        assert _result_section(out) == "name=Rustwright Test;size=l"
 
-        assert await _call(session, "browser_close") == "Browser closed."
+        assert _result_section(await _call(session, "browser_close")) == "Browser closed."
 
     asyncio.run(_run_session(checks))
 
@@ -89,9 +104,10 @@ def test_stdio_evaluate_opt_in():
 
         await _call(session, "browser_navigate", url=FIXTURE.as_uri())
         title = await _call(session, "browser_evaluate", expression="() => document.title")
-        assert title == "Form Test"
+        assert _result_section(title) == '"Form Test"'
+        assert "### Snapshot" in title
 
-        assert await _call(session, "browser_close") == "Browser closed."
+        assert _result_section(await _call(session, "browser_close")) == "Browser closed."
 
     asyncio.run(
         _run_session(checks, {"RUSTWRIGHT_MCP_ALLOW_EVAL": "1"})

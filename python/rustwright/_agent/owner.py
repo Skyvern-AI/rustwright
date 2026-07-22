@@ -51,7 +51,7 @@ def _reject_browser_args(values: List[str]) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="rustwright-agent-owner")
+    parser = argparse.ArgumentParser(prog="rustwright-owner")
     parser.add_argument("--session", required=True)
     parser.add_argument("--headed", action="store_true")
     parser.add_argument("--executable-path")

@@ -2,6 +2,7 @@
 
 import argparse
 import errno
+from importlib import metadata
 import ipaddress
 import json
 import os
@@ -25,6 +26,7 @@ from .state import (
     launch_config_hash,
     mark_dirty,
     owner_lock_is_held,
+    persistent_sessions_supported,
     read_json,
     read_state,
     remove_session_files,
@@ -57,6 +59,13 @@ _COMMANDS = {
 }
 
 _SNAPSHOT_REF_RESERVATION = 1000
+
+
+def _version() -> str:
+    try:
+        return metadata.version("rustwright")
+    except metadata.PackageNotFoundError:
+        return "0.1.1"
 
 
 class ParserExit(Exception):
@@ -108,8 +117,8 @@ def _add_wait_until(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> NonExitingArgumentParser:
-    parser = NonExitingArgumentParser(prog="rustwright-agent")
-    parser.add_argument("--version", action="version", version="rustwright-agent 1")
+    parser = NonExitingArgumentParser(prog="rustwright")
+    parser.add_argument("--version", action="version", version=_version())
     parser.add_argument("--session", default="default")
     parser.add_argument("--json", action="store_true", dest="json_output")
     parser.add_argument(
@@ -130,6 +139,12 @@ def build_parser() -> NonExitingArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     open_parser = commands.add_parser("open")
     open_parser.add_argument("url", nargs="?")
+    open_parser.add_argument(
+        "-b",
+        "--browser",
+        default="chromium",
+        help="browser to use (cr or chromium; other Chromium executables require --executable-path)",
+    )
 
     navigate_parser = commands.add_parser("navigate")
     navigate_parser.add_argument("url")
@@ -448,6 +463,19 @@ def _is_mutating(args: argparse.Namespace) -> bool:
 
 def _validate_command(args: argparse.Namespace) -> None:
     validate_session_name(args.session)
+    if args.command == "open":
+        if args.browser in {"ff", "firefox", "wk", "webkit"}:
+            raise AgentError(
+                "invalid_argument",
+                f"{args.browser} is not implemented; Rustwright currently supports Chromium over direct CDP.",
+            )
+        if args.browser in {"chrome", "msedge"} and args.executable_path is None:
+            raise AgentError(
+                "invalid_argument",
+                f"{args.browser} channel selection is not supported; use --executable-path to launch that browser.",
+            )
+        if args.browser not in {"cr", "chromium", "chrome", "msedge"}:
+            raise AgentError("invalid_argument", f"Unknown browser: {args.browser}")
     forbidden_browser_args = (
         "--remote-debugging-port",
         "--remote-debugging-pipe",
@@ -737,6 +765,11 @@ def _success_exit(args: argparse.Namespace, data: Dict[str, Any]) -> int:
 
 
 def _run(args: argparse.Namespace, argv: List[str]) -> Dict[str, Any]:
+    if not persistent_sessions_supported():
+        raise AgentError(
+            "unsupported_platform",
+            "persistent sessions require macOS or Linux",
+        )
     _validate_command(args)
     with session_lock(args.session):
         if args.command == "status":

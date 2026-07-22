@@ -1,16 +1,10 @@
 [package]
 name = "rustwright"
-version = "0.1.1"
+version = "0.1.0-alpha.4"
 edition = "2021"
-description = "Idiomatic native Rust API for the Rustwright Chromium CDP engine (a Rust rewrite of Playwright)."
-license = "MIT"
-repository = "https://github.com/Skyvern-AI/rustwright"
-homepage = "https://github.com/Skyvern-AI/rustwright"
-readme = "README.md"
-keywords = ["browser", "automation", "cdp", "chromium", "playwright"]
-categories = ["web-programming"]
+publish = false
 
 [dependencies]
-rustwright_core = { package = "rustwright-core", path = "..", version = "0.1.1", default-features = false }
-serde = { version = "=1.0.188", features = ["derive"] }
-serde_json = "=1.0.107"
+rustwright_core = { package = "rustwright-core", path = "..", default-features = false }
+serde = { version = "=1.0.194", features = ["derive"] }
+serde_json = "=1.0.127"

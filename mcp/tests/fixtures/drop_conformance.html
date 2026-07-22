@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Drop Conformance</title>
+  <style>
+    .dropzone { border: 1px solid #444; margin: 8px; min-height: 36px; padding: 8px; }
+    #results { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <main>
+    <div id="standard" class="dropzone">Standard HTML5 dropzone</div>
+    <div id="trust" class="dropzone">Event trust dropzone</div>
+    <div id="items" class="dropzone">Types and items dropzone</div>
+    <div id="framework" class="dropzone">Framework-style dropzone</div>
+    <pre id="results"></pre>
+  </main>
+  <script>
+    const observed = {
+      a: {events: [], files: [], data: {}, status: "pending"},
+      b: {isTrusted: {}},
+      c: {types: [], items: []},
+      d: {events: [], dragoverPrevented: false, accepted: false, value: null},
+    };
+    const results = document.querySelector("#results");
+    const render = () => { results.textContent = JSON.stringify(observed); };
+    const readFile = (file) => new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.addEventListener("load", () => resolve(String(reader.result)));
+      reader.addEventListener("error", () => reject(reader.error));
+      reader.readAsText(file);
+    });
+
+    const standard = document.querySelector("#standard");
+    standard.addEventListener("dragenter", () => {
+      observed.a.events.push("dragenter");
+      render();
+    });
+    standard.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      observed.a.events.push("dragover");
+      render();
+    });
+    standard.addEventListener("drop", async (event) => {
+      event.preventDefault();
+      observed.a.events.push("drop");
+      observed.a.data = {
+        "text/plain": event.dataTransfer.getData("text/plain"),
+        "application/x-conformance": event.dataTransfer.getData("application/x-conformance"),
+      };
+      observed.a.files = await Promise.all(
+        Array.from(event.dataTransfer.files, async (file) => ({
+          name: file.name,
+          size: file.size,
+          type: file.type,
+          content: await readFile(file),
+        }))
+      );
+      observed.a.status = "done";
+      render();
+    });
+
+    const trust = document.querySelector("#trust");
+    for (const type of ["dragenter", "dragover", "drop"]) {
+      trust.addEventListener(type, (event) => {
+        if (type === "dragover") event.preventDefault();
+        observed.b.isTrusted[type] = event.isTrusted;
+        render();
+      });
+    }
+
+    const items = document.querySelector("#items");
+    items.addEventListener("dragover", (event) => event.preventDefault());
+    items.addEventListener("drop", (event) => {
+      event.preventDefault();
+      observed.c.types = Array.from(event.dataTransfer.types);
+      observed.c.items = Array.from(event.dataTransfer.items, (item) => ({
+        kind: item.kind,
+        type: item.type,
+      }));
+      render();
+    });
+
+    const framework = document.querySelector("#framework");
+    framework.addEventListener("dragenter", () => {
+      observed.d.events.push("dragenter");
+      render();
+    });
+    framework.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      observed.d.events.push("dragover");
+      observed.d.dragoverPrevented = event.defaultPrevented;
+      render();
+    });
+    framework.addEventListener("drop", (event) => {
+      observed.d.events.push("drop");
+      if (observed.d.dragoverPrevented) {
+        event.preventDefault();
+        observed.d.accepted = true;
+        observed.d.value = event.dataTransfer.getData("text/plain");
+      }
+      render();
+    });
+
+    render();
+  </script>
+</body>
+</html>

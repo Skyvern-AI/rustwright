@@ -116,8 +116,8 @@ fn run() -> Result<bool, String> {
     let raw: Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid manifest JSON: {error}"))?;
     validate_raw_step_fields(&raw)?;
-    let manifest: Manifest = serde_json::from_value(raw)
-        .map_err(|error| format!("invalid manifest: {error}"))?;
+    let manifest: Manifest =
+        serde_json::from_value(raw).map_err(|error| format!("invalid manifest: {error}"))?;
     if manifest.version != 1 {
         return Err(format!(
             "unsupported manifest version {}; expected 1",

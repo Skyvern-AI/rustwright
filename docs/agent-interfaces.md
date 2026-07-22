@@ -1,16 +1,21 @@
 # Agent CLI
 
-`rustwright-agent` is a command-line interface for driving a Chromium browser
-over CDP from an AI agent or a shell. It is pure Python, adds no third-party
-runtime dependencies, and is installed with the package. Named sessions keep one
-browser alive across invocations, so a sequence of commands drives a single
-browser.
+`rustwright` is a command-line interface for driving a Chromium browser over CDP
+from an AI agent or a shell. It is pure Python, adds no third-party runtime
+dependencies, and is installed with the package. Named sessions keep one browser
+alive across invocations, so a sequence of commands drives a single browser.
 
 It is Chromium-only (Rustwright automates Chromium over CDP).
 
 > An MCP server for Rustwright is maintained as a separate, opt-in package
 > (`rustwright-mcp`) rather than part of the core wheel. This document covers the
 > CLI.
+
+## MCP stdio server
+
+Install both `rustwright` and `rustwright-mcp`, then start the server with
+`rustwright mcp`. Any arguments after `mcp`, including `--caps=...`, pass through
+to the MCP entry point unchanged.
 
 ## The accessibility snapshot and element refs
 
@@ -56,11 +61,11 @@ snapshot output as potentially sensitive.
 ## Using it
 
 ```bash
-rustwright-agent open https://example.com   # launch + navigate; prints a snapshot
-rustwright-agent snapshot                    # accessibility tree with refs
-rustwright-agent click e3                     # click by ref
-rustwright-agent fill e2 "user@example.com"  # fill by ref
-rustwright-agent close                        # shut the session down
+rustwright open https://example.com   # launch + navigate; prints a snapshot
+rustwright snapshot                    # accessibility tree with refs
+rustwright click e3                     # click by ref
+rustwright fill e2 "user@example.com"  # fill by ref
+rustwright close                        # shut the session down
 ```
 
 Chromium must be available. If you have not already installed a browser for
@@ -84,27 +89,27 @@ If a command process is interrupted mid-action, the session records that it may
 be mid-change; the next command clears its refs and re-snapshots before acting,
 so you never act on a ref from an uncertain state.
 
-The persistent CLI is supported on macOS and Linux.
+Persistent sessions require macOS or Linux; non-session commands remain available on Windows.
 
 ### Verbs
 
 | Verb | Example | Notes |
 |---|---|---|
-| `open [URL]` | `rustwright-agent open example.com` | Start/attach a session; optional navigate. |
-| `navigate URL` | `rustwright-agent navigate example.com` | Navigate the active tab. |
+| `open [URL]` | `rustwright open example.com` | Start/attach a session; optional navigate. |
+| `navigate URL` | `rustwright navigate example.com` | Navigate the active tab. |
 | `back` / `reload` | | History + reload. |
-| `snapshot` | `rustwright-agent snapshot --depth 6` | Print the accessibility tree with refs. |
-| `click REF` | `rustwright-agent click e3` | Click by ref. |
-| `fill REF TEXT` | `rustwright-agent fill e2 hello` | Clear and fill (text is not echoed back). |
+| `snapshot` | `rustwright snapshot --depth 6` | Print the accessibility tree with refs. |
+| `click REF` | `rustwright click e3` | Click by ref. |
+| `fill REF TEXT` | `rustwright fill e2 hello` | Clear and fill (text is not echoed back). |
 | `type REF TEXT` | | Type with optional `--delay-ms`. |
 | `select REF VALUE…` | | Select `<option>` values. |
 | `hover REF` / `press KEY` | | Hover / keyboard press. |
-| `wait …` | `rustwright-agent wait --text Loaded` | Wait for time / text / text-gone / load state. |
-| `tabs …` | `rustwright-agent tabs new example.com` | `list` / `new` / `use` / `close`. |
-| `screenshot [PATH]` | `rustwright-agent screenshot shot.png --full` | Save a screenshot. |
-| `status` | `rustwright-agent status` | Show whether a session is running (endpoint redacted). |
-| `close [--force]` | `rustwright-agent close --force` | Shut down; `--force` also clears a wedged session. |
-| `eval EXPR` | `rustwright-agent --allow-eval eval "document.title"` | Requires `--allow-eval`. |
+| `wait …` | `rustwright wait --text Loaded` | Wait for time / text / text-gone / load state. |
+| `tabs …` | `rustwright tabs new example.com` | `list` / `new` / `use` / `close`. |
+| `screenshot [PATH]` | `rustwright screenshot shot.png --full` | Save a screenshot. |
+| `status` | `rustwright status` | Show whether a session is running (endpoint redacted). |
+| `close [--force]` | `rustwright close --force` | Shut down; `--force` also clears a wedged session. |
+| `eval EXPR` | `rustwright --allow-eval eval "document.title"` | Requires `--allow-eval`. |
 
 Global flags include `--session NAME` (default `default`), `--json` (emit one
 JSON object per command), `--timeout-ms`, `--navigation-timeout-ms`, `--headed`,
@@ -130,7 +135,7 @@ Errors print `error[code]: message` on standard error.
 
 - **No browser found** — run `rustwright install chromium` once.
 - **`session_lost`** — the owner process is gone or the endpoint is unreachable.
-  Run `rustwright-agent close --force` to clear the session, then `open` again.
+  Run `rustwright close --force` to clear the session, then `open` again.
 - **`session_busy`** — another command holds the session lock; retry after it
   finishes.
 - **Stale ref** — take a new `snapshot` and use a ref from it.
@@ -140,3 +145,12 @@ Errors print `error[code]: message` on standard error.
 `find`/`read` helpers, batch execution, cookie/storage/network/console tools,
 PDF export, file upload, viewport resize, child-frame and shadow-DOM refs, and
 Windows support for the persistent CLI are planned follow-ups.
+
+## Differences from the playwright CLI
+
+`rustwright open` starts a persistent session; pass `--headed` before `open` for
+a visible window, and run `rustwright close` to end the session. `screenshot`
+keeps the two-argument, one-shot `screenshot <url> <file>` form and adds a
+session form, `screenshot [file]`. Emulation flags such as `--device` remain on
+the one-shot `screenshot` and `pdf` commands but no longer exist on `open`; use
+the Python API when full emulation is required.

@@ -33,6 +33,18 @@ void rw_string_free(char *s);
 void rw_bytes_free(uint8_t *buf, size_t len);
 
 /**
+ * Decode the core evaluate wire format into plain caller-owned JSON UTF-8.
+ *
+ * Array and object wrappers are removed, repeated non-cyclic references are
+ * duplicated, and references that form cycles become
+ * `{"__rustwright_cdp_cycle__": true}`. Leaf scalar tags are preserved for
+ * binding-specific native-value mapping. On success, free `*out_json` with
+ * rw_string_free. On failure, `*out_json` is NULL and rw_last_error describes
+ * the error.
+ */
+int32_t rw_decode_wire(const char *wire_json, char **out_json);
+
+/**
  * Discover Chromium and return its executable path.
  *
  * On success, `*out_path` is a caller-owned UTF-8 string, or NULL when no

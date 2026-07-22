@@ -210,6 +210,26 @@ pub unsafe extern "C" fn rw_bytes_free(buffer: *mut u8, len: usize) {
     }
 }
 
+/// Decodes the core evaluate wire format into caller-owned plain JSON.
+#[no_mangle]
+pub unsafe extern "C" fn rw_decode_wire(
+    wire_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    ffi_status(|| {
+        if out_json.is_null() {
+            return Err("out_json must not be NULL".to_string());
+        }
+        // SAFETY: Validated above; initialize before any fallible work.
+        unsafe { *out_json = ptr::null_mut() };
+        let wire_json = unsafe { required_str(wire_json, "wire_json")? };
+        let decoded = rw::decode_wire_value(wire_json).map_err(|error| error.to_string())?;
+        // SAFETY: Validated above.
+        unsafe { *out_json = owned_string(decoded)? };
+        Ok(())
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn rw_chromium_executable_path(out_path: *mut *mut c_char) -> c_int {
     ffi_status(|| {
@@ -532,5 +552,33 @@ pub unsafe extern "C" fn rw_page_free(page: *mut RwPage) {
             "panic at Rustwright C ABI boundary: {}",
             panic_message(payload)
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_wire_round_trip_uses_c_string_ownership() {
+        let wire = CString::new(
+            r#"{"__rustwright_cdp_array__":1,"items":[{"value":true},{"__rustwright_cdp_ref__":1}]}"#,
+        )
+        .unwrap();
+        let mut out = ptr::null_mut();
+
+        let status = unsafe { rw_decode_wire(wire.as_ptr(), &mut out) };
+
+        assert_eq!(status, 0);
+        assert!(!out.is_null());
+        let decoded = unsafe { CStr::from_ptr(out) }.to_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(decoded).unwrap(),
+            serde_json::json!([
+                {"value": true},
+                {"__rustwright_cdp_cycle__": true},
+            ])
+        );
+        unsafe { rw_string_free(out) };
     }
 }

@@ -11,8 +11,8 @@ crate-type = ["cdylib"]
 napi = { version = "=2.16.17", features = ["tokio_rt"] }
 napi-derive = "=2.16.13"
 rustwright_core = { package = "rustwright-core", path = "..", default-features = false }
-serde = { version = "=1.0.188", features = ["derive"] }
-serde_json = "=1.0.107"
+serde = { version = "=1.0.194", features = ["derive"] }
+serde_json = "=1.0.127"
 tokio = { version = "=1.52.3", features = ["rt-multi-thread"] }
 unicode-segmentation = "=1.10.1"
 

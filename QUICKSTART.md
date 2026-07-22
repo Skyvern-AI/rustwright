@@ -97,20 +97,22 @@ beta.
 
 ### 5. Drive a browser from an agent (CLI)
 
-Installing Rustwright also installs `rustwright-agent`, a CLI that keeps one
-browser alive across commands:
+The `rustwright` CLI keeps one browser alive across agent commands:
 
 ```bash
-rustwright-agent open example.com    # launch + navigate; prints an accessibility snapshot
-rustwright-agent snapshot            # accessibility tree with refs (e1, e2, …)
-rustwright-agent click e3            # act on an element by its ref
-rustwright-agent --json snapshot     # one JSON object, for scripting
-rustwright-agent close               # shut the session down
+rustwright open example.com    # launch + navigate; prints an accessibility snapshot
+rustwright snapshot            # accessibility tree with refs (e1, e2, …)
+rustwright click e3            # act on an element by its ref
+rustwright --json snapshot     # one JSON object, for scripting
+rustwright close               # shut the session down
 ```
+
+The CLI verbs and the MCP server's tools are the same surface.
 
 See [docs/agent-interfaces.md](docs/agent-interfaces.md) for the CLI verbs,
 configuration, threat model, and current scope. An MCP server for Rustwright is
 available as a separate, opt-in package (`rustwright-mcp`).
+After installing both packages, start the stdio server with `rustwright mcp`.
 
 ## Node.js (experimental)
 
