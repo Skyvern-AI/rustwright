@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub use rustwright_core::{CancelToken, RwError as Error};
+pub use rustwright_core::{ActionabilityError, CancelToken, RwError as Error};
 
 /// Result type returned by the native API.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -534,7 +534,8 @@ impl Page {
             .wait_for_load_state_with_cancel(state, timeout, cancel)
     }
 
-    /// Click the first element matching `selector`.
+    /// Strictly resolve `selector`, auto-wait for actionability, and click it
+    /// through Chromium's physical mouse input pipeline.
     pub fn click(&self, selector: &str, options: ActionOptions) -> Result<()> {
         self.click_with_cancel(selector, options, None)
     }
@@ -548,6 +549,59 @@ impl Page {
     ) -> Result<()> {
         self.inner
             .click_with_cancel(selector, options.timeout, cancel)
+    }
+
+    /// Strictly resolve `selector`, auto-wait, and physically double-click it.
+    pub fn dblclick(&self, selector: &str, options: ActionOptions) -> Result<()> {
+        self.dblclick_with_cancel(selector, options, None)
+    }
+
+    /// Double-click with an optional cancellation signal.
+    pub fn dblclick_with_cancel(
+        &self,
+        selector: &str,
+        options: ActionOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
+        self.inner
+            .dblclick_with_cancel(selector, options.timeout, cancel)
+    }
+
+    /// Click an element inside the first frame matching `frame_selector`.
+    pub fn click_in_frame(
+        &self,
+        frame_selector: &str,
+        selector: &str,
+        options: ActionOptions,
+    ) -> Result<()> {
+        self.click_in_frame_with_cancel(frame_selector, selector, options, None)
+    }
+
+    /// Click inside a frame with an optional cancellation signal.
+    pub fn click_in_frame_with_cancel(
+        &self,
+        frame_selector: &str,
+        selector: &str,
+        options: ActionOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
+        let locator = serde_json::json!({
+            "kind": "frame",
+            "frame_selector": frame_selector,
+            "frame_index": 0,
+            "frame_strict": true,
+            "inner": {
+                "kind": "css",
+                "selector": selector,
+            },
+        });
+        self.inner.click_locator_json_with_cancel(
+            &locator.to_string(),
+            0,
+            options.timeout,
+            true,
+            cancel,
+        )
     }
 
     /// Fill the first element matching `selector`.
@@ -621,19 +675,57 @@ impl Page {
         self.hover_with_cancel(selector, None)
     }
 
-    /// Hover with an optional cancellation signal.
+    /// Hover with an optional cancellation signal and a 30-second default timeout.
     pub fn hover_with_cancel(&self, selector: &str, cancel: Option<&CancelToken>) -> Result<()> {
-        self.inner.hover_with_cancel(selector, cancel)
+        self.hover_with_options_and_cancel(selector, ActionOptions::default(), cancel)
+    }
+
+    /// Hover with an operation timeout.
+    pub fn hover_with_options(&self, selector: &str, options: ActionOptions) -> Result<()> {
+        self.hover_with_options_and_cancel(selector, options, None)
+    }
+
+    /// Hover with an operation timeout and optional cancellation signal.
+    pub fn hover_with_options_and_cancel(
+        &self,
+        selector: &str,
+        options: ActionOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
+        self.inner
+            .hover_with_timeout_and_cancel(selector, options.timeout, cancel)
     }
 
     /// Check a checkbox through Chromium's native mouse input.
     pub fn check(&self, selector: &str) -> Result<()> {
-        self.inner.check(selector)
+        self.check_with_cancel(selector, ActionOptions::default(), None)
+    }
+
+    /// Check with an operation timeout and optional cancellation signal.
+    pub fn check_with_cancel(
+        &self,
+        selector: &str,
+        options: ActionOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
+        self.inner
+            .check_with_cancel(selector, options.timeout, cancel)
     }
 
     /// Uncheck a checkbox through Chromium's native mouse input.
     pub fn uncheck(&self, selector: &str) -> Result<()> {
-        self.inner.uncheck(selector)
+        self.uncheck_with_cancel(selector, ActionOptions::default(), None)
+    }
+
+    /// Uncheck with an operation timeout and optional cancellation signal.
+    pub fn uncheck_with_cancel(
+        &self,
+        selector: &str,
+        options: ActionOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
+        self.inner
+            .uncheck_with_cancel(selector, options.timeout, cancel)
     }
 
     /// Return the DOM-backed rendered inner text of an element.
