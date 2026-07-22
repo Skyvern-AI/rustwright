@@ -13,7 +13,7 @@ use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 #[cfg(feature = "python")]
 use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -53,8 +53,14 @@ pub struct CancelToken {
 #[derive(Debug, Default)]
 struct CancelTokenInner {
     cancelled: Arc<AtomicBool>,
+    physical_action_state: AtomicU8,
+    physical_action_ever_committed: AtomicBool,
     changed: tokio::sync::Notify,
 }
+
+const PHYSICAL_ACTION_ACTIVE: u8 = 0;
+const PHYSICAL_ACTION_CANCELLED: u8 = 1;
+const PHYSICAL_ACTION_COMMITTED: u8 = 2;
 
 impl CancelToken {
     pub fn new() -> Self {
@@ -62,13 +68,72 @@ impl CancelToken {
     }
 
     pub fn cancel(&self) {
+        let _ = self.try_cancel();
+    }
+
+    /// Attempt to cancel before a physical pointer action commits.
+    ///
+    /// Returns `false` if cancellation already won or physical dispatch has
+    /// committed, making the cancellation boundary atomic for callers that
+    /// need to report whether cancellation took effect. The persistent
+    /// cancellation signal is recorded either way so this token remains
+    /// cancelled for later operations.
+    pub fn try_cancel(&self) -> bool {
         if !self.inner.cancelled.swap(true, Ordering::SeqCst) {
             self.inner.changed.notify_waiters();
         }
+        let won_physical_action_arbitration = self
+            .inner
+            .physical_action_state
+            .compare_exchange(
+                PHYSICAL_ACTION_ACTIVE,
+                PHYSICAL_ACTION_CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok();
+        won_physical_action_arbitration
     }
 
+    /// Whether cancellation has ever been requested for this token.
     pub fn is_cancelled(&self) -> bool {
         self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Whether any physical pointer action has crossed its cancellation boundary.
+    ///
+    /// This observation remains true for request-level result ownership. The
+    /// separate per-action arbitration state is reset after each dispatch.
+    pub fn is_physical_action_committed(&self) -> bool {
+        self.inner
+            .physical_action_ever_committed
+            .load(Ordering::SeqCst)
+    }
+
+    fn commit_physical_action(&self) -> bool {
+        let committed = self
+            .inner
+            .physical_action_state
+            .compare_exchange(
+                PHYSICAL_ACTION_ACTIVE,
+                PHYSICAL_ACTION_COMMITTED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok();
+        if committed {
+            self.inner
+                .physical_action_ever_committed
+                .store(true, Ordering::SeqCst);
+        }
+        committed
+    }
+
+    fn begin_physical_action(&self) -> RwResult<PhysicalActionCommitGuard<'_>> {
+        if self.is_cancelled() || !self.commit_physical_action() {
+            return Err(RwError::Cancelled);
+        }
+        Ok(PhysicalActionCommitGuard { token: self })
     }
 
     fn atomic_flag(&self) -> Arc<AtomicBool> {
@@ -87,6 +152,36 @@ impl CancelToken {
             changed.await;
         }
     }
+}
+
+struct PhysicalActionCommitGuard<'a> {
+    token: &'a CancelToken,
+}
+
+impl Drop for PhysicalActionCommitGuard<'_> {
+    fn drop(&mut self) {
+        let reset = self.token.inner.physical_action_state.compare_exchange(
+            PHYSICAL_ACTION_COMMITTED,
+            PHYSICAL_ACTION_ACTIVE,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        debug_assert!(
+            reset.is_ok(),
+            "only the physical-action committer may reset its arbitration state"
+        );
+    }
+}
+
+async fn dispatch_committed_physical_action<T, Fut>(
+    cancel: Option<&CancelToken>,
+    dispatch: Fut,
+) -> RwResult<T>
+where
+    Fut: Future<Output = RwResult<T>>,
+{
+    let _commit = cancel.map(CancelToken::begin_physical_action).transpose()?;
+    dispatch.await
 }
 
 async fn cancelable<T, Fut>(token: Option<CancelToken>, future: Fut) -> RwResult<T>
@@ -1216,6 +1311,25 @@ impl std::fmt::Display for ActionTimeoutError {
 impl std::error::Error for ActionTimeoutError {}
 const MAX_FRAME_TREE_DEPTH: usize = 256;
 
+/// A terminal element state observed by an auto-waiting physical action.
+///
+/// Transport deadlines and caller cancellation remain [`RwError::Timeout`] and
+/// [`RwError::Cancelled`]; this enum reports which element precondition was
+/// still blocking the action when its actionability budget expired.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum ActionabilityError {
+    #[error("element is not visible")]
+    NotVisible,
+    #[error("element did not become stable")]
+    NotStable,
+    #[error("element is not receiving pointer events")]
+    NotReceivingEvents,
+    #[error("element is disabled")]
+    Disabled,
+    #[error("element was detached while waiting for actionability")]
+    Detached,
+}
+
 #[derive(Debug, Error)]
 pub enum RwError {
     #[error("{0}")]
@@ -1238,6 +1352,8 @@ pub enum RwError {
     PageCrashed,
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("actionability check failed: {0}")]
+    Actionability(#[from] ActionabilityError),
     #[error(transparent)]
     ActionTimeout(#[from] ActionTimeoutError),
     #[error(transparent)]
@@ -1765,6 +1881,8 @@ fn map_chromium_permissions(permissions: &Value, fallback: bool) -> RwResult<Val
 mod tests {
     use super::*;
 
+    use std::sync::atomic::AtomicUsize;
+
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     #[test]
@@ -1851,6 +1969,147 @@ mod tests {
     }
 
     #[test]
+    fn cancel_and_physical_commit_have_one_atomic_winner() {
+        let cancelled_first = CancelToken::new();
+        assert!(cancelled_first.try_cancel());
+        assert!(!cancelled_first.commit_physical_action());
+        assert!(cancelled_first.is_cancelled());
+        assert!(!cancelled_first.is_physical_action_committed());
+
+        let committed_first = CancelToken::new();
+        assert!(committed_first.commit_physical_action());
+        assert!(!committed_first.try_cancel());
+        assert!(committed_first.is_cancelled());
+        assert!(committed_first.is_physical_action_committed());
+    }
+
+    #[tokio::test]
+    async fn late_cancellation_wakes_waiter_and_cancels_a_subsequent_operation() {
+        let token = CancelToken::new();
+        assert!(token.commit_physical_action());
+
+        let waiting = token.clone();
+        let (waiting_tx, waiting_rx) = oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let notified = waiting.inner.changed.notified();
+            waiting_tx.send(()).unwrap();
+            notified.await;
+            waiting.is_cancelled()
+        });
+        waiting_rx.await.unwrap();
+
+        assert!(!token.try_cancel());
+        assert!(token.is_cancelled());
+        assert!(tokio::time::timeout(Duration::from_millis(250), waiter)
+            .await
+            .expect("late cancellation waiter should wake")
+            .unwrap());
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            cancelable(Some(token), std::future::pending::<RwResult<()>>()),
+        )
+        .await
+        .expect("a later operation should observe persistent cancellation");
+        assert!(matches!(result, Err(RwError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn sequential_physical_actions_reuse_one_uncancelled_token() {
+        let token = CancelToken::new();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..2 {
+            let dispatches = Arc::clone(&dispatches);
+            dispatch_committed_physical_action(Some(&token), async move {
+                dispatches.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(dispatches.load(Ordering::SeqCst), 2);
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_physical_actions_blocks_the_next_dispatch() {
+        let token = CancelToken::new();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+
+        let first_dispatches = Arc::clone(&dispatches);
+        dispatch_committed_physical_action(Some(&token), async move {
+            first_dispatches.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert!(token.try_cancel());
+        let second_dispatches = Arc::clone(&dispatches);
+        let result = dispatch_committed_physical_action(Some(&token), async move {
+            second_dispatches.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(result, Err(RwError::Cancelled)));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_committed_action_blocks_the_next_dispatch() {
+        let token = CancelToken::new();
+        let action_token = token.clone();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let action_dispatches = Arc::clone(&dispatches);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let action = tokio::spawn(async move {
+            dispatch_committed_physical_action(Some(&action_token), async move {
+                action_dispatches.fetch_add(1, Ordering::SeqCst);
+                started_tx.send(()).unwrap();
+                finish_rx.await.unwrap();
+                Ok(())
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+
+        assert!(!token.try_cancel());
+        assert!(token.is_cancelled());
+        finish_tx.send(()).unwrap();
+        action.await.unwrap().unwrap();
+
+        let next_dispatches = Arc::clone(&dispatches);
+        let result = dispatch_committed_physical_action(Some(&token), async move {
+            next_dispatches.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert!(matches!(result, Err(RwError::Cancelled)));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn command_timeout_without_override_is_thirty_seconds() {
+        assert_eq!(BrowserInner::command_timeout(None), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn committed_click_ignores_release_confirmation_timeout() {
+        assert_eq!(RELEASE_CLEANUP_TIMEOUT, Duration::from_secs(5));
+        assert!(committed_click_dispatch_result(
+            Ok(Value::Null),
+            Ok(()),
+            Err(RwError::Timeout(5_000))
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn locator_wait_context_loss_classification_is_narrow() {
         for message in [
             "Inspected target navigated or closed",
@@ -1881,6 +2140,111 @@ mod tests {
             "Execution context was destroyed.".to_string()
         )));
         assert!(!is_locator_wait_context_loss(&RwError::Timeout(100)));
+    }
+
+    #[test]
+    fn actionability_terminal_states_have_distinct_errors() {
+        let actionable = ActionabilityState {
+            count: 1,
+            strict_violation: false,
+            attached: true,
+            visible: true,
+            enabled: true,
+            stable: true,
+            receives_events: true,
+            point_x: None,
+            point_y: None,
+            rect_x: None,
+            rect_y: None,
+        };
+        let cases = [
+            (
+                ActionabilityState {
+                    attached: false,
+                    ..actionable
+                },
+                ActionabilityError::Detached,
+            ),
+            (
+                ActionabilityState {
+                    visible: false,
+                    ..actionable
+                },
+                ActionabilityError::NotVisible,
+            ),
+            (
+                ActionabilityState {
+                    enabled: false,
+                    ..actionable
+                },
+                ActionabilityError::Disabled,
+            ),
+            (
+                ActionabilityState {
+                    stable: false,
+                    ..actionable
+                },
+                ActionabilityError::NotStable,
+            ),
+            (
+                ActionabilityState {
+                    receives_events: false,
+                    ..actionable
+                },
+                ActionabilityError::NotReceivingEvents,
+            ),
+        ];
+
+        for (state, expected) in cases {
+            assert!(matches!(
+                terminal_actionability_error(Some(&state), Duration::from_millis(10), true),
+                RwError::Actionability(actual) if actual == expected
+            ));
+        }
+        assert!(matches!(
+            terminal_actionability_error(None, Duration::from_millis(10), true),
+            RwError::Timeout(10)
+        ));
+        assert!(matches!(
+            terminal_actionability_error(
+                Some(&ActionabilityState {
+                    enabled: false,
+                    ..actionable
+                }),
+                Duration::from_millis(10),
+                false,
+            ),
+            RwError::Timeout(10)
+        ));
+    }
+
+    #[test]
+    fn hit_tested_point_translation_preserves_clamping_and_frame_offsets() {
+        let partially_offscreen = HitTestedLocatorPoint {
+            point: ActionabilityPoint { x: 0.0, y: 142.0 },
+            rect: ActionabilityRect {
+                x: -1000.0,
+                y: 120.0,
+            },
+        };
+        assert_eq!(
+            translate_hit_tested_point(-1000.0, 120.0, partially_offscreen),
+            (0.0, 142.0)
+        );
+
+        let same_process_frame = HitTestedLocatorPoint {
+            point: ActionabilityPoint { x: 190.0, y: 104.0 },
+            rect: ActionabilityRect { x: 110.0, y: 80.0 },
+        };
+        assert_eq!(
+            translate_hit_tested_point(250.0, 170.0, same_process_frame),
+            (330.0, 194.0)
+        );
+
+        assert_eq!(
+            translate_hit_tested_point(110.0, 80.0, same_process_frame),
+            (190.0, 104.0)
+        );
     }
 
     #[test]
@@ -6960,6 +7324,204 @@ impl OperationDeadline {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct ActionabilityState {
+    count: usize,
+    strict_violation: bool,
+    attached: bool,
+    visible: bool,
+    enabled: bool,
+    stable: bool,
+    receives_events: bool,
+    point_x: Option<f64>,
+    point_y: Option<f64>,
+    rect_x: Option<f64>,
+    rect_y: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct ActionabilityPoint {
+    x: f64,
+    y: f64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct ActionabilityRect {
+    x: f64,
+    y: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HitTestedLocatorPoint {
+    point: ActionabilityPoint,
+    rect: ActionabilityRect,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PhysicalPointerAction {
+    Click { click_count: i64 },
+    Hover,
+}
+
+impl PhysicalPointerAction {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Click { click_count: 2 } => "double click",
+            Self::Click { .. } => "click",
+            Self::Hover => "hover",
+        }
+    }
+
+    fn requires_enabled(self) -> bool {
+        !matches!(self, Self::Hover)
+    }
+}
+
+fn actionability_probe_body(
+    strict: bool,
+    position_x: Option<f64>,
+    position_y: Option<f64>,
+) -> String {
+    let strict = if strict { "true" } else { "false" };
+    let position_x = position_x.map_or_else(|| "null".to_owned(), |value| value.to_string());
+    let position_y = position_y.map_or_else(|| "null".to_owned(), |value| value.to_string());
+    format!(
+        r#"
+const strict = {strict};
+const positionX = {position_x};
+const positionY = {position_y};
+if (strict && matches.length > 1) {{
+  return {{
+    count: matches.length,
+    strict_violation: true,
+    attached: false,
+    visible: false,
+    enabled: false,
+    stable: false,
+    receives_events: false,
+  }};
+}}
+const ownerDocument = el ? (el.ownerDocument || document) : document;
+const ownerWindow = ownerDocument.defaultView || window;
+const deepElementFromPoint = (x, y) => {{
+  let hit = ownerDocument.elementFromPoint(x, y);
+  while (hit && hit.shadowRoot) {{
+    const nested = hit.shadowRoot.elementFromPoint(x, y);
+    if (!nested || nested === hit) break;
+    hit = nested;
+  }}
+  return hit;
+}};
+const targetContains = node => {{
+  let current = node;
+  while (current) {{
+    if (current === el) return true;
+    const root = current.getRootNode ? current.getRootNode() : null;
+    current = current.parentElement || (root && root.host) || null;
+  }}
+  return false;
+}};
+const snapshot = () => {{
+  const attached = !!el && el.isConnected;
+  const rect = attached ? el.getBoundingClientRect() : null;
+  const style = attached ? ownerWindow.getComputedStyle(el) : null;
+  const visible = !!(
+    attached &&
+    style &&
+    style.display !== 'none' &&
+    style.visibility !== 'hidden' &&
+    rect &&
+    rect.width > 0 &&
+    rect.height > 0
+  );
+  const enabled = attached && !disabledState(el);
+  const point = visible ? {{
+    x: Math.min(
+      Math.max(rect.left + (positionX === null ? rect.width / 2 : positionX), 0),
+      Math.max(ownerWindow.innerWidth - 1, 0)
+    ),
+    y: Math.min(
+      Math.max(rect.top + (positionY === null ? rect.height / 2 : positionY), 0),
+      Math.max(ownerWindow.innerHeight - 1, 0)
+    ),
+  }} : null;
+  const hit = point ? deepElementFromPoint(point.x, point.y) : null;
+  return {{
+    count: matches.length,
+    strict_violation: false,
+    attached,
+    visible,
+    enabled,
+    stable: false,
+    receives_events: !!(visible && hit && targetContains(hit)),
+    point_x: point ? point.x : null,
+    point_y: point ? point.y : null,
+    rect_x: rect ? Number(rect.left) : null,
+    rect_y: rect ? Number(rect.top) : null,
+    rect: rect ? {{
+      x: Number(rect.left),
+      y: Number(rect.top),
+      width: Number(rect.width),
+      height: Number(rect.height),
+    }} : null,
+  }};
+}};
+if (el && el.isConnected) {{
+  el.scrollIntoView({{ block: 'center', inline: 'center', behavior: 'instant' }});
+}}
+const first = snapshot();
+if (!first.attached) return first;
+return new Promise(resolve => {{
+  let settled = false;
+  const settle = () => {{
+    if (settled) return;
+    settled = true;
+    const second = snapshot();
+    const left = first.rect;
+    const right = second.rect;
+    second.stable = !!left && !!right && ['x', 'y', 'width', 'height'].every(
+      key => Math.abs(Number(left[key] || 0) - Number(right[key] || 0)) <= 0.5
+    );
+    resolve(second);
+  }};
+  // Two animation frames detect motion between samples on a live page and win this race
+  // in ~one frame there. But Chromium pauses requestAnimationFrame on hidden/occluded
+  // pages, which would otherwise hang this probe until the operation deadline; a timer
+  // still fires there (throttled at worst), so it bounds the wait and lets a static
+  // element on a background page be judged stable instead of stalling actionability.
+  ownerWindow.requestAnimationFrame(() => ownerWindow.requestAnimationFrame(settle));
+  ownerWindow.setTimeout(settle, 300);
+}});
+"#
+    )
+}
+
+fn terminal_actionability_error(
+    state: Option<&ActionabilityState>,
+    timeout: Duration,
+    requires_enabled: bool,
+) -> RwError {
+    let Some(state) = state else {
+        return RwError::Timeout(duration_millis_u64(timeout));
+    };
+    if !state.attached {
+        return ActionabilityError::Detached.into();
+    }
+    if !state.visible {
+        return ActionabilityError::NotVisible.into();
+    }
+    if requires_enabled && !state.enabled {
+        return ActionabilityError::Disabled.into();
+    }
+    if !state.stable {
+        return ActionabilityError::NotStable.into();
+    }
+    if !state.receives_events {
+        return ActionabilityError::NotReceivingEvents.into();
+    }
+    RwError::Timeout(duration_millis_u64(timeout))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_mouse_click_sequence_in_session(
     client: &CdpClient,
@@ -6993,7 +7555,7 @@ async fn dispatch_mouse_click_sequence_in_session(
     }
 
     for count in 1..=click_count.max(0) {
-        client
+        let press_result = client
             .send(
                 "Input.dispatchMouseEvent",
                 mouse_event_payload(
@@ -7008,18 +7570,25 @@ async fn dispatch_mouse_click_sequence_in_session(
                 Some(session_id),
                 deadline.remaining()?,
             )
-            .await?;
-        if delay_ms > 0.0 {
-            tokio::time::timeout(
-                deadline.remaining()?,
-                tokio::time::sleep(Duration::from_secs_f64(delay_ms / 1000.0)),
-            )
-            .await
-            .map_err(|_| {
-                RwError::Timeout(deadline.timeout.as_millis().min(u128::from(u64::MAX)) as u64)
-            })?;
-        }
-        client
+            .await;
+
+        // A timed-out or failed response is ambiguous: Chromium may already
+        // have accepted the press. Always send a release with an independent
+        // cleanup budget before returning from this owned physical phase.
+        let delay_result = if press_result.is_ok() && delay_ms > 0.0 {
+            match deadline.remaining() {
+                Ok(remaining) => tokio::time::timeout(
+                    remaining,
+                    tokio::time::sleep(Duration::from_secs_f64(delay_ms / 1000.0)),
+                )
+                .await
+                .map_err(|_| RwError::Timeout(duration_millis_u64(deadline.timeout))),
+                Err(error) => Err(error),
+            }
+        } else {
+            Ok(())
+        };
+        let release_result = client
             .send(
                 "Input.dispatchMouseEvent",
                 mouse_event_payload(
@@ -7032,9 +7601,11 @@ async fn dispatch_mouse_click_sequence_in_session(
                     modifiers,
                 ),
                 Some(session_id),
-                deadline.remaining()?,
+                RELEASE_CLEANUP_TIMEOUT,
             )
-            .await?;
+            .await
+            .map(|_| ());
+        committed_click_dispatch_result(press_result, delay_result, release_result)?;
         if count < click_count && delay_ms > 0.0 {
             tokio::time::timeout(
                 deadline.remaining()?,
@@ -7047,6 +7618,22 @@ async fn dispatch_mouse_click_sequence_in_session(
         }
     }
     Ok(())
+}
+
+const RELEASE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn committed_click_dispatch_result(
+    press_result: RwResult<Value>,
+    delay_result: RwResult<()>,
+    release_result: RwResult<()>,
+) -> RwResult<()> {
+    if let Err(error) = release_result {
+        eprintln!(
+            "rustwright: mouse release cleanup received no confirmation after committed click: {error}"
+        );
+    }
+    press_result?;
+    delay_result
 }
 
 #[derive(Debug)]
@@ -7065,13 +7652,22 @@ async fn resolve_locator_point(
     index: usize,
     position_x: Option<f64>,
     position_y: Option<f64>,
+    hit_tested: Option<HitTestedLocatorPoint>,
+    strict: bool,
     deadline: OperationDeadline,
 ) -> RwResult<ResolvedLocatorPoint> {
     let resolution = resolve_locator_session(Arc::clone(&page), locator_json, deadline).await?;
+    let strict_guard = if strict {
+        "if (matches.length > 1) throw new Error(`strict mode violation: locator resolved to ${matches.length} elements while trying to click`);"
+    } else {
+        ""
+    };
     let expression = locator_script(
         &resolution.locator_json,
         index,
-        "if (!el) throw new Error('No element matches locator'); return el;",
+        &format!(
+            "{strict_guard} if (!el) throw new Error('No element matches locator'); return el;"
+        ),
     );
     let remote = if let Some(frame_id) = resolution.frame_id.as_deref() {
         evaluate_handle_expression_in_frame_context(
@@ -7119,6 +7715,11 @@ async fn resolve_locator_point(
             .await;
     }
     let box_model = box_model?;
+    // DOM.getBoxModel coordinates are relative to the CDP target that owns the
+    // execution context. A same-process child frame shares the page target, so
+    // its quad already includes the frame-owner offset. An OOPIF has its own
+    // target-local viewport, so keep its local quad and dispatch input through
+    // that OOPIF session rather than incorrectly adding the owner offset twice.
     let quad = box_model
         .pointer("/model/border")
         .and_then(Value::as_array)
@@ -7138,8 +7739,15 @@ async fn resolve_locator_point(
     let max_x = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let min_y = ys.iter().copied().fold(f64::INFINITY, f64::min);
     let max_y = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let x = position_x.map_or((min_x + max_x) / 2.0, |offset| min_x + offset);
-    let y = position_y.map_or((min_y + max_y) / 2.0, |offset| min_y + offset);
+    let (x, y) = hit_tested.map_or_else(
+        || {
+            (
+                position_x.map_or((min_x + max_x) / 2.0, |offset| min_x + offset),
+                position_y.map_or((min_y + max_y) / 2.0, |offset| min_y + offset),
+            )
+        },
+        |hit_tested| translate_hit_tested_point(min_x, min_y, hit_tested),
+    );
     Ok(ResolvedLocatorPoint {
         session_id: resolution.session_id,
         frame_id: resolution.frame_id,
@@ -7148,6 +7756,22 @@ async fn resolve_locator_point(
         x,
         y,
     })
+}
+
+fn translate_hit_tested_point(
+    target_min_x: f64,
+    target_min_y: f64,
+    hit_tested: HitTestedLocatorPoint,
+) -> (f64, f64) {
+    // The probe runs in the element's owner frame. DOM.getBoxModel uses the
+    // owning CDP target's coordinates, which include the frame-owner offset
+    // for an in-process iframe but remain frame-local for an OOPIF. Applying
+    // the box-vs-client-rect delta preserves the exact point that passed hit
+    // testing in both cases instead of recomputing another point.
+    (
+        hit_tested.point.x + (target_min_x - hit_tested.rect.x),
+        hit_tested.point.y + (target_min_y - hit_tested.rect.y),
+    )
 }
 
 async fn evaluate_resolved_locator_body(
@@ -7176,6 +7800,337 @@ async fn evaluate_resolved_locator_body(
         .await?
     };
     Ok(serde_json::from_str(&json)?)
+}
+
+async fn evaluate_actionability_probe(
+    page: &Arc<PageInner>,
+    locator_json: &str,
+    index: usize,
+    position_x: Option<f64>,
+    position_y: Option<f64>,
+    strict: bool,
+    deadline: OperationDeadline,
+) -> RwResult<ActionabilityState> {
+    let resolution = resolve_locator_session(Arc::clone(page), locator_json, deadline).await?;
+    let expression = locator_script(
+        &resolution.locator_json,
+        index,
+        &actionability_probe_body(strict, position_x, position_y),
+    );
+    let value =
+        evaluate_locator_resolution(page, &resolution, expression, deadline, Duration::ZERO)
+            .await?;
+    let value = serde_json::from_str::<Value>(&value)?;
+    let state = value.get("entries").cloned().unwrap_or(value);
+    Ok(serde_json::from_value(state)?)
+}
+
+fn is_transient_actionability_target_error(error: &RwError) -> bool {
+    if is_locator_wait_context_loss(error) {
+        return true;
+    }
+    let message = match error {
+        RwError::Cdp { message, .. } | RwError::Message(message) => message.to_ascii_lowercase(),
+        _ => return false,
+    };
+    [
+        "could not find object",
+        "no node with given id",
+        "does not have a layout object",
+        "could not compute box model",
+        "locator did not resolve to an element",
+        "no element matches locator",
+    ]
+    .iter()
+    .any(|fragment| message.contains(fragment))
+}
+
+async fn wait_for_actionable_locator_point(
+    page: Arc<PageInner>,
+    locator_json: &str,
+    index: usize,
+    position_x: Option<f64>,
+    position_y: Option<f64>,
+    timeout: Duration,
+    strict: bool,
+    action: PhysicalPointerAction,
+    deadline: OperationDeadline,
+) -> RwResult<ResolvedLocatorPoint> {
+    let mut last_state = None;
+    let requires_enabled = action.requires_enabled();
+
+    loop {
+        if tokio::time::Instant::now() >= deadline.at {
+            return Err(terminal_actionability_error(
+                last_state.as_ref(),
+                timeout,
+                requires_enabled,
+            ));
+        }
+
+        let state = match evaluate_actionability_probe(
+            &page,
+            locator_json,
+            index,
+            position_x,
+            position_y,
+            strict,
+            deadline,
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(RwError::Timeout(_)) if last_state.is_some() => {
+                return Err(terminal_actionability_error(
+                    last_state.as_ref(),
+                    timeout,
+                    requires_enabled,
+                ));
+            }
+            Err(error) if is_locator_wait_context_loss(&error) => {
+                verify_locator_wait_target_liveness(&page, deadline).await?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        if state.strict_violation {
+            return Err(RwError::Message(format!(
+                "strict mode violation: locator resolved to {} elements while trying to {}",
+                state.count,
+                action.name(),
+            )));
+        }
+
+        let hit_tested = match (state.point_x, state.point_y, state.rect_x, state.rect_y) {
+            (Some(point_x), Some(point_y), Some(rect_x), Some(rect_y)) => {
+                Some(HitTestedLocatorPoint {
+                    point: ActionabilityPoint {
+                        x: point_x,
+                        y: point_y,
+                    },
+                    rect: ActionabilityRect {
+                        x: rect_x,
+                        y: rect_y,
+                    },
+                })
+            }
+            _ => None,
+        };
+        let actionable = state.attached
+            && state.visible
+            && (!requires_enabled || state.enabled)
+            && state.stable
+            && state.receives_events
+            && hit_tested.is_some();
+        last_state = Some(state);
+        if actionable {
+            match resolve_locator_point(
+                Arc::clone(&page),
+                locator_json,
+                index,
+                position_x,
+                position_y,
+                hit_tested,
+                strict,
+                deadline,
+            )
+            .await
+            {
+                Ok(resolved) => return Ok(resolved),
+                Err(error) if is_transient_actionability_target_error(&error) => {
+                    if let Some(state) = last_state.as_mut() {
+                        state.attached = false;
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+        }
+
+        let remaining = match deadline.remaining() {
+            Ok(remaining) => remaining,
+            Err(_) => {
+                return Err(terminal_actionability_error(
+                    last_state.as_ref(),
+                    timeout,
+                    requires_enabled,
+                ));
+            }
+        };
+        tokio::time::sleep(remaining.min(Duration::from_millis(10))).await;
+    }
+}
+
+async fn dispatch_actionable_pointer_action(
+    page: &Arc<PageInner>,
+    resolved: &ResolvedLocatorPoint,
+    action: PhysicalPointerAction,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    let mut events = page.browser.client.subscribe();
+    match action {
+        PhysicalPointerAction::Click { click_count } => {
+            dispatch_mouse_click_sequence_in_session(
+                &page.browser.client,
+                &resolved.session_id,
+                resolved.x,
+                resolved.y,
+                resolved.x,
+                resolved.y,
+                1,
+                "left",
+                1,
+                click_count,
+                0.0,
+                0,
+                0,
+                deadline,
+            )
+            .await?;
+        }
+        PhysicalPointerAction::Hover => {
+            dispatch_mouse_move_sequence_in_session(
+                &page.browser.client,
+                &resolved.session_id,
+                0.0,
+                0.0,
+                resolved.x,
+                resolved.y,
+                1,
+                0,
+                0,
+                deadline,
+            )
+            .await?;
+        }
+    }
+    settle_after_pointer_action(page, &resolved.session_id, &mut events, deadline).await
+}
+
+async fn page_pointer_actionable_async(
+    page: Arc<PageInner>,
+    locator_json: String,
+    index: usize,
+    timeout: Duration,
+    strict: bool,
+    action: PhysicalPointerAction,
+    cancel: Option<CancelToken>,
+) -> RwResult<()> {
+    let deadline = OperationDeadline::new(timeout);
+    let resolved = cancelable(
+        cancel.clone(),
+        wait_for_actionable_locator_point(
+            Arc::clone(&page),
+            &locator_json,
+            index,
+            None,
+            None,
+            timeout,
+            strict,
+            action,
+            deadline,
+        ),
+    )
+    .await?;
+
+    // Cancellation is intentionally observed only before this handoff. Once
+    // actionability resolves, the physical action is committed: dispatch and
+    // its ordering settlement are owned by this future. Late cancellation is
+    // persistent for later operations but cannot make this action return
+    // Cancelled for an accepted press.
+    dispatch_committed_physical_action(
+        cancel.as_ref(),
+        dispatch_actionable_pointer_action(&page, &resolved, action, deadline),
+    )
+    .await
+}
+
+async fn page_set_checked_actionable_async(
+    page: Arc<PageInner>,
+    locator_json: String,
+    timeout: Duration,
+    strict: bool,
+    checked: bool,
+    cancel: Option<CancelToken>,
+) -> RwResult<()> {
+    let deadline = OperationDeadline::new(timeout);
+    let action = PhysicalPointerAction::Click { click_count: 1 };
+    let resolved = cancelable(cancel.clone(), async {
+        let resolved = wait_for_actionable_locator_point(
+            Arc::clone(&page),
+            &locator_json,
+            0,
+            None,
+            None,
+            timeout,
+            strict,
+            action,
+            deadline,
+        )
+        .await?;
+        let state = evaluate_resolved_locator_body(
+            &page,
+            &resolved,
+            &format!("return JSON.stringify(({NATIVE_CHECKED_STATE_JS})(el));"),
+            deadline,
+        )
+        .await?;
+        let encoded = state
+            .as_str()
+            .ok_or_else(|| RwError::Message("invalid checked state".to_string()))?;
+        let state = serde_json::from_str::<Value>(encoded)?;
+        if !state.get("valid").and_then(Value::as_bool).unwrap_or(false) {
+            return Err(RwError::Message(
+                "element is not a checkbox, radio button, or checked ARIA control".to_string(),
+            ));
+        }
+        let current = state
+            .get("checked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if current == checked {
+            return Ok(None);
+        }
+        if !checked
+            && state
+                .get("native_radio")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            return Err(RwError::Message(
+                "radio buttons cannot be unchecked directly".to_string(),
+            ));
+        }
+        Ok(Some(resolved))
+    })
+    .await?;
+    let Some(resolved) = resolved else {
+        return Ok(());
+    };
+
+    // As with click/double-click, cancellation is too late after preparation:
+    // the native click, release cleanup, settlement, and state verification
+    // complete as one owned phase.
+    dispatch_committed_physical_action(cancel.as_ref(), async {
+        dispatch_actionable_pointer_action(&page, &resolved, action, deadline).await?;
+        let updated = evaluate_resolved_locator_body(
+            &page,
+            &resolved,
+            &format!("return ({NATIVE_CHECKED_STATE_JS})(el).checked;"),
+            deadline,
+        )
+        .await?
+        .as_bool()
+        .unwrap_or(false);
+        if updated != checked {
+            return Err(RwError::Message(
+                "native click did not change the checked state".to_string(),
+            ));
+        }
+        Ok(())
+    })
+    .await
 }
 
 async fn wait_for_drag_intercepted(
@@ -7299,7 +8254,7 @@ async fn dispatch_mouse_move_sequence_in_session(
 async fn pointer_action_ordering_barrier(
     client: &CdpClient,
     session_id: &str,
-    mut events: broadcast::Receiver<Value>,
+    events: &mut broadcast::Receiver<Value>,
     deadline: OperationDeadline,
 ) -> RwResult<()> {
     let barrier = client.send(
@@ -7332,6 +8287,38 @@ async fn pointer_action_ordering_barrier(
             },
             result = &mut barrier => return result.map(|_| ()),
         }
+    }
+}
+
+async fn settle_after_pointer_action(
+    page: &PageInner,
+    session_id: &str,
+    events: &mut broadcast::Receiver<Value>,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    match pointer_action_ordering_barrier(&page.browser.client, session_id, events, deadline).await
+    {
+        Ok(()) => Ok(()),
+        Err(error)
+            if session_id == page.session_id
+                && (is_locator_wait_context_loss(&error) || is_page_not_attached_error(&error)) =>
+        {
+            settle_history_navigation(
+                &page.browser.client,
+                events,
+                session_id,
+                "domcontentloaded",
+                deadline,
+            )
+            .await
+        }
+        // An OOPIF can replace its target session synchronously from the click
+        // handler. Context loss proves the input reached that renderer; the page
+        // frame-session listener owns the remap and subsequent locator actions.
+        Err(error) if session_id != page.session_id && is_locator_wait_context_loss(&error) => {
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -10155,6 +11142,8 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                     locator_index,
                     position.and_then(|value| value.get("x")).and_then(Value::as_f64),
                     position.and_then(|value| value.get("y")).and_then(Value::as_f64),
+                    None,
+                    false,
                     deadline,
                 )
                 .await?;
@@ -10165,7 +11154,7 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                 let steps = integer("steps", 1).max(1) as u32;
                 let initial_buttons = integer("initialButtons", 0);
                 let modifiers = integer("modifiers", 0);
-                let detach_events = client.subscribe();
+                let mut detach_events = client.subscribe();
 
                 match kind {
                     "click" => {
@@ -10251,6 +11240,8 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                             integer("targetIndex", 0).max(0) as usize,
                             target_position.and_then(|value| value.get("x")).and_then(Value::as_f64),
                             target_position.and_then(|value| value.get("y")).and_then(Value::as_f64),
+                            None,
+                            false,
                             deadline,
                         )
                         .await?;
@@ -10443,10 +11434,10 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                     }
                 }
 
-                pointer_action_ordering_barrier(
-                    &client,
+                settle_after_pointer_action(
+                    &page,
                     &resolved.session_id,
-                    detach_events,
+                    &mut detach_events,
                     deadline,
                 )
                 .await
@@ -14728,15 +15719,60 @@ impl RustwrightPage {
         cancel: Option<&CancelToken>,
     ) -> RwResult<()> {
         let locator_json = selector_to_locator_json(selector)?;
-        let body = r#"
-if (!el) throw new Error('No element matches locator');
-el.scrollIntoView({ block: 'center', inline: 'center' });
-if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-el.click();
-return true;
-"#;
-        self.evaluate_locator_json_cancelable(locator_json, 0, body.to_string(), timeout_ms, cancel)
-            .map(|_| ())
+        self.click_locator_json_with_cancel(&locator_json, 0, timeout_ms, true, cancel)
+    }
+
+    /// Run the physical click pipeline for an engine locator specification.
+    ///
+    /// This narrow entry point lets higher-level Rust facades compose frame
+    /// locators without exposing the CDP transport.
+    pub fn click_locator_json_with_cancel(
+        &self,
+        locator_json: &str,
+        index: usize,
+        timeout_ms: Option<f64>,
+        strict: bool,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
+        let page = Arc::clone(&self.inner);
+        let locator_json = locator_json.to_string();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let browser = Arc::clone(&page.browser);
+        browser.block_on_raw(page_pointer_actionable_async(
+            page,
+            locator_json,
+            index,
+            timeout,
+            strict,
+            PhysicalPointerAction::Click { click_count: 1 },
+            cancel.cloned(),
+        ))
+    }
+
+    /// Strictly resolve and double-click the matching element through physical input.
+    pub fn dblclick(&self, selector: &str, timeout_ms: Option<f64>) -> RwResult<()> {
+        self.dblclick_with_cancel(selector, timeout_ms, None)
+    }
+
+    pub fn dblclick_with_cancel(
+        &self,
+        selector: &str,
+        timeout_ms: Option<f64>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
+        let locator_json = selector_to_locator_json(selector)?;
+        let page = Arc::clone(&self.inner);
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let browser = Arc::clone(&page.browser);
+        browser.block_on_raw(page_pointer_actionable_async(
+            page,
+            locator_json,
+            0,
+            timeout,
+            true,
+            PhysicalPointerAction::Click { click_count: 2 },
+            cancel.cloned(),
+        ))
     }
 
     pub fn fill(&self, selector: &str, value: &str, timeout_ms: Option<f64>) -> RwResult<()> {
@@ -14871,40 +15907,58 @@ return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value)
         self.hover_with_cancel(selector, None)
     }
 
+    /// Hover with an optional cancellation signal and a 30-second default timeout.
     pub fn hover_with_cancel(&self, selector: &str, cancel: Option<&CancelToken>) -> RwResult<()> {
+        self.hover_with_timeout_and_cancel(selector, None, cancel)
+    }
+
+    pub fn hover_with_timeout_and_cancel(
+        &self,
+        selector: &str,
+        timeout_ms: Option<f64>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
         let locator_json = selector_to_locator_json(selector)?;
         let page = Arc::clone(&self.inner);
+        let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
-        browser.block_on_raw(cancelable(cancel.cloned(), async move {
-            let deadline = OperationDeadline::new(Duration::from_secs(30));
-            scroll_locator_into_view(&page, &locator_json, deadline).await?;
-            let resolved =
-                resolve_locator_point(Arc::clone(&page), &locator_json, 0, None, None, deadline)
-                    .await?;
-            dispatch_mouse_move_sequence_in_session(
-                &page.browser.client,
-                &resolved.session_id,
-                0.0,
-                0.0,
-                resolved.x,
-                resolved.y,
-                1,
-                0,
-                0,
-                deadline,
-            )
-            .await
-        }))
+        browser.block_on_raw(page_pointer_actionable_async(
+            page,
+            locator_json,
+            0,
+            timeout,
+            true,
+            PhysicalPointerAction::Hover,
+            cancel.cloned(),
+        ))
     }
 
     /// Check the matching checkbox through a native mouse click.
     pub fn check(&self, selector: &str) -> RwResult<()> {
-        self.set_checked(selector, true)
+        self.check_with_cancel(selector, None, None)
+    }
+
+    pub fn check_with_cancel(
+        &self,
+        selector: &str,
+        timeout_ms: Option<f64>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
+        self.set_checked_with_cancel(selector, true, timeout_ms, cancel)
     }
 
     /// Uncheck the matching checkbox through a native mouse click.
     pub fn uncheck(&self, selector: &str) -> RwResult<()> {
-        self.set_checked(selector, false)
+        self.uncheck_with_cancel(selector, None, None)
+    }
+
+    pub fn uncheck_with_cancel(
+        &self,
+        selector: &str,
+        timeout_ms: Option<f64>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
+        self.set_checked_with_cancel(selector, false, timeout_ms, cancel)
     }
 
     /// Return the rendered inner text of the matching element.
@@ -15080,83 +16134,25 @@ return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value)
         )
     }
 
-    fn set_checked(&self, selector: &str, checked: bool) -> RwResult<()> {
+    fn set_checked_with_cancel(
+        &self,
+        selector: &str,
+        checked: bool,
+        timeout_ms: Option<f64>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
         let locator_json = selector_to_locator_json(selector)?;
         let page = Arc::clone(&self.inner);
+        let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
-        browser.block_on_raw(async move {
-            let deadline = OperationDeadline::new(Duration::from_secs(30));
-            scroll_locator_into_view(&page, &locator_json, deadline).await?;
-            let resolved =
-                resolve_locator_point(Arc::clone(&page), &locator_json, 0, None, None, deadline)
-                    .await?;
-            let state_json = evaluate_resolved_locator_body(
-                &page,
-                &resolved,
-                &format!("return JSON.stringify(({NATIVE_CHECKED_STATE_JS})(el));"),
-                deadline,
-            )
-            .await?;
-            let state = serde_json::from_str::<Value>(
-                state_json
-                    .as_str()
-                    .ok_or_else(|| RwError::Message("invalid checked state".to_string()))?,
-            )?;
-            if !state.get("valid").and_then(Value::as_bool).unwrap_or(false) {
-                return Err(RwError::Message(
-                    "element is not a checkbox, radio button, or checked ARIA control".to_string(),
-                ));
-            }
-            let current = state
-                .get("checked")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if current == checked {
-                return Ok(());
-            }
-            if !checked
-                && state
-                    .get("native_radio")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-            {
-                return Err(RwError::Message(
-                    "radio buttons cannot be unchecked directly".to_string(),
-                ));
-            }
-            dispatch_mouse_click_sequence_in_session(
-                &page.browser.client,
-                &resolved.session_id,
-                resolved.x,
-                resolved.y,
-                resolved.x,
-                resolved.y,
-                1,
-                "left",
-                1,
-                1,
-                0.0,
-                0,
-                0,
-                deadline,
-            )
-            .await?;
-            let updated = evaluate_resolved_locator_body(
-                &page,
-                &resolved,
-                &format!("return ({NATIVE_CHECKED_STATE_JS})(el).checked;"),
-                deadline,
-            )
-            .await?
-            .as_bool()
-            .unwrap_or(false);
-            if updated != checked {
-                return Err(RwError::Message(
-                    "native click did not change the checked state".to_string(),
-                ));
-            }
-            Ok(())
-        })
+        browser.block_on_raw(page_set_checked_actionable_async(
+            page,
+            locator_json,
+            timeout,
+            true,
+            checked,
+            cancel.cloned(),
+        ))
     }
 
     fn evaluate_locator_bool(&self, selector: &str, body: &str) -> RwResult<bool> {
