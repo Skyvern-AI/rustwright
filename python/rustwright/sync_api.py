@@ -26792,32 +26792,6 @@ def _normalize_expected_text_value(value: Any) -> Any:
     return _normalize_expected_text_values([value])[0]
 
 
-def _js_property_values_equal(expected: Any, actual: Any) -> bool:
-    if isinstance(expected, bool) or isinstance(actual, bool):
-        return isinstance(expected, bool) and isinstance(actual, bool) and expected is actual
-    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
-        if isinstance(expected, float) and isinstance(actual, float) and math.isnan(expected) and math.isnan(actual):
-            return True
-        return expected == actual
-    if expected is None or actual is None:
-        return expected is None and actual is None
-    if isinstance(expected, str) or isinstance(actual, str):
-        return isinstance(expected, str) and isinstance(actual, str) and expected == actual
-    if isinstance(expected, (list, tuple)) or isinstance(actual, (list, tuple)):
-        if not isinstance(expected, (list, tuple)) or not isinstance(actual, (list, tuple)):
-            return False
-        return len(expected) == len(actual) and all(
-            _js_property_values_equal(want, got) for want, got in zip(expected, actual)
-        )
-    if isinstance(expected, dict) or isinstance(actual, dict):
-        if not isinstance(expected, dict) or not isinstance(actual, dict):
-            return False
-        if set(expected) != set(actual):
-            return False
-        return all(_js_property_values_equal(expected[key], actual[key]) for key in expected)
-    return type(expected) is type(actual) and expected == actual
-
-
 class _Expectation:
     def __init__(self, actual: Any, negate: bool = False, timeout: Optional[float] = None, message: Optional[str] = None):
         self.actual = actual
@@ -26892,6 +26866,134 @@ class _Expectation:
                 raise AssertionError(detail)
             time.sleep(0.05)
 
+    def _native_locator_poll(
+        self,
+        matcher: dict[str, Any],
+        message: str,
+        detail_for_actual: Callable[[Any], str],
+        timeout: Optional[float],
+        *,
+        api_method: str,
+        timeout_message: Optional[str] = None,
+    ) -> None:
+        if not isinstance(self.actual, Locator):
+            raise AssertionError("native locator polling requires a Locator")
+        effective_timeout = timeout if timeout is not None else self._timeout if self._timeout is not None else 5_000.0
+        timeout_ms = _normalize_float_option(effective_timeout, method=api_method, name="timeout")
+        payload = dict(matcher)
+        payload["negated"] = self._negate
+        try:
+            result_json = _call_with_method_prefix(
+                api_method,
+                self.actual._page._core.assert_locator,
+                _json(self.actual._spec),
+                self.actual._index,
+                json.dumps(payload, separators=(",", ":")),
+                timeout_ms,
+                50.0,
+            )
+        except TimeoutError as exc:
+            # Assertion probe timeouts are retry-budget exhaustion only when the native
+            # boundary attached the structured timeout kind. Deliberately do not infer
+            # timeout classification from user-visible prose.
+            if getattr(exc, _WIRE_ERROR_KIND_ATTRIBUTE, None) != "timeout":
+                raise
+            result: dict[str, Any] = {"passed": False, "actual": None, "log": ""}
+        else:
+            decoded = _decode_json_result(json.loads(result_json))
+            if not isinstance(decoded, dict):
+                raise Error(f"{api_method}: native assertion returned an invalid result")
+            result = decoded
+
+        if bool(result.get("passed")):
+            return
+        if timeout_message is not None:
+            detail = timeout_message
+        else:
+            prefix = "expected not: " if self._negate else "expected: "
+            log = result.get("log")
+            last_detail = str(log) if log else detail_for_actual(result.get("actual"))
+            suffix = f"; {last_detail}" if last_detail else ""
+            detail = prefix + message + suffix
+        if self._custom_message:
+            raise AssertionError(f"{self._custom_message}\n{detail}")
+        raise AssertionError(detail)
+
+    def _native_matcher_base(self, kind: str, *, strict: bool = True, strict_action: str = "assert") -> dict[str, Any]:
+        return {
+            "kind": kind,
+            "strict": strict and self.actual._strict and not self.actual._explicit_index,
+            "strict_action": strict_action,
+        }
+
+    @staticmethod
+    def _native_text_matcher(value: Any) -> Any:
+        return _text_matcher(value)
+
+    @classmethod
+    def _native_js_property_expected(cls, value: Any) -> dict[str, Any]:
+        if value is None:
+            return {"type": "none"}
+        if isinstance(value, bool):
+            return {"type": "boolean", "value": value}
+        if isinstance(value, int):
+            return {"type": "integer", "value": str(value)}
+        if isinstance(value, float):
+            if math.isnan(value):
+                encoded_number: Any = "NaN"
+            elif math.isinf(value):
+                encoded_number = "Infinity" if value > 0 else "-Infinity"
+            else:
+                encoded_number = value
+            return {"type": "number", "value": encoded_number}
+        if isinstance(value, str):
+            return {"type": "string", "value": value}
+        if type(value) in (list, tuple):
+            return {"type": "array", "value": [cls._native_js_property_expected(item) for item in value]}
+        if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+            return {
+                "type": "object",
+                "value": {key: cls._native_js_property_expected(item) for key, item in value.items()},
+            }
+        return {"type": "unsupported"}
+
+    @classmethod
+    def _native_js_property_expected_supported(cls, expected: dict[str, Any]) -> bool:
+        expected_type = expected.get("type")
+        if expected_type == "unsupported":
+            return False
+        if expected_type == "array":
+            return all(cls._native_js_property_expected_supported(item) for item in expected["value"])
+        if expected_type == "object":
+            return all(cls._native_js_property_expected_supported(item) for item in expected["value"].values())
+        return True
+
+    @classmethod
+    def _js_property_values_equal(cls, expected: Any, actual: Any) -> bool:
+        if isinstance(expected, bool) or isinstance(actual, bool):
+            return isinstance(expected, bool) and isinstance(actual, bool) and expected is actual
+        if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+            if isinstance(expected, float) and isinstance(actual, float) and math.isnan(expected) and math.isnan(actual):
+                return True
+            return expected == actual
+        if expected is None or actual is None:
+            return expected is None and actual is None
+        if isinstance(expected, str) or isinstance(actual, str):
+            return isinstance(expected, str) and isinstance(actual, str) and expected == actual
+        if isinstance(expected, (list, tuple)) or isinstance(actual, (list, tuple)):
+            if not isinstance(expected, (list, tuple)) or not isinstance(actual, (list, tuple)):
+                return False
+            return len(expected) == len(actual) and all(
+                cls._js_property_values_equal(want, got) for want, got in zip(expected, actual)
+            )
+        if isinstance(expected, dict) or isinstance(actual, dict):
+            if not isinstance(expected, dict) or not isinstance(actual, dict):
+                return False
+            if set(expected) != set(actual):
+                return False
+            return all(cls._js_property_values_equal(expected[key], actual[key]) for key in expected)
+        return type(expected) is type(actual) and expected == actual
+
     def _matches(self, expected: Any, actual: Any, *, contains: bool = False, ignore_case: Optional[bool] = None) -> bool:
         actual_text = "" if actual is None else str(actual)
         if hasattr(expected, "search"):
@@ -26906,65 +27008,6 @@ class _Expectation:
             return expected_text in actual_text
         return actual == expected or actual_text == expected_text
 
-    def _normalize_expected_text(self, value: Any) -> str:
-        return re.sub(r"\s+", " ", "" if value is None else str(value)).strip()
-
-    def _matches_text(self, expected: Any, actual: Any, *, contains: bool = False, ignore_case: Optional[bool] = None) -> bool:
-        actual_text = "" if actual is None else str(actual)
-        if hasattr(expected, "search"):
-            if ignore_case is True:
-                return bool(re.search(expected.pattern, actual_text, expected.flags | re.IGNORECASE))  # type: ignore[union-attr]
-            return bool(expected.search(actual_text))  # type: ignore[union-attr]
-        actual_text = self._normalize_expected_text(actual_text)
-        expected_text = self._normalize_expected_text(expected)
-        if ignore_case is True:
-            actual_text = actual_text.lower()
-            expected_text = expected_text.lower()
-        if contains:
-            return expected_text in actual_text
-        return actual_text == expected_text
-
-    def _contains_text_sequence(self, expected: list[Any], actual: list[Any], *, ignore_case: Optional[bool] = None) -> bool:
-        actual_index = 0
-        for wanted in expected:
-            while actual_index < len(actual):
-                got = actual[actual_index]
-                actual_index += 1
-                if self._matches_text(wanted, got, contains=not hasattr(wanted, "search"), ignore_case=ignore_case):
-                    break
-            else:
-                return False
-        return True
-
-    @staticmethod
-    def _assertion_text_script(array: bool = False) -> str:
-        body = """
-        const textFor = el => {
-          const tag = el && el.tagName;
-          const type = String((el && el.getAttribute('type')) || '').toLowerCase();
-          if (tag === 'INPUT' && (type === 'button' || type === 'submit')) return el.value || '';
-          return el ? el.textContent : null;
-        };
-        """
-        if array:
-            return f"(els) => {{ {body} return els.map(textFor); }}"
-        return f"(el) => {{ {body} return textFor(el); }}"
-
-    def _assertion_text(self) -> Any:
-        if hasattr(self.actual, "evaluate"):
-            return self.actual.evaluate(self._assertion_text_script())
-        if hasattr(self.actual, "text_content"):
-            return self.actual.text_content()
-        return str(self.actual)
-
-    def _assertion_texts(self) -> list[Any]:
-        if hasattr(self.actual, "evaluate_all"):
-            value = self.actual.evaluate_all(self._assertion_text_script(array=True))
-            return value if isinstance(value, list) else []
-        if hasattr(self.actual, "all_text_contents"):
-            return self.actual.all_text_contents()
-        return [str(self.actual)]
-
     def to_have_text(
         self,
         expected: Any,
@@ -26976,25 +27019,31 @@ class _Expectation:
         expected_arg = _required_expectation_arg(expected, "to_have_text", "expected")
         if _is_text_expectation_sequence(expected_arg):
             expected_values = _normalize_expected_text_values(expected_arg)
+            native_expected: Any = [self._native_text_matcher(value) for value in expected_values]
         else:
             expected_value = _normalize_expected_text_value(expected_arg)
+            native_expected = self._native_text_matcher(expected_value)
 
-        def check() -> tuple[bool, str]:
-            if _is_text_expectation_sequence(expected_arg) and hasattr(self.actual, "all_text_contents"):
-                actual = self.actual.all_inner_texts() if use_inner_text else self._assertion_texts()
-                ok = len(actual) == len(expected_values) and all(
-                    self._matches_text(want, got, ignore_case=ignore_case) for want, got in zip(expected_values, actual)
-                )
-                return ok, f"texts {expected_values!r}, got {actual!r}"
-            if hasattr(self.actual, "text_content") and not use_inner_text:
-                actual = self._assertion_text()
-            elif hasattr(self.actual, "inner_text"):
-                actual = self.actual.inner_text()
-            else:
-                actual = str(self.actual)
-            return self._matches_text(expected_value, actual, ignore_case=ignore_case), f"text {expected_value!r}, got {actual!r}"
-
-        self._poll(check, f"text {expected_arg!r}", timeout, api_method="LocatorAssertions.to_have_text")
+        is_array = _is_text_expectation_sequence(expected_arg)
+        display_expected = expected_values if is_array else expected_value
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("text", strict=not is_array, strict_action="assert text"),
+                "expected": native_expected,
+                "array": is_array,
+                "contains": False,
+                "ignore_case": ignore_case is True,
+                "use_inner_text": bool(use_inner_text),
+            },
+            f"text {expected_arg!r}",
+            lambda actual: (
+                f"texts {display_expected!r}, got {actual!r}"
+                if is_array
+                else f"text {display_expected!r}, got {actual!r}"
+            ),
+            timeout,
+            api_method="LocatorAssertions.to_have_text",
+        )
 
     def to_contain_text(
         self,
@@ -27007,80 +27056,76 @@ class _Expectation:
         expected_arg = _required_expectation_arg(expected, "to_contain_text", "expected")
         if _is_text_expectation_sequence(expected_arg):
             expected_values = _normalize_expected_text_values(expected_arg)
+            native_expected: Any = [self._native_text_matcher(value) for value in expected_values]
         else:
             expected_value = _normalize_expected_text_value(expected_arg)
+            native_expected = self._native_text_matcher(expected_value)
 
-        def check() -> tuple[bool, str]:
-            if _is_text_expectation_sequence(expected_arg) and hasattr(self.actual, "all_text_contents"):
-                actual = self.actual.all_inner_texts() if use_inner_text else self._assertion_texts()
-                ok = len(actual) >= len(expected_values) and self._contains_text_sequence(expected_values, actual, ignore_case=ignore_case)
-                return ok, f"texts containing {expected_values!r}, got {actual!r}"
-            if hasattr(self.actual, "text_content") and not use_inner_text:
-                actual = self._assertion_text()
-            elif hasattr(self.actual, "inner_text"):
-                actual = self.actual.inner_text()
-            else:
-                actual = str(self.actual)
-            return self._matches_text(expected_value, actual, contains=not _is_regex_like(expected_value), ignore_case=ignore_case), (
-                f"text containing {expected_value!r}, got {actual!r}"
-            )
-
-        self._poll(check, f"text containing {expected_arg!r}", timeout, api_method="LocatorAssertions.to_contain_text")
+        is_array = _is_text_expectation_sequence(expected_arg)
+        display_expected = expected_values if is_array else expected_value
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("text", strict=not is_array, strict_action="assert text"),
+                "expected": native_expected,
+                "array": is_array,
+                "contains": True,
+                "ignore_case": ignore_case is True,
+                "use_inner_text": bool(use_inner_text),
+            },
+            f"text containing {expected_arg!r}",
+            lambda actual: (
+                f"texts containing {display_expected!r}, got {actual!r}"
+                if is_array
+                else f"text containing {display_expected!r}, got {actual!r}"
+            ),
+            timeout,
+            api_method="LocatorAssertions.to_contain_text",
+        )
 
     def to_be_visible(self, *, visible: Optional[bool] = None, timeout: Optional[float] = None) -> None:
         expected_visible = True if visible is None else bool(visible)
-
-        def check() -> tuple[bool, str]:
-            actual = bool(self.actual.is_visible())
-            return actual is expected_visible, f"visible state is {actual!r}"
-
-        self._poll(
-            check,
+        self._native_locator_poll(
+            {**self._native_matcher_base("visible", strict_action="check visibility"), "expected": expected_visible},
             f"locator visible state to be {expected_visible!r}",
+            lambda actual: f"visible state is {bool(actual)!r}",
             timeout,
             api_method="LocatorAssertions.to_be_visible",
         )
 
     def to_be_hidden(self, *, timeout: Optional[float] = None) -> None:
-        self._poll(
-            lambda: (not bool(self.actual.is_visible()), "locator is visible"),
+        self._native_locator_poll(
+            self._native_matcher_base("hidden", strict_action="check visibility"),
             "locator to be hidden",
+            lambda actual: "locator is visible",
             timeout,
             api_method="LocatorAssertions.to_be_hidden",
         )
 
     def to_be_enabled(self, *, enabled: Optional[bool] = None, timeout: Optional[float] = None) -> None:
         expected_enabled = True if enabled is None else bool(enabled)
-
-        def check() -> tuple[bool, str]:
-            actual = bool(self.actual.is_enabled())
-            return actual is expected_enabled, f"enabled state is {actual!r}"
-
-        self._poll(
-            check,
+        self._native_locator_poll(
+            {**self._native_matcher_base("enabled", strict_action="check enabled state"), "expected": expected_enabled},
             f"locator enabled state to be {expected_enabled!r}",
+            lambda actual: f"enabled state is {bool(actual)!r}",
             timeout,
             api_method="LocatorAssertions.to_be_enabled",
         )
 
     def to_be_disabled(self, *, timeout: Optional[float] = None) -> None:
-        self._poll(
-            lambda: (bool(self.actual.is_disabled()), "locator is not disabled"),
+        self._native_locator_poll(
+            {**self._native_matcher_base("disabled", strict_action="check enabled state"), "expected": True},
             "locator to be disabled",
+            lambda actual: "locator is not disabled",
             timeout,
             api_method="LocatorAssertions.to_be_disabled",
         )
 
     def to_be_editable(self, *, editable: Optional[bool] = None, timeout: Optional[float] = None) -> None:
         expected_editable = True if editable is None else bool(editable)
-
-        def check() -> tuple[bool, str]:
-            actual = bool(self.actual.is_editable())
-            return actual is expected_editable, f"editable state is {actual!r}"
-
-        self._poll(
-            check,
+        self._native_locator_poll(
+            {**self._native_matcher_base("editable", strict_action="check editable state"), "expected": expected_editable},
             f"locator editable state to be {expected_editable!r}",
+            lambda actual: f"editable state is {bool(actual)!r}",
             timeout,
             api_method="LocatorAssertions.to_be_editable",
         )
@@ -27094,66 +27139,50 @@ class _Expectation:
     ) -> None:
         expected_indeterminate = bool(indeterminate) if indeterminate is not None else False
 
-        def checked_state() -> dict[str, bool]:
-            state = self.actual.evaluate(_CHECKED_STATE_JS)
-            if not isinstance(state, dict):
-                return {"valid": False, "checked": False, "indeterminate": False}
-            return {
-                "valid": bool(state.get("valid", True)),
-                "checked": bool(state.get("checked")),
-                "indeterminate": bool(state.get("indeterminate")),
-            }
-
-        def check() -> tuple[bool, str]:
-            state = checked_state()
-            if not state["valid"]:
-                return False, f"checked state is {state!r}"
-            if expected_indeterminate:
-                ok = checked is None and state["indeterminate"]
-                return ok, f"checked state is {state!r}"
-            expected_checked = False if checked is False else True
-            ok = state["checked"] is expected_checked
-            return ok, f"checked state is {state!r}"
-
         if expected_indeterminate:
             expected = "indeterminate"
+            expected_checked: Optional[bool] = None
         else:
             expected_checked = False if checked is False else True
             expected = "checked" if expected_checked else "unchecked"
-        self._poll(check, f"locator checked state to be {expected}", timeout, api_method="LocatorAssertions.to_be_checked")
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("checked", strict_action="check checked state"),
+                "checked": expected_checked,
+                "indeterminate": expected_indeterminate,
+            },
+            f"locator checked state to be {expected}",
+            lambda actual: f"checked state is {actual!r}",
+            timeout,
+            api_method="LocatorAssertions.to_be_checked",
+        )
 
     def to_be_attached(self, *, attached: Optional[bool] = None, timeout: Optional[float] = None) -> None:
         expected_attached = True if attached is None else bool(attached)
-
-        def check() -> tuple[bool, str]:
-            count = self.actual.count()
-            is_attached = count > 0
-            return is_attached is expected_attached, f"attached state is {is_attached!r}, count {count}"
-
-        self._poll(check, f"locator attached state to be {expected_attached!r}", timeout, api_method="LocatorAssertions.to_be_attached")
+        self._native_locator_poll(
+            {**self._native_matcher_base("attached", strict=False), "expected": expected_attached},
+            f"locator attached state to be {expected_attached!r}",
+            lambda actual: (
+                f"attached state is {bool((actual or {}).get('attached'))!r}, count {int((actual or {}).get('count') or 0)}"
+            ),
+            timeout,
+            api_method="LocatorAssertions.to_be_attached",
+        )
 
     def to_be_empty(self, *, timeout: Optional[float] = None) -> None:
-        def check() -> tuple[bool, str]:
-            actual = self.actual.evaluate(
-                """(el) => {
-                const tag = el.tagName || '';
-                if (tag === 'INPUT' || tag === 'TEXTAREA')
-                  return { value: el.value || '' };
-                return { text: String(el.textContent || '').replace(/\\s+/g, ' ').trim() };
-                }"""
-            )
-            if isinstance(actual, dict) and "value" in actual:
-                ok = actual.get("value") == ""
-            else:
-                ok = isinstance(actual, dict) and actual.get("text") == ""
-            return ok, f"element is not empty: {actual!r}"
-
-        self._poll(check, "locator to be empty", timeout, api_method="LocatorAssertions.to_be_empty")
+        self._native_locator_poll(
+            self._native_matcher_base("empty", strict_action="assert empty"),
+            "locator to be empty",
+            lambda actual: f"element is not empty: {actual!r}",
+            timeout,
+            api_method="LocatorAssertions.to_be_empty",
+        )
 
     def to_be_focused(self, *, timeout: Optional[float] = None) -> None:
-        self._poll(
-            lambda: (bool(self.actual.evaluate("(el) => document.activeElement === el")), "locator is not focused"),
+        self._native_locator_poll(
+            self._native_matcher_base("focused", strict_action="assert focused"),
             "locator to be focused",
+            lambda actual: "locator is not focused",
             timeout,
             api_method="LocatorAssertions.to_be_focused",
         )
@@ -27171,13 +27200,10 @@ class _Expectation:
             )
             timeout_message = f"Locator expected to have count '{_format_timeout_value(expected)}'"
 
-        def check() -> tuple[bool, str]:
-            actual = self.actual.count()
-            return actual == expected, f"count {expected}, got {actual}"
-
-        self._poll(
-            check,
+        self._native_locator_poll(
+            {**self._native_matcher_base("count", strict=False), "expected": expected},
             f"count {expected}",
+            lambda actual: f"count {expected}, got {actual}",
             timeout,
             api_method="LocatorAssertions.to_have_count",
             timeout_message=timeout_message,
@@ -27185,36 +27211,29 @@ class _Expectation:
 
     def to_have_value(self, value: Any, *, timeout: Optional[float] = None) -> None:
         expected = _normalize_expected_text_value(_required_expectation_arg(value, "to_have_value", "value"))
-
-        def check() -> tuple[bool, str]:
-            actual = self.actual.input_value()
-            return self._matches(expected, actual), f"value {expected!r}, got {actual!r}"
-
-        self._poll(check, f"value {expected!r}", timeout, api_method="LocatorAssertions.to_have_value")
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("value", strict_action="read input value"),
+                "expected": self._native_text_matcher(expected),
+            },
+            f"value {expected!r}",
+            lambda actual: f"value {expected!r}, got {actual!r}",
+            timeout,
+            api_method="LocatorAssertions.to_have_value",
+        )
 
     def to_have_values(self, values: Any, *, timeout: Optional[float] = None) -> None:
         expected = _normalize_expected_text_values(_required_expectation_arg(values, "to_have_values", "values"))
-
-        def check() -> tuple[bool, str]:
-            actual = self.actual.evaluate(
-                """(el) => ({
-                valid: String(el.tagName || '').toUpperCase() === 'SELECT' && !!el.multiple,
-                values: Array.from(el.selectedOptions || []).map(option => option.value)
-                })"""
-            )
-            if not isinstance(actual, dict):
-                return False, f"values {expected!r}, got {actual!r}"
-            actual_values = actual.get("values")
-            if not isinstance(actual_values, list):
-                actual_values = []
-            ok = (
-                bool(actual.get("valid"))
-                and len(actual_values) == len(expected)
-                and all(self._matches(want, got) for want, got in zip(expected, actual_values))
-            )
-            return ok, f"values {expected!r}, got {actual_values!r}"
-
-        self._poll(check, f"values {expected!r}", timeout, api_method="LocatorAssertions.to_have_values")
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("values", strict_action="assert values"),
+                "expected": [self._native_text_matcher(value) for value in expected],
+            },
+            f"values {expected!r}",
+            lambda actual: f"values {expected!r}, got {actual!r}",
+            timeout,
+            api_method="LocatorAssertions.to_have_values",
+        )
 
     def to_have_attribute(
         self,
@@ -27225,14 +27244,18 @@ class _Expectation:
         timeout: Optional[float] = None,
     ) -> None:
         expected = _normalize_expected_text_value(value)
-
-        def check() -> tuple[bool, str]:
-            actual = self.actual.evaluate("(el, name) => el.getAttribute(name)", name)
-            if actual is None:
-                return False, f"attribute {name!r} {expected!r}, got {actual!r}"
-            return self._matches(expected, actual, ignore_case=ignore_case), f"attribute {name!r} {expected!r}, got {actual!r}"
-
-        self._poll(check, f"attribute {name!r}", timeout, api_method="LocatorAssertions.to_have_attribute")
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("attribute", strict_action="get attribute"),
+                "name": name,
+                "expected": self._native_text_matcher(expected),
+                "ignore_case": ignore_case is True,
+            },
+            f"attribute {name!r}",
+            lambda actual: f"attribute {name!r} {expected!r}, got {actual!r}",
+            timeout,
+            api_method="LocatorAssertions.to_have_attribute",
+        )
 
     def to_have_id(self, id: Any, *, timeout: Optional[float] = None) -> None:
         expected = _required_expectation_arg(id, "to_have_id", "id")
@@ -27242,25 +27265,27 @@ class _Expectation:
         expected_arg = _required_expectation_arg(expected, "to_have_class", "expected")
         if _is_text_expectation_sequence(expected_arg):
             expected_values = _normalize_expected_text_values(expected_arg)
+            native_expected: Any = [self._native_text_matcher(value) for value in expected_values]
         else:
             expected_value = _normalize_expected_text_value(expected_arg)
-        class_value_script = """(el) => {
-            const value = el.className;
-            if (typeof value === 'string') return value;
-            if (value && typeof value.baseVal === 'string') return value.baseVal;
-            return el.getAttribute('class') || '';
-        }"""
-        class_values_script = f"(els) => els.map({class_value_script})"
-
-        def check() -> tuple[bool, str]:
-            if _is_text_expectation_sequence(expected_arg) and hasattr(self.actual, "evaluate_all"):
-                actual = self.actual.evaluate_all(class_values_script)
-                ok = len(actual) == len(expected_values) and all(self._matches(want, got) for want, got in zip(expected_values, actual))
-                return ok, f"classes {expected_values!r}, got {actual!r}"
-            actual = self.actual.evaluate(class_value_script)
-            return self._matches(expected_value, actual), f"class {expected_value!r}, got {actual!r}"
-
-        self._poll(check, f"class {expected_arg!r}", timeout, api_method="LocatorAssertions.to_have_class")
+            native_expected = self._native_text_matcher(expected_value)
+        is_array = _is_text_expectation_sequence(expected_arg)
+        display_expected = expected_values if is_array else expected_value
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("class", strict=not is_array, strict_action="assert class"),
+                "expected": native_expected,
+                "array": is_array,
+            },
+            f"class {expected_arg!r}",
+            lambda actual: (
+                f"classes {display_expected!r}, got {actual!r}"
+                if is_array
+                else f"class {display_expected!r}, got {actual!r}"
+            ),
+            timeout,
+            api_method="LocatorAssertions.to_have_class",
+        )
 
     def to_contain_class(self, expected: Any, *, timeout: Optional[float] = None) -> None:
         expected_arg = _required_expectation_arg(expected, "to_contain_class", "expected")
@@ -27268,72 +27293,28 @@ class _Expectation:
             expected_values = _normalize_expected_text_values(expected_arg)
         else:
             expected_value = _normalize_expected_text_value(expected_arg)
-
-        def wanted_tokens(value: Any) -> set[str]:
-            return set(str(value).split())
-        class_value_script = """(el) => {
-            const value = el.className;
-            if (typeof value === 'string') return value;
-            if (value && typeof value.baseVal === 'string') return value.baseVal;
-            return el.getAttribute('class') || '';
-        }"""
-        class_values_script = f"(els) => els.map({class_value_script})"
-
-        def check() -> tuple[bool, str]:
-            if _is_text_expectation_sequence(expected_arg) and hasattr(self.actual, "evaluate_all"):
-                actual = self.actual.evaluate_all(class_values_script)
-                ok = len(actual) == len(expected_values) and all(wanted_tokens(want).issubset(wanted_tokens(got)) for want, got in zip(expected_values, actual))
-                return ok, f"classes containing {expected_values!r}, got {actual!r}"
-            actual = self.actual.evaluate(class_value_script)
-            return wanted_tokens(expected_value).issubset(wanted_tokens(actual)), f"class containing {expected_value!r}, got {actual!r}"
-
-        self._poll(check, f"class containing {expected_arg!r}", timeout, api_method="LocatorAssertions.to_contain_class")
-
-    def _try_fast_simple_css_role_match(self, expected: str, *, timeout: Optional[float]) -> Any:
-        if not isinstance(self.actual, Locator):
-            return _MISSING
-        payload = self.actual._simple_css_indexed_read_payload()
-        if payload is None:
-            return _MISSING
-        if not self.actual._ensure_fast_simple_role_helper(timeout=timeout, method="LocatorAssertions.to_have_role"):
-            return _MISSING
-        role_payload = {
-            **payload,
-            "direct_role": True,
-            "role": expected,
-            "include_hidden": True,
-            "disabled": None,
-            "checked": None,
-            "name": None,
-            "css_strict": bool(payload.get("strict")),
-            "strict": False,
-        }
-        result = self.actual._evaluate_simple_css_fast_path(
-            Locator._fast_simple_role_action_script(
-                """
-if (helperResult.missing) return { ok: true, value: false, missing: true };
-const actualRole = String(helperResult.role || '');
-return { ok: true, value: actualRole === String(payload.role || ''), actual: actualRole };
-"""
-            ),
-            role_payload,
-            timeout=timeout,
-            method="LocatorAssertions.to_have_role",
+        is_array = _is_text_expectation_sequence(expected_arg)
+        display_expected = expected_values if is_array else expected_value
+        native_tokens: Any = (
+            [str(value).split() for value in expected_values]
+            if is_array
+            else str(expected_value).split()
         )
-        if not isinstance(result, dict):
-            return _MISSING
-        if result.get("ok"):
-            matched = bool(result.get("value"))
-            if result.get("missing"):
-                return False, f"role {expected!r}, got no matching element"
-            actual = result.get("actual")
-            if actual is None:
-                actual = expected if matched else f"not {expected}"
-            return matched, f"role {expected!r}, got {actual!r}"
-        if result.get("type") == "strict":
-            count = int(result.get("count") or 0)
-            raise Error(f"strict mode violation: locator resolved to {count} elements while trying to assert role")
-        return _MISSING
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("contain_class", strict=not is_array, strict_action="assert class"),
+                "expected_tokens": native_tokens,
+                "array": is_array,
+            },
+            f"class containing {expected_arg!r}",
+            lambda actual: (
+                f"classes containing {display_expected!r}, got {actual!r}"
+                if is_array
+                else f"class containing {display_expected!r}, got {actual!r}"
+            ),
+            timeout,
+            api_method="LocatorAssertions.to_contain_class",
+        )
 
     def to_have_role(self, role: Any, *, timeout: Optional[float] = None) -> None:
         role_arg = _required_expectation_arg(role, "to_have_role", "role")
@@ -27341,768 +27322,19 @@ return { ok: true, value: actualRole === String(payload.role || ''), actual: act
             raise Error('"role" argument in to_have_role must be a string')
         expected = _normalize_expected_text_value(role_arg)
 
-        def check() -> tuple[bool, str]:
-            if isinstance(self.actual, Locator):
-                fast = self._try_fast_simple_css_role_match(expected, timeout=timeout)
-                if fast is not _MISSING:
-                    return fast
-                strict_single = "true" if self.actual._strict and not self.actual._explicit_index else "false"
-                actual = self.actual._eval(
-                    """
-if (strictFrameViolation) {
-  throw new Error(`strict mode violation: locator("${strictFrameViolation.selector || 'iframe'}") resolved to ${strictFrameViolation.count || 0} elements`);
-}
-if (__STRICT_SINGLE__ && matches.length > 1) {
-  throw new Error(`strict mode violation: locator resolved to ${matches.length} elements while trying to assert role`);
-}
-if (!el) throw new Error('No element matches locator');
-return locatorRoleOf(el);
-""".replace("__STRICT_SINGLE__", strict_single),
-                    timeout,
-                    method="LocatorAssertions.to_have_role",
-                )
-                return self._matches(expected, actual), f"role {expected!r}, got {actual!r}"
-            actual = self.actual.evaluate(
-                """(el) => {
-                const knownRoles = new Set([
-                  'alert', 'alertdialog', 'application', 'article', 'banner', 'blockquote', 'button',
-                  'caption', 'cell', 'checkbox', 'code', 'columnheader', 'combobox', 'complementary',
-                  'contentinfo', 'definition', 'deletion', 'dialog', 'directory', 'document', 'emphasis',
-                  'feed', 'figure', 'form', 'generic', 'grid', 'gridcell', 'group', 'heading', 'img',
-                  'insertion', 'link', 'list', 'listbox', 'listitem', 'log', 'main', 'mark', 'marquee', 'math',
-                  'meter', 'menu', 'menubar', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'navigation',
-                  'none', 'note', 'option', 'paragraph', 'presentation', 'progressbar', 'radio',
-                  'radiogroup', 'region', 'row', 'rowgroup', 'rowheader', 'scrollbar', 'search',
-                  'searchbox', 'separator', 'slider', 'spinbutton', 'status', 'strong', 'subscript',
-                  'superscript', 'switch', 'tab', 'table', 'tablist', 'tabpanel', 'term', 'textbox',
-                  'time', 'timer', 'toolbar', 'tooltip', 'tree', 'treegrid', 'treeitem'
-                ]);
-                const explicit = String(el.getAttribute('role') || '').trim().split(/\\s+/).filter(Boolean).find(token => knownRoles.has(token));
-                const normalize = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
-                const referencedText = attribute => normalize(String(el.getAttribute(attribute) || '')
-                  .split(/\\s+/)
-                  .filter(Boolean)
-                  .map(id => {
-                    const node = el.ownerDocument.getElementById(id);
-                    const referencedControlText = current => {
-                      const tag = current && current.tagName || '';
-                      const type = String(current && current.getAttribute('type') || '').toLowerCase();
-                      if (tag === 'TEXTAREA') return current.value || current.textContent || '';
-                      if (tag === 'SELECT') {
-                        return Array.from(current.selectedOptions || [])
-                          .map(option => option.label || option.innerText || option.textContent || '')
-                          .join(' ');
-                      }
-                      if (tag === 'INPUT') {
-                        if (type === 'image') return current.getAttribute('alt') || current.getAttribute('title') || current.value || '';
-                        if (['button', 'submit', 'reset'].includes(type)) {
-                          if (current.value) return current.value;
-                          if (type === 'submit') return 'Submit';
-                          if (type === 'reset') return 'Reset';
-                          return '';
-                        }
-                        if (type === 'hidden') return '';
-                        return current.value || '';
-                      }
-                      return '';
-                    };
-                    const referencedNodeText = current => {
-                      if (!current || current.nodeType !== 1) return '';
-                      const controlText = referencedControlText(current);
-                      if (controlText) return controlText;
-                      const ariaLabel = current.getAttribute('aria-label');
-                      if (ariaLabel) return ariaLabel;
-                      const nestedText = nested => {
-                        if (!nested) return '';
-                        if (nested.nodeType === Node.TEXT_NODE) return nested.textContent || '';
-                        if (nested.nodeType !== Node.ELEMENT_NODE) return '';
-                        if (nested !== current && nested.getAttribute('aria-hidden') === 'true') return '';
-                        const style = nested.ownerDocument.defaultView.getComputedStyle(nested);
-                        if (nested !== current && (style.display === 'none' || style.visibility === 'hidden')) return '';
-                        const tag = nested.tagName || '';
-                        if (tag === 'IMG') return nested.getAttribute('alt') || nested.getAttribute('title') || '';
-                        if (String(tag).toLowerCase() === 'svg') {
-                          const title = nested.querySelector('title');
-                          return title ? title.textContent || '' : nested.getAttribute('title') || '';
-                        }
-                        if (String(nested.getAttribute('role') || '').trim().split(/\\s+/).filter(Boolean)[0] === 'img') {
-                          return nested.getAttribute('aria-label') || nested.getAttribute('title') || '';
-                        }
-                        return Array.from(nested.childNodes).map(nestedText).join(' ');
-                      };
-                      return nestedText(current) || current.innerText || current.textContent || '';
-                    };
-                    return referencedNodeText(node);
-                  })
-                  .join(' '));
-                const explicitAccessibleName = () => normalize(referencedText('aria-labelledby') || el.getAttribute('aria-label') || '');
-                const presentationalRoleOf = node => {
-                  const role = String(node.getAttribute('role') || '').trim().split(/\\s+/).filter(Boolean).find(token => knownRoles.has(token));
-                  return role === 'none' || role === 'presentation' ? role : '';
-                };
-                const presentationalTableConflictNativeRoleOf = node => {
-                  if (String(node.tagName || '').toLowerCase() !== 'table') return '';
-                  if (!presentationalRoleOf(node)) return '';
-                  if (node === el) return node.hasAttribute('tabindex') || explicitAccessibleName() ? 'table' : '';
-                  const labelled = normalize(String(node.getAttribute('aria-labelledby') || '')
-                    .split(/\\s+/)
-                    .filter(Boolean)
-                    .map(id => {
-                      const ref = node.ownerDocument.getElementById(id);
-                      return ref ? ref.innerText || ref.textContent || ref.getAttribute('aria-label') || '' : '';
-                    })
-                    .join(' '));
-                  return node.hasAttribute('tabindex') || labelled || node.getAttribute('aria-label') ? 'table' : '';
-                };
-                const presentationalTableAncestorRoleOf = () => {
-                  const tag = String(el.tagName || '').toLowerCase();
-                  if (!['thead', 'tbody', 'tfoot', 'tr', 'td', 'th'].includes(tag)) return '';
-                  let current = el.parentElement;
-                  while (current && current.nodeType === 1) {
-                    if (String(current.tagName || '').toLowerCase() === 'table') {
-                      const role = presentationalRoleOf(current);
-                      return role && !presentationalTableConflictNativeRoleOf(current) ? role : '';
-                    }
-                    current = current.parentElement;
-                  }
-                  return '';
-                };
-                const presentationalConflictNativeRole = () => {
-                  const nativeTag = el.tagName.toLowerCase();
-                  const type = String(el.getAttribute('type') || 'text').toLowerCase();
-                  if (nativeTag === 'button') return 'button';
-                  if (nativeTag === 'a' && el.hasAttribute('href')) return 'link';
-                  if (nativeTag === 'img' || nativeTag === 'svg') {
-                    return el.hasAttribute('tabindex') || explicitAccessibleName() ? 'img' : '';
-                  }
-                  if (nativeTag === 'table') return presentationalTableConflictNativeRoleOf(el);
-                  if (nativeTag === 'select') return el.multiple || Number(el.getAttribute('size') || 0) > 1 ? 'listbox' : 'combobox';
-                  if (nativeTag === 'textarea') return 'textbox';
-                  if (nativeTag === 'input') {
-                    if (type === 'checkbox') return 'checkbox';
-                    if (type === 'radio') return 'radio';
-                    if (type === 'range') return 'slider';
-                    if (type === 'search') return 'searchbox';
-                    if (type === 'number') return 'spinbutton';
-                    if (['button', 'submit', 'reset', 'image', 'file'].includes(type)) return 'button';
-                    if (!['hidden', 'file', 'image'].includes(type)) return 'textbox';
-                  }
-                  return '';
-                };
-                if (explicit === 'none' || explicit === 'presentation') {
-                  const nativeRole = presentationalConflictNativeRole();
-                  if (nativeRole) return nativeRole;
-                  if (explicitAccessibleName()) return '';
-                  return explicit;
-                }
-                if (explicit) return explicit;
-                const hasScopedLandmarkAncestor = () => {
-                  let current = el.parentElement;
-                  while (current && current.nodeType === 1) {
-                    const currentTag = String(current.tagName || '').toLowerCase();
-                    if (['article', 'aside', 'main', 'nav', 'section'].includes(currentTag)) return true;
-                    const currentRole = String(current.getAttribute('role') || '').trim().split(/\\s+/).filter(Boolean).find(token => knownRoles.has(token));
-                    if (['article', 'complementary', 'main', 'navigation', 'region'].includes(currentRole)) return true;
-                    current = current.parentElement;
-                  }
-                  return false;
-                };
-                const tag = el.tagName.toLowerCase();
-                const tablePresentationRole = presentationalTableAncestorRoleOf();
-                if (tablePresentationRole) return tablePresentationRole;
-                if (tag === 'html') return 'document';
-                if (tag === 'button') return 'button';
-                if (tag === 'a' && el.hasAttribute('href')) return 'link';
-                if (/^h[1-6]$/.test(tag)) return 'heading';
-                if (tag === 'img') {
-                  if (el.hasAttribute('alt') && el.getAttribute('alt') === '') {
-                    const nameSource = normalize(explicitAccessibleName() || el.getAttribute('title') || '');
-                    if (!nameSource && !el.hasAttribute('tabindex')) return '';
-                  }
-                  return 'img';
-                }
-                if (tag === 'svg') return 'img';
-                if (tag === 'figure') return 'figure';
-                if (tag === 'dfn' || tag === 'dt') return 'term';
-                if (tag === 'dd') return 'definition';
-                if (tag === 'math') return 'math';
-                if (tag === 'mark') return 'mark';
-                if (tag === 'header') return hasScopedLandmarkAncestor() ? '' : 'banner';
-                if (tag === 'footer') return hasScopedLandmarkAncestor() ? '' : 'contentinfo';
-                if (tag === 'aside') return 'complementary';
-                if (tag === 'article') return 'article';
-                if (tag === 'blockquote') return 'blockquote';
-                if (tag === 'caption') return 'caption';
-                if (tag === 'code') return 'code';
-                if (tag === 'del') return 'deletion';
-                if (tag === 'em') return 'emphasis';
-                if (tag === 'ins') return 'insertion';
-                if (tag === 'form') return explicitAccessibleName() ? 'form' : '';
-                if (tag === 'section') return explicitAccessibleName() ? 'region' : '';
-                if (tag === 'ul' || tag === 'ol') return 'list';
-                if (tag === 'li') return 'listitem';
-                if (tag === 'table') return 'table';
-                if (['thead', 'tbody', 'tfoot'].includes(tag)) return 'rowgroup';
-                if (tag === 'tr') return 'row';
-                if (tag === 'td') return 'cell';
-                if (tag === 'th') {
-                  const scope = String(el.getAttribute('scope') || '').toLowerCase();
-                  if (scope === 'col' || scope === 'colgroup') return 'columnheader';
-                  if (scope === 'row' || scope === 'rowgroup') return 'rowheader';
-                  return el.closest('thead') ? 'columnheader' : 'rowheader';
-                }
-                if (tag === 'option') return 'option';
-                if (tag === 'progress') return 'progressbar';
-                if (tag === 'meter') return 'meter';
-                if (tag === 'output') return 'status';
-                if (tag === 'p') return 'paragraph';
-                if (tag === 'search') return 'search';
-                if (tag === 'strong') return 'strong';
-                if (tag === 'sub') return 'subscript';
-                if (tag === 'sup') return 'superscript';
-                if (tag === 'time') return 'time';
-                if (tag === 'hr') return 'separator';
-                if (tag === 'details' || tag === 'fieldset') return 'group';
-                if (tag === 'dialog') return 'dialog';
-                if (tag === 'nav') return 'navigation';
-                if (tag === 'main') return 'main';
-                if (tag === 'select') return el.multiple || Number(el.getAttribute('size') || 0) > 1 ? 'listbox' : 'combobox';
-                if (tag === 'textarea') return 'textbox';
-                if (tag === 'input') {
-                  const type = (el.getAttribute('type') || 'text').toLowerCase();
-                  if (type === 'checkbox') return 'checkbox';
-                  if (type === 'radio') return 'radio';
-                  if (type === 'range') return 'slider';
-                  if (type === 'search') return 'searchbox';
-                  if (type === 'number') return 'spinbutton';
-                  if (['button', 'submit', 'reset', 'image', 'file'].includes(type)) return 'button';
-                  if (!['hidden', 'file', 'image'].includes(type)) return 'textbox';
-                  return '';
-                }
-                return '';
-                }"""
-            )
-            return self._matches(expected, actual), f"role {expected!r}, got {actual!r}"
-
-        self._poll(check, f"role {expected!r}", timeout, api_method="LocatorAssertions.to_have_role")
-
-    def _try_fast_accessible_text(self, kind: str) -> Any:
-        if kind != "name" or not isinstance(self.actual, Locator):
-            return _MISSING
-        payload = self.actual._simple_css_indexed_read_payload()
-        if payload is None:
-            return _MISSING
-        result = self.actual._evaluate_simple_css_fast_path(
-            r"""(payload) => {
-const allElements = document.querySelectorAll('*');
-for (let i = 0; i < allElements.length; i++) {
-  if (allElements[i].shadowRoot) return { ok: false, type: 'fallback' };
-}
-const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
-const hiddenForName = (node, root) => {
-  if (!node || node.nodeType !== 1 || node === root) return false;
-  if (node.hasAttribute('hidden')) return true;
-  if (String(node.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return true;
-  const view = (node.ownerDocument && node.ownerDocument.defaultView) || window;
-  const style = view.getComputedStyle(node);
-  return style.visibility === 'hidden' || style.display === 'none';
-};
-const descendantText = (node, root) => {
-  if (!node) return '';
-  if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
-  if (node.nodeType !== Node.ELEMENT_NODE || hiddenForName(node, root)) return '';
-  const tag = node.tagName || '';
-  const type = String(node.getAttribute('type') || '').toLowerCase();
-  if (tag === 'IMG') return node.getAttribute('alt') || node.getAttribute('title') || '';
-  if (String(tag).toLowerCase() === 'svg') {
-    const title = node.querySelector('title');
-    return title ? title.textContent || '' : node.getAttribute('title') || '';
-  }
-  if (String(node.getAttribute('role') || '').trim().split(/\s+/).filter(Boolean)[0] === 'img') {
-    return node.getAttribute('aria-label') || node.getAttribute('title') || '';
-  }
-  if (tag === 'INPUT' && type === 'image') return node.getAttribute('alt') || node.getAttribute('title') || 'Submit';
-  if (tag === 'INPUT' && type === 'file') return 'Choose File';
-  if (tag === 'INPUT' && ['button', 'submit', 'reset'].includes(type)) {
-    if (node.value) return node.value;
-    if (node.getAttribute('title')) return node.getAttribute('title') || '';
-    if (type === 'submit') return 'Submit';
-    if (type === 'reset') return 'Reset';
-    return '';
-  }
-  return Array.from(node.childNodes || []).map(child => descendantText(child, root)).join(' ');
-};
-const referencedText = (el, attribute) => {
-  const doc = el.ownerDocument || document;
-  return normalize(String(el.getAttribute(attribute) || '')
-    .split(/\s+/)
-    .filter(Boolean)
-    .map(id => {
-      const node = doc.getElementById(id);
-      if (!node || node.nodeType !== 1) return '';
-      const tag = node.tagName || '';
-      const type = String(node.getAttribute('type') || '').toLowerCase();
-      if (tag === 'TEXTAREA') return node.value || node.textContent || '';
-      if (tag === 'SELECT') {
-        return Array.from(node.selectedOptions || [])
-          .map(option => option.label || option.innerText || option.textContent || '')
-          .join(' ');
-      }
-      if (tag === 'INPUT') {
-        if (type === 'image') return node.getAttribute('alt') || node.getAttribute('title') || node.value || '';
-        if (['button', 'submit', 'reset'].includes(type)) {
-          if (node.value) return node.value;
-          if (type === 'submit') return 'Submit';
-          if (type === 'reset') return 'Reset';
-          return '';
-        }
-        if (type === 'hidden') return '';
-        return node.value || '';
-      }
-      const ariaLabel = node.getAttribute('aria-label');
-      if (ariaLabel) return ariaLabel;
-      return descendantText(node, node) || node.innerText || node.textContent || '';
-    })
-    .join(' '));
-};
-const knownRoles = new Set([
-  'alert', 'alertdialog', 'application', 'article', 'banner', 'blockquote', 'button',
-  'caption', 'cell', 'checkbox', 'code', 'columnheader', 'combobox', 'complementary',
-  'contentinfo', 'definition', 'deletion', 'dialog', 'directory', 'document', 'emphasis',
-  'feed', 'figure', 'form', 'generic', 'grid', 'gridcell', 'group', 'heading', 'img',
-  'insertion', 'link', 'list', 'listbox', 'listitem', 'log', 'main', 'mark', 'marquee', 'math',
-  'meter', 'menu', 'menubar', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'navigation',
-  'none', 'note', 'option', 'paragraph', 'presentation', 'progressbar', 'radio',
-  'radiogroup', 'region', 'row', 'rowgroup', 'rowheader', 'scrollbar', 'search',
-  'searchbox', 'separator', 'slider', 'spinbutton', 'status', 'strong', 'subscript',
-  'superscript', 'switch', 'tab', 'table', 'tablist', 'tabpanel', 'term', 'textbox',
-  'time', 'timer', 'toolbar', 'tooltip', 'tree', 'treegrid', 'treeitem'
-]);
-const explicitRoleOf = el => {
-  for (const token of String(el.getAttribute('role') || '').trim().split(/\s+/).filter(Boolean)) {
-    if (knownRoles.has(token)) return token;
-  }
-  return '';
-};
-const labelText = el => {
-  const labelledBy = referencedText(el, 'aria-labelledby');
-  if (labelledBy) return labelledBy;
-  const ariaLabel = el.getAttribute('aria-label');
-  if (ariaLabel) return normalize(ariaLabel);
-  if (el.labels && el.labels.length) {
-    return normalize(Array.from(el.labels).map(label => descendantText(label, label) || label.innerText || label.textContent || '').join(' '));
-  }
-  return '';
-};
-const presentationalConflictNativeRoleOf = el => {
-  const tag = el.tagName || '';
-  const type = String(el.getAttribute('type') || 'text').toLowerCase();
-  if (tag === 'BUTTON') return 'button';
-  if (tag === 'A' && el.hasAttribute('href')) return 'link';
-  if (tag === 'IMG' || String(tag).toLowerCase() === 'svg') {
-    return el.hasAttribute('tabindex') || labelText(el) ? 'img' : '';
-  }
-  if (tag === 'SELECT') return el.multiple || Number(el.getAttribute('size') || 0) > 1 ? 'listbox' : 'combobox';
-  if (tag === 'TEXTAREA') return 'textbox';
-  if (tag === 'INPUT') {
-    if (type === 'checkbox') return 'checkbox';
-    if (type === 'radio') return 'radio';
-    if (type === 'range') return 'slider';
-    if (type === 'search') return 'searchbox';
-    if (type === 'number') return 'spinbutton';
-    if (['button', 'submit', 'reset', 'image', 'file'].includes(type)) return 'button';
-    if (!['hidden', 'file', 'image'].includes(type)) return 'textbox';
-  }
-  return '';
-};
-const hasScopedLandmarkAncestor = el => {
-  let current = el.parentElement;
-  while (current && current.nodeType === 1) {
-    const tag = current.tagName || '';
-    if (['ARTICLE', 'ASIDE', 'MAIN', 'NAV', 'SECTION'].includes(tag)) return true;
-    const role = explicitRoleOf(current);
-    if (['article', 'complementary', 'main', 'navigation', 'region'].includes(role)) return true;
-    current = current.parentElement;
-  }
-  return false;
-};
-const roleOf = el => {
-  const explicit = explicitRoleOf(el);
-  if (explicit === 'none' || explicit === 'presentation') {
-    const nativeRole = presentationalConflictNativeRoleOf(el);
-    return nativeRole || explicit;
-  }
-  if (explicit) return explicit;
-  const tag = el.tagName || '';
-  const type = String(el.getAttribute('type') || '').toLowerCase();
-  if (tag === 'HTML') return 'document';
-  if (tag === 'BUTTON') return 'button';
-  if (tag === 'A' && el.hasAttribute('href')) return 'link';
-  if (/^H[1-6]$/.test(tag)) return 'heading';
-  if (tag === 'IMG') {
-    if (el.hasAttribute('alt') && el.getAttribute('alt') === '') {
-      const nameSource = normalize(labelText(el) || el.getAttribute('title') || '');
-      if (!nameSource && !el.hasAttribute('tabindex')) return '';
-    }
-    return 'img';
-  }
-  if (String(tag).toLowerCase() === 'svg') return 'img';
-  if (tag === 'FIGURE') return 'figure';
-  if (tag === 'DFN' || tag === 'DT') return 'term';
-  if (tag === 'DD') return 'definition';
-  if (String(tag).toLowerCase() === 'math') return 'math';
-  if (tag === 'MARK') return 'mark';
-  if (tag === 'BLOCKQUOTE') return 'blockquote';
-  if (tag === 'CAPTION') return 'caption';
-  if (tag === 'CODE') return 'code';
-  if (tag === 'DEL') return 'deletion';
-  if (tag === 'EM') return 'emphasis';
-  if (tag === 'INS') return 'insertion';
-  if (tag === 'HEADER') return hasScopedLandmarkAncestor(el) ? '' : 'banner';
-  if (tag === 'FOOTER') return hasScopedLandmarkAncestor(el) ? '' : 'contentinfo';
-  if (tag === 'ASIDE') return 'complementary';
-  if (tag === 'ARTICLE') return 'article';
-  if (tag === 'FORM') return labelText(el) ? 'form' : '';
-  if (tag === 'SECTION') return labelText(el) ? 'region' : '';
-  if (tag === 'UL' || tag === 'OL') return 'list';
-  if (tag === 'LI') return 'listitem';
-  if (tag === 'TABLE') return 'table';
-  if (tag === 'OUTPUT') return 'status';
-  if (tag === 'P') return 'paragraph';
-  if (tag === 'SEARCH') return 'search';
-  if (tag === 'STRONG') return 'strong';
-  if (tag === 'SUB') return 'subscript';
-  if (tag === 'SUP') return 'superscript';
-  if (tag === 'TIME') return 'time';
-  if (tag === 'HR') return 'separator';
-  if (tag === 'DETAILS' || tag === 'FIELDSET') return 'group';
-  if (tag === 'DIALOG') return 'dialog';
-  if (tag === 'NAV') return 'navigation';
-  if (tag === 'MAIN') return 'main';
-  if (tag === 'SELECT') return el.multiple || Number(el.getAttribute('size') || 0) > 1 ? 'listbox' : 'combobox';
-  if (tag === 'TEXTAREA') return 'textbox';
-  if (tag === 'INPUT') {
-    if (type === 'checkbox') return 'checkbox';
-    if (type === 'radio') return 'radio';
-    if (type === 'range') return 'slider';
-    if (type === 'search') return 'searchbox';
-    if (type === 'number') return 'spinbutton';
-    if (['button', 'submit', 'reset', 'image', 'file'].includes(type)) return 'button';
-    if (!['hidden', 'file', 'image'].includes(type)) return 'textbox';
-  }
-  return '';
-};
-const accessibleName = el => {
-  const role = roleOf(el);
-  if (['term', 'definition', 'generic', 'mark'].includes(role)) return '';
-  const labelled = labelText(el);
-  if (labelled) return labelled;
-  if (['none', 'presentation'].includes(role)) return '';
-  const tag = el.tagName || '';
-  if (role === 'table' && tag === 'TABLE') {
-    const caption = el.querySelector('caption');
-    return normalize(caption ? caption.innerText || caption.textContent || '' : '');
-  }
-  if (role === 'group' && tag === 'FIELDSET') {
-    const legend = el.querySelector('legend');
-    return normalize(legend ? legend.innerText || legend.textContent || '' : '');
-  }
-  if (role === 'figure') {
-    const caption = el.querySelector('figcaption');
-    return normalize(caption ? caption.innerText || caption.textContent || '' : el.getAttribute('title') || '');
-  }
-  if (role === 'math') return normalize(el.getAttribute('title') || '');
-  if (role === 'img' && String(tag).toLowerCase() === 'svg') return normalize(descendantText(el, el) || el.getAttribute('title') || '');
-  if (role === 'img') return normalize(el.getAttribute('alt') || el.getAttribute('title') || '');
-  if (role === 'textbox' || role === 'searchbox') return normalize(el.getAttribute('title') || el.getAttribute('placeholder') || '');
-  if (role === 'button' && tag === 'INPUT' && String(el.getAttribute('type') || '').toLowerCase() === 'image') {
-    return normalize(el.getAttribute('alt') || el.getAttribute('title') || 'Submit');
-  }
-  if (role === 'button' && tag === 'INPUT' && String(el.getAttribute('type') || '').toLowerCase() === 'file') return 'Choose File';
-  if (role === 'button' && tag === 'INPUT') {
-    const type = String(el.getAttribute('type') || '').toLowerCase();
-    if (type === 'submit') return normalize(el.value || el.getAttribute('title') || 'Submit');
-    if (type === 'reset') return normalize(el.value || el.getAttribute('title') || 'Reset');
-  }
-  if (['alert', 'alertdialog', 'application', 'article', 'banner', 'combobox', 'complementary', 'contentinfo', 'dialog', 'directory', 'document', 'feed', 'form', 'grid', 'group', 'list', 'listbox', 'listitem', 'log', 'main', 'marquee', 'menubar', 'menu', 'navigation', 'note', 'radiogroup', 'region', 'rowgroup', 'scrollbar', 'search', 'separator', 'status', 'table', 'tablist', 'tabpanel', 'timer', 'toolbar', 'tree', 'treegrid'].includes(role)) return '';
-  return normalize(descendantText(el, el) || el.value || el.getAttribute('title') || '');
-};
-const matches = Array.from(document.querySelectorAll(String(payload.selector || '')));
-if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-let index = Number(payload.index || 0);
-if (index < 0) index = matches.length + index;
-const el = matches[index] || null;
-if (!el) return { ok: false, type: 'fallback' };
-return { ok: true, value: accessibleName(el) };
-}""",
-            payload,
-            timeout=None,
-            method="LocatorAssertions.to_have_accessible_name",
-        )
-        if isinstance(result, dict) and result.get("ok"):
-            return str(result.get("value") or "")
-        if isinstance(result, dict) and result.get("type") == "strict":
-            count = int(result.get("count") or 0)
-            raise Error(
-                f"strict mode violation: locator resolved to {count} elements while trying to assert accessible name"
-            )
-        return _MISSING
-
-    def _accessible_text(self, kind: str) -> str:
-        fast = self._try_fast_accessible_text(kind)
-        if fast is not _MISSING:
-            return str(fast)
-        return str(
-            self.actual.evaluate(
-                """(el, kind) => {
-                const normalize = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
-                const descendantText = node => {
-                  if (!node) return '';
-                  if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
-                  if (node.nodeType !== Node.ELEMENT_NODE) return '';
-                  if (node.getAttribute('aria-hidden') === 'true') return '';
-                  const style = node.ownerDocument.defaultView.getComputedStyle(node);
-                  if (node !== el && (style.display === 'none' || style.visibility === 'hidden')) return '';
-                  const tag = node.tagName || '';
-                  const type = String(node.getAttribute('type') || '').toLowerCase();
-                  if (tag === 'IMG') return node.getAttribute('alt') || node.getAttribute('title') || '';
-                  if (String(tag).toLowerCase() === 'svg') {
-                    const title = node.querySelector('title');
-                    return title ? title.textContent || '' : '';
-                  }
-                  if (String(node.getAttribute('role') || '').trim().split(/\\s+/).filter(Boolean)[0] === 'img') {
-                    return node.getAttribute('aria-label') || node.getAttribute('title') || '';
-                  }
-                  if (tag === 'INPUT' && type === 'image') {
-                    return node.getAttribute('alt') || node.getAttribute('title') || 'Submit';
-                  }
-                  if (tag === 'INPUT' && type === 'file') {
-                    return 'Choose File';
-                  }
-                  if (tag === 'INPUT' && ['button', 'submit', 'reset'].includes(type)) {
-                    if (node.value) return node.value;
-                    if (node.getAttribute('title')) return node.getAttribute('title') || '';
-                    if (type === 'submit') return 'Submit';
-                    if (type === 'reset') return 'Reset';
-                    return '';
-                  }
-                  return Array.from(node.childNodes).map(descendantText).join(' ');
-                };
-                const referencedText = attribute => normalize(String(el.getAttribute(attribute) || '')
-                  .split(/\\s+/)
-                  .filter(Boolean)
-                  .map(id => {
-                    const node = el.ownerDocument.getElementById(id);
-                    const referencedControlText = current => {
-                      const tag = current && current.tagName || '';
-                      const type = String(current && current.getAttribute('type') || '').toLowerCase();
-                      if (tag === 'TEXTAREA') return current.value || current.textContent || '';
-                      if (tag === 'SELECT') {
-                        return Array.from(current.selectedOptions || [])
-                          .map(option => option.label || option.innerText || option.textContent || '')
-                          .join(' ');
-                      }
-                      if (tag === 'INPUT') {
-                        if (type === 'image') return current.getAttribute('alt') || current.getAttribute('title') || current.value || '';
-                        if (['button', 'submit', 'reset'].includes(type)) {
-                          if (current.value) return current.value;
-                          if (type === 'submit') return 'Submit';
-                          if (type === 'reset') return 'Reset';
-                          return '';
-                        }
-                        if (type === 'hidden') return '';
-                        return current.value || '';
-                      }
-                      return '';
-                    };
-                    const referencedNodeText = current => {
-                      if (!current || current.nodeType !== 1) return '';
-                      const controlText = referencedControlText(current);
-                      if (controlText) return controlText;
-                      const ariaLabel = current.getAttribute('aria-label');
-                      if (ariaLabel) return ariaLabel;
-                      const nestedText = nested => {
-                        if (!nested) return '';
-                        if (nested.nodeType === Node.TEXT_NODE) return nested.textContent || '';
-                        if (nested.nodeType !== Node.ELEMENT_NODE) return '';
-                        if (nested !== current && nested.getAttribute('aria-hidden') === 'true') return '';
-                        const style = nested.ownerDocument.defaultView.getComputedStyle(nested);
-                        if (nested !== current && (style.display === 'none' || style.visibility === 'hidden')) return '';
-                        const tag = nested.tagName || '';
-                        if (tag === 'IMG') return nested.getAttribute('alt') || nested.getAttribute('title') || '';
-                        if (String(tag).toLowerCase() === 'svg') {
-                          const title = nested.querySelector('title');
-                          return title ? title.textContent || '' : nested.getAttribute('title') || '';
-                        }
-                        if (String(nested.getAttribute('role') || '').trim().split(/\\s+/).filter(Boolean)[0] === 'img') {
-                          return nested.getAttribute('aria-label') || nested.getAttribute('title') || '';
-                        }
-                        return Array.from(nested.childNodes).map(nestedText).join(' ');
-                      };
-                      return nestedText(current) || current.innerText || current.textContent || '';
-                    };
-                    return referencedNodeText(node);
-                  })
-                  .join(' '));
-                const labelText = () => {
-                  const labelledBy = referencedText('aria-labelledby');
-                  if (labelledBy) return labelledBy;
-                  const ariaLabel = el.getAttribute('aria-label');
-                  if (ariaLabel) return normalize(ariaLabel);
-                  if (el.labels && el.labels.length) {
-                    return normalize(Array.from(el.labels).map(label => descendantText(label) || label.innerText || label.textContent || '').join(' '));
-                  }
-                  return '';
-                };
-                const explicitRoleOf = node => String(node.getAttribute('role') || '').trim().split(/\\s+/).filter(Boolean)[0] || '';
-                const presentationalConflictNativeRoleOf = node => {
-                  const tag = node.tagName || '';
-                  const type = String(node.getAttribute('type') || 'text').toLowerCase();
-                  if (tag === 'BUTTON') return 'button';
-                  if (tag === 'A' && node.hasAttribute('href')) return 'link';
-                  if (tag === 'IMG' || String(tag).toLowerCase() === 'svg') {
-                    return node.hasAttribute('tabindex') || labelText() ? 'img' : '';
-                  }
-                  if (tag === 'SELECT') return node.multiple || Number(node.getAttribute('size') || 0) > 1 ? 'listbox' : 'combobox';
-                  if (tag === 'TEXTAREA') return 'textbox';
-                  if (tag === 'INPUT') {
-                    if (type === 'checkbox') return 'checkbox';
-                    if (type === 'radio') return 'radio';
-                    if (type === 'range') return 'slider';
-                    if (type === 'search') return 'searchbox';
-                    if (type === 'number') return 'spinbutton';
-                    if (['button', 'submit', 'reset', 'image', 'file'].includes(type)) return 'button';
-                    if (!['hidden', 'file', 'image'].includes(type)) return 'textbox';
-                  }
-                  return '';
-                };
-                const hasScopedLandmarkAncestor = node => {
-                  let current = node.parentElement;
-                  while (current && current.nodeType === 1) {
-                    const tag = current.tagName || '';
-                    if (['ARTICLE', 'ASIDE', 'MAIN', 'NAV', 'SECTION'].includes(tag)) return true;
-                    const currentRole = explicitRoleOf(current);
-                    if (['article', 'complementary', 'main', 'navigation', 'region'].includes(currentRole)) return true;
-                    current = current.parentElement;
-                  }
-                  return false;
-                };
-                const role = (node => {
-                  const explicit = explicitRoleOf(node);
-                  if (explicit === 'none' || explicit === 'presentation') {
-                    const nativeRole = presentationalConflictNativeRoleOf(node);
-                    if (nativeRole) return nativeRole;
-                    if (labelText()) return '';
-                    return explicit;
-                  }
-                  if (explicit && !['none', 'presentation'].includes(explicit)) return explicit;
-                  const tag = node.tagName || '';
-                  const type = String(node.getAttribute('type') || '').toLowerCase();
-                  if (tag === 'HTML') return 'document';
-                  if (tag === 'BUTTON') return 'button';
-                  if (tag === 'A' && node.hasAttribute('href')) return 'link';
-                  if (/^H[1-6]$/.test(tag)) return 'heading';
-                  if (tag === 'IMG') {
-                    if (node.hasAttribute('alt') && node.getAttribute('alt') === '') {
-                      const nameSource = normalize(labelText() || node.getAttribute('title') || '');
-                      if (!nameSource && !node.hasAttribute('tabindex')) return '';
-                    }
-                    return 'img';
-                  }
-                  if (String(tag).toLowerCase() === 'svg') return 'img';
-                  if (tag === 'FIGURE') return 'figure';
-                  if (tag === 'DFN' || tag === 'DT') return 'term';
-                  if (tag === 'DD') return 'definition';
-                  if (String(tag).toLowerCase() === 'math') return 'math';
-                  if (tag === 'MARK') return 'mark';
-                  if (tag === 'HEADER') return hasScopedLandmarkAncestor(node) ? '' : 'banner';
-                  if (tag === 'FOOTER') return hasScopedLandmarkAncestor(node) ? '' : 'contentinfo';
-                  if (tag === 'ASIDE') return 'complementary';
-                  if (tag === 'ARTICLE') return 'article';
-                  if (tag === 'NAV') return 'navigation';
-                  if (tag === 'MAIN') return 'main';
-                  if (tag === 'SEARCH') return 'search';
-                  if (tag === 'FORM') return labelText() ? 'form' : '';
-                  if (tag === 'UL' || tag === 'OL') return 'list';
-                  if (tag === 'LI') return 'listitem';
-                  if (tag === 'TABLE') return 'table';
-                  if (tag === 'FIELDSET' || tag === 'DETAILS') return 'group';
-                  if (tag === 'DIALOG') return 'dialog';
-                  if (tag === 'SECTION') return labelText() ? 'region' : '';
-                  if (['THEAD', 'TBODY', 'TFOOT'].includes(tag)) return 'rowgroup';
-                  if (tag === 'OUTPUT') return 'status';
-                  if (tag === 'TR') return 'row';
-                  if (tag === 'TD') return 'cell';
-                  if (tag === 'TH') {
-                    const scope = String(el.getAttribute('scope') || '').toLowerCase();
-                    if (scope === 'col' || scope === 'colgroup') return 'columnheader';
-                    if (scope === 'row' || scope === 'rowgroup') return 'rowheader';
-                    return el.closest('thead') ? 'columnheader' : 'rowheader';
-                  }
-                  if (tag === 'TEXTAREA') return 'textbox';
-                  if (tag === 'INPUT') {
-                    if (type === 'checkbox') return 'checkbox';
-                    if (type === 'radio') return 'radio';
-                    if (type === 'button' || type === 'submit' || type === 'reset' || type === 'image' || type === 'file') return 'button';
-                    if (!['hidden', 'file', 'image', 'range'].includes(type)) return 'textbox';
-                  }
-                  return '';
-                })(el);
-                if (kind === 'name') {
-                  if (role === 'term' || role === 'definition' || role === 'generic' || role === 'mark') return '';
-                  const labelled = labelText();
-                  if (labelled) return labelled;
-                  if (role === 'none' || role === 'presentation') return '';
-                  if (role === 'table' && el.tagName === 'TABLE') {
-                    const caption = el.querySelector('caption');
-                    return normalize(caption ? caption.innerText || caption.textContent || '' : '');
-                  }
-                  if (role === 'group' && el.tagName === 'FIELDSET') {
-                    const legend = el.querySelector('legend');
-                    return normalize(legend ? legend.innerText || legend.textContent || '' : '');
-                  }
-                  if ([
-                    'alert', 'alertdialog', 'application', 'article', 'banner', 'combobox',
-                    'complementary', 'contentinfo', 'dialog', 'directory', 'document', 'feed',
-                    'form', 'grid', 'group', 'list', 'listbox', 'listitem', 'log', 'main',
-                    'marquee', 'menubar', 'menu', 'navigation', 'note', 'radiogroup', 'region',
-                    'rowgroup', 'scrollbar', 'search', 'separator', 'status', 'table',
-                    'tablist', 'tabpanel', 'timer', 'toolbar', 'tree', 'treegrid',
-                  ].includes(role)) return '';
-                  if (role === 'figure') {
-                    const caption = el.querySelector('figcaption');
-                    return normalize(caption ? caption.innerText || caption.textContent || '' : el.getAttribute('title') || '');
-                  }
-                  if (role === 'math') return normalize(el.getAttribute('title') || '');
-                  if (role === 'img' && String(el.tagName || '').toLowerCase() === 'svg') return normalize(descendantText(el) || el.getAttribute('title') || '');
-                  if (role === 'img') return normalize(el.getAttribute('alt') || el.getAttribute('title') || '');
-                  if (role === 'textbox') return normalize(el.getAttribute('title') || el.getAttribute('placeholder') || '');
-                  if (role === 'button' && el.tagName === 'INPUT' && String(el.getAttribute('type') || '').toLowerCase() === 'image') {
-                    return normalize(el.getAttribute('alt') || el.getAttribute('title') || 'Submit');
-                  }
-                  if (role === 'button' && el.tagName === 'INPUT' && String(el.getAttribute('type') || '').toLowerCase() === 'file') {
-                    return 'Choose File';
-                  }
-                  if (role === 'button' && el.tagName === 'INPUT') {
-                    const type = String(el.getAttribute('type') || '').toLowerCase();
-                    if (type === 'submit') return normalize(el.value || el.getAttribute('title') || 'Submit');
-                    if (type === 'reset') return normalize(el.value || el.getAttribute('title') || 'Reset');
-                  }
-                  return normalize(descendantText(el) || el.value || el.getAttribute('title') || '');
-                }
-                if (kind === 'description') {
-                  return referencedText('aria-describedby') || normalize(el.getAttribute('aria-description') || el.getAttribute('title') || '');
-                }
-                if (kind === 'error') {
-                  const invalid = String(el.getAttribute('aria-invalid') || '').toLowerCase();
-                  if (!invalid || invalid === 'false') return '';
-                  return referencedText('aria-errormessage');
-                }
-                return '';
-                }""",
-                kind,
-            )
-            or ""
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("role", strict_action="assert role"),
+                "expected": self._native_text_matcher(expected),
+            },
+            f"role {expected!r}",
+            lambda actual: (
+                f"role {expected!r}, got no matching element"
+                if actual is None
+                else f"role {expected!r}, got {actual!r}"
+            ),
+            timeout,
+            api_method="LocatorAssertions.to_have_role",
         )
 
     def to_have_accessible_name(
@@ -28113,12 +27345,17 @@ return { ok: true, value: accessibleName(el) };
         timeout: Optional[float] = None,
     ) -> None:
         expected = _normalize_expected_text_value(_required_expectation_arg(name, "to_have_accessible_name", "name"))
-
-        def check() -> tuple[bool, str]:
-            actual = self._accessible_text("name")
-            return self._matches_text(expected, actual, ignore_case=ignore_case), f"accessible name {expected!r}, got {actual!r}"
-
-        self._poll(check, f"accessible name {expected!r}", timeout, api_method="LocatorAssertions.to_have_accessible_name")
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("accessible_name", strict_action="assert accessible name"),
+                "expected": self._native_text_matcher(expected),
+                "ignore_case": ignore_case is True,
+            },
+            f"accessible name {expected!r}",
+            lambda actual: f"accessible name {expected!r}, got {actual!r}",
+            timeout,
+            api_method="LocatorAssertions.to_have_accessible_name",
+        )
 
     def to_have_accessible_description(
         self,
@@ -28128,14 +27365,17 @@ return { ok: true, value: accessibleName(el) };
         timeout: Optional[float] = None,
     ) -> None:
         expected = _normalize_expected_text_value(_required_expectation_arg(description, "to_have_accessible_description", "description"))
-
-        def check() -> tuple[bool, str]:
-            actual = self._accessible_text("description")
-            return self._matches_text(expected, actual, ignore_case=ignore_case), (
-                f"accessible description {expected!r}, got {actual!r}"
-            )
-
-        self._poll(check, f"accessible description {expected!r}", timeout, api_method="LocatorAssertions.to_have_accessible_description")
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("accessible_description", strict_action="assert accessible description"),
+                "expected": self._native_text_matcher(expected),
+                "ignore_case": ignore_case is True,
+            },
+            f"accessible description {expected!r}",
+            lambda actual: f"accessible description {expected!r}, got {actual!r}",
+            timeout,
+            api_method="LocatorAssertions.to_have_accessible_description",
+        )
 
     def to_have_accessible_error_message(
         self,
@@ -28145,14 +27385,17 @@ return { ok: true, value: accessibleName(el) };
         timeout: Optional[float] = None,
     ) -> None:
         expected = _normalize_expected_text_value(_required_expectation_arg(error_message, "to_have_accessible_error_message", "error_message"))
-
-        def check() -> tuple[bool, str]:
-            actual = self._accessible_text("error")
-            return self._matches_text(expected, actual, ignore_case=ignore_case), (
-                f"accessible error message {expected!r}, got {actual!r}"
-            )
-
-        self._poll(check, f"accessible error message {expected!r}", timeout, api_method="LocatorAssertions.to_have_accessible_error_message")
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("accessible_error", strict_action="assert accessible error message"),
+                "expected": self._native_text_matcher(expected),
+                "ignore_case": ignore_case is True,
+            },
+            f"accessible error message {expected!r}",
+            lambda actual: f"accessible error message {expected!r}, got {actual!r}",
+            timeout,
+            api_method="LocatorAssertions.to_have_accessible_error_message",
+        )
 
     def to_match_aria_snapshot(self, expected: str, *, timeout: Optional[float] = None) -> None:
         if not isinstance(expected, str) and expected not in (None, False, 0):
@@ -28166,20 +27409,50 @@ return { ok: true, value: accessibleName(el) };
 
     def to_have_css(self, name: str, value: Any, *, timeout: Optional[float] = None) -> None:
         expected = _normalize_expected_text_value(value)
-
-        def check() -> tuple[bool, str]:
-            actual = self.actual.evaluate("(el, name) => getComputedStyle(el).getPropertyValue(name)", name)
-            actual = "" if actual is None else str(actual).strip()
-            return self._matches(expected, actual), f"css {name!r} {expected!r}, got {actual!r}"
-
-        self._poll(check, f"css {name!r} {expected!r}", timeout, api_method="LocatorAssertions.to_have_css")
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("css", strict_action="assert CSS"),
+                "name": name,
+                "expected": self._native_text_matcher(expected),
+            },
+            f"css {name!r} {expected!r}",
+            lambda actual: f"css {name!r} {expected!r}, got {actual!r}",
+            timeout,
+            api_method="LocatorAssertions.to_have_css",
+        )
 
     def to_have_js_property(self, name: str, value: Any, *, timeout: Optional[float] = None) -> None:
-        def check() -> tuple[bool, str]:
-            actual = self.actual.evaluate("(el, name) => el[name]", name)
-            return _js_property_values_equal(value, actual), f"js property {name!r} {value!r}, got {actual!r}"
+        native_expected = self._native_js_property_expected(value)
+        if not self._native_js_property_expected_supported(native_expected):
+            # Some runtime values intentionally decode to Python-native objects such
+            # as datetime and ParseResult. Preserve their exact legacy equality
+            # semantics instead of forcing them through the JSON matcher schema.
+            def check() -> tuple[bool, str]:
+                actual = self.actual.evaluate("(el, name) => el[name]", name)
+                return (
+                    self._js_property_values_equal(value, actual),
+                    f"js property {name!r} {value!r}, got {actual!r}",
+                )
 
-        self._poll(check, f"js property {name!r} {value!r}", timeout, api_method="LocatorAssertions.to_have_js_property")
+            self._poll(
+                check,
+                f"js property {name!r} {value!r}",
+                timeout,
+                api_method="LocatorAssertions.to_have_js_property",
+            )
+            return
+
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("js_property", strict_action="assert JavaScript property"),
+                "name": name,
+                "expected": native_expected,
+            },
+            f"js property {name!r} {value!r}",
+            lambda actual: f"js property {name!r} {value!r}, got {actual!r}",
+            timeout,
+            api_method="LocatorAssertions.to_have_js_property",
+        )
 
     def to_be_in_viewport(self, *, ratio: Optional[float] = None, timeout: Optional[float] = None) -> None:
         expected_ratio = (
@@ -28192,24 +27465,16 @@ return { ok: true, value: accessibleName(el) };
             )
         )
 
-        def check() -> tuple[bool, str]:
-            actual_ratio = self.actual.evaluate(
-                """(el) => {
-                const rect = el.getBoundingClientRect();
-                const left = Math.max(0, rect.left);
-                const top = Math.max(0, rect.top);
-                const right = Math.min(innerWidth, rect.right);
-                const bottom = Math.min(innerHeight, rect.bottom);
-                const visibleArea = Math.max(0, right - left) * Math.max(0, bottom - top);
-                const area = Math.max(1, rect.width * rect.height);
-                return visibleArea / area;
-                }"""
-            )
-            numeric_ratio = float(actual_ratio or 0)
-            ok = numeric_ratio > 0 and numeric_ratio >= expected_ratio
-            return ok, f"viewport ratio {actual_ratio!r} < {expected_ratio!r}"
-
-        self._poll(check, "locator to be in viewport", timeout, api_method="LocatorAssertions.to_be_in_viewport")
+        self._native_locator_poll(
+            {
+                **self._native_matcher_base("viewport", strict_action="assert viewport"),
+                "ratio": expected_ratio,
+            },
+            "locator to be in viewport",
+            lambda actual: f"viewport ratio {actual!r} < {expected_ratio!r}",
+            timeout,
+            api_method="LocatorAssertions.to_be_in_viewport",
+        )
 
     def to_be_ok(self) -> None:
         if not isinstance(self.actual, (Response, APIResponse)):
