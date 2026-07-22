@@ -476,6 +476,345 @@ el.dispatchEvent(new Event('change', { bubbles: true }));
 return { ok: true, info };
 "#;
 
+const LOCATOR_SELECT_APPLY_TEMPLATE: &str = r#"
+if (!el) throw new Error('No element matches locator');
+if (!(el instanceof HTMLSelectElement)) throw new Error('Element is not a <select> element');
+const values = __VALUES__;
+const labels = __LABELS__;
+const indexes = __INDEXES__;
+const options = Array.from(el.options);
+const foundValues = new Set();
+const foundLabels = new Set();
+const foundIndexes = new Set();
+const selectedOptions = [];
+for (const option of options) {
+  let matched = false;
+  for (const value of values) {
+    if (option.value === value || option.label === value) {
+      foundValues.add(value);
+      matched = true;
+    }
+  }
+  for (const label of labels) {
+    if (option.label === label) {
+      foundLabels.add(label);
+      matched = true;
+    }
+  }
+  for (const index of indexes) {
+    if (option.index === index) {
+      foundIndexes.add(index);
+      matched = true;
+    }
+  }
+  if (matched) selectedOptions.push(option);
+}
+const hasRequests = values.length > 0 || labels.length > 0 || indexes.length > 0;
+const allRequestedFound =
+  values.every(value => foundValues.has(value)) &&
+  labels.every(label => foundLabels.has(label)) &&
+  indexes.every(index => foundIndexes.has(index));
+const ready = !hasRequests || (el.multiple ? allRequestedFound : selectedOptions.length > 0);
+if (!ready) {
+  return {
+    ok: false,
+    missing: [
+      ...values.filter(value => !foundValues.has(value)).map(value => `value=${value}`),
+      ...labels.filter(label => !foundLabels.has(label)).map(label => `label=${label}`),
+      ...indexes.filter(index => !foundIndexes.has(index)).map(index => `index=${index}`),
+    ],
+  };
+}
+for (const option of options) option.selected = false;
+if (el.multiple) {
+  for (const option of selectedOptions) option.selected = true;
+} else if (selectedOptions.length) {
+  selectedOptions[0].selected = true;
+}
+el.dispatchEvent(new Event('input', { bubbles: true }));
+el.dispatchEvent(new Event('change', { bubbles: true }));
+return { ok: true, selected: Array.from(el.selectedOptions).map(option => option.value) };
+"#;
+
+const LOCATOR_FAST_PATH_TEMPLATE: &str = r#"
+const fastArgs = __ARGS__;
+for (const candidate of Array.from(document.querySelectorAll('*'))) {
+  if (candidate.shadowRoot) return { ok: false, type: 'fallback' };
+}
+if (fastArgs.strict && matches.length > 1) {
+  return { ok: false, type: 'strict', count: matches.length };
+}
+__BODY__
+"#;
+
+const LOCATOR_FAST_COUNT_BODY: &str = "return { ok: true, count: matches.length };";
+const LOCATOR_FAST_TEXT_BODY: &str = r#"
+if (!el) return { ok: false, type: 'fallback' };
+if (fastArgs.property === 'innerText') return { ok: true, value: el.innerText };
+return { ok: true, value: el.textContent };
+"#;
+const LOCATOR_FAST_ALL_TEXTS_BODY: &str = r#"
+const values = matches.map(current => {
+  if (fastArgs.property === 'innerText') return current.innerText || current.textContent || '';
+  return current.textContent;
+});
+return { ok: true, values };
+"#;
+const LOCATOR_FAST_ATTRIBUTE_BODY: &str = r#"
+if (!el) return { ok: false, type: 'fallback' };
+return { ok: true, value: el.getAttribute(String(fastArgs.name || '')) };
+"#;
+const LOCATOR_FAST_INNER_HTML_BODY: &str = r#"
+if (!el) return { ok: false, type: 'fallback' };
+return { ok: true, value: el.innerHTML };
+"#;
+const LOCATOR_FAST_VISIBILITY_BODY: &str = "return { ok: true, value: !!el && visible(el) };";
+const LOCATOR_FAST_ROLE_VISIBILITY_BODY: &str = "return { ok: true, value: !!el };";
+const LOCATOR_FAST_ENABLED_BODY: &str = r#"
+if (!el) return { ok: false, type: 'fallback' };
+return { ok: true, value: !disabledState(el) };
+"#;
+const LOCATOR_FAST_BOUNDING_BOX_BODY: &str = r#"
+if (!el) return { ok: false, type: 'fallback' };
+const rect = el.getBoundingClientRect();
+return { ok: true, box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
+"#;
+const LOCATOR_FAST_INPUT_VALUE_BODY: &str = r#"
+if (!el) return { ok: false, type: 'fallback' };
+const tagName = String(el.tagName || '').toUpperCase();
+if (tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT') {
+  return { ok: true, value: el.value };
+}
+return { ok: false, type: 'non-control' };
+"#;
+const LOCATOR_FAST_IMMEDIATE_STATE_BODY: &str = r#"
+const satisfied = fastArgs.state === 'detached' ? !el : (!el || !visible(el));
+return { ok: true, satisfied };
+"#;
+
+fn locator_probe_state_body(options_json: &str) -> RwResult<String> {
+    let options: Value = serde_json::from_str(options_json)?;
+    let flag = |name: &str| {
+        if options.get(name).and_then(Value::as_bool).unwrap_or(false) {
+            "true"
+        } else {
+            "false"
+        }
+    };
+    let action_position = match options.get("action_position") {
+        Some(Value::Object(position)) => json!({
+            "x": position.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+            "y": position.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+        })
+        .to_string(),
+        _ => "null".to_string(),
+    };
+    Ok(LOCATOR_TARGET_STATE_TEMPLATE
+        .replace("__SCROLL__", flag("scroll"))
+        .replace("__STABLE__", flag("stable"))
+        .replace("__RECEIVES_EVENTS__", flag("receives_events"))
+        .replace(
+            "__STABLE_POSITION_REQUIRED__",
+            flag("stable_position_required"),
+        )
+        .replace("__ACTION_POSITION__", &action_position))
+}
+
+fn locator_fill_apply_body(value: &str, strict: bool, forced: bool) -> RwResult<String> {
+    Ok(LOCATOR_FILL_TEMPLATE
+        .replace("__STRICT__", if strict { "true" } else { "false" })
+        .replace("__FORCED__", if forced { "true" } else { "false" })
+        .replace("__VALUE__", &serde_json::to_string(value)?))
+}
+
+fn locator_select_apply_body(
+    values_json: &str,
+    labels_json: &str,
+    indexes_json: &str,
+) -> RwResult<String> {
+    let values: Value = serde_json::from_str(values_json)?;
+    let labels: Value = serde_json::from_str(labels_json)?;
+    let indexes: Value = serde_json::from_str(indexes_json)?;
+    if !values.is_array() || !labels.is_array() || !indexes.is_array() {
+        return Err(RwError::InvalidInput(
+            "locator select arguments must be arrays".to_string(),
+        ));
+    }
+    Ok(LOCATOR_SELECT_APPLY_TEMPLATE
+        .replace("__VALUES__", &values.to_string())
+        .replace("__LABELS__", &labels.to_string())
+        .replace("__INDEXES__", &indexes.to_string()))
+}
+
+fn locator_check_state_body() -> String {
+    format!("return ({NATIVE_CHECKED_STATE_JS})(el);")
+}
+
+fn object_field_is_present(spec: &Value, key: &str) -> bool {
+    spec.get(key).is_some_and(|value| !value.is_null())
+}
+
+fn simple_css_fast_spec(spec: &Value) -> bool {
+    let css = match spec.get("kind").and_then(Value::as_str) {
+        Some("css") => spec,
+        Some("nth") => match spec.get("base") {
+            Some(base) if base.get("kind").and_then(Value::as_str) == Some("css") => base,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    css.get("selector").and_then(Value::as_str).is_some()
+        && !["visible", "has_text", "text_pseudo", "layout"]
+            .iter()
+            .any(|key| object_field_is_present(css, key))
+}
+
+fn simple_attribute_fast_spec(spec: &Value) -> bool {
+    let attribute = match spec.get("kind").and_then(Value::as_str) {
+        Some("nth") => match spec.get("base") {
+            Some(base) => base,
+            None => return false,
+        },
+        _ => spec,
+    };
+    matches!(
+        attribute.get("kind").and_then(Value::as_str),
+        Some("test_id" | "alt" | "title" | "placeholder")
+    )
+}
+
+fn simple_role_fast_spec(spec: &Value, explicit_index: bool) -> bool {
+    if explicit_index || spec.get("kind").and_then(Value::as_str) != Some("role") {
+        return false;
+    }
+    if ["selected", "expanded", "pressed", "level"]
+        .iter()
+        .any(|key| object_field_is_present(spec, key))
+    {
+        return false;
+    }
+    if spec.get("role").and_then(Value::as_str).is_none() {
+        return false;
+    }
+    match spec.get("name") {
+        None | Some(Value::Null | Value::String(_)) => true,
+        Some(Value::Object(value)) => value.get("kind").and_then(Value::as_str) == Some("regex"),
+        _ => false,
+    }
+}
+
+fn simple_text_fast_spec(spec: &Value) -> bool {
+    match spec.get("kind").and_then(Value::as_str) {
+        Some("text") => true,
+        Some("nth") => {
+            spec.get("base")
+                .and_then(|base| base.get("kind"))
+                .and_then(Value::as_str)
+                == Some("text")
+        }
+        _ => false,
+    }
+}
+
+fn simple_label_fast_spec(spec: &Value, explicit_index: bool) -> bool {
+    if explicit_index {
+        return false;
+    }
+    let label = if spec.get("kind").and_then(Value::as_str) == Some("descendant") {
+        let Some(base) = spec.get("base") else {
+            return false;
+        };
+        if !simple_css_fast_spec(base) {
+            return false;
+        }
+        match spec.get("inner") {
+            Some(inner) => inner,
+            None => return false,
+        }
+    } else {
+        spec
+    };
+    label.get("kind").and_then(Value::as_str) == Some("label")
+        && matches!(
+            label.get("value"),
+            Some(Value::String(_) | Value::Object(_))
+        )
+}
+
+fn locator_fast_path_body(
+    locator_json: &str,
+    operation: &str,
+    args_json: &str,
+) -> RwResult<Option<String>> {
+    let spec: Value = serde_json::from_str(locator_json)?;
+    let args: Value = serde_json::from_str(args_json)?;
+    if args
+        .get("has_handlers")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    let explicit_index = args
+        .get("explicit_index")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (applicable, body) = match operation {
+        "css_count" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_COUNT_BODY),
+        "css_text" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_TEXT_BODY),
+        "css_all_texts" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_ALL_TEXTS_BODY),
+        "css_attribute" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_ATTRIBUTE_BODY),
+        "css_inner_html" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_INNER_HTML_BODY),
+        "css_visibility" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_VISIBILITY_BODY),
+        "css_enabled" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_ENABLED_BODY),
+        "css_bounding_box" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_BOUNDING_BOX_BODY),
+        "css_input_value" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_INPUT_VALUE_BODY),
+        "css_immediate_state" if simple_css_fast_spec(&spec) => {
+            let state = args.get("state").and_then(Value::as_str);
+            (
+                matches!(state, Some("hidden" | "detached")),
+                LOCATOR_FAST_IMMEDIATE_STATE_BODY,
+            )
+        }
+        "attribute_text" if simple_attribute_fast_spec(&spec) => (true, LOCATOR_FAST_TEXT_BODY),
+        "attribute_visibility" if simple_attribute_fast_spec(&spec) => {
+            (true, LOCATOR_FAST_VISIBILITY_BODY)
+        }
+        "role_count" if simple_role_fast_spec(&spec, explicit_index) => {
+            (true, LOCATOR_FAST_COUNT_BODY)
+        }
+        "role_attribute" if simple_role_fast_spec(&spec, explicit_index) => {
+            (true, LOCATOR_FAST_ATTRIBUTE_BODY)
+        }
+        "role_visibility" if simple_role_fast_spec(&spec, explicit_index) => {
+            (true, LOCATOR_FAST_ROLE_VISIBILITY_BODY)
+        }
+        "text_visibility" if simple_text_fast_spec(&spec) => (true, LOCATOR_FAST_VISIBILITY_BODY),
+        "label_count" if simple_label_fast_spec(&spec, explicit_index) => {
+            (true, LOCATOR_FAST_COUNT_BODY)
+        }
+        "label_attribute" if simple_label_fast_spec(&spec, explicit_index) => {
+            (true, LOCATOR_FAST_ATTRIBUTE_BODY)
+        }
+        _ => (false, ""),
+    };
+    if !applicable {
+        return Ok(None);
+    }
+    let mut effective_args = args;
+    if matches!(
+        operation,
+        "css_count" | "css_all_texts" | "role_count" | "label_count"
+    ) {
+        effective_args["strict"] = Value::Bool(false);
+    }
+    Ok(Some(
+        LOCATOR_FAST_PATH_TEMPLATE
+            .replace("__ARGS__", &effective_args.to_string())
+            .replace("__BODY__", body),
+    ))
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TargetClosedKind {
@@ -1640,6 +1979,70 @@ mod tests {
             pending[field] = Value::Bool(false);
             assert!(!actionability_state_succeeds(&pending));
         }
+    }
+
+    #[test]
+    fn native_locator_probe_builders_replace_all_placeholders() {
+        let probe = locator_probe_state_body(
+            r#"{"scroll":true,"stable":true,"receives_events":true,"stable_position_required":false,"action_position":{"x":4.5,"y":9}}"#,
+        )
+        .unwrap();
+        for placeholder in [
+            "__SCROLL__",
+            "__STABLE__",
+            "__RECEIVES_EVENTS__",
+            "__STABLE_POSITION_REQUIRED__",
+            "__ACTION_POSITION__",
+        ] {
+            assert!(!probe.contains(placeholder));
+        }
+        assert!(probe.contains("const actionPosition = {\"x\":4.5,\"y\":9.0};"));
+
+        let fill = locator_fill_apply_body("Ada", true, false).unwrap();
+        for placeholder in ["__STRICT__", "__FORCED__", "__VALUE__"] {
+            assert!(!fill.contains(placeholder));
+        }
+        assert!(fill.contains("const value = \"Ada\";"));
+
+        let select = locator_select_apply_body(r#"["a"]"#, "[]", "[1]").unwrap();
+        for placeholder in ["__VALUES__", "__LABELS__", "__INDEXES__"] {
+            assert!(!select.contains(placeholder));
+        }
+        assert!(select.contains(r#"const values = ["a"];"#));
+        assert!(select.contains("const indexes = [1];"));
+    }
+
+    #[test]
+    fn native_locator_fast_path_detection_preserves_cheap_sentinel_cases() {
+        let args = r#"{"strict":true,"explicit_index":false,"has_handlers":false}"#;
+        assert!(locator_fast_path_body(
+            r#"{"kind":"css","selector":"button"}"#,
+            "css_visibility",
+            args,
+        )
+        .unwrap()
+        .is_some());
+        assert!(locator_fast_path_body(
+            r#"{"kind":"css","selector":"button","has_text":"Save"}"#,
+            "css_visibility",
+            args,
+        )
+        .unwrap()
+        .is_none());
+        assert!(locator_fast_path_body(
+            r#"{"kind":"role","role":"button"}"#,
+            "role_count",
+            r#"{"strict":false,"explicit_index":false,"has_handlers":true}"#,
+        )
+        .unwrap()
+        .is_none());
+        assert!(locator_fast_path_body(
+            r#"{"kind":"label","value":"Email","exact":false}"#,
+            "label_attribute",
+            args,
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]
@@ -10769,6 +11172,109 @@ return true;
             .map_err(py_err)
     }
 
+    #[pyo3(signature = (locator_json, index, options_json, timeout_ms=None))]
+    fn locator_probe_state(
+        &self,
+        py: Python<'_>,
+        locator_json: &str,
+        index: usize,
+        options_json: &str,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<String> {
+        let body = locator_probe_state_body(options_json).map_err(py_err)?;
+        let page = Arc::clone(&self.inner);
+        let locator_json = locator_json.to_string();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        py.detach(move || {
+            let browser = Arc::clone(&page.browser);
+            browser.block_on(async move {
+                evaluate_locator_for_page(page, locator_json, index, body, timeout).await
+            })
+        })
+        .map_err(py_err)
+    }
+
+    #[pyo3(signature = (locator_json, index, value, strict, forced, timeout_ms=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn locator_fill_apply(
+        &self,
+        py: Python<'_>,
+        locator_json: &str,
+        index: usize,
+        value: &str,
+        strict: bool,
+        forced: bool,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<String> {
+        let body = locator_fill_apply_body(value, strict, forced).map_err(py_err)?;
+        py.detach(|| self.evaluate_locator(locator_json, index, &body, timeout_ms))
+            .map_err(py_err)
+    }
+
+    #[pyo3(signature = (locator_json, index, values_json, labels_json, indexes_json, timeout_ms=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn locator_select_apply(
+        &self,
+        py: Python<'_>,
+        locator_json: &str,
+        index: usize,
+        values_json: &str,
+        labels_json: &str,
+        indexes_json: &str,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<String> {
+        let body =
+            locator_select_apply_body(values_json, labels_json, indexes_json).map_err(py_err)?;
+        py.detach(|| self.evaluate_locator(locator_json, index, &body, timeout_ms))
+            .map_err(py_err)
+    }
+
+    #[pyo3(signature = (locator_json, index, timeout_ms=None))]
+    fn locator_check_apply(
+        &self,
+        py: Python<'_>,
+        locator_json: &str,
+        index: usize,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<String> {
+        let body = locator_check_state_body();
+        py.detach(|| self.evaluate_locator(locator_json, index, &body, timeout_ms))
+            .map_err(py_err)
+    }
+
+    #[pyo3(signature = (locator_json, index, operation, args_json="{}", timeout_ms=None))]
+    fn locator_fast_path(
+        &self,
+        py: Python<'_>,
+        locator_json: &str,
+        index: usize,
+        operation: &str,
+        args_json: &str,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<String> {
+        let Some(body) =
+            locator_fast_path_body(locator_json, operation, args_json).map_err(py_err)?
+        else {
+            return Ok(json!({ "ok": false, "type": "not-applicable" }).to_string());
+        };
+        let page = Arc::clone(&self.inner);
+        let locator_json = locator_json.to_string();
+        let wait_probe = operation == "css_immediate_state";
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        py.detach(move || {
+            if wait_probe {
+                let expression = locator_script(&locator_json, index, &body);
+                evaluate_locator_wait_probe_for_page(page, expression, timeout_ms)
+            } else {
+                let browser = Arc::clone(&page.browser);
+                browser.block_on(async move {
+                    evaluate_locator_for_page(page, locator_json, index, body, timeout).await
+                })
+            }
+        })
+        .map_err(py_err)
+    }
+
     #[pyo3(signature = (locator_json, index, body, timeout_ms=None))]
     fn locator_eval_handle(
         &self,
@@ -14261,10 +14767,21 @@ const role = el && typeof locatorRoleOf === 'function' ? locatorRoleOf(el) : '';
 const aria = String(el && el.getAttribute ? el.getAttribute('aria-checked') || '' : '').toLowerCase();
 if (tagName === 'INPUT' && (inputType === 'checkbox' || inputType === 'radio')) {
   const checked = !!el.checked;
-  return { valid: true, checked, native_radio: inputType === 'radio' };
+  return {
+    valid: true,
+    checked,
+    indeterminate: !!(el.indeterminate && !checked),
+    native_input: true,
+    native_radio: inputType === 'radio',
+  };
 }
-if (!checkedRoles.has(role)) return { valid: false, checked: false, native_radio: false };
-return { valid: true, checked: aria === 'true', native_radio: false };
+if (!checkedRoles.has(role)) {
+  return { valid: false, checked: false, indeterminate: false, native_input: false, native_radio: false };
+}
+if (aria === 'true') return { valid: true, checked: true, indeterminate: false, native_input: false, native_radio: false };
+if (aria === 'false') return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
+if (aria === 'mixed') return { valid: true, checked: false, indeterminate: true, native_input: false, native_radio: false };
+return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
 }"#;
 
 fn native_page_event_from_cdp(
