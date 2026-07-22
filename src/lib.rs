@@ -416,6 +416,259 @@ return new Promise(resolve => {
   ownerWindow.setTimeout(finish, 20);
 });
 "#;
+const LOCATOR_ASSERTION_PROBE_TEMPLATE: &str = r#"
+const matcher = __MATCHER__;
+const normalizeAssertionText = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+const assertionRegExp = expected => {
+  try {
+    let flags = String(expected.flags || '');
+    if (matcher.ignore_case && !flags.includes('i')) flags += 'i';
+    return new RegExp(String(expected.pattern || ''), flags);
+  } catch (_) {
+    return /(?!)\b/;
+  }
+};
+const matchesAssertionValue = (expected, actual, normalizeText = false, contains = false) => {
+  const raw = actual == null ? '' : String(actual);
+  if (expected && typeof expected === 'object' && expected.kind === 'regex') {
+    return assertionRegExp(expected).test(raw);
+  }
+  let left = raw;
+  let right = String(expected ?? '');
+  if (normalizeText) {
+    left = normalizeAssertionText(left);
+    right = normalizeAssertionText(right);
+  }
+  if (matcher.ignore_case) {
+    left = left.toLowerCase();
+    right = right.toLowerCase();
+  }
+  return contains ? left.includes(right) : left === right;
+};
+const assertionTextFor = current => {
+  if (!current) return null;
+  const tag = current.tagName || '';
+  const type = String(current.getAttribute('type') || '').toLowerCase();
+  if (tag === 'INPUT' && (type === 'button' || type === 'submit')) return current.value || '';
+  return matcher.use_inner_text ? current.innerText : current.textContent;
+};
+const assertionClassFor = current => {
+  if (!current) return null;
+  const value = current.className;
+  if (typeof value === 'string') return value;
+  if (value && typeof value.baseVal === 'string') return value.baseVal;
+  return current.getAttribute('class') || '';
+};
+const assertionCheckedState = current => {
+  if (!current) return { valid: false, checked: false, indeterminate: false };
+  const tag = String(current.tagName || '').toUpperCase();
+  const type = tag === 'INPUT' ? String(current.type || 'text').toLowerCase() : '';
+  if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) {
+    const checked = !!current.checked;
+    return { valid: true, checked, indeterminate: !!(current.indeterminate && !checked) };
+  }
+  const checkedRoles = new Set([
+    'checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem',
+  ]);
+  if (!checkedRoles.has(locatorRoleOf(current))) {
+    return { valid: false, checked: false, indeterminate: false };
+  }
+  const aria = String(current.getAttribute('aria-checked') || '').toLowerCase();
+  if (aria === 'true') return { valid: true, checked: true, indeterminate: false };
+  if (aria === 'mixed') return { valid: true, checked: false, indeterminate: true };
+  return { valid: true, checked: false, indeterminate: false };
+};
+const assertionAccessibleText = (current, kind) => {
+  if (!current) return '';
+  if (kind === 'accessible_name') return accessibleName(current);
+  if (kind === 'accessible_description') {
+    return normalizeAssertionText(
+      referencedText(current, 'aria-describedby') ||
+      current.getAttribute('aria-description') ||
+      current.getAttribute('title') ||
+      ''
+    );
+  }
+  const invalid = String(current.getAttribute('aria-invalid') || '').toLowerCase();
+  if (!invalid || invalid === 'false') return '';
+  return normalizeAssertionText(referencedText(current, 'aria-errormessage'));
+};
+const assertionJsPropertyEqual = (expected, actual) => {
+  if (!expected || typeof expected !== 'object') return false;
+  if (expected.type === 'unsupported') return false;
+  if (expected.type === 'none') {
+    return actual == null || typeof actual === 'symbol' || typeof actual === 'function';
+  }
+  if (expected.type === 'boolean') return typeof actual === 'boolean' && actual === expected.value;
+  if (expected.type === 'string') return typeof actual === 'string' && actual === expected.value;
+  if (expected.type === 'integer') {
+    try {
+      if (typeof actual === 'bigint') return actual === BigInt(expected.value);
+      return typeof actual === 'number' && Number.isInteger(actual) && BigInt(actual) === BigInt(expected.value);
+    } catch (_) {
+      return false;
+    }
+  }
+  if (expected.type === 'number') {
+    if (typeof actual === 'bigint') {
+      const expectedNumber = Number(expected.value);
+      return Number.isInteger(expectedNumber) && BigInt(expectedNumber) === actual;
+    }
+    if (typeof actual !== 'number') return false;
+    if (expected.value === 'NaN') return Number.isNaN(actual);
+    if (expected.value === 'Infinity') return actual === Infinity;
+    if (expected.value === '-Infinity') return actual === -Infinity;
+    return actual === Number(expected.value);
+  }
+  if (expected.type === 'array') {
+    return Array.isArray(actual) && actual.length === expected.value.length &&
+      expected.value.every((item, index) => assertionJsPropertyEqual(item, actual[index]));
+  }
+  if (expected.type === 'object') {
+    if (!actual || typeof actual !== 'object' || Array.isArray(actual)) return false;
+    const actualKeys = Object.keys(actual);
+    const expectedKeys = Object.keys(expected.value);
+    return actualKeys.length === expectedKeys.length &&
+      expectedKeys.every(key => Object.prototype.hasOwnProperty.call(actual, key) &&
+        assertionJsPropertyEqual(expected.value[key], actual[key]));
+  }
+  return false;
+};
+
+let condition = false;
+let actual = null;
+let log = '';
+if (strictFrameViolation && Number(strictFrameViolation.count || 0) > 1) {
+  const selector = String(strictFrameViolation.selector || 'iframe');
+  log = `strict mode violation: locator("${selector}") resolved to ${Number(strictFrameViolation.count || 0)} elements`;
+} else if (matcher.strict && matches.length > 1) {
+  log = `strict mode violation: locator resolved to ${matches.length} elements while trying to ${String(matcher.strict_action || 'assert')}`;
+} else if (matcher.kind === 'text') {
+  if (matcher.array) {
+    actual = matches.map(assertionTextFor);
+    if (matcher.contains) {
+      let actualIndex = 0;
+      condition = matcher.expected.every(expected => {
+        while (actualIndex < actual.length) {
+          const got = actual[actualIndex++];
+          const contains = !(expected && typeof expected === 'object' && expected.kind === 'regex');
+          if (matchesAssertionValue(expected, got, true, contains)) return true;
+        }
+        return false;
+      });
+    } else {
+      condition = actual.length === matcher.expected.length &&
+        matcher.expected.every((expected, index) => matchesAssertionValue(expected, actual[index], true, false));
+    }
+  } else {
+    actual = assertionTextFor(el);
+    const contains = matcher.contains &&
+      !(matcher.expected && typeof matcher.expected === 'object' && matcher.expected.kind === 'regex');
+    condition = matchesAssertionValue(matcher.expected, actual, true, contains);
+  }
+} else if (matcher.kind === 'visible') {
+  actual = !!el && visible(el);
+  condition = actual === matcher.expected;
+} else if (matcher.kind === 'hidden') {
+  actual = !!el && visible(el);
+  condition = !actual;
+} else if (matcher.kind === 'enabled' || matcher.kind === 'disabled') {
+  const disabled = !!el && disabledState(el);
+  actual = matcher.kind === 'enabled' ? (!!el && !disabled) : disabled;
+  condition = actual === matcher.expected;
+} else if (matcher.kind === 'editable') {
+  actual = !!el && !disabledState(el) && !el.readOnly &&
+    (el.isContentEditable || /^(INPUT|TEXTAREA)$/.test(el.tagName));
+  condition = actual === matcher.expected;
+} else if (matcher.kind === 'checked') {
+  actual = assertionCheckedState(el);
+  if (actual.valid) {
+    condition = matcher.indeterminate
+      ? matcher.checked == null && actual.indeterminate
+      : actual.checked === matcher.checked;
+  }
+} else if (matcher.kind === 'attached') {
+  actual = { attached: matches.length > 0, count: matches.length };
+  condition = actual.attached === matcher.expected;
+} else if (matcher.kind === 'empty') {
+  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
+    actual = { value: el.value || '' };
+    condition = actual.value === '';
+  } else if (el) {
+    actual = { text: normalizeAssertionText(el.textContent || '') };
+    condition = actual.text === '';
+  }
+} else if (matcher.kind === 'focused') {
+  actual = !!el && (el.ownerDocument || document).activeElement === el;
+  condition = actual;
+} else if (matcher.kind === 'count') {
+  actual = matches.length;
+  condition = actual === matcher.expected;
+} else if (matcher.kind === 'value') {
+  actual = el && 'value' in el ? el.value : null;
+  condition = matchesAssertionValue(matcher.expected, actual, false, false);
+} else if (matcher.kind === 'values') {
+  const valid = !!el && el.tagName === 'SELECT' && !!el.multiple;
+  actual = el ? Array.from(el.selectedOptions || []).map(option => option.value) : [];
+  condition = valid && actual.length === matcher.expected.length &&
+    matcher.expected.every((expected, index) => matchesAssertionValue(expected, actual[index], false, false));
+} else if (matcher.kind === 'attribute') {
+  actual = el ? el.getAttribute(String(matcher.name || '')) : null;
+  condition = actual !== null && matchesAssertionValue(matcher.expected, actual, false, false);
+} else if (matcher.kind === 'class') {
+  if (matcher.array) {
+    actual = matches.map(assertionClassFor);
+    condition = actual.length === matcher.expected.length &&
+      matcher.expected.every((expected, index) => matchesAssertionValue(expected, actual[index], false, false));
+  } else {
+    actual = assertionClassFor(el);
+    condition = matchesAssertionValue(matcher.expected, actual, false, false);
+  }
+} else if (matcher.kind === 'contain_class') {
+  const containsTokens = (wanted, got) => {
+    const tokens = new Set(String(got ?? '').split(/\s+/).filter(Boolean));
+    return wanted.every(token => tokens.has(token));
+  };
+  if (matcher.array) {
+    actual = matches.map(assertionClassFor);
+    condition = actual.length === matcher.expected_tokens.length &&
+      matcher.expected_tokens.every((wanted, index) => containsTokens(wanted, actual[index]));
+  } else {
+    actual = assertionClassFor(el);
+    condition = containsTokens(matcher.expected_tokens, actual);
+  }
+} else if (matcher.kind === 'role') {
+  actual = el ? locatorRoleOf(el) : null;
+  condition = matchesAssertionValue(matcher.expected, actual, false, false);
+} else if (
+  matcher.kind === 'accessible_name' ||
+  matcher.kind === 'accessible_description' ||
+  matcher.kind === 'accessible_error'
+) {
+  actual = assertionAccessibleText(el, matcher.kind);
+  condition = matchesAssertionValue(matcher.expected, actual, true, false);
+} else if (matcher.kind === 'css') {
+  actual = el ? String(getComputedStyle(el).getPropertyValue(String(matcher.name || '')) ?? '').trim() : '';
+  condition = matchesAssertionValue(matcher.expected, actual, false, false);
+} else if (matcher.kind === 'js_property') {
+  actual = el ? el[String(matcher.name || '')] : undefined;
+  condition = assertionJsPropertyEqual(matcher.expected, actual);
+} else if (matcher.kind === 'viewport') {
+  if (el) {
+    const rect = el.getBoundingClientRect();
+    const left = Math.max(0, rect.left);
+    const top = Math.max(0, rect.top);
+    const right = Math.min(innerWidth, rect.right);
+    const bottom = Math.min(innerHeight, rect.bottom);
+    const visibleArea = Math.max(0, right - left) * Math.max(0, bottom - top);
+    actual = visibleArea / Math.max(1, rect.width * rect.height);
+  } else {
+    actual = 0;
+  }
+  condition = actual > 0 && actual >= matcher.ratio;
+}
+return { passed: matcher.negated ? !condition : condition, actual, log };
+"#;
 const LOCATOR_FILL_TEMPLATE: &str = r#"
 const info = {
   count: matches.length,
@@ -8136,16 +8389,15 @@ async fn wait_before_rearming_locator_wait(
     deadline.remaining().map(|_| ())
 }
 
-async fn run_locator_wait_retry<T, Attempt, AttemptFuture>(
+async fn run_locator_wait_retry_before<T, Attempt, AttemptFuture>(
     page: Arc<PageInner>,
-    timeout: Duration,
+    deadline: OperationDeadline,
     mut attempt: Attempt,
 ) -> RwResult<T>
 where
     Attempt: FnMut(OperationDeadline) -> AttemptFuture,
     AttemptFuture: Future<Output = RwResult<T>>,
 {
-    let deadline = OperationDeadline::new(timeout);
     loop {
         if let Some(error) = locator_wait_terminal_error(&page) {
             return Err(error);
@@ -8168,9 +8420,238 @@ where
                 verify_locator_wait_target_liveness(&page, deadline).await?;
                 wait_before_rearming_locator_wait(&page, deadline).await?;
             }
-            Err(RwError::Timeout(_)) => return Err(locator_wait_timeout(timeout)),
+            Err(RwError::Timeout(_)) => {
+                return Err(locator_wait_timeout(deadline.timeout));
+            }
             Err(error) => return Err(error),
         }
+    }
+}
+
+async fn run_locator_wait_retry<T, Attempt, AttemptFuture>(
+    page: Arc<PageInner>,
+    timeout: Duration,
+    attempt: Attempt,
+) -> RwResult<T>
+where
+    Attempt: FnMut(OperationDeadline) -> AttemptFuture,
+    AttemptFuture: Future<Output = RwResult<T>>,
+{
+    let deadline = OperationDeadline::new(timeout);
+    run_locator_wait_retry_before(page, deadline, attempt).await
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct LocatorAssertionResult {
+    passed: bool,
+    actual: Value,
+    #[serde(default)]
+    log: String,
+}
+
+const LOCATOR_ASSERTION_MATCHER_KINDS: [&str; 23] = [
+    "text",
+    "visible",
+    "hidden",
+    "enabled",
+    "disabled",
+    "editable",
+    "checked",
+    "attached",
+    "empty",
+    "focused",
+    "count",
+    "value",
+    "values",
+    "attribute",
+    "class",
+    "contain_class",
+    "role",
+    "accessible_name",
+    "accessible_description",
+    "accessible_error",
+    "css",
+    "js_property",
+    "viewport",
+];
+
+fn locator_assertion_probe_body(matcher_json: &str) -> RwResult<String> {
+    let matcher = serde_json::from_str::<Value>(matcher_json)?;
+    let matcher_object = matcher.as_object().ok_or_else(|| {
+        RwError::InvalidInput("locator assertion matcher must be a JSON object".to_string())
+    })?;
+    let kind = matcher_object
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            RwError::InvalidInput("locator assertion matcher kind must be a string".to_string())
+        })?;
+    if !LOCATOR_ASSERTION_MATCHER_KINDS.contains(&kind) {
+        return Err(RwError::InvalidInput(format!(
+            "unsupported locator assertion matcher kind: {kind}"
+        )));
+    }
+    Ok(LOCATOR_ASSERTION_PROBE_TEMPLATE.replacen("__MATCHER__", &matcher.to_string(), 1))
+}
+
+fn locator_assertion_duration(ms: f64, name: &str, allow_zero: bool) -> RwResult<Duration> {
+    if !ms.is_finite() || ms < 0.0 || (!allow_zero && ms == 0.0) {
+        let qualifier = if allow_zero {
+            "non-negative"
+        } else {
+            "positive"
+        };
+        return Err(RwError::InvalidInput(format!(
+            "locator assertion {name} must be a finite {qualifier} number"
+        )));
+    }
+    Ok(Duration::from_secs_f64(ms / 1_000.0))
+}
+
+fn locator_assertion_result_from_wire(wire_json: &str) -> RwResult<LocatorAssertionResult> {
+    let decoded = decode_wire_value(wire_json)?;
+    serde_json::from_str::<LocatorAssertionResult>(&decoded).map_err(RwError::from)
+}
+
+fn locator_assertion_result_json(result: &LocatorAssertionResult) -> RwResult<String> {
+    serde_json::to_string(result).map_err(RwError::from)
+}
+
+async fn evaluate_locator_assertion_attempt(
+    page: Arc<PageInner>,
+    locator_json: String,
+    index: usize,
+    probe_body: String,
+    deadline: OperationDeadline,
+) -> RwResult<LocatorAssertionResult> {
+    let resolution = resolve_locator_session(Arc::clone(&page), &locator_json, deadline).await?;
+    let expression = locator_script(&resolution.locator_json, index, &probe_body);
+    let wire_json =
+        evaluate_locator_resolution(&page, &resolution, expression, deadline, Duration::ZERO)
+            .await?;
+    locator_assertion_result_from_wire(&wire_json)
+}
+
+async fn assert_locator_for_page(
+    page: Arc<PageInner>,
+    locator_json: String,
+    index: usize,
+    matcher_json: String,
+    timeout: Duration,
+    polling_interval: Duration,
+) -> RwResult<String> {
+    let probe_body = locator_assertion_probe_body(&matcher_json)?;
+    let deadline = OperationDeadline::new(timeout.max(Duration::from_millis(1)));
+    let mut last_result: Option<LocatorAssertionResult> = None;
+
+    loop {
+        let attempt_page = Arc::clone(&page);
+        let attempt_locator_json = locator_json.clone();
+        let attempt_probe_body = probe_body.clone();
+        let current = run_locator_wait_retry_before(Arc::clone(&page), deadline, move |deadline| {
+            evaluate_locator_assertion_attempt(
+                Arc::clone(&attempt_page),
+                attempt_locator_json.clone(),
+                index,
+                attempt_probe_body.clone(),
+                deadline,
+            )
+        })
+        .await;
+
+        match current {
+            Ok(result) if result.passed => return locator_assertion_result_json(&result),
+            Ok(result) => last_result = Some(result),
+            Err(RwError::Timeout(_)) if last_result.is_some() => {
+                return locator_assertion_result_json(last_result.as_ref().unwrap());
+            }
+            Err(error) => return Err(error),
+        }
+
+        let Ok(remaining) = deadline.remaining() else {
+            return locator_assertion_result_json(last_result.as_ref().unwrap());
+        };
+        tokio::time::sleep(remaining.min(polling_interval)).await;
+        if let Some(error) = locator_wait_terminal_error(&page) {
+            return Err(error);
+        }
+        if deadline.remaining().is_err() {
+            return locator_assertion_result_json(last_result.as_ref().unwrap());
+        }
+    }
+}
+
+#[cfg(test)]
+mod locator_assertion_tests {
+    use super::*;
+
+    #[test]
+    fn declarative_matcher_kinds_build_one_bundled_probe() {
+        for kind in LOCATOR_ASSERTION_MATCHER_KINDS {
+            let matcher = json!({"kind": kind, "negated": false});
+            let body = locator_assertion_probe_body(&matcher.to_string()).unwrap();
+            assert!(!body.contains("__MATCHER__"));
+            assert!(body.contains(&format!(r#""kind":"{kind}""#)));
+            assert_eq!(body.matches("const matcher = ").count(), 1);
+        }
+    }
+
+    #[test]
+    fn declarative_matcher_rejects_unknown_or_non_object_payloads() {
+        let unknown = locator_assertion_probe_body(r#"{"kind":"custom_predicate"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("unsupported locator assertion matcher kind"));
+
+        let non_object = locator_assertion_probe_body("[]").unwrap_err().to_string();
+        assert!(non_object.contains("matcher must be a JSON object"));
+    }
+
+    #[test]
+    fn native_assertion_result_keeps_final_actual_and_log_from_wire() {
+        let wire = json!({
+            "__rustwright_cdp_object__": 1,
+            "entries": {
+                "passed": false,
+                "actual": {
+                    "__rustwright_cdp_object__": 2,
+                    "entries": {"count": 3, "state": "pending"}
+                },
+                "log": "last probe"
+            }
+        });
+        let result = locator_assertion_result_from_wire(&wire.to_string()).unwrap();
+        assert_eq!(
+            result,
+            LocatorAssertionResult {
+                passed: false,
+                actual: json!({"count": 3, "state": "pending"}),
+                log: "last probe".to_string(),
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&locator_assertion_result_json(&result).unwrap())
+                .unwrap(),
+            json!({
+                "passed": false,
+                "actual": {"count": 3, "state": "pending"},
+                "log": "last probe"
+            })
+        );
+    }
+
+    #[test]
+    fn native_assertion_timing_inputs_are_bounded() {
+        assert_eq!(
+            locator_assertion_duration(50.0, "polling interval", false).unwrap(),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            locator_assertion_duration(0.0, "timeout", true).unwrap(),
+            Duration::ZERO
+        );
+        assert!(locator_assertion_duration(0.0, "polling interval", false).is_err());
+        assert!(locator_assertion_duration(f64::NAN, "timeout", true).is_err());
     }
 }
 
@@ -11172,6 +11653,28 @@ return true;
             .map_err(py_err)
     }
 
+    #[pyo3(signature = (locator_json, index, matcher_json, timeout_ms, polling_interval_ms))]
+    fn assert_locator(
+        &self,
+        py: Python<'_>,
+        locator_json: &str,
+        index: usize,
+        matcher_json: &str,
+        timeout_ms: f64,
+        polling_interval_ms: f64,
+    ) -> PyResult<String> {
+        py.detach(|| {
+            self.assert_locator_sync(
+                locator_json,
+                index,
+                matcher_json,
+                timeout_ms,
+                polling_interval_ms,
+            )
+        })
+        .map_err(py_err)
+    }
+
     #[pyo3(signature = (locator_json, index, options_json, timeout_ms=None))]
     fn locator_probe_state(
         &self,
@@ -13371,6 +13874,34 @@ impl PyPage {
         let browser = Arc::clone(&page.browser);
         browser.block_on(async move {
             evaluate_locator_for_page(page, locator_json, index, body, timeout).await
+        })
+    }
+
+    fn assert_locator_sync(
+        &self,
+        locator_json: &str,
+        index: usize,
+        matcher_json: &str,
+        timeout_ms: f64,
+        polling_interval_ms: f64,
+    ) -> RwResult<String> {
+        let page = Arc::clone(&self.inner);
+        let locator_json = locator_json.to_string();
+        let matcher_json = matcher_json.to_string();
+        let timeout = locator_assertion_duration(timeout_ms, "timeout", true)?;
+        let polling_interval =
+            locator_assertion_duration(polling_interval_ms, "polling interval", false)?;
+        let browser = Arc::clone(&page.browser);
+        browser.block_on(async move {
+            assert_locator_for_page(
+                page,
+                locator_json,
+                index,
+                matcher_json,
+                timeout,
+                polling_interval,
+            )
+            .await
         })
     }
 }
