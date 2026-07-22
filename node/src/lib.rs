@@ -87,6 +87,30 @@ impl Page {
         self.inner.target_id()
     }
 
+    #[napi(js_name = "setDefaultTimeout")]
+    pub fn set_default_timeout(&self, timeout: f64) {
+        self.inner
+            .set_default_timeout((!timeout.is_nan()).then_some(timeout));
+    }
+
+    #[napi(js_name = "setDefaultNavigationTimeout")]
+    pub fn set_default_navigation_timeout(&self, timeout: f64) {
+        self.inner
+            .set_default_navigation_timeout((!timeout.is_nan()).then_some(timeout));
+    }
+
+    #[napi(js_name = "setContextDefaultTimeout")]
+    pub fn set_context_default_timeout(&self, timeout: f64) {
+        self.inner
+            .set_context_default_timeout((!timeout.is_nan()).then_some(timeout));
+    }
+
+    #[napi(js_name = "setContextDefaultNavigationTimeout")]
+    pub fn set_context_default_navigation_timeout(&self, timeout: f64) {
+        self.inner
+            .set_context_default_navigation_timeout((!timeout.is_nan()).then_some(timeout));
+    }
+
     #[napi]
     pub async fn goto(
         &self,

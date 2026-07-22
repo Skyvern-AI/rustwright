@@ -1175,6 +1175,74 @@ mod tests {
 
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+    #[test]
+    fn default_timeout_register_unset_preserves_command_timeout_default() {
+        let register = DefaultTimeoutRegister::default();
+
+        assert_eq!(register.resolve(None, false), None);
+        assert_eq!(register.resolve(None, true), None);
+        assert_eq!(
+            BrowserInner::command_timeout(register.resolve(None, false)),
+            Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            BrowserInner::command_timeout(register.resolve(None, true)),
+            Duration::from_millis(30_000)
+        );
+    }
+
+    #[test]
+    fn default_timeout_register_general_precedence_lattice() {
+        let mut register = DefaultTimeoutRegister {
+            general: DefaultTimeoutSlots {
+                page_default: Some(2_000.0),
+                context_default: Some(3_000.0),
+            },
+            navigation: DefaultTimeoutSlots {
+                page_default: Some(4_000.0),
+                context_default: Some(5_000.0),
+            },
+        };
+
+        assert_eq!(register.resolve(Some(1_000.0), false), Some(1_000.0));
+        assert_eq!(register.resolve(None, false), Some(2_000.0));
+
+        register.general.page_default = None;
+        assert_eq!(register.resolve(None, false), Some(3_000.0));
+
+        register.general.context_default = None;
+        assert_eq!(register.resolve(None, false), None);
+    }
+
+    #[test]
+    fn default_timeout_register_navigation_precedence_lattice() {
+        let mut register = DefaultTimeoutRegister {
+            general: DefaultTimeoutSlots {
+                page_default: Some(4_000.0),
+                context_default: Some(5_000.0),
+            },
+            navigation: DefaultTimeoutSlots {
+                page_default: Some(2_000.0),
+                context_default: Some(3_000.0),
+            },
+        };
+
+        assert_eq!(register.resolve(Some(1_000.0), true), Some(1_000.0));
+        assert_eq!(register.resolve(None, true), Some(2_000.0));
+
+        register.navigation.page_default = None;
+        assert_eq!(register.resolve(None, true), Some(3_000.0));
+
+        register.navigation.context_default = None;
+        assert_eq!(register.resolve(None, true), Some(4_000.0));
+
+        register.general.page_default = None;
+        assert_eq!(register.resolve(None, true), Some(5_000.0));
+
+        register.general.context_default = None;
+        assert_eq!(register.resolve(None, true), None);
+    }
+
     #[tokio::test]
     async fn cancel_token_interrupts_an_async_wait() {
         let token = CancelToken::new();
@@ -2321,6 +2389,7 @@ mod tests {
                 background_override_active: Arc::new(AtomicBool::new(false)),
                 screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
                 mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+                default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
                 lifecycle: Arc::new(CloseLifecycle::new()),
                 target_closed: AtomicBool::new(false),
                 crashed: AtomicBool::new(false),
@@ -4506,6 +4575,34 @@ impl Drop for ContextInner {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct DefaultTimeoutSlots {
+    page_default: Option<f64>,
+    context_default: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct DefaultTimeoutRegister {
+    general: DefaultTimeoutSlots,
+    navigation: DefaultTimeoutSlots,
+}
+
+impl DefaultTimeoutRegister {
+    fn resolve(&self, explicit: Option<f64>, navigation: bool) -> Option<f64> {
+        explicit.or_else(|| {
+            if navigation {
+                self.navigation
+                    .page_default
+                    .or(self.navigation.context_default)
+                    .or(self.general.page_default)
+                    .or(self.general.context_default)
+            } else {
+                self.general.page_default.or(self.general.context_default)
+            }
+        })
+    }
+}
+
 struct PageInner {
     browser: Arc<BrowserInner>,
     target_id: String,
@@ -4519,6 +4616,7 @@ struct PageInner {
     background_override_active: Arc<AtomicBool>,
     screenshot_lock: Arc<tokio::sync::Mutex<()>>,
     mouse_dispatch_lock: Arc<tokio::sync::Mutex<()>>,
+    default_timeouts: Mutex<DefaultTimeoutRegister>,
     lifecycle: Arc<CloseLifecycle>,
     target_closed: AtomicBool,
     crashed: AtomicBool,
@@ -13297,6 +13395,54 @@ impl RustwrightPage {
         self.inner.cached_main_frame_url().unwrap_or_default()
     }
 
+    /// Set or clear this page's general default timeout in milliseconds.
+    pub fn set_default_timeout(&self, timeout_ms: Option<f64>) {
+        self.inner
+            .default_timeouts
+            .lock()
+            .unwrap()
+            .general
+            .page_default = timeout_ms.filter(|value| !value.is_nan());
+    }
+
+    /// Set or clear this page's navigation default timeout in milliseconds.
+    pub fn set_default_navigation_timeout(&self, timeout_ms: Option<f64>) {
+        self.inner
+            .default_timeouts
+            .lock()
+            .unwrap()
+            .navigation
+            .page_default = timeout_ms.filter(|value| !value.is_nan());
+    }
+
+    /// Set or clear the inherited context general timeout stored for this page.
+    pub fn set_context_default_timeout(&self, timeout_ms: Option<f64>) {
+        self.inner
+            .default_timeouts
+            .lock()
+            .unwrap()
+            .general
+            .context_default = timeout_ms.filter(|value| !value.is_nan());
+    }
+
+    /// Set or clear the inherited context navigation timeout stored for this page.
+    pub fn set_context_default_navigation_timeout(&self, timeout_ms: Option<f64>) {
+        self.inner
+            .default_timeouts
+            .lock()
+            .unwrap()
+            .navigation
+            .context_default = timeout_ms.filter(|value| !value.is_nan());
+    }
+
+    fn resolve_timeout(&self, explicit: Option<f64>, navigation: bool) -> Option<f64> {
+        self.inner
+            .default_timeouts
+            .lock()
+            .unwrap()
+            .resolve(explicit, navigation)
+    }
+
     /// Subscribe to typed page events through a bounded, drop-oldest queue.
     pub fn events(&self) -> RustwrightPageEventReceiver {
         let queue = Arc::new(NativePageEventQueue::new());
@@ -13360,6 +13506,7 @@ impl RustwrightPage {
         referer: Option<&str>,
         cancel: Option<&CancelToken>,
     ) -> RwResult<String> {
+        let timeout_ms = self.resolve_timeout(timeout_ms, true);
         let page = Arc::clone(&self.inner);
         let url = url.to_string();
         let wait_until = wait_until.unwrap_or("load").to_string();
@@ -13523,6 +13670,7 @@ impl RustwrightPage {
         timeout_ms: Option<f64>,
         cancel: Option<&CancelToken>,
     ) -> RwResult<String> {
+        let timeout_ms = self.resolve_timeout(timeout_ms, false);
         let expression = make_evaluate_expression(expression, arg_json);
         evaluate_expression_for_page_raw_cancelable(
             Arc::clone(&self.inner),
@@ -13851,6 +13999,7 @@ return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value)
         omit_background: Option<bool>,
         cancel: Option<&CancelToken>,
     ) -> RwResult<Vec<u8>> {
+        let timeout_ms = self.resolve_timeout(timeout_ms, false);
         let page = Arc::clone(&self.inner);
         let path = path.map(ToString::to_string);
         let timeout = BrowserInner::command_timeout(timeout_ms);
@@ -13878,6 +14027,7 @@ return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value)
     }
 
     pub fn close(&self, timeout_ms: Option<f64>, run_before_unload: bool) -> RwResult<()> {
+        let timeout_ms = self.resolve_timeout(timeout_ms, false);
         let page = Arc::clone(&self.inner);
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
@@ -13885,6 +14035,7 @@ return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value)
     }
 
     fn evaluate_expression(&self, expression: &str, timeout_ms: Option<f64>) -> RwResult<String> {
+        let timeout_ms = self.resolve_timeout(timeout_ms, false);
         evaluate_expression_for_page_raw(
             Arc::clone(&self.inner),
             expression.to_string(),
@@ -14092,6 +14243,7 @@ return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value)
         timeout_ms: Option<f64>,
         cancel: Option<&CancelToken>,
     ) -> RwResult<String> {
+        let timeout_ms = self.resolve_timeout(timeout_ms, false);
         let page = Arc::clone(&self.inner);
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
@@ -14872,6 +15024,7 @@ async fn attach_existing_page_unregistered(
         background_override_active: Arc::new(AtomicBool::new(false)),
         screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
         mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+        default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
         lifecycle: Arc::new(CloseLifecycle::new()),
         target_closed: AtomicBool::new(false),
         crashed: AtomicBool::new(false),

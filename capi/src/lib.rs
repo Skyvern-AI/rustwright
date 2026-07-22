@@ -330,6 +330,57 @@ pub unsafe extern "C" fn rw_page_target_id(page: *mut RwPage) -> *mut c_char {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn rw_page_set_default_timeout(
+    page: *mut RwPage,
+    timeout_ms_or_nan: c_double,
+) -> c_int {
+    ffi_status(|| {
+        let page = unsafe { page_ref(page)? };
+        page.inner.set_default_timeout(timeout(timeout_ms_or_nan));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_page_set_default_navigation_timeout(
+    page: *mut RwPage,
+    timeout_ms_or_nan: c_double,
+) -> c_int {
+    ffi_status(|| {
+        let page = unsafe { page_ref(page)? };
+        page.inner
+            .set_default_navigation_timeout(timeout(timeout_ms_or_nan));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_page_set_context_default_timeout(
+    page: *mut RwPage,
+    timeout_ms_or_nan: c_double,
+) -> c_int {
+    ffi_status(|| {
+        let page = unsafe { page_ref(page)? };
+        page.inner
+            .set_context_default_timeout(timeout(timeout_ms_or_nan));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_page_set_context_default_navigation_timeout(
+    page: *mut RwPage,
+    timeout_ms_or_nan: c_double,
+) -> c_int {
+    ffi_status(|| {
+        let page = unsafe { page_ref(page)? };
+        page.inner
+            .set_context_default_navigation_timeout(timeout(timeout_ms_or_nan));
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn rw_page_goto(
     page: *mut RwPage,
     url: *const c_char,

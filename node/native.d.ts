@@ -12,6 +12,10 @@ export declare class Browser {
 }
 export declare class Page {
   targetId(): string
+  setDefaultTimeout(timeout: number): void
+  setDefaultNavigationTimeout(timeout: number): void
+  setContextDefaultTimeout(timeout: number): void
+  setContextDefaultNavigationTimeout(timeout: number): void
   goto(url: string, waitUntil?: string | undefined | null, timeout?: number | undefined | null, referer?: string | undefined | null): Promise<string>
   click(selector: string, timeout?: number | undefined | null): Promise<void>
   fill(selector: string, value: string, timeout?: number | undefined | null): Promise<void>

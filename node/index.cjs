@@ -188,20 +188,28 @@ class BrowserContext {
 
   async newPage() {
     const page = new Page(await this._browser._inner.newPage());
-    page._defaultTimeout = this._defaultTimeout;
-    page._defaultNavigationTimeout = this._defaultNavigationTimeout;
+    if (this._defaultTimeout != null) {
+      page._inner.setContextDefaultTimeout(this._defaultTimeout);
+    }
+    if (this._defaultNavigationTimeout != null) {
+      page._inner.setContextDefaultNavigationTimeout(this._defaultNavigationTimeout);
+    }
     this._pages.push(page);
     return page;
   }
 
   setDefaultTimeout(timeout) {
     this._defaultTimeout = Number(timeout);
-    for (const page of this._pages) page.setDefaultTimeout(timeout);
+    for (const page of this._pages) {
+      page._inner.setContextDefaultTimeout(this._defaultTimeout);
+    }
   }
 
   setDefaultNavigationTimeout(timeout) {
     this._defaultNavigationTimeout = Number(timeout);
-    for (const page of this._pages) page.setDefaultNavigationTimeout(timeout);
+    for (const page of this._pages) {
+      page._inner.setContextDefaultNavigationTimeout(this._defaultNavigationTimeout);
+    }
   }
 
   async close() {
@@ -217,76 +225,58 @@ class BrowserContext {
 class Page {
   constructor(inner) {
     this._inner = inner;
-    // undefined => defer to the engine's built-in default; a number set via
-    // setDefaultTimeout()/setDefaultNavigationTimeout() becomes the per-call fallback.
-    this._defaultTimeout = undefined;
-    this._defaultNavigationTimeout = undefined;
   }
 
   setDefaultTimeout(timeout) {
-    this._defaultTimeout = Number(timeout);
+    this._inner.setDefaultTimeout(Number(timeout));
   }
 
   setDefaultNavigationTimeout(timeout) {
-    this._defaultNavigationTimeout = Number(timeout);
-  }
-
-  // An explicit per-call timeout wins; otherwise fall back to the page default.
-  // `undefined` is passed through so the native layer applies its own default.
-  _resolveTimeout(explicit) {
-    if (explicit != null) return Number(explicit);
-    return this._defaultTimeout;
-  }
-
-  _resolveNavigationTimeout(explicit) {
-    if (explicit != null) return Number(explicit);
-    if (this._defaultNavigationTimeout != null) return this._defaultNavigationTimeout;
-    return this._defaultTimeout;
+    this._inner.setDefaultNavigationTimeout(Number(timeout));
   }
 
   async goto(url, options = {}) {
     const response = await this._inner.goto(
       String(url),
       options.waitUntil == null ? undefined : String(options.waitUntil),
-      this._resolveNavigationTimeout(options.timeout),
+      options.timeout == null ? undefined : Number(options.timeout),
       options.referer == null ? undefined : String(options.referer)
     );
     return response === 'null' ? null : parseRustJson(response);
   }
 
   async click(selector, options = {}) {
-    await this._inner.click(String(selector), this._resolveTimeout(options.timeout));
+    await this._inner.click(String(selector), options.timeout == null ? undefined : Number(options.timeout));
   }
 
   async fill(selector, value, options = {}) {
     await this._inner.fill(
       String(selector),
       String(value),
-      this._resolveTimeout(options.timeout)
+      options.timeout == null ? undefined : Number(options.timeout)
     );
   }
 
   async title(options = {}) {
-    return this._inner.title(this._resolveTimeout(options.timeout));
+    return this._inner.title(options.timeout == null ? undefined : Number(options.timeout));
   }
 
   async textContent(selector, options = {}) {
     return this._inner.textContent(
       String(selector),
-      this._resolveTimeout(options.timeout)
+      options.timeout == null ? undefined : Number(options.timeout)
     );
   }
 
   async evaluate(expression, arg, options = {}) {
     const source = typeof expression === 'function' ? expression.toString() : String(expression);
-    const json = await this._inner.evaluate(source, encodeEvaluateArg(arg), this._resolveTimeout(options.timeout));
+    const timeout = options.timeout == null ? undefined : Number(options.timeout);
+    const json = await this._inner.evaluate(source, encodeEvaluateArg(arg), timeout);
     return parseRustJson(json);
   }
 
   async screenshot(options = {}) {
     const normalized = normalizeScreenshotOptions(options);
-    const resolved = this._resolveTimeout(normalized.timeout);
-    if (resolved != null) normalized.timeout = resolved;
     const bytes = await this._inner.screenshot(JSON.stringify(normalized));
     return Buffer.from(bytes);
   }

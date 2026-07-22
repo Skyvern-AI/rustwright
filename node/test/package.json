@@ -1,4 +1,4 @@
 {
   "private": true,
-  "main": "decode.test.mjs"
+  "main": "all.test.mjs"
 }

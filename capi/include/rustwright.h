@@ -86,6 +86,32 @@ void rw_browser_free(RwBrowser *b);
 char *rw_page_target_id(RwPage *p);
 
 /**
+ * Set this page's general default timeout in milliseconds.
+ *
+ * NAN clears the slot. General calls resolve an omitted timeout from the page
+ * slot, then the context slot, then the core's 30 second command default.
+ */
+int32_t rw_page_set_default_timeout(RwPage *p, double timeout_ms_or_nan);
+
+/** Set or clear (with NAN) this page's navigation default timeout. */
+int32_t rw_page_set_default_navigation_timeout(RwPage *p,
+                                               double timeout_ms_or_nan);
+
+/** Set or clear (with NAN) the inherited context general slot for this page. */
+int32_t rw_page_set_context_default_timeout(RwPage *p,
+                                            double timeout_ms_or_nan);
+
+/**
+ * Set or clear (with NAN) the inherited context navigation slot for this page.
+ *
+ * Navigation calls resolve an omitted timeout from page navigation, context
+ * navigation, page general, context general, then the 30 second core default.
+ */
+int32_t rw_page_set_context_default_navigation_timeout(
+    RwPage *p,
+    double timeout_ms_or_nan);
+
+/**
  * Navigate and return the response payload as caller-owned JSON UTF-8.
  *
  * `wait_until` and `referer` may be NULL. For every timeout argument in this
