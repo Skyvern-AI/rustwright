@@ -23,18 +23,23 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by an import-hook re
 
 
 _SESSION_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_STATE_FIELDS = {
+_HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_COMMON_STATE_FIELDS = {
     "schema",
     "session",
-    "owner_pid",
-    "endpoint",
-    "control_token",
+    "mode",
+    "remote",
     "session_nonce",
     "active_target_id",
     "tabs",
     "next_tab_id",
     "next_ref_id",
     "dirty",
+}
+_OWNED_STATE_FIELDS = {
+    "owner_pid",
+    "endpoint",
+    "control_token",
     "launch_config_hash",
 }
 
@@ -282,15 +287,49 @@ def read_json(path: Any, missing_ok: bool = False) -> Optional[Dict[str, Any]]:
 
 
 def _validate_state(value: Dict[str, Any], expected_session: str) -> Dict[str, Any]:
-    if set(value) != _STATE_FIELDS or value.get("schema") != 1:
+    if value.get("schema") != 1:
         raise _unsafe_path("The session state schema is unsupported")
     if value.get("session") != expected_session:
         raise _unsafe_path("The session state name does not match")
-    if isinstance(value.get("owner_pid"), bool) or not isinstance(value.get("owner_pid"), int):
-        raise _unsafe_path("The session owner pid is invalid")
-    for field in ("endpoint", "control_token", "session_nonce", "launch_config_hash"):
+    mode = value.get("mode")
+    expected_fields = _COMMON_STATE_FIELDS | (_OWNED_STATE_FIELDS if mode == "owned" else set())
+    if mode not in {"owned", "remote"} or set(value) != expected_fields:
+        raise _unsafe_path("The session state schema is unsupported")
+    for field in ("session_nonce",):
         if not isinstance(value.get(field), str) or not value[field]:
             raise _unsafe_path("The session state is incomplete")
+    if mode == "owned":
+        if isinstance(value.get("owner_pid"), bool) or not isinstance(value.get("owner_pid"), int):
+            raise _unsafe_path("The session owner pid is invalid")
+        for field in ("endpoint", "control_token", "launch_config_hash"):
+            if not isinstance(value.get(field), str) or not value[field]:
+                raise _unsafe_path("The session state is incomplete")
+        if value.get("remote") is not None:
+            raise _unsafe_path("The owned session state is invalid")
+    else:
+        remote = value.get("remote")
+        if not isinstance(remote, dict) or set(remote) != {"endpoint", "headers", "timeout_ms"}:
+            raise _unsafe_path("The remote session state is incomplete")
+        if not isinstance(remote.get("endpoint"), str) or not remote["endpoint"]:
+            raise _unsafe_path("The remote session endpoint is invalid")
+        headers = remote.get("headers")
+        if not isinstance(headers, dict) or any(
+            not isinstance(name, str)
+            or _HEADER_NAME.fullmatch(name) is None
+            or not isinstance(header_value, str)
+            or "\r" in header_value
+            or "\n" in header_value
+            for name, header_value in headers.items()
+        ):
+            raise _unsafe_path("The remote session headers are invalid")
+        timeout_ms = remote.get("timeout_ms")
+        if (
+            isinstance(timeout_ms, bool)
+            or not isinstance(timeout_ms, int)
+            or timeout_ms < 1
+            or timeout_ms > 120000
+        ):
+            raise _unsafe_path("The remote session timeout is invalid")
     active_target = value.get("active_target_id")
     if active_target is not None and not isinstance(active_target, str):
         raise _unsafe_path("The active tab metadata is invalid")

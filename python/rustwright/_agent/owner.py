@@ -148,6 +148,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         state = {
             "schema": 1,
             "session": session,
+            "mode": "owned",
+            "remote": None,
             "owner_pid": os.getpid(),
             "endpoint": endpoint,
             "control_token": control_token,

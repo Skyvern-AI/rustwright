@@ -57,6 +57,8 @@ class AttachedSession(BrowserSession):
         snapshot_depth: int = 8,
         snapshot_max_chars: int = 50000,
         allow_eval: bool = False,
+        headers: Optional[Dict[str, str]] = None,
+        connect_timeout_ms: Optional[int] = None,
     ) -> None:
         super().__init__(
             headless=True,
@@ -68,6 +70,8 @@ class AttachedSession(BrowserSession):
             allow_eval=allow_eval,
         )
         self.endpoint = endpoint
+        self.headers = dict(headers) if headers is not None else None
+        self.connect_timeout_ms = connect_timeout_ms
         self._persisted_tabs = dict(tabs or {})
         self._persisted_active_target_id = active_target_id
         self._next_tab_number = max(1, int(next_tab_id))
@@ -176,7 +180,15 @@ class AttachedSession(BrowserSession):
             return
         try:
             self.playwright = sync_playwright().start()
-            self.browser = self.playwright.chromium.connect_over_cdp(self.endpoint)
+            connect_options = {}  # type: Dict[str, Any]
+            if self.headers is not None:
+                connect_options["headers"] = self.headers
+            if self.connect_timeout_ms is not None:
+                connect_options["timeout"] = self.connect_timeout_ms
+            self.browser = self.playwright.chromium.connect_over_cdp(
+                self.endpoint,
+                **connect_options,
+            )
             contexts = list(self.browser.contexts)
             if not contexts:
                 raise AgentError("session_lost", "The browser owner has no context")
@@ -261,6 +273,15 @@ class AttachedSession(BrowserSession):
     def clear_active_refs(self) -> None:
         for registry in self._registries.values():
             registry.state.active = {}
+
+    def is_connected(self) -> bool:
+        browser = self.browser
+        if browser is None:
+            return False
+        try:
+            return bool(browser.is_connected())
+        except Exception:
+            return False
 
     def close(self) -> None:
         """Disconnect the CDP client without closing owner pages or contexts."""

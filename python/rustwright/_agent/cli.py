@@ -6,6 +6,7 @@ from importlib import metadata
 import ipaddress
 import json
 import os
+import re
 import secrets
 import signal
 import stat
@@ -59,6 +60,7 @@ _COMMANDS = {
 }
 
 _SNAPSHOT_REF_RESERVATION = 1000
+_HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 
 
 def _version() -> str:
@@ -144,6 +146,13 @@ def build_parser() -> NonExitingArgumentParser:
         "--browser",
         default="chromium",
         help="browser to use (cr or chromium; other Chromium executables require --executable-path)",
+    )
+    open_parser.add_argument("--cdp-endpoint")
+    open_parser.add_argument("--cdp-header", action="append", default=[])
+    open_parser.add_argument(
+        "--cdp-timeout-ms",
+        type=_bounded_integer("cdp-timeout-ms", 1, 120000),
+        default=60000,
     )
 
     navigate_parser = commands.add_parser("navigate")
@@ -317,6 +326,63 @@ def _launch_flags_explicit(argv: List[str]) -> bool:
     return any(item == prefix or item.startswith(prefix + "=") for item in argv for prefix in prefixes)
 
 
+def _valid_header(name: Any, value: Any) -> bool:
+    return (
+        isinstance(name, str)
+        and _HEADER_NAME.fullmatch(name) is not None
+        and isinstance(value, str)
+        and "\r" not in value
+        and "\n" not in value
+    )
+
+
+def _remote_open_config(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+    """Resolve remote-CDP settings without exposing connection material in errors."""
+
+    endpoint = args.cdp_endpoint
+    if endpoint is None:
+        endpoint = os.environ.get("RUSTWRIGHT_AGENT_CDP_ENDPOINT")
+    if endpoint is not None and (not isinstance(endpoint, str) or not endpoint.strip()):
+        raise AgentError("invalid_argument", "The remote CDP endpoint is invalid")
+
+    headers = {}  # type: Dict[str, str]
+    encoded_headers = os.environ.get("RUSTWRIGHT_AGENT_CDP_HEADERS")
+    if encoded_headers is not None:
+        try:
+            environment_headers = json.loads(encoded_headers)
+        except (TypeError, ValueError):
+            raise AgentError(
+                "invalid_argument",
+                "RUSTWRIGHT_AGENT_CDP_HEADERS must be a JSON object of string headers",
+            ) from None
+        if not isinstance(environment_headers, dict) or any(
+            not _valid_header(name, value) for name, value in environment_headers.items()
+        ):
+            raise AgentError(
+                "invalid_argument",
+                "RUSTWRIGHT_AGENT_CDP_HEADERS must be a JSON object of string headers",
+            )
+        headers.update(environment_headers)
+
+    for item in args.cdp_header:
+        if "=" not in item:
+            raise AgentError("invalid_argument", "CDP headers must use NAME=VALUE")
+        name, value = item.split("=", 1)
+        if not _valid_header(name, value):
+            raise AgentError("invalid_argument", "CDP headers must use NAME=VALUE")
+        headers[name] = value
+
+    if endpoint is None:
+        if headers:
+            raise AgentError("invalid_argument", "CDP headers require a remote CDP endpoint")
+        return None
+    return {
+        "endpoint": endpoint,
+        "headers": headers,
+        "timeout_ms": args.cdp_timeout_ms,
+    }
+
+
 def _remove_startup_error(session: str) -> None:
     for path in (error_path(session), bootstrap_ack_path(session)):
         try:
@@ -406,7 +472,41 @@ def _spawn_owner(args: argparse.Namespace) -> Dict[str, Any]:
 def _state_for_browser(args: argparse.Namespace, argv: List[str]) -> Dict[str, Any]:
     state = read_state(args.session)
     if state is None:
+        remote = getattr(args, "remote_config", None)
+        if remote is not None:
+            return {
+                "schema": 1,
+                "session": args.session,
+                "mode": "remote",
+                "remote": remote,
+                "session_nonce": secrets.token_hex(16),
+                "active_target_id": None,
+                "tabs": {},
+                "next_tab_id": 1,
+                "next_ref_id": 1,
+                "dirty": None,
+            }
         state = _spawn_owner(args)
+    elif state["mode"] == "remote":
+        requested = getattr(args, "remote_config", None)
+        if requested is not None and requested != state["remote"]:
+            raise AgentError(
+                "invalid_argument",
+                "Remote CDP options do not match the running session",
+                "Close the session before changing remote CDP options.",
+            )
+        if _launch_flags_explicit(argv):
+            raise AgentError(
+                "invalid_argument",
+                "Local browser launch options do not apply to remote CDP sessions",
+            )
+        return state
+    elif getattr(args, "remote_config", None) is not None:
+        raise AgentError(
+            "invalid_argument",
+            "The running session owns a local browser",
+            "Close the session before changing to a remote CDP endpoint.",
+        )
     elif not _pid_alive(state["owner_pid"]):
         raise AgentError(
             "session_lost",
@@ -426,18 +526,27 @@ def _state_for_browser(args: argparse.Namespace, argv: List[str]) -> Dict[str, A
 
 
 def _attach(args: argparse.Namespace, state: Dict[str, Any]) -> AttachedSession:
-    return AttachedSession(
-        state["endpoint"],
-        state["tabs"],
-        active_target_id=state["active_target_id"],
-        next_tab_id=state["next_tab_id"],
-        next_ref_id=state["next_ref_id"],
-        session_nonce=state["session_nonce"],
-        restore_refs=state["dirty"] is None,
-        action_timeout_ms=args.timeout_ms,
-        navigation_timeout_ms=args.navigation_timeout_ms,
-        allow_eval=args.allow_eval,
-    )
+    remote = state["remote"] if state["mode"] == "remote" else None
+    endpoint = remote["endpoint"] if remote is not None else state["endpoint"]
+    try:
+        return AttachedSession(
+            endpoint,
+            state["tabs"],
+            active_target_id=state["active_target_id"],
+            next_tab_id=state["next_tab_id"],
+            next_ref_id=state["next_ref_id"],
+            session_nonce=state["session_nonce"],
+            restore_refs=state["dirty"] is None,
+            action_timeout_ms=args.timeout_ms,
+            navigation_timeout_ms=args.navigation_timeout_ms,
+            allow_eval=args.allow_eval,
+            headers=remote["headers"] if remote is not None else None,
+            connect_timeout_ms=remote["timeout_ms"] if remote is not None else None,
+        )
+    except Exception:
+        if remote is not None:
+            raise AgentError("session_lost", "remote CDP session unreachable") from None
+        raise
 
 
 def _is_mutating(args: argparse.Namespace) -> bool:
@@ -461,8 +570,16 @@ def _is_mutating(args: argparse.Namespace) -> bool:
     }
 
 
-def _validate_command(args: argparse.Namespace) -> None:
+def _validate_command(args: argparse.Namespace, argv: List[str]) -> None:
     validate_session_name(args.session)
+    args.remote_config = _remote_open_config(args) if args.command == "open" else None
+    if args.remote_config is not None and (
+        _launch_flags_explicit(argv) or args.browser not in {"cr", "chromium"}
+    ):
+        raise AgentError(
+            "invalid_argument",
+            "Local browser launch options do not apply to remote CDP sessions",
+        )
     if args.command == "open":
         if args.browser in {"ff", "firefox", "wk", "webkit"}:
             raise AgentError(
@@ -639,7 +756,16 @@ def _write_screenshot(args: argparse.Namespace, result: Dict[str, Any]) -> Dict[
 
 
 def _status_data(session_name: str, state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if state is None or not _pid_alive(state["owner_pid"]):
+    if state is None:
+        return {"running": False, "session": session_name}
+    if state["mode"] == "remote":
+        return {
+            "running": True,
+            "session": session_name,
+            "mode": "remote",
+            "tabs": len(state["tabs"]),
+        }
+    if not _pid_alive(state["owner_pid"]):
         return {"running": False, "session": session_name}
     return {
         "running": True,
@@ -677,6 +803,10 @@ def _close_session(args: argparse.Namespace) -> Dict[str, Any]:
         remove_session_files(args.session)
         return {"message": "closed session", "running": False}
     if state is None:
+        remove_session_files(args.session)
+        return {"message": "closed session", "running": False}
+
+    if state["mode"] == "remote":
         remove_session_files(args.session)
         return {"message": "closed session", "running": False}
 
@@ -718,10 +848,13 @@ def _close_session(args: argparse.Namespace) -> Dict[str, Any]:
 def _human_success(args: argparse.Namespace, data: Dict[str, Any]) -> None:
     if args.command == "status":
         if data["running"]:
-            _write_stdout(
-                "running\t%s\t%d\t%d\n"
-                % (data["session"], data["owner_pid"], data["tabs"])
-            )
+            if data.get("mode") == "remote":
+                _write_stdout("running\t%s\tremote\t%d\n" % (data["session"], data["tabs"]))
+            else:
+                _write_stdout(
+                    "running\t%s\t%d\t%d\n"
+                    % (data["session"], data["owner_pid"], data["tabs"])
+                )
         else:
             _write_stdout("stopped\n")
         return
@@ -770,7 +903,7 @@ def _run(args: argparse.Namespace, argv: List[str]) -> Dict[str, Any]:
             "unsupported_platform",
             "persistent sessions require macOS or Linux",
         )
-    _validate_command(args)
+    _validate_command(args, argv)
     with session_lock(args.session):
         if args.command == "status":
             return _status_data(args.session, read_state(args.session))
@@ -788,8 +921,18 @@ def _run(args: argparse.Namespace, argv: List[str]) -> Dict[str, Any]:
             result = _dispatch(args, session)
             if args.command == "screenshot":
                 result = _write_screenshot(args, result)
+            if state["mode"] == "remote" and not session.is_connected():
+                raise AgentError("session_lost", "remote CDP session unreachable")
             _persist(state, session)
             return result
+        except AgentError:
+            if (
+                state["mode"] == "remote"
+                and session is not None
+                and not session.is_connected()
+            ):
+                raise AgentError("session_lost", "remote CDP session unreachable") from None
+            raise
         finally:
             if session is not None:
                 session.close()
