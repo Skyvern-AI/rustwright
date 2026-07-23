@@ -73,11 +73,11 @@ Rustwright, run `rustwright install chromium` once.
 
 ### How persistence works
 
-`open` launches a small background owner process that holds the browser. Each
-later command connects to that browser over a local CDP endpoint, performs one
-action, and detaches. State for a session lives in a per-user runtime directory
-(`$XDG_RUNTIME_DIR/rustwright/agent` or a temporary directory), with the state
-file created private to your user.
+For a local session, `open` launches a small background owner process that holds
+the browser. Each later command connects to that browser over a local CDP
+endpoint, performs one action, and detaches. State for a session lives in a
+per-user runtime directory (`$XDG_RUNTIME_DIR/rustwright/agent` or a temporary
+directory), with the state file created private to your user.
 
 **Threat model: a single trusted local user.** The browser's CDP endpoint listens
 on a loopback port. Any process running as any user on the same host that can
@@ -91,11 +91,43 @@ so you never act on a ref from an uncertain state.
 
 Persistent sessions require macOS or Linux; non-session commands remain available on Windows.
 
+### Remote browsers over CDP
+
+To attach a named session to an externally owned Chromium browser instead of
+launching a local browser, pass its CDP address to `open`:
+
+```bash
+rustwright open --cdp-endpoint <address> \
+  --cdp-header <name>=<value> \
+  --cdp-timeout-ms 60000
+```
+
+`--cdp-header NAME=VALUE` is repeatable. The environment equivalents are
+`RUSTWRIGHT_AGENT_CDP_ENDPOINT` for the address and
+`RUSTWRIGHT_AGENT_CDP_HEADERS` for a JSON object of header names and values.
+Connection headers are stored in the private session state file and are never
+shown by `status`.
+
+Remote sessions do not launch or own a browser. Local-launch options
+`--headed`, `--executable-path`, and `--browser-arg`, as well as non-Chromium
+`-b`/`--browser` values, therefore cannot be combined with `--cdp-endpoint`. If
+the remote address is dead, unreachable, or rejects authentication, the command
+fails with `session_lost`; it never falls back to a local browser. `close`,
+including `close --force`, only clears the local session state and does not stop
+the remote browser.
+
+For example, Skyvern Browser Sessions gives you a CDP address plus an
+`x-api-key` header:
+
+```bash
+rustwright open --cdp-endpoint <addr> --cdp-header x-api-key=<key>
+```
+
 ### Verbs
 
 | Verb | Example | Notes |
 |---|---|---|
-| `open [URL]` | `rustwright open example.com` | Start/attach a session; optional navigate. |
+| `open [URL]` | `rustwright open example.com` | Start/attach a local or remote session; optional navigate. |
 | `navigate URL` | `rustwright navigate example.com` | Navigate the active tab. |
 | `back` / `reload` | | History + reload. |
 | `snapshot` | `rustwright snapshot --depth 6` | Print the accessibility tree with refs. |
@@ -107,8 +139,8 @@ Persistent sessions require macOS or Linux; non-session commands remain availabl
 | `wait …` | `rustwright wait --text Loaded` | Wait for time / text / text-gone / load state. |
 | `tabs …` | `rustwright tabs new example.com` | `list` / `new` / `use` / `close`. |
 | `screenshot [PATH]` | `rustwright screenshot shot.png --full` | Save a screenshot. |
-| `status` | `rustwright status` | Show whether a session is running (endpoint redacted). |
-| `close [--force]` | `rustwright close --force` | Shut down; `--force` also clears a wedged session. |
+| `status` | `rustwright status` | Show session mode/status with connection details redacted. |
+| `close [--force]` | `rustwright close --force` | Stop an owned browser or clear local remote-session state. |
 | `eval EXPR` | `rustwright --allow-eval eval "document.title"` | Requires `--allow-eval`. |
 
 Global flags include `--session NAME` (default `default`), `--json` (emit one
