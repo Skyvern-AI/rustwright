@@ -4,6 +4,8 @@ Rustwright is an alpha Rust/PyO3 project with a Playwright-shaped Python API.
 Expect some rough edges, large files, and compatibility behavior that is still
 being proven.
 
+PRs with user-facing changes should add a bullet under `## [Unreleased]` in `CHANGELOG.md`.
+
 ## Local Setup
 
 Use a virtual environment and build the native extension with maturin:
