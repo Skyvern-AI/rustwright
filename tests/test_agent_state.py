@@ -29,6 +29,8 @@ def _state(name):
     return {
         "schema": 1,
         "session": name,
+        "mode": "owned",
+        "remote": None,
         "owner_pid": os.getpid(),
         "endpoint": "ws://127.0.0.1:1/browser/example",
         "control_token": "control-value",

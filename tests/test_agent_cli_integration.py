@@ -195,6 +195,9 @@ def test_agent_cli_uses_top_level_program_and_version(capsys):
     assert cli.main(["open", "--help"]) == 0
     output = capsys.readouterr().out
     assert "usage: rustwright open" in output
+    assert "--cdp-endpoint" in output
+    assert "--cdp-header" in output
+    assert "--cdp-timeout-ms" in output
     assert "rustwright-agent" not in output
 
 
@@ -279,6 +282,8 @@ def test_force_close_cleans_dead_owner_state(isolated_runtime, capsys, monkeypat
     state = {
         "schema": 1,
         "session": name,
+        "mode": "owned",
+        "remote": None,
         # Model a dead owner's stale state after its PID has been reused by this
         # unrelated live process. The free owner lock must prevent signaling.
         "owner_pid": os.getpid(),
