@@ -431,3 +431,53 @@ fn promoted_input_read_and_viewport_surface_uses_fixture_page() {
 
     browser.close().expect("close input browser");
 }
+
+#[test]
+fn background_page_scroll_hover_and_check_settle_without_waiting_for_animation_frames() {
+    let Some(browser) = launch() else {
+        return;
+    };
+    let fixture = FixtureServer::start();
+    let page = browser.new_page().expect("create background action page");
+    goto(&page, &fixture.url("/input"));
+    let visibility = evaluate(
+        &page,
+        r#"() => {
+          Object.defineProperty(document, 'visibilityState', {
+            configurable: true,
+            get: () => 'hidden',
+          });
+          globalThis.requestAnimationFrame = () => 1;
+          return document.visibilityState;
+        }"#,
+    );
+    assert_eq!(visibility, Value::String("hidden".to_owned()));
+
+    let started = Instant::now();
+    page.scroll_into_view_with_cancel("#bottom", ActionOptions::timeout(2_000.0), None)
+        .expect("scroll hidden page target");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "hidden-page scroll waited too long: {:?}",
+        started.elapsed()
+    );
+
+    let started = Instant::now();
+    page.hover("#hover").expect("hover target on hidden page");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "hidden-page hover waited too long: {:?}",
+        started.elapsed()
+    );
+
+    let started = Instant::now();
+    page.check("#check").expect("check target on hidden page");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "hidden-page check waited too long: {:?}",
+        started.elapsed()
+    );
+    assert!(page.is_checked("#check").expect("read checked state"));
+
+    browser.close().expect("close background action browser");
+}

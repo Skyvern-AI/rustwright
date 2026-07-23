@@ -500,6 +500,54 @@ impl Page {
         Ok(serde_json::from_str(&json)?)
     }
 
+    /// Navigate backward and report whether a history entry existed.
+    pub fn go_back_with_cancel_status(
+        &self,
+        options: GotoOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<(bool, Value)> {
+        let timeout = duration_from_timeout_ms(options.timeout);
+        let (had_entry, json) = self.inner.go_back_with_cancel_status(
+            options.wait_until.as_deref(),
+            timeout,
+            cancel,
+        )?;
+        Ok((had_entry, serde_json::from_str(&json)?))
+    }
+
+    /// Navigate to the next history entry, if one exists.
+    pub fn go_forward(&self, options: GotoOptions) -> Result<Value> {
+        self.go_forward_with_cancel(options, None)
+    }
+
+    /// Navigate forward with an optional cancellation signal.
+    pub fn go_forward_with_cancel(
+        &self,
+        options: GotoOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Value> {
+        let timeout = duration_from_timeout_ms(options.timeout);
+        let json =
+            self.inner
+                .go_forward_with_cancel(options.wait_until.as_deref(), timeout, cancel)?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    /// Navigate forward and report whether a history entry existed.
+    pub fn go_forward_with_cancel_status(
+        &self,
+        options: GotoOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<(bool, Value)> {
+        let timeout = duration_from_timeout_ms(options.timeout);
+        let (had_entry, json) = self.inner.go_forward_with_cancel_status(
+            options.wait_until.as_deref(),
+            timeout,
+            cancel,
+        )?;
+        Ok((had_entry, serde_json::from_str(&json)?))
+    }
+
     /// Reload the page and wait for the requested navigation state.
     pub fn reload(&self, options: GotoOptions) -> Result<Value> {
         self.reload_with_cancel(options, None)
@@ -762,7 +810,34 @@ impl Page {
     ///
     /// This is an explicit DOM-backed shortcut pending P3 actionability checks.
     pub fn scroll_into_view(&self, selector: &str) -> Result<()> {
-        self.inner.scroll_into_view(selector)
+        self.scroll_into_view_with_cancel(selector, ActionOptions::default(), None)
+    }
+
+    /// Scroll an element into view with an optional cancellation signal.
+    pub fn scroll_into_view_with_cancel(
+        &self,
+        selector: &str,
+        options: ActionOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
+        self.inner
+            .scroll_into_view_with_cancel(selector, options.timeout, cancel)
+    }
+
+    /// Scroll the page viewport and wait briefly for the visual position to settle.
+    pub fn scroll_viewport(&self, delta_y: f64, options: ActionOptions) -> Result<()> {
+        self.scroll_viewport_with_cancel(delta_y, options, None)
+    }
+
+    /// Scroll the page viewport with an optional cancellation signal.
+    pub fn scroll_viewport_with_cancel(
+        &self,
+        delta_y: f64,
+        options: ActionOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
+        self.inner
+            .scroll_viewport_with_cancel(delta_y, options.timeout, cancel)
     }
 
     /// Return the document title.
