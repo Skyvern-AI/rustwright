@@ -69,6 +69,8 @@ The Node binding drives an existing Chromium/Chrome — point Rustwright at it w
   await browser.close();
 ```
 
+See the network-independent [`examples/quickstart.js`](examples/quickstart.js) example. After building the Node binding from source, run it from the repository root with `node examples/quickstart.js`.
+
 Only a subset of the API surface is bridged — see [Limitations](#limitations).
 
 ## Why Rustwright?
