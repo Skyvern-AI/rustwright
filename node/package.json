@@ -44,7 +44,7 @@
     "test": "node --test"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.4"
+    "@napi-rs/cli": "^3.7.4"
   },
   "napi": {
     "name": "rustwright",
