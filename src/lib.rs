@@ -4073,6 +4073,36 @@ mod tests {
         assert_eq!(batch[0]["payload"]["frameId"], "frame-1");
     }
 
+    #[tokio::test]
+    async fn navigation_wait_completes_on_expected_same_document_url() {
+        let (events, mut receiver) = broadcast::channel(4);
+        events
+            .send(json!({
+                "sessionId": "page-session",
+                "method": "Page.navigatedWithinDocument",
+                "params": {
+                    "frameId": "frame-1",
+                    "url": "https://example.test/app#second"
+                }
+            }))
+            .expect("queue same-document navigation");
+
+        let response = wait_for_navigation(
+            &mut receiver,
+            "page-session",
+            "load",
+            None,
+            Some("https://example.test/app#second"),
+            "Page.go_forward",
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("same-document navigation should complete");
+
+        assert!(response.response.is_none());
+        assert!(response.same_document);
+    }
+
     #[test]
     fn network_request_mutation_is_idempotent_per_event_sequence() {
         let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
@@ -9208,6 +9238,7 @@ async fn page_goto_async(
     )
     .await?;
     Ok(response
+        .response
         .unwrap_or_else(|| {
             json!({
                 "url": result.get("url").cloned().unwrap_or(Value::Null),
@@ -11562,6 +11593,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                 .await?;
                 let _ = client;
                 Ok(response
+                    .response
                     .unwrap_or_else(|| {
                         json!({
                             "url": result.get("url").cloned().unwrap_or(Value::Null),
@@ -11641,6 +11673,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                 .await?;
                 let _ = client;
                 Ok(response
+                    .response
                     .unwrap_or_else(|| {
                         json!({
                             "url": result.get("url").cloned().unwrap_or(Value::Null),
@@ -14773,7 +14806,7 @@ impl PyPage {
                     timeout,
                 )
                 .await?;
-                Ok(response.unwrap_or(Value::Null).to_string())
+                Ok(response.response.unwrap_or(Value::Null).to_string())
             })
             .map_err(py_err)
     }
@@ -15562,6 +15595,39 @@ impl RustwrightPage {
         cancel: Option<&CancelToken>,
     ) -> RwResult<String> {
         self.navigate_history(-1, wait_until, timeout, cancel)
+            .map(|(_, response)| response)
+    }
+
+    pub fn go_back_with_cancel_status(
+        &self,
+        wait_until: Option<&str>,
+        timeout: Duration,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<(bool, String)> {
+        self.navigate_history(-1, wait_until, timeout, cancel)
+    }
+
+    pub fn go_forward(&self, wait_until: Option<&str>, timeout: Duration) -> RwResult<String> {
+        self.go_forward_with_cancel(wait_until, timeout, None)
+    }
+
+    pub fn go_forward_with_cancel(
+        &self,
+        wait_until: Option<&str>,
+        timeout: Duration,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<String> {
+        self.navigate_history(1, wait_until, timeout, cancel)
+            .map(|(_, response)| response)
+    }
+
+    pub fn go_forward_with_cancel_status(
+        &self,
+        wait_until: Option<&str>,
+        timeout: Duration,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<(bool, String)> {
+        self.navigate_history(1, wait_until, timeout, cancel)
     }
 
     pub fn reload(&self, wait_until: Option<&str>, timeout: Duration) -> RwResult<String> {
@@ -16030,17 +16096,47 @@ return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value)
 
     /// Scroll the matching element into view using the page DOM.
     pub fn scroll_into_view(&self, selector: &str) -> RwResult<()> {
+        self.scroll_into_view_with_cancel(selector, None, None)
+    }
+
+    /// Scroll the matching element into view with an optional cancellation signal.
+    pub fn scroll_into_view_with_cancel(
+        &self,
+        selector: &str,
+        timeout_ms: Option<f64>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
         let locator_json = selector_to_locator_json(selector)?;
         let page = Arc::clone(&self.inner);
+        let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
-        browser.block_on_raw(async move {
-            scroll_locator_into_view(
-                &page,
-                &locator_json,
-                OperationDeadline::new(Duration::from_secs(30)),
-            )
-            .await
-        })
+        browser.block_on_raw(cancelable(cancel.cloned(), async move {
+            scroll_locator_into_view(&page, &locator_json, OperationDeadline::new(timeout)).await
+        }))
+    }
+
+    /// Scroll the page viewport and wait briefly for the visual position to settle.
+    pub fn scroll_viewport(&self, delta_y: f64, timeout_ms: Option<f64>) -> RwResult<()> {
+        self.scroll_viewport_with_cancel(delta_y, timeout_ms, None)
+    }
+
+    /// Scroll the page viewport with an optional cancellation signal.
+    pub fn scroll_viewport_with_cancel(
+        &self,
+        delta_y: f64,
+        timeout_ms: Option<f64>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
+        let expression = format!(
+            r#"(deltaY) => {{
+{SCROLL_SETTLE_JS}
+window.scrollBy({{ top: deltaY, left: 0, behavior: 'instant' }});
+return waitForScrollSettle();
+}}"#
+        );
+        let arg_json = serde_json::to_string(&delta_y)?;
+        self.evaluate_with_cancel(&expression, Some(&arg_json), timeout_ms, cancel)
+            .map(|_| ())
     }
 
     pub fn text_content(
@@ -16170,7 +16266,7 @@ return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value)
         wait_until: Option<&str>,
         timeout: Duration,
         cancel: Option<&CancelToken>,
-    ) -> RwResult<String> {
+    ) -> RwResult<(bool, String)> {
         let page = Arc::clone(&self.inner);
         let wait_until = wait_until.unwrap_or("load").to_string();
         validate_navigation_wait_state(&wait_until)?;
@@ -16209,7 +16305,7 @@ return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value)
                         message: "response did not include entries".to_string(),
                     })?;
                 if target_index < 0 || target_index as usize >= entries.len() {
-                    return Ok(Value::Null.to_string());
+                    return Ok((false, Value::Null.to_string()));
                 }
                 let entry = &entries[target_index as usize];
                 let entry_id =
@@ -16239,11 +16335,15 @@ return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value)
                     &wait_until,
                     None,
                     target_url.as_deref(),
-                    "Page.go_back",
+                    if offset < 0 {
+                        "Page.go_back"
+                    } else {
+                        "Page.go_forward"
+                    },
                     deadline.remaining()?,
                 )
                 .await?;
-                if wait_until != "commit" {
+                if !response.same_document && wait_until != "commit" {
                     settle_history_navigation(
                         &operation_client,
                         &mut events,
@@ -16253,7 +16353,11 @@ return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value)
                     )
                     .await?;
                 }
-                Ok(response.unwrap_or(Value::Null).to_string())
+                let main_frame_id = page.main_frame_id.lock().unwrap().clone();
+                if let (Some(frame_id), Some(target_url)) = (main_frame_id, target_url.as_deref()) {
+                    page.record_main_frame_navigation_url(&frame_id, target_url);
+                }
+                Ok((true, response.response.unwrap_or(Value::Null).to_string()))
             },
         ))
     }
@@ -16310,6 +16414,14 @@ if (aria === 'false') return { valid: true, checked: false, indeterminate: false
 if (aria === 'mixed') return { valid: true, checked: false, indeterminate: true, native_input: false, native_radio: false };
 return { valid: true, checked: false, indeterminate: false, native_input: false, native_radio: false };
 }"#;
+
+const SCROLL_SETTLE_JS: &str = r#"const waitForScrollSettle = () => {
+  if (document.visibilityState !== 'visible') return Promise.resolve(true);
+  return Promise.race([
+    new Promise(resolve => requestAnimationFrame(() => resolve(true))),
+    new Promise(resolve => setTimeout(() => resolve(true), 32)),
+  ]);
+};"#;
 
 fn native_page_event_from_cdp(
     page: &Arc<PageInner>,
@@ -16423,11 +16535,13 @@ async fn scroll_locator_into_view(
     deadline: OperationDeadline,
 ) -> RwResult<()> {
     let resolution = resolve_locator_session(Arc::clone(page), locator_json, deadline).await?;
-    let expression = locator_script(
-        &resolution.locator_json,
-        0,
-        "if (!el) throw new Error('No element matches locator'); el.scrollIntoView({ block: 'center', inline: 'center' }); return true;",
+    let body = format!(
+        r#"{SCROLL_SETTLE_JS}
+if (!el) throw new Error('No element matches locator');
+el.scrollIntoView({{ block: 'center', inline: 'center' }});
+return waitForScrollSettle();"#
     );
+    let expression = locator_script(&resolution.locator_json, 0, &body);
     evaluate_locator_resolution(page, &resolution, expression, deadline, Duration::ZERO)
         .await
         .map(|_| ())
@@ -21105,6 +21219,18 @@ fn request_lifecycle_from_event(
     Some(request)
 }
 
+struct NavigationWaitResult {
+    response: Option<Value>,
+    same_document: bool,
+}
+
+fn completed_navigation(response: Option<Value>, same_document: bool) -> NavigationWaitResult {
+    NavigationWaitResult {
+        response,
+        same_document,
+    }
+}
+
 async fn wait_for_navigation(
     events: &mut broadcast::Receiver<Value>,
     session_id: &str,
@@ -21113,7 +21239,7 @@ async fn wait_for_navigation(
     expected_url: Option<&str>,
     method_label: &str,
     timeout: Duration,
-) -> RwResult<Option<Value>> {
+) -> RwResult<NavigationWaitResult> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut response = None;
     let mut requests: HashMap<String, Value> = HashMap::new();
@@ -21138,11 +21264,11 @@ async fn wait_for_navigation(
                 .map(|idle| now >= idle)
                 .unwrap_or(false)
         {
-            return Ok(response);
+            return Ok(completed_navigation(response, false));
         }
         if let Some(grace_deadline) = state_reached_deadline {
             if now >= grace_deadline {
-                return Ok(response);
+                return Ok(completed_navigation(response, false));
             }
         }
         if response_extra_deadline
@@ -21155,10 +21281,10 @@ async fn wait_for_navigation(
         if state_ready_to_return {
             if let Some(extra_deadline) = response_extra_deadline {
                 if now >= extra_deadline {
-                    return Ok(response);
+                    return Ok(completed_navigation(response, false));
                 }
             } else {
-                return Ok(response);
+                return Ok(completed_navigation(response, false));
             }
         }
         let mut remaining = deadline - now;
@@ -21243,14 +21369,14 @@ async fn wait_for_navigation(
                                 state_ready_to_return = true;
                                 continue;
                             }
-                            return Ok(response);
+                            return Ok(completed_navigation(response, false));
                         }
                         if state != "networkidle" && is_non_document {
                             if response_extra_deadline.is_some() {
                                 state_ready_to_return = true;
                                 continue;
                             }
-                            return Ok(response);
+                            return Ok(completed_navigation(response, false));
                         }
                     }
                     continue;
@@ -21272,7 +21398,7 @@ async fn wait_for_navigation(
                             response_extra_request_id = None;
                             response_extra_deadline = None;
                             if state_ready_to_return {
-                                return Ok(response);
+                                return Ok(completed_navigation(response, false));
                             }
                         }
                     }
@@ -21308,6 +21434,15 @@ async fn wait_for_navigation(
                         .zip(event.pointer("/params/frame/url").and_then(Value::as_str))
                         .map(|(expected, actual)| expected == actual)
                         .unwrap_or(false);
+                let navigated_within_document_to_expected = method
+                    == "Page.navigatedWithinDocument"
+                    && expected_url
+                        .zip(event.pointer("/params/url").and_then(Value::as_str))
+                        .map(|(expected, actual)| expected == actual)
+                        .unwrap_or(false);
+                if navigated_within_document_to_expected {
+                    return Ok(completed_navigation(response, true));
+                }
                 let reached_state = match state {
                     "domcontentloaded" => {
                         method == "Page.domContentEventFired" || frame_navigated_to_expected
@@ -21331,7 +21466,7 @@ async fn wait_for_navigation(
                             state_ready_to_return = true;
                             continue;
                         }
-                        return Ok(response);
+                        return Ok(completed_navigation(response, false));
                     }
                     state_reached_deadline =
                         Some(tokio::time::Instant::now() + Duration::from_millis(250));
@@ -21346,10 +21481,10 @@ async fn wait_for_navigation(
                     && response.is_some()
                     && active_requests.is_empty()
                 {
-                    return Ok(response);
+                    return Ok(completed_navigation(response, false));
                 }
                 if state_reached_deadline.is_some() {
-                    return Ok(response);
+                    return Ok(completed_navigation(response, false));
                 }
                 return Err(RwError::Timeout(timeout.as_millis() as u64));
             }
