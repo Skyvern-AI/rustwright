@@ -24,7 +24,7 @@ name = "_rustwright"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-base64 = "0.21.7"
+base64 = "0.22.1"
 futures-util = "0.3.31"
 futures-channel = "0.3.31"
 futures-core = "0.3.31"
