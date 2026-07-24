@@ -280,9 +280,7 @@ impl ActorShared {
             let mut queue = self.queue.lock().unwrap();
             queue.closed = true;
             if let Some(in_flight) = &queue.in_flight {
-                let _ = in_flight
-                    .cancellation
-                    .cancel(CancellationReason::Cancelled);
+                let _ = in_flight.cancellation.cancel(CancellationReason::Cancelled);
             }
             self.ready.notify_all();
             queue.queued.drain(..).collect::<Vec<_>>()
@@ -2626,11 +2624,8 @@ mod tests {
                         && event["hit"] == Value::Bool(true))
             );
 
-            page.click(
-                "#partially-offscreen",
-                ActionOptions::timeout(1_000.0),
-            )
-            .expect("click partially-offscreen target at its hit-tested viewport point");
+            page.click("#partially-offscreen", ActionOptions::timeout(1_000.0))
+                .expect("click partially-offscreen target at its hit-tested viewport point");
             let partially_offscreen = page
                 .evaluate(
                     "globalThis.partiallyOffscreenEvents",
@@ -2648,10 +2643,12 @@ mod tests {
                     .collect::<Vec<_>>(),
                 ["mousedown", "mouseup", "click"]
             );
-            assert!(partially_offscreen
-                .iter()
-                .all(|event| event["trusted"] == Value::Bool(true)
-                    && event["clientX"] == json!(0)));
+            assert!(
+                partially_offscreen
+                    .iter()
+                    .all(|event| event["trusted"] == Value::Bool(true)
+                        && event["clientX"] == json!(0))
+            );
 
             assert_actionability(
                 page.click("#detach", ActionOptions::timeout(500.0))
