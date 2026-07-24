@@ -130,10 +130,10 @@ compact accessibility snapshots and inline PNG screenshots. It lives in
 From source (needs a Rust toolchain):
 
 ```bash
-cargo install --git https://github.com/Skyvern-AI/rustwright mcp-rs
+cargo install --git https://github.com/Skyvern-AI/rustwright rustwright-mcp
 ```
 
-This installs the server binary as `mcp-rs`. An npm package (`rustwright-mcp`,
+This installs the server binary as `rustwright-mcp`. An npm package (`rustwright-mcp`,
 prebuilt binaries via `npx rustwright-mcp`) is on the way.
 
 If Chrome or Chromium is already installed, point Rustwright at it with
@@ -156,7 +156,7 @@ Open `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS 
 {
   "mcpServers": {
     "rustwright": {
-      "command": "mcp-rs"
+      "command": "rustwright-mcp"
     }
   }
 }
@@ -168,7 +168,7 @@ Open `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS 
 {
   "mcpServers": {
     "rustwright": {
-      "command": "mcp-rs"
+      "command": "rustwright-mcp"
     }
   }
 }
