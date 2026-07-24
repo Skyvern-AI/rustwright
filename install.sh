@@ -56,7 +56,17 @@ install_from_source() {
     command -v cargo >/dev/null 2>&1 ||
         err "no prebuilt binary for this platform and cargo is not installed. Install Rust from https://rustup.rs and re-run."
     say "building $BIN from source with cargo (this may take a few minutes) ..."
-    cargo install --git "https://github.com/${REPO}" "$BIN"
+    # Build into a temporary --root so the binary honors INSTALL_DIR rather than
+    # landing in cargo's default bin directory.
+    tmproot="$(mktemp -d)"
+    if ! cargo install --git "https://github.com/${REPO}" "$BIN" --root "$tmproot"; then
+        rm -rf "$tmproot"
+        err "cargo install failed"
+    fi
+    mkdir -p "$INSTALL_DIR"
+    mv "$tmproot/bin/$BIN" "$INSTALL_DIR/$BIN"
+    rm -rf "$tmproot"
+    say "installed $BIN to $INSTALL_DIR/$BIN"
 }
 
 main() {
