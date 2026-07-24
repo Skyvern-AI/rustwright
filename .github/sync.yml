@@ -32,6 +32,27 @@ Skyvern-AI/rustwright-cloud:
   - source: rust-native/
     dest: rust-native/
     deleteOrphaned: true
+  # Cross-language binding packages and their shared contract; mapped so
+  # external contributions to any binding back-sync to the cloud repo. Every
+  # directory exists on this repo's main (a deleteOrphaned prerequisite).
+  - source: bindings/
+    dest: bindings/
+    deleteOrphaned: true
+  - source: go/
+    dest: go/
+    deleteOrphaned: true
+  - source: java/
+    dest: java/
+    deleteOrphaned: true
+  - source: csharp/
+    dest: csharp/
+    deleteOrphaned: true
+  - source: ruby/
+    dest: ruby/
+    deleteOrphaned: true
+  - source: php/
+    dest: php/
+    deleteOrphaned: true
   - source: docs/
     dest: docs/
     deleteOrphaned: true
