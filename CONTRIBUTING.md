@@ -25,6 +25,18 @@ cargo check --locked
 cargo test --locked
 ```
 
+The repository also ships a native agent CLI in [`cli/`](cli/), a standalone Cargo workspace with
+its own lockfile. Build and exercise it with:
+
+```bash
+cargo run --manifest-path cli/Cargo.toml -- open https://example.com
+cargo run --manifest-path cli/Cargo.toml -- close
+cargo test --manifest-path cli/Cargo.toml
+```
+
+Once Chromium is installed, run the real-browser CLI and daemon cases with
+`cargo test --manifest-path cli/Cargo.toml -- --ignored`.
+
 ## Tests
 
 The full pytest suite is heavy: **1,046 tests pass** in the full Docker gate,
