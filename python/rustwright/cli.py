@@ -1477,26 +1477,16 @@ def _agent_main(argv: Sequence[str]) -> int:
 
 
 def _mcp_main(argv: Sequence[str], *, program: str) -> int:
-    try:
-        from rustwright_mcp import server
-    except ModuleNotFoundError as exc:
-        if exc.name not in {"rustwright_mcp", "rustwright_mcp.server"}:
-            raise
+    binary = shutil.which("rustwright-mcp") or shutil.which("mcp-rs")
+    if binary is None:
         print(
-            "rustwright mcp requires the separately installed rustwright-mcp package; "
-            "install it with: pip install rustwright-mcp\n"
-            "or uvx --from 'git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp' rustwright-mcp",
+            "rustwright mcp requires the native rustwright-mcp server binary; "
+            "install it with: cargo install --git https://github.com/Skyvern-AI/rustwright mcp-rs\n"
+            "or install the rustwright-mcp npm package once it is published",
             file=sys.stderr,
         )
         return 1
-
-    original_argv = sys.argv
-    sys.argv = [f"{program} mcp", *argv]
-    try:
-        exit_code = server.main()
-    finally:
-        sys.argv = original_argv
-    return 0 if exit_code is None else exit_code
+    return subprocess.run([binary, *argv]).returncode
 
 
 def _leading_agent_command_index(args: Sequence[str]) -> int | None:
@@ -1563,8 +1553,8 @@ def _print_screenshot_help(program: str) -> None:
 def _print_mcp_help(program: str) -> None:
     print(
         f"usage: {program} mcp [args...]\n\n"
-        "Run the MCP stdio server (requires rustwright-mcp).\n"
-        "Install with: pip install rustwright-mcp"
+        "Run the native MCP stdio server (requires the rustwright-mcp binary).\n"
+        "Install with: cargo install --git https://github.com/Skyvern-AI/rustwright mcp-rs"
     )
 
 
@@ -1591,7 +1581,7 @@ def main(argv: Sequence[str] | None = None, *, program: Optional[str] = None) ->
             "  tabs [list|new|use|close]\n"
             "  screenshot [file]  screenshot the session's current page\n"
             "  status / close     session lifecycle\n"
-            "  mcp                run the MCP server (requires rustwright-mcp)\n\n"
+            "  mcp                run the native MCP server (requires the rustwright-mcp binary)\n\n"
             "Playwright-compatible tools:\n"
             "  install / install-deps / uninstall / codegen\n"
             "  screenshot <url> <file>   one-shot capture (two-argument form)\n"
