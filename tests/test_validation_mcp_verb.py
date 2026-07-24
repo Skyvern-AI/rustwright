@@ -1,6 +1,5 @@
-import builtins
+import stat
 import sys
-from types import ModuleType
 
 import pytest
 
@@ -9,94 +8,86 @@ from rustwright._agent import cli as agent_cli
 from rustwright._agent.errors import AgentError
 
 
-def _install_stub_mcp(monkeypatch, main):
-    package = ModuleType("rustwright_mcp")
-    package.__path__ = []
-    server = ModuleType("rustwright_mcp.server")
-    server.main = main
-    package.server = server
-    monkeypatch.setitem(sys.modules, "rustwright_mcp", package)
-    monkeypatch.setitem(sys.modules, "rustwright_mcp.server", server)
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32", reason="stub server binaries use POSIX shell scripts"
+)
 
 
-def test_validation_mcp_passthrough_is_exact_and_argv_restores_after_success(monkeypatch):
-    observed = []
-    original_argv = sys.argv
-
-    def server_main():
-        observed.append((sys.argv[0], list(sys.argv[1:])))
-        return 41
-
-    _install_stub_mcp(monkeypatch, server_main)
-
-    assert cli.main(
-        ["mcp", "--caps=network", "extra", "args"], program="rustwright"
-    ) == 41
-    assert observed == [("rustwright mcp", ["--caps=network", "extra", "args"])]
-    assert sys.argv is original_argv
+def _install_stub_binary(directory, monkeypatch, *, exit_code=0, name="rustwright-mcp"):
+    record = directory / f"{name}-invocation.txt"
+    script = directory / name
+    script.write_text(
+        "#!/bin/sh\n"
+        f': > "{record}"\n'
+        f'[ "$#" -eq 0 ] || printf \'%s\\n\' "$@" >> "{record}"\n'
+        f"exit {exit_code}\n"
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("PATH", str(directory))
+    return record
 
 
-def test_validation_mcp_exception_propagates_and_argv_restores(monkeypatch):
-    original_argv = sys.argv
-    expected = RuntimeError("stub server failure")
+def test_validation_mcp_passthrough_is_exact_including_spaces(tmp_path, monkeypatch):
+    record = _install_stub_binary(tmp_path, monkeypatch, exit_code=41)
 
-    def server_main():
-        assert sys.argv[1:] == ["--caps=network", "extra", "args"]
-        raise expected
-
-    _install_stub_mcp(monkeypatch, server_main)
-
-    with pytest.raises(RuntimeError) as raised:
-        cli.main(
-            ["mcp", "--caps=network", "extra", "args"], program="rustwright"
-        )
-
-    assert raised.value is expected
-    assert sys.argv is original_argv
+    assert (
+        cli.main(["mcp", "--caps=network", "two words", "x"], program="rustwright")
+        == 41
+    )
+    assert record.read_text().splitlines() == ["--caps=network", "two words", "x"]
 
 
-def test_validation_missing_mcp_is_clean_two_line_error(monkeypatch, capsys):
-    real_import = builtins.__import__
+def test_validation_mcp_zero_exit_passes_through(tmp_path, monkeypatch):
+    record = _install_stub_binary(tmp_path, monkeypatch, exit_code=0)
 
-    def import_without_mcp(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "rustwright_mcp":
-            raise ModuleNotFoundError(
-                "No module named 'rustwright_mcp'", name="rustwright_mcp"
-            )
-        return real_import(name, globals, locals, fromlist, level)
+    assert cli.main(["mcp"], program="rustwright") == 0
+    assert record.read_text() == ""
 
-    monkeypatch.setattr(builtins, "__import__", import_without_mcp)
+
+def test_validation_missing_binary_is_clean_two_line_error(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("PATH", str(tmp_path))
 
     assert cli.main(["mcp"], program="rustwright") == 1
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err.splitlines() == [
-        "rustwright mcp requires the separately installed rustwright-mcp package; "
-        "install it with: pip install rustwright-mcp",
-        "or uvx --from 'git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp' "
-        "rustwright-mcp",
+        "rustwright mcp requires the native rustwright-mcp server binary; "
+        "install it with: cargo install --git https://github.com/Skyvern-AI/rustwright mcp-rs",
+        "or install the rustwright-mcp npm package once it is published",
     ]
     assert "Traceback" not in captured.err
 
 
-@pytest.mark.parametrize(
-    "argv, unknown_command",
-    [
-        (["--session", "x", "mcp"], "--session"),
-        (["--json", "mcp"], "--json"),
-    ],
-)
-def test_validation_leading_agent_globals_do_not_route_to_mcp(
-    monkeypatch, capsys, argv, unknown_command
+def test_validation_leading_session_flag_does_not_route_to_mcp(
+    tmp_path, monkeypatch, capsys
 ):
-    mcp_calls = []
-    _install_stub_mcp(monkeypatch, lambda: mcp_calls.append(list(sys.argv)))
+    record = _install_stub_binary(tmp_path, monkeypatch)
 
-    assert cli.main(argv, program="rustwright") == 1
+    assert cli.main(["--session", "x", "mcp"], program="rustwright") == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == f"Unknown Rustwright CLI command: {unknown_command}\n"
-    assert mcp_calls == []
+    assert captured.err == "Unknown Rustwright CLI command: mcp\n"
+    assert not record.exists()
+
+
+def test_validation_leading_json_flag_does_not_route_to_mcp(
+    tmp_path, monkeypatch, capsys
+):
+    import json as json_module
+
+    record = _install_stub_binary(tmp_path, monkeypatch)
+
+    assert cli.main(["--json", "mcp"], program="rustwright") == 2
+    captured = capsys.readouterr()
+    error = json_module.loads(captured.out)
+    assert error["success"] is False
+    assert error["command"] == "unknown"
+    assert error["error"]["code"] == "invalid_argument"
+    assert "mcp" in error["error"]["message"]
+    assert captured.err == ""
+    assert not record.exists()
 
 
 def test_validation_help_mcp_succeeds(capsys):
@@ -104,12 +95,16 @@ def test_validation_help_mcp_succeeds(capsys):
     captured = capsys.readouterr()
     assert captured.err == ""
     assert "usage: rustwright mcp [args...]" in captured.out
-    assert "pip install rustwright-mcp" in captured.out
+    assert (
+        "cargo install --git https://github.com/Skyvern-AI/rustwright mcp-rs"
+        in captured.out
+    )
 
 
-def test_validation_mcp_as_click_ref_uses_normal_agent_path(monkeypatch, capsys):
-    mcp_calls = []
-    _install_stub_mcp(monkeypatch, lambda: mcp_calls.append(list(sys.argv)))
+def test_validation_mcp_as_click_ref_uses_normal_agent_path(
+    tmp_path, monkeypatch, capsys
+):
+    record = _install_stub_binary(tmp_path, monkeypatch)
 
     def normal_agent_failure(args, argv):
         assert args.command == "click"
@@ -123,4 +118,4 @@ def test_validation_mcp_as_click_ref_uses_normal_agent_path(monkeypatch, capsys)
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "error[invalid_ref]: Ref must have the form e1 or @e1\n"
-    assert mcp_calls == []
+    assert not record.exists()

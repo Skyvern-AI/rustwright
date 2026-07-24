@@ -1,9 +1,8 @@
-import importlib.util
-from importlib import metadata
 import json
 import os
 from pathlib import Path
 from queue import Empty, Queue
+import shutil
 import subprocess
 import sys
 from threading import Thread
@@ -12,52 +11,25 @@ import time
 import pytest
 
 
-def _rustwright_mcp_is_installed():
-    try:
-        metadata.distribution("rustwright-mcp")
-    except metadata.PackageNotFoundError:
-        return False
-    return importlib.util.find_spec("rustwright_mcp") is not None
+REPOSITORY = Path(__file__).resolve().parents[1]
 
 
-requires_rustwright_mcp = pytest.mark.skipif(
-    not _rustwright_mcp_is_installed(),
-    reason="requires the separately installed rustwright-mcp package",
+def _native_server_binary():
+    found = shutil.which("rustwright-mcp") or shutil.which("mcp-rs")
+    if found:
+        return Path(found)
+    for profile in ("debug", "release"):
+        candidate = REPOSITORY / "mcp-rs" / "target" / profile / "mcp-rs"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+requires_native_server = pytest.mark.skipif(
+    _native_server_binary() is None,
+    reason="requires the native rustwright-mcp server binary "
+    "(cargo build --manifest-path mcp-rs/Cargo.toml)",
 )
-
-
-def _installed_rustwright_mcp_console_scripts():
-    entry_points = metadata.entry_points()
-    if hasattr(entry_points, "select"):
-        candidates = entry_points.select(
-            group="console_scripts", name="rustwright-mcp"
-        )
-    else:
-        candidates = [
-            entry_point
-            for entry_point in entry_points.get("console_scripts", [])
-            if entry_point.name == "rustwright-mcp"
-        ]
-    return [
-        entry_point
-        for entry_point in candidates
-        if getattr(getattr(entry_point, "dist", None), "name", "")
-        .lower()
-        .replace("_", "-")
-        == "rustwright-mcp"
-    ]
-
-
-@requires_rustwright_mcp
-def test_mcp_console_script_and_cli_verb_use_same_callable():
-    from rustwright_mcp import server
-
-    entry_points = _installed_rustwright_mcp_console_scripts()
-
-    assert len(entry_points) == 1
-    # rustwright.cli._mcp_main imports this module and invokes server.main.
-    verb_dispatch_target = server.main
-    assert entry_points[0].load() is verb_dispatch_target
 
 
 def _send_message(process, message):
@@ -87,20 +59,20 @@ def _read_response(process, messages, request_id, timeout):
             return payload
 
 
-@requires_rustwright_mcp
+@requires_native_server
 def test_mcp_cli_real_stdio_initialize_and_tools_list():
-    repository = Path(__file__).resolve().parents[1]
+    binary = _native_server_binary()
     environment = os.environ.copy()
-    python_path = str(repository / "python")
+    python_path = str(REPOSITORY / "python")
     if environment.get("PYTHONPATH"):
         python_path += os.pathsep + environment["PYTHONPATH"]
     environment["PYTHONPATH"] = python_path
-    environment["RUSTWRIGHT_MCP_HEADLESS"] = "1"
-    environment["RUSTWRIGHT_MCP_TOOLSET"] = "mirror"
+    # The CLI verb resolves the server from PATH; put the binary's directory first.
+    environment["PATH"] = str(binary.parent) + os.pathsep + environment.get("PATH", "")
 
     process = subprocess.Popen(
         [sys.executable, "-m", "rustwright.cli", "mcp"],
-        cwd=repository,
+        cwd=REPOSITORY,
         env=environment,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -150,7 +122,7 @@ def test_mcp_cli_real_stdio_initialize_and_tools_list():
         assert "error" not in initialize_response
         initialize_result = initialize_response["result"]
         assert initialize_result["protocolVersion"] == "2024-11-05"
-        assert initialize_result["serverInfo"]["name"] == "rustwright-mcp"
+        assert initialize_result["serverInfo"]["name"] == "mcp-rs"
 
         _send_message(
             process,
@@ -171,9 +143,16 @@ def test_mcp_cli_real_stdio_initialize_and_tools_list():
         )
         tools_response = _read_response(process, messages, 2, timeout=10)
         assert "error" not in tools_response
-        tools = tools_response["result"]["tools"]
-        assert tools
-        assert "browser_navigate" in {tool["name"] for tool in tools}
+        tools = {tool["name"] for tool in tools_response["result"]["tools"]}
+        assert {
+            "browser_navigate",
+            "browser_navigate_back",
+            "browser_navigate_forward",
+            "browser_snapshot",
+            "browser_click",
+            "browser_scroll",
+            "browser_take_screenshot",
+        } <= tools
 
         assert process.stdin is not None
         process.stdin.close()
