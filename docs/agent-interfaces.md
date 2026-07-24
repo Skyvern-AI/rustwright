@@ -7,15 +7,15 @@ alive across invocations, so a sequence of commands drives a single browser.
 
 It is Chromium-only (Rustwright automates Chromium over CDP).
 
-> An MCP server for Rustwright is maintained as a separate, opt-in package
-> (`rustwright-mcp`) rather than part of the core wheel. This document covers the
-> CLI.
+> The MCP server for Rustwright is the native `rustwright-mcp` server, maintained
+> in [`mcp-rs/`](../mcp-rs/) rather than as part of the core wheel. This document
+> covers the CLI.
 
 ## MCP stdio server
 
-Install both `rustwright` and `rustwright-mcp`, then start the server with
-`rustwright mcp`. Any arguments after `mcp`, including `--caps=...`, pass through
-to the MCP entry point unchanged.
+Install the native server (see [`mcp-rs/README.md`](../mcp-rs/README.md)), then
+start it with `rustwright mcp`. Any arguments after `mcp` pass through to the
+server unchanged.
 
 ## The accessibility snapshot and element refs
 
