@@ -59,7 +59,8 @@ other MCP client:
 
 Drop the `env` block if you installed the managed Chromium instead.
 
-To verify: ask the client to list tools (the seven below should appear), then
+To verify: ask the client to list tools (the 22 below should appear in the
+default `mirror` profile), then
 try `browser_navigate` to `https://example.com` — the tool result is an
 accessibility snapshot of the page.
 
@@ -70,21 +71,45 @@ accessibility snapshot of the page.
 | `browser_navigate` | Navigate to a URL; returns a fresh snapshot. |
 | `browser_navigate_back` | Go back in history; returns a fresh snapshot. |
 | `browser_navigate_forward` | Go forward in history; returns a fresh snapshot. |
-| `browser_snapshot` | Accessibility snapshot with element refs (`e1`, `e2`, …). |
-| `browser_click` | Click an element by ref using trusted physical input; returns the post-click snapshot. |
+| `browser_reload` | Reload the active page; returns a fresh snapshot. |
+| `browser_resize` | Resize the active viewport in CSS pixels. |
+| `browser_snapshot` | Full or targeted accessibility snapshot with element refs (`e1`, `e2`, …), optional depth limiting, and optional boxes. |
+| `browser_find` | Search a fresh snapshot by text or JavaScript regular expression. |
+| `browser_click` | Click or double-click an element by ref using trusted physical input. |
 | `browser_scroll` | Scroll an element into view by ref, or scroll the viewport by an amount; waits for the visual position to settle. |
-| `browser_take_screenshot` | Capture the page as an inline PNG image content block. |
+| `browser_type` | Clear, fill, append to, or slowly type into an element, optionally submitting with Enter. |
+| `browser_select_option` | Select one or more option values or labels. |
+| `browser_fill_form` | Fill a sequential batch of text, checkbox, radio, combobox, and slider fields. |
+| `browser_hover` | Move Chromium's native pointer over an element. |
+| `browser_press_key` | Press a native browser key or modifier chord. |
+| `browser_drop` | Dispatch a `DataTransfer` drop containing MIME strings and/or workspace-confined files. |
+| `browser_tabs` | List, open, select, or close tabs with stable indices. |
+| `browser_handle_dialog` | Accept or dismiss the currently pending JavaScript dialog. |
+| `browser_wait_for` | Wait for time, visible text, or text disappearance. |
+| `browser_get_text` | Return rendered text for a unique CSS selector. |
+| `browser_evaluate` | Evaluate a JavaScript function in the page or element-ref context. |
+| `browser_take_screenshot` | Capture the page as inline PNG or JPEG image content. |
+| `browser_close` | Close the browser; the next browser operation starts a fresh session. |
 
 Refs are session-scoped and never reused, so a stale ref can never silently
 point at a different element; snapshots include page values but mask password
-fields. The tool set is growing toward parity with the deprecated Python
-server (typing, dialogs, tabs, network introspection, and friends).
+fields. Operations that encounter a JavaScript modal return promptly with the
+pending dialog details and defer further page work until
+`browser_handle_dialog` resolves it.
+
+Set `RUSTWRIGHT_MCP_TOOLSET=lean` to expose the smaller interaction-oriented
+profile. The default `mirror` profile exposes all 22 native tools.
+`browser_evaluate` can be removed from either profile by setting
+`RUSTWRIGHT_MCP_ALLOW_EVAL=false`.
 
 ## Configuration
 
 | Variable | Effect |
 |---|---|
 | `RUSTWRIGHT_CHROMIUM` / `CHROME` / `CHROMIUM` | Path to the browser executable to launch. |
+| `RUSTWRIGHT_MCP_TOOLSET` | Tool profile: `mirror` (default) or `lean`. |
+| `RUSTWRIGHT_MCP_ALLOW_EVAL` | Enable or disable `browser_evaluate`; defaults to enabled. |
+| `RUSTWRIGHT_MCP_WORKSPACE` | Absolute directory that confines file paths supplied to `browser_drop`. |
 | `RUSTWRIGHT_MCP_SCREENSHOT_MAX_BYTES` | Largest screenshot returned inline. Oversized captures are written to a private (0600) temp file and the path is returned instead. |
 
 ## Development

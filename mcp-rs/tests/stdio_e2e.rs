@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
@@ -19,6 +19,7 @@ use rustwright::{ActionOptions, GotoOptions, LaunchOptions, chromium};
 use serde_json::{Value, json};
 
 const REMOTE_UNREACHABLE: &str = "remote CDP session unreachable — restart or reconfigure";
+static STDIO_SERVER_LOCK: Mutex<()> = Mutex::new(());
 
 const PAGE_HTML: &str = r#"<!doctype html>
 <html><head><title>MCP test page</title></head>
@@ -28,6 +29,46 @@ const PAGE_HTML: &str = r#"<!doctype html>
   <input aria-label="Secret input" type="password" value="do-not-render">
   <button onclick="this.textContent='Clicked button'; document.getElementById('status').textContent='Clicked successfully'">Activate feature</button>
   <div id="status">Waiting</div>
+</body></html>"#;
+
+const PARITY_PAGE_HTML: &str = r#"<!doctype html>
+<html><head><title>Parity controls</title>
+<style>#drop { width: 180px; height: 60px; border: 1px solid black; }</style>
+</head>
+<body>
+  <main>
+    <h1>Parity controls</h1>
+    <label for="text">Text target</label>
+    <input id="text" value="seed">
+    <label for="choice">Choice target</label>
+    <select id="choice">
+      <option value="alpha">Alpha</option>
+      <option value="beta">Beta</option>
+    </select>
+    <input id="check" type="checkbox"><label for="check">Check target</label>
+    <input id="radio" type="radio" name="r"><label for="radio">Radio target</label>
+    <label for="range">Range target</label>
+    <input id="range" type="range" value="10">
+    <button id="hover">Hover target</button>
+    <button id="dialog">Dialog target</button>
+    <div id="drop" role="button" tabindex="0">Drop target</div>
+    <div id="status" role="status">Status waiting</div>
+    <div id="delayed" role="status">Delayed absent</div>
+  </main>
+  <script>
+    const status = document.getElementById('status');
+    document.getElementById('hover').addEventListener('mouseover', () => {
+      status.textContent = 'Hover observed';
+    });
+    document.getElementById('dialog').addEventListener('click', () => {
+      alert('Parity dialog');
+      status.textContent = 'Dialog handled';
+    });
+    document.getElementById('drop').addEventListener('drop', (event) => {
+      event.preventDefault();
+      status.textContent = `Dropped ${event.dataTransfer.getData('text/plain')}`;
+    });
+  </script>
 </body></html>"#;
 
 const HISTORY_PAGE_A_HTML: &str = r#"<!doctype html>
@@ -280,6 +321,10 @@ impl PageServer {
     fn background_scroll_url(&self) -> String {
         format!("http://{}/background-scroll", self.addr)
     }
+
+    fn parity_url(&self) -> String {
+        format!("http://{}/parity", self.addr)
+    }
 }
 
 impl Drop for PageServer {
@@ -296,24 +341,44 @@ fn serve_connection(mut stream: TcpStream) {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("set request read timeout");
-    let mut request = [0_u8; 2048];
-    let read = stream.read(&mut request).unwrap_or(0);
-    let request = String::from_utf8_lossy(&request[..read]);
-    if request.starts_with("GET /slow ") {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 2048];
+    while request.len() < 8192 {
+        let read = stream.read(&mut buffer).unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let request = String::from_utf8_lossy(&request);
+    let request_target = request.split_whitespace().nth(1).unwrap_or("/");
+    let path = request_target
+        .strip_prefix("http://")
+        .and_then(|rest| rest.find('/').map(|offset| &rest[offset..]))
+        .unwrap_or(request_target)
+        .split('?')
+        .next()
+        .unwrap_or("/");
+    if path == "/slow" {
         thread::sleep(Duration::from_millis(450));
     }
-    let body = if request.starts_with("GET /history-a ") {
+    let body = if path == "/history-a" {
         HISTORY_PAGE_A_HTML
-    } else if request.starts_with("GET /history-b ") {
+    } else if path == "/history-b" {
         HISTORY_PAGE_B_HTML
-    } else if request.starts_with("GET /history-spa ") {
+    } else if path == "/history-spa" {
         SPA_HISTORY_PAGE_HTML
-    } else if request.starts_with("GET /history-hash ") {
+    } else if path == "/history-hash" {
         HASH_HISTORY_PAGE_HTML
-    } else if request.starts_with("GET /background-scroll ") {
+    } else if path == "/background-scroll" {
         BACKGROUND_SCROLL_PAGE_HTML
-    } else if request.starts_with("GET /scroll ") {
+    } else if path == "/scroll" {
         SCROLL_PAGE_HTML
+    } else if path == "/parity" {
+        PARITY_PAGE_HTML
     } else {
         PAGE_HTML
     };
@@ -328,6 +393,7 @@ fn serve_connection(mut stream: TcpStream) {
 }
 
 struct ServerProcess {
+    _test_guard: MutexGuard<'static, ()>,
     child: Child,
     input: Option<ChildStdin>,
     output: BufReader<ChildStdout>,
@@ -351,6 +417,9 @@ impl ServerProcess {
         remote: Option<(&str, &Value, u64)>,
         environment: &[(&str, &str)],
     ) -> Self {
+        let test_guard = STDIO_SERVER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut command = Command::new(env!("CARGO_BIN_EXE_rustwright-mcp"));
         command
             .env_remove("RUSTWRIGHT_MCP_CDP_ENDPOINT")
@@ -374,6 +443,7 @@ impl ServerProcess {
         let input = child.stdin.take().expect("server stdin");
         let output = BufReader::new(child.stdout.take().expect("server stdout"));
         Self {
+            _test_guard: test_guard,
             child,
             input: Some(input),
             output,
@@ -539,6 +609,49 @@ fn error_result_text(message: &Value) -> &str {
         .expect("tool error response text")
 }
 
+fn call_tool(server: &mut ServerProcess, id: i64, name: &str, arguments: Value) -> Value {
+    server.send(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments}
+    }));
+    let response = server.receive();
+    assert_eq!(response["id"], id);
+    response
+}
+
+fn converge_snapshot_text(
+    server: &mut ServerProcess,
+    mut response: Value,
+    mut poll_id: i64,
+    expected: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !result_text(&response).contains(expected) {
+        assert!(
+            Instant::now() < deadline,
+            "snapshot did not converge to {expected:?}: {}",
+            result_text(&response)
+        );
+        thread::sleep(Duration::from_millis(25));
+        response = call_tool(server, poll_id, "browser_snapshot", json!({}));
+        poll_id += 1;
+    }
+    response
+}
+
+fn named_ref(snapshot: &str, role: &str, name: &str) -> String {
+    let line = snapshot
+        .lines()
+        .find(|line| line.contains(&format!("- {role}")) && line.contains(name))
+        .unwrap_or_else(|| panic!("{role} {name:?} missing from snapshot:\n{snapshot}"));
+    let marker = "[ref=";
+    let start = line.find(marker).expect("named ref start") + marker.len();
+    let end = line[start..].find(']').expect("named ref end") + start;
+    line[start..end].to_owned()
+}
+
 fn png_path_from_fallback(text: &str) -> PathBuf {
     text.split_whitespace()
         .map(|candidate| {
@@ -676,7 +789,7 @@ fn real_stdio_snapshot_click_monotonic_refs_and_clean_shutdown() {
     server.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}));
     let listed = server.receive();
     let tools = listed["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 7);
+    assert_eq!(tools.len(), 22);
     assert_eq!(
         tools
             .iter()
@@ -686,29 +799,61 @@ fn real_stdio_snapshot_click_monotonic_refs_and_clean_shutdown() {
             "browser_navigate",
             "browser_navigate_back",
             "browser_navigate_forward",
+            "browser_reload",
+            "browser_resize",
             "browser_snapshot",
+            "browser_find",
             "browser_click",
             "browser_scroll",
+            "browser_type",
+            "browser_select_option",
+            "browser_fill_form",
+            "browser_hover",
+            "browser_press_key",
+            "browser_drop",
+            "browser_tabs",
+            "browser_handle_dialog",
+            "browser_wait_for",
+            "browser_get_text",
+            "browser_evaluate",
             "browser_take_screenshot",
+            "browser_close",
         ]
     );
-    assert_eq!(tools[0]["inputSchema"]["required"], json!(["url"]));
+    let tool = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"))
+    };
     assert_eq!(
-        tools[0]["inputSchema"]["properties"]["url"]["type"],
+        tool("browser_navigate")["inputSchema"]["required"],
+        json!(["url"])
+    );
+    assert_eq!(
+        tool("browser_navigate")["inputSchema"]["properties"]["url"]["type"],
         "string"
     );
-    assert_eq!(tools[1]["inputSchema"]["properties"], json!({}));
-    assert_eq!(tools[2]["inputSchema"]["properties"], json!({}));
-    assert_eq!(tools[3]["inputSchema"]["properties"], json!({}));
     assert_eq!(
-        tools[4]["inputSchema"]["properties"]["target"]["pattern"],
+        tool("browser_navigate_back")["inputSchema"]["properties"],
+        json!({})
+    );
+    assert_eq!(
+        tool("browser_navigate_forward")["inputSchema"]["properties"],
+        json!({})
+    );
+    assert_eq!(
+        tool("browser_click")["inputSchema"]["properties"]["target"]["pattern"],
         "^e[1-9][0-9]*$"
     );
     assert_eq!(
-        tools[5]["inputSchema"]["properties"]["direction"]["enum"],
+        tool("browser_scroll")["inputSchema"]["properties"]["direction"]["enum"],
         json!(["up", "down"])
     );
-    assert_eq!(tools[6]["inputSchema"]["properties"], json!({}));
+    assert_eq!(
+        tool("browser_take_screenshot")["inputSchema"]["properties"]["type"]["enum"],
+        json!(["png", "jpeg"])
+    );
     assert!(
         tools
             .iter()
@@ -786,6 +931,365 @@ fn real_stdio_snapshot_click_monotonic_refs_and_clean_shutdown() {
 }
 
 #[test]
+fn real_stdio_tool_profiles_and_evaluation_gate_match_contract() {
+    fn names(environment: &[(&str, &str)]) -> Vec<String> {
+        let mut server = ServerProcess::spawn_with_env(environment);
+        server.initialize();
+        server.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}));
+        let listed = server.receive();
+        let names = listed["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name").to_owned())
+            .collect();
+        server.finish();
+        names
+    }
+
+    let mirror = names(&[("RUSTWRIGHT_MCP_TOOLSET", "mirror")]);
+    assert_eq!(mirror.len(), 22);
+    assert!(mirror.contains(&"browser_fill_form".to_owned()));
+    assert!(mirror.contains(&"browser_evaluate".to_owned()));
+
+    let lean = names(&[("RUSTWRIGHT_MCP_TOOLSET", "lean")]);
+    assert_eq!(lean.len(), 17);
+    assert!(!lean.contains(&"browser_fill_form".to_owned()));
+    assert!(lean.contains(&"browser_evaluate".to_owned()));
+
+    let no_eval = names(&[
+        ("RUSTWRIGHT_MCP_TOOLSET", "lean"),
+        ("RUSTWRIGHT_MCP_ALLOW_EVAL", "false"),
+    ]);
+    assert_eq!(no_eval.len(), 16);
+    assert!(!no_eval.contains(&"browser_evaluate".to_owned()));
+}
+
+#[test]
+fn real_stdio_parity_actions_inspection_wait_reload_and_close() {
+    if chromium().executable_path().is_none() {
+        eprintln!("skipping parity action MCP test: Chromium executable unavailable");
+        return;
+    }
+
+    let page_server = PageServer::start();
+    let mut server = ServerProcess::spawn();
+    server.initialize();
+
+    let navigated = call_tool(
+        &mut server,
+        200,
+        "browser_navigate",
+        json!({"url": page_server.parity_url()}),
+    );
+    let mut snapshot = result_text(&navigated).to_owned();
+    assert!(snapshot.contains("Parity controls"));
+
+    let resized = call_tool(
+        &mut server,
+        201,
+        "browser_resize",
+        json!({"width": 900.5, "height": 700.4}),
+    );
+    snapshot = result_text(&resized).to_owned();
+    assert!(snapshot.contains("Parity controls"));
+
+    let boxed = call_tool(
+        &mut server,
+        202,
+        "browser_snapshot",
+        json!({"boxes": true, "depth": 4}),
+    );
+    snapshot = result_text(&boxed).to_owned();
+    assert!(snapshot.contains("[box="), "{snapshot}");
+
+    let found = call_tool(
+        &mut server,
+        203,
+        "browser_find",
+        json!({"regex": "/Text target/i"}),
+    );
+    assert!(result_text(&found).contains("Match 1"));
+
+    let refreshed = call_tool(&mut server, 204, "browser_snapshot", json!({}));
+    snapshot = result_text(&refreshed).to_owned();
+    let text_ref = named_ref(&snapshot, "textbox", "Text target");
+    let typed = call_tool(
+        &mut server,
+        205,
+        "browser_type",
+        json!({"target": text_ref, "text": "native", "clear": true}),
+    );
+    snapshot = result_text(&typed).to_owned();
+    assert!(snapshot.contains(r#"[value="native"]"#), "{snapshot}");
+
+    let pressed = call_tool(&mut server, 206, "browser_press_key", json!({"key": "A"}));
+    snapshot = result_text(&pressed).to_owned();
+    assert!(snapshot.contains("native"), "{snapshot}");
+
+    let select_ref = named_ref(&snapshot, "combobox", "Choice target");
+    let selected = call_tool(
+        &mut server,
+        207,
+        "browser_select_option",
+        json!({"target": select_ref, "values": "beta"}),
+    );
+    snapshot = result_text(&selected).to_owned();
+    let select_ref = named_ref(&snapshot, "combobox", "Choice target");
+    let selected_value = call_tool(
+        &mut server,
+        208,
+        "browser_evaluate",
+        json!({"target": select_ref, "function": "(element) => element.value"}),
+    );
+    snapshot = result_text(&selected_value).to_owned();
+    assert!(snapshot.starts_with("\"beta\""), "{snapshot}");
+
+    let textbox = named_ref(&snapshot, "textbox", "Text target");
+    let checkbox = named_ref(&snapshot, "checkbox", "Check target");
+    let radio = named_ref(&snapshot, "radio", "Radio target");
+    let slider = named_ref(&snapshot, "slider", "Range target");
+    let filled = call_tool(
+        &mut server,
+        209,
+        "browser_fill_form",
+        json!({
+            "fields": [
+                {"target": textbox, "name": "text", "type": "textbox", "value": "batch"},
+                {"target": checkbox, "name": "check", "type": "checkbox", "value": "true"},
+                {"target": radio, "name": "radio", "type": "radio", "value": "true"},
+                {"target": slider, "name": "range", "type": "slider", "value": "35"}
+            ]
+        }),
+    );
+    snapshot = result_text(&filled).to_owned();
+    assert!(snapshot.contains(r#"[value="batch"]"#), "{snapshot}");
+    assert!(
+        snapshot
+            .lines()
+            .any(|line| line.contains("checkbox") && line.contains("[checked]")),
+        "{snapshot}"
+    );
+    assert!(
+        snapshot
+            .lines()
+            .any(|line| line.contains("radio") && line.contains("[checked]")),
+        "{snapshot}"
+    );
+
+    let hover_ref = named_ref(&snapshot, "button", "Hover target");
+    let hovered = call_tool(
+        &mut server,
+        210,
+        "browser_hover",
+        json!({"target": hover_ref}),
+    );
+    snapshot = result_text(&hovered).to_owned();
+    let convergence_deadline = Instant::now() + Duration::from_secs(5);
+    let mut poll_id = 211;
+    while !snapshot.contains("Hover observed") {
+        assert!(
+            Instant::now() < convergence_deadline,
+            "hover state did not converge: {snapshot}"
+        );
+        let polled = call_tool(&mut server, poll_id, "browser_snapshot", json!({}));
+        poll_id += 1;
+        snapshot = result_text(&polled).to_owned();
+    }
+
+    let drop_ref = named_ref(&snapshot, "button", "Drop target");
+    let dropped = call_tool(
+        &mut server,
+        poll_id,
+        "browser_drop",
+        json!({"target": drop_ref, "data": {"text/plain": "payload"}}),
+    );
+    poll_id += 1;
+    snapshot = result_text(&dropped).to_owned();
+    let convergence_deadline = Instant::now() + Duration::from_secs(5);
+    while !snapshot.contains("Dropped payload") {
+        assert!(
+            Instant::now() < convergence_deadline,
+            "drop state did not converge: {snapshot}"
+        );
+        let polled = call_tool(&mut server, poll_id, "browser_snapshot", json!({}));
+        poll_id += 1;
+        snapshot = result_text(&polled).to_owned();
+    }
+
+    let status = call_tool(
+        &mut server,
+        poll_id,
+        "browser_get_text",
+        json!({"selector": "#status"}),
+    );
+    poll_id += 1;
+    assert_eq!(result_text(&status), "Dropped payload");
+
+    let scheduled = call_tool(
+        &mut server,
+        poll_id,
+        "browser_evaluate",
+        json!({
+            "function": "() => { setTimeout(() => { document.querySelector('#delayed').textContent = 'Delayed ready'; }, 150); return 'scheduled'; }"
+        }),
+    );
+    poll_id += 1;
+    assert!(result_text(&scheduled).starts_with("\"scheduled\""));
+
+    let waited = call_tool(
+        &mut server,
+        poll_id,
+        "browser_wait_for",
+        json!({"text": "Delayed ready", "timeout_ms": 5000}),
+    );
+    poll_id += 1;
+    assert!(result_text(&waited).contains("Delayed ready"));
+
+    let reloaded = call_tool(&mut server, poll_id, "browser_reload", json!({}));
+    poll_id += 1;
+    assert!(result_text(&reloaded).contains("Status waiting"));
+
+    let closed = call_tool(&mut server, poll_id, "browser_close", json!({}));
+    assert_eq!(result_text(&closed), "Browser closed.");
+    server.finish();
+}
+
+#[test]
+fn real_stdio_dialog_returns_fast_surfaces_modal_and_converges_after_accept() {
+    if chromium().executable_path().is_none() {
+        eprintln!("skipping dialog MCP test: Chromium executable unavailable");
+        return;
+    }
+
+    let page_server = PageServer::start();
+    let mut server = ServerProcess::spawn();
+    server.initialize();
+    let navigated = call_tool(
+        &mut server,
+        300,
+        "browser_navigate",
+        json!({"url": page_server.parity_url()}),
+    );
+    let dialog_ref = named_ref(result_text(&navigated), "button", "Dialog target");
+
+    let started = Instant::now();
+    let clicked = call_tool(
+        &mut server,
+        301,
+        "browser_click",
+        json!({"target": dialog_ref}),
+    );
+    let click_elapsed = started.elapsed();
+    assert!(
+        click_elapsed < Duration::from_secs(5),
+        "dialog-triggering click did not return promptly: {click_elapsed:?}"
+    );
+    let modal = result_text(&clicked);
+    assert!(modal.contains("### Modal"), "{modal}");
+    assert!(modal.contains("Parity dialog"), "{modal}");
+
+    let deferred_started = Instant::now();
+    let deferred = call_tool(&mut server, 302, "browser_snapshot", json!({}));
+    assert!(
+        deferred_started.elapsed() < Duration::from_secs(2),
+        "snapshot did not defer promptly while dialog was pending"
+    );
+    assert!(
+        result_text(&deferred).contains("deferred until the pending modal"),
+        "{}",
+        result_text(&deferred)
+    );
+
+    let handled = call_tool(
+        &mut server,
+        303,
+        "browser_handle_dialog",
+        json!({"accept": true}),
+    );
+    assert_eq!(result_text(&handled), "Accepted the pending dialog.");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut id = 304;
+    loop {
+        let snapshot = call_tool(&mut server, id, "browser_snapshot", json!({}));
+        id += 1;
+        if result_text(&snapshot).contains("Dialog handled") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "post-dialog page state did not converge: {}",
+            result_text(&snapshot)
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    server.finish();
+}
+
+#[test]
+fn real_stdio_tabs_list_new_select_and_close() {
+    if chromium().executable_path().is_none() {
+        eprintln!("skipping tabs MCP test: Chromium executable unavailable");
+        return;
+    }
+
+    let page_server = PageServer::start();
+    let mut server = ServerProcess::spawn();
+    server.initialize();
+    call_tool(
+        &mut server,
+        400,
+        "browser_navigate",
+        json!({"url": page_server.url()}),
+    );
+
+    let listed = call_tool(&mut server, 401, "browser_tabs", json!({"action": "list"}));
+    assert!(result_text(&listed).contains("- 0:"));
+    assert!(
+        !result_text(&listed).contains("- 1:"),
+        "{}",
+        result_text(&listed)
+    );
+
+    let opened = call_tool(
+        &mut server,
+        402,
+        "browser_tabs",
+        json!({"action": "new", "url": page_server.parity_url()}),
+    );
+    assert!(result_text(&opened).contains("Parity controls"));
+    assert!(result_text(&opened).contains("- 1:"));
+    assert!(
+        !result_text(&opened).contains("- 2:"),
+        "{}",
+        result_text(&opened)
+    );
+
+    let selected = call_tool(
+        &mut server,
+        403,
+        "browser_tabs",
+        json!({"action": "select", "index": 0}),
+    );
+    assert!(result_text(&selected).contains("Activate feature"));
+
+    let closed = call_tool(
+        &mut server,
+        404,
+        "browser_tabs",
+        json!({"action": "close", "index": 1}),
+    );
+    assert!(result_text(&closed).contains("- 0:"));
+    assert!(
+        !result_text(&closed).contains("- 1:"),
+        "{}",
+        result_text(&closed)
+    );
+    server.finish();
+}
+
+#[test]
 fn real_stdio_history_navigation_returns_snapshots_and_errors_at_forward_boundary() {
     if chromium().executable_path().is_none() {
         eprintln!("skipping history navigation MCP test: Chromium executable unavailable");
@@ -804,7 +1308,7 @@ fn real_stdio_history_navigation_returns_snapshots_and_errors_at_forward_boundar
         }
     }));
     let page_a = server.receive();
-    assert!(result_text(&page_a).contains("History page A"));
+    let _page_a = converge_snapshot_text(&mut server, page_a, 210, "History page A");
 
     server.send(json!({
         "jsonrpc":"2.0","id":22,"method":"tools/call",
@@ -814,13 +1318,14 @@ fn real_stdio_history_navigation_returns_snapshots_and_errors_at_forward_boundar
         }
     }));
     let page_b = server.receive();
-    assert!(result_text(&page_b).contains("History page B"));
+    let _page_b = converge_snapshot_text(&mut server, page_b, 220, "History page B");
 
     server.send(json!({
         "jsonrpc":"2.0","id":23,"method":"tools/call",
         "params":{"name":"browser_navigate_back","arguments":{}}
     }));
     let back = server.receive();
+    let back = converge_snapshot_text(&mut server, back, 230, "History page A");
     let back_snapshot = result_text(&back);
     assert!(back_snapshot.contains("History page A"), "{back_snapshot}");
     assert!(!back_snapshot.contains("History page B"), "{back_snapshot}");
@@ -830,6 +1335,7 @@ fn real_stdio_history_navigation_returns_snapshots_and_errors_at_forward_boundar
         "params":{"name":"browser_navigate_forward","arguments":{}}
     }));
     let forward = server.receive();
+    let forward = converge_snapshot_text(&mut server, forward, 240, "History page B");
     let forward_snapshot = result_text(&forward);
     assert!(
         forward_snapshot.contains("History page B"),
