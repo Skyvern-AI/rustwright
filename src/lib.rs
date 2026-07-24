@@ -1342,8 +1342,10 @@ pub enum RwError {
     Timeout(u64),
     #[error("operation cancelled")]
     Cancelled,
+    /// The operation was attempted after this handle intentionally began closing.
     #[error("target or browser is closed")]
     Closed,
+    /// The underlying CDP transport ended without this handle initiating close.
     #[error("target or browser is closed")]
     Disconnected,
     #[error("Target page, context or browser has been closed")]
@@ -3532,6 +3534,69 @@ multiline-compatible = """4.5.6"""
         second.await.unwrap().unwrap();
         assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
         assert!(lifecycle.is_closed());
+    }
+
+    #[test]
+    fn browser_operations_distinguish_intentional_close_from_transport_loss() {
+        let make_browser = || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(1)
+                .build()
+                .unwrap();
+            let (write_tx, write_rx) = mpsc::unbounded_channel();
+            let (events, _) = broadcast::channel(4);
+            let (alive_tx, _) = watch::channel(true);
+            let inner = Arc::new(BrowserInner {
+                runtime: OwnedRuntime::new(runtime),
+                client: Arc::new(CdpClient {
+                    write_tx,
+                    pending: Arc::new(Mutex::new(HashMap::new())),
+                    events,
+                    event_log: Arc::new(Mutex::new(CdpEventLog::new())),
+                    next_id: AtomicU64::new(1),
+                    sent_runtime_enable_count: AtomicU64::new(0),
+                    sent_target_close_count: AtomicU64::new(0),
+                    sent_context_dispose_count: AtomicU64::new(0),
+                    alive: Arc::new(AtomicBool::new(true)),
+                    alive_tx,
+                }),
+                process: Mutex::new(None),
+                profile_dir: Mutex::new(None),
+                owned: false,
+                ws_endpoint: "ws://test.invalid".to_string(),
+                stealth_user_agent_override: Mutex::new(None),
+                single_process_fallback: false,
+                lifecycle: Arc::new(CloseLifecycle::new()),
+                attached_pages: AttachedPageRegistry::default(),
+            });
+            (RustwrightBrowser { inner }, write_rx)
+        };
+
+        let (closed_browser, mut closed_writes) = make_browser();
+        let sender = match closed_browser.inner.lifecycle.start() {
+            CloseStart::Lead(sender) => sender,
+            _ => panic!("new lifecycle must lead close"),
+        };
+        closed_browser.inner.lifecycle.finish(sender, &Ok(()), true);
+        assert!(matches!(closed_browser.new_page(), Err(RwError::Closed)));
+        assert!(matches!(
+            closed_browser.pages(Duration::from_secs(1)),
+            Err(RwError::Closed)
+        ));
+        assert!(closed_writes.try_recv().is_err());
+
+        let (disconnected_browser, mut disconnected_writes) = make_browser();
+        disconnected_browser.inner.client.mark_closed();
+        assert!(matches!(
+            disconnected_browser.new_page(),
+            Err(RwError::Disconnected)
+        ));
+        assert!(matches!(
+            disconnected_browser.pages(Duration::from_secs(1)),
+            Err(RwError::Disconnected)
+        ));
+        assert!(disconnected_writes.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -5818,6 +5883,13 @@ where
 }
 
 impl BrowserInner {
+    fn ensure_open(&self) -> RwResult<()> {
+        if self.lifecycle.is_closing_or_closed() {
+            return Err(RwError::Closed);
+        }
+        Ok(())
+    }
+
     fn block_on_raw<Fut>(&self, future: Fut) -> Fut::Output
     where
         Fut: Future,
@@ -15826,6 +15898,7 @@ impl RustwrightBrowser {
     }
 
     pub fn new_page_with_cancel(&self, cancel: Option<&CancelToken>) -> RwResult<RustwrightPage> {
+        self.inner.ensure_open()?;
         let inner = create_page_raw_cancelable(Arc::clone(&self.inner), None, cancel)?;
         inner.mark_delivered();
         Ok(RustwrightPage { inner })
@@ -15836,6 +15909,7 @@ impl RustwrightBrowser {
     }
 
     pub fn pages(&self, timeout: Duration) -> RwResult<Vec<RustwrightPage>> {
+        self.inner.ensure_open()?;
         list_pages_raw(Arc::clone(&self.inner), None, timeout).map(|pages| {
             pages
                 .into_iter()
