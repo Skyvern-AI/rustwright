@@ -63,7 +63,7 @@ def test_mcp_missing_binary_prints_install_help_without_traceback(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert (
-        "cargo install --git https://github.com/Skyvern-AI/rustwright mcp-rs"
+        "cargo install --git https://github.com/Skyvern-AI/rustwright rustwright-mcp"
         in captured.err
     )
     assert len(captured.err.splitlines()) == 2
@@ -97,4 +97,4 @@ def test_help_mcp_prints_usage_and_install_hint(capsys):
     captured = capsys.readouterr()
     assert captured.err == ""
     assert "usage: rustwright mcp [args...]" in captured.out
-    assert "cargo install --git https://github.com/Skyvern-AI/rustwright mcp-rs" in captured.out
+    assert "cargo install --git https://github.com/Skyvern-AI/rustwright rustwright-mcp" in captured.out

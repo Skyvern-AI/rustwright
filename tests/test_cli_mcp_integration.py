@@ -19,9 +19,10 @@ def _native_server_binary():
     if found:
         return Path(found)
     for profile in ("debug", "release"):
-        candidate = REPOSITORY / "mcp-rs" / "target" / profile / "mcp-rs"
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return candidate
+        for name in ("rustwright-mcp", "mcp-rs"):
+            candidate = REPOSITORY / "mcp-rs" / "target" / profile / name
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
     return None
 
 
@@ -122,7 +123,7 @@ def test_mcp_cli_real_stdio_initialize_and_tools_list():
         assert "error" not in initialize_response
         initialize_result = initialize_response["result"]
         assert initialize_result["protocolVersion"] == "2024-11-05"
-        assert initialize_result["serverInfo"]["name"] == "mcp-rs"
+        assert initialize_result["serverInfo"]["name"] == "rustwright-mcp"
 
         _send_message(
             process,
