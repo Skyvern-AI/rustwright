@@ -110,9 +110,10 @@ rustwright close               # shut the session down
 The CLI verbs and the MCP server's tools are the same surface.
 
 See [docs/agent-interfaces.md](docs/agent-interfaces.md) for the CLI verbs,
-configuration, threat model, and current scope. An MCP server for Rustwright is
-available as a separate, opt-in package (`rustwright-mcp`).
-After installing both packages, start the stdio server with `rustwright mcp`.
+configuration, threat model, and current scope. The MCP server for Rustwright
+is the native `rustwright-mcp` server — see [mcp-rs/README.md](mcp-rs/README.md)
+for install and client configuration. With its binary installed, `rustwright mcp`
+starts it.
 
 ## Node.js (experimental)
 
