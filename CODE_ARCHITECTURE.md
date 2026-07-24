@@ -71,7 +71,8 @@ C-ABI bindings.
 | `python/rustwright/pytest_plugin.py` | Pytest fixtures. |
 | `python/playwright/*`, `python/patchright/*`, `python/cloakbrowser/*` | Compatibility import packages. Public alpha compatibility imports should be enabled only through opt-in compatibility mode. |
 | `rust-native/` | Native Rust facade crate over `rustwright-core` (crates.io `rustwright`); also the facade `mcp-rs/` consumes. |
-| `mcp-rs/` | Native Rust MCP stdio server on the promoted engine facade. |
+| `mcp-rs/` | `rustwright-mcp`: the canonical native Rust MCP stdio server on the promoted engine facade, with its npm packaging under `mcp-rs/npm/`. |
+| `mcp/` | Deprecated Python MCP server (present in the public tree only, outside the sync map); superseded by `mcp-rs/` and removed once the native tool set reaches parity. |
 | `node/` | napi-rs binding (in-process, links `rustwright-core` directly). |
 | `capi/` | Shared C ABI (`librustwright_capi`) over `rustwright-core`; the boundary for the Go/Java/C#/Ruby/PHP bindings. |
 | `go/`, `java/`, `csharp/`, `ruby/`, `php/` | C-ABI language bindings (alpha surface) + per-language conformance runners. |
