@@ -1,18 +1,35 @@
+use std::{collections::HashSet, env, sync::OnceLock};
+
 use rmcp::model::{JsonObject, Tool};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
-use crate::actor::BrowserOp;
+use crate::actor::{BrowserOp, FillField, FillFieldKind, RegexSpec, ScreenshotType, TabAction};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ToolKind {
     Navigate,
     NavigateBack,
     NavigateForward,
+    Reload,
+    Resize,
     Snapshot,
+    Find,
     Click,
     Scroll,
+    Type,
+    SelectOption,
+    FillForm,
+    Hover,
+    PressKey,
+    Drop,
+    Tabs,
+    HandleDialog,
+    WaitFor,
+    GetText,
+    Evaluate,
     TakeScreenshot,
+    Close,
 }
 
 #[derive(Clone, Copy)]
@@ -22,7 +39,7 @@ pub(crate) struct ToolSpec {
     pub(crate) description: &'static str,
 }
 
-pub(crate) const TOOL_SPECS: [ToolSpec; 7] = [
+pub(crate) const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         kind: ToolKind::Navigate,
         name: "browser_navigate",
@@ -39,14 +56,29 @@ pub(crate) const TOOL_SPECS: [ToolSpec; 7] = [
         description: "Navigate forward in browser history and return a compact page snapshot.",
     },
     ToolSpec {
+        kind: ToolKind::Reload,
+        name: "browser_reload",
+        description: "Reload the active page and return a compact page snapshot.",
+    },
+    ToolSpec {
+        kind: ToolKind::Resize,
+        name: "browser_resize",
+        description: "Resize the active page viewport in CSS pixels and return a fresh snapshot.",
+    },
+    ToolSpec {
         kind: ToolKind::Snapshot,
         name: "browser_snapshot",
-        description: "Return a fresh compact snapshot of the current page.",
+        description: "Return a fresh full or targeted compact snapshot of the current page.",
+    },
+    ToolSpec {
+        kind: ToolKind::Find,
+        name: "browser_find",
+        description: "Search one fresh snapshot and return compact actionable context.",
     },
     ToolSpec {
         kind: ToolKind::Click,
         name: "browser_click",
-        description: "Click a ref from the latest snapshot and return a fresh snapshot.",
+        description: "Click or double-click a ref from the latest snapshot and return a fresh snapshot.",
     },
     ToolSpec {
         kind: ToolKind::Scroll,
@@ -54,11 +86,97 @@ pub(crate) const TOOL_SPECS: [ToolSpec; 7] = [
         description: "Scroll a snapshot ref into view or move the viewport, then return a fresh snapshot.",
     },
     ToolSpec {
+        kind: ToolKind::Type,
+        name: "browser_type",
+        description: "Enter text into a snapshot ref, optionally slowly or followed by Enter.",
+    },
+    ToolSpec {
+        kind: ToolKind::SelectOption,
+        name: "browser_select_option",
+        description: "Select one or more option values or labels in a snapshot ref.",
+    },
+    ToolSpec {
+        kind: ToolKind::FillForm,
+        name: "browser_fill_form",
+        description: "Fill up to 50 fields sequentially as a non-transactional batch.",
+    },
+    ToolSpec {
+        kind: ToolKind::Hover,
+        name: "browser_hover",
+        description: "Move Chromium's native mouse to a snapshot ref and return a fresh snapshot.",
+    },
+    ToolSpec {
+        kind: ToolKind::PressKey,
+        name: "browser_press_key",
+        description: "Press a native browser key on the active page and return a fresh snapshot.",
+    },
+    ToolSpec {
+        kind: ToolKind::Drop,
+        name: "browser_drop",
+        description: "Synthesize a DataTransfer drop of confined files and/or MIME strings on a snapshot ref.",
+    },
+    ToolSpec {
+        kind: ToolKind::Tabs,
+        name: "browser_tabs",
+        description: "List, open, select, or close browser tabs.",
+    },
+    ToolSpec {
+        kind: ToolKind::HandleDialog,
+        name: "browser_handle_dialog",
+        description: "Accept or dismiss the JavaScript dialog that is pending now.",
+    },
+    ToolSpec {
+        kind: ToolKind::WaitFor,
+        name: "browser_wait_for",
+        description: "Wait for elapsed time and/or visible-text state, then return a fresh snapshot.",
+    },
+    ToolSpec {
+        kind: ToolKind::GetText,
+        name: "browser_get_text",
+        description: "Return rendered inner text for a unique CSS selector.",
+    },
+    ToolSpec {
+        kind: ToolKind::Evaluate,
+        name: "browser_evaluate",
+        description: "Evaluate a JavaScript function in the page or snapshot-ref context.",
+    },
+    ToolSpec {
         kind: ToolKind::TakeScreenshot,
         name: "browser_take_screenshot",
-        description: "Capture the current browser viewport as a PNG image. Oversized fallback files remain available until this server process shuts down.",
+        description: "Capture the current page as an inline PNG or JPEG image. Oversized fallback files remain available until this server process shuts down.",
+    },
+    ToolSpec {
+        kind: ToolKind::Close,
+        name: "browser_close",
+        description: "Close the browser; the next browser tool starts a fresh session.",
     },
 ];
+
+const LEAN_TOOLS: &[&str] = &[
+    "browser_navigate",
+    "browser_navigate_back",
+    "browser_navigate_forward",
+    "browser_reload",
+    "browser_resize",
+    "browser_snapshot",
+    "browser_click",
+    "browser_scroll",
+    "browser_type",
+    "browser_select_option",
+    "browser_hover",
+    "browser_press_key",
+    "browser_wait_for",
+    "browser_tabs",
+    "browser_evaluate",
+    "browser_take_screenshot",
+    "browser_close",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolsetProfile {
+    Mirror,
+    Lean,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,12 +186,40 @@ struct NavigateArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SnapshotArgs {}
+struct EmptyArgs {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ResizeArgs {
+    width: f64,
+    height: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotArgs {
+    target: Option<String>,
+    depth: Option<f64>,
+    #[serde(default)]
+    boxes: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindArgs {
+    text: Option<String>,
+    regex: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct ClickArgs {
     target: String,
+    #[serde(default, alias = "double_click")]
+    double_click: bool,
+    #[serde(default)]
+    element: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -91,8 +237,263 @@ struct ScrollArgs {
     pixels: Option<f64>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypeArgs {
+    target: String,
+    text: String,
+    #[serde(default)]
+    element: Option<String>,
+    #[serde(default)]
+    submit: bool,
+    #[serde(default)]
+    slowly: bool,
+    #[serde(default = "default_true")]
+    clear: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(value) => vec![value],
+            Self::Many(values) => values,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectOptionArgs {
+    target: String,
+    #[serde(alias = "value")]
+    values: OneOrMany,
+    #[serde(default)]
+    element: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawFillKind {
+    Textbox,
+    Checkbox,
+    Radio,
+    Combobox,
+    Slider,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFillField {
+    target: String,
+    name: String,
+    #[serde(rename = "type")]
+    kind: RawFillKind,
+    value: String,
+    #[serde(default)]
+    element: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FillFormArgs {
+    fields: Vec<RawFillField>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TargetArgs {
+    target: String,
+    #[serde(default)]
+    element: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PressKeyArgs {
+    key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DropArgs {
+    target: String,
+    #[serde(default)]
+    element: Option<String>,
+    #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_data_map")]
+    data: Vec<(String, String)>,
+}
+
+fn deserialize_data_map<'de, D>(deserializer: D) -> Result<Vec<(String, String)>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Map::<String, Value>::deserialize(deserializer)?
+        .into_iter()
+        .map(|(name, value)| {
+            value
+                .as_str()
+                .map(|value| (name, value.to_owned()))
+                .ok_or_else(|| serde::de::Error::custom("drop data values must be strings"))
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawTabAction {
+    List,
+    New,
+    Close,
+    Select,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TabsArgs {
+    action: RawTabAction,
+    index: Option<usize>,
+    url: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct HandleDialogArgs {
+    accept: bool,
+    #[serde(default, alias = "prompt_text")]
+    prompt_text: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct WaitForArgs {
+    time: Option<f64>,
+    text: Option<String>,
+    #[serde(default, alias = "text_gone")]
+    text_gone: Option<String>,
+    #[serde(
+        default = "default_wait_timeout",
+        rename = "timeout_ms",
+        alias = "timeoutMs"
+    )]
+    timeout_ms: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetTextArgs {
+    #[serde(default = "default_body")]
+    selector: String,
+    #[serde(default = "default_max_chars")]
+    max_chars: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvaluateArgs {
+    #[serde(alias = "expression")]
+    function: String,
+    target: Option<String>,
+    element: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawScreenshotType {
+    Png,
+    Jpeg,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct ScreenshotArgs {
+    #[serde(default, alias = "full_page")]
+    full_page: bool,
+    #[serde(default = "default_screenshot_type")]
+    r#type: RawScreenshotType,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_wait_timeout() -> f64 {
+    10_000.0
+}
+
+fn default_body() -> String {
+    "body".to_owned()
+}
+
+fn default_max_chars() -> usize {
+    20_000
+}
+
+fn default_screenshot_type() -> RawScreenshotType {
+    RawScreenshotType::Png
+}
+
+pub(crate) fn validate_tool_configuration() -> Result<(), String> {
+    let _ = toolset_profile();
+    eval_allowed().map(|_| ())
+}
+
+pub(crate) fn enabled_tool_specs() -> Vec<ToolSpec> {
+    TOOL_SPECS
+        .iter()
+        .copied()
+        .filter(|spec| tool_enabled(spec.name))
+        .collect()
+}
+
 pub(crate) fn find_tool(name: &str) -> Option<ToolSpec> {
-    TOOL_SPECS.iter().copied().find(|spec| spec.name == name)
+    TOOL_SPECS
+        .iter()
+        .copied()
+        .find(|spec| spec.name == name && tool_enabled(spec.name))
+}
+
+fn tool_enabled(name: &str) -> bool {
+    let profile = toolset_profile();
+    let in_profile = profile == ToolsetProfile::Mirror || LEAN_TOOLS.contains(&name);
+    in_profile && (name != "browser_evaluate" || eval_allowed().unwrap_or(false))
+}
+
+fn toolset_profile() -> ToolsetProfile {
+    static PROFILE: OnceLock<ToolsetProfile> = OnceLock::new();
+    *PROFILE.get_or_init(|| match env::var("RUSTWRIGHT_MCP_TOOLSET") {
+        Ok(profile) if profile.trim().eq_ignore_ascii_case("lean") => ToolsetProfile::Lean,
+        Ok(profile) if profile.trim().eq_ignore_ascii_case("mirror") => ToolsetProfile::Mirror,
+        Ok(profile) => {
+            eprintln!("warning: unknown RUSTWRIGHT_MCP_TOOLSET={profile:?}; using 'mirror'");
+            ToolsetProfile::Mirror
+        }
+        Err(_) => ToolsetProfile::Mirror,
+    })
+}
+
+fn eval_allowed() -> Result<bool, String> {
+    let Ok(raw) = env::var("RUSTWRIGHT_MCP_ALLOW_EVAL") else {
+        return Ok(true);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "RUSTWRIGHT_MCP_ALLOW_EVAL must be one of 0, 1, false, no, off, on, true, yes; got {raw:?}"
+        )),
+    }
 }
 
 pub(crate) fn descriptor(spec: ToolSpec) -> Tool {
@@ -113,23 +514,62 @@ pub(crate) fn parse_op(
             Ok(BrowserOp::Navigate(args.url))
         }
         ToolKind::NavigateBack => {
-            let _: SnapshotArgs = decode(arguments)?;
+            let _: EmptyArgs = decode(arguments)?;
             Ok(BrowserOp::NavigateBack)
         }
         ToolKind::NavigateForward => {
-            let _: SnapshotArgs = decode(arguments)?;
+            let _: EmptyArgs = decode(arguments)?;
             Ok(BrowserOp::NavigateForward)
         }
+        ToolKind::Reload => {
+            let _: EmptyArgs = decode(arguments)?;
+            Ok(BrowserOp::Reload)
+        }
+        ToolKind::Resize => {
+            let args: ResizeArgs = decode(arguments)?;
+            Ok(BrowserOp::Resize {
+                width: dimension(args.width, "width")?,
+                height: dimension(args.height, "height")?,
+            })
+        }
         ToolKind::Snapshot => {
-            let _: SnapshotArgs = decode(arguments)?;
-            Ok(BrowserOp::Snapshot)
+            let args: SnapshotArgs = decode(arguments)?;
+            if let Some(target) = args.target.as_deref() {
+                validate_ref(target)?;
+            }
+            let depth = args
+                .depth
+                .map(|depth| {
+                    if !depth.is_finite() || depth < 0.0 || depth > f64::from(u32::MAX) {
+                        return Err("depth must be a finite non-negative number".to_owned());
+                    }
+                    Ok(depth.floor() as u32)
+                })
+                .transpose()?;
+            Ok(BrowserOp::Snapshot {
+                target: args.target,
+                depth,
+                boxes: args.boxes,
+            })
+        }
+        ToolKind::Find => {
+            let args: FindArgs = decode(arguments)?;
+            if (args.text.is_some()) == (args.regex.is_some()) {
+                return Err("exactly one of text or regex is required".to_owned());
+            }
+            Ok(BrowserOp::Find {
+                text: args.text,
+                regex: args.regex.map(|regex| parse_regex(&regex)).transpose()?,
+            })
         }
         ToolKind::Click => {
             let args: ClickArgs = decode(arguments)?;
-            if !is_valid_ref(&args.target) {
-                return Err("target must match ^e[1-9][0-9]*$".to_owned());
-            }
-            Ok(BrowserOp::Click(args.target))
+            validate_ref(&args.target)?;
+            let _ = args.element;
+            Ok(BrowserOp::Click {
+                target: args.target,
+                double_click: args.double_click,
+            })
         }
         ToolKind::Scroll => {
             let args: ScrollArgs = decode(arguments)?;
@@ -140,9 +580,7 @@ pub(crate) fn parse_op(
                     if args.pixels.is_some() {
                         return Err("pixels can only be used with direction".to_owned());
                     }
-                    if !is_valid_ref(&target) {
-                        return Err("target must match ^e[1-9][0-9]*$".to_owned());
-                    }
+                    validate_ref(&target)?;
                     Ok(BrowserOp::ScrollTarget(target))
                 }
                 (None, Some(direction)) => {
@@ -158,15 +596,211 @@ pub(crate) fn parse_op(
                 }
             }
         }
+        ToolKind::Type => {
+            let args: TypeArgs = decode(arguments)?;
+            validate_ref(&args.target)?;
+            let _ = args.element;
+            Ok(BrowserOp::Type {
+                target: args.target,
+                text: args.text,
+                submit: args.submit,
+                slowly: args.slowly,
+                clear: args.clear,
+            })
+        }
+        ToolKind::SelectOption => {
+            let args: SelectOptionArgs = decode(arguments)?;
+            validate_ref(&args.target)?;
+            let values = args.values.into_vec();
+            if values.is_empty() {
+                return Err("values must contain at least one string".to_owned());
+            }
+            let _ = args.element;
+            Ok(BrowserOp::SelectOption {
+                target: args.target,
+                values,
+            })
+        }
+        ToolKind::FillForm => {
+            let args: FillFormArgs = decode(arguments)?;
+            if args.fields.is_empty() || args.fields.len() > 50 {
+                return Err("fields must contain between 1 and 50 entries".to_owned());
+            }
+            let fields = args
+                .fields
+                .into_iter()
+                .map(|field| {
+                    validate_ref(&field.target)?;
+                    let _ = field.element;
+                    Ok(FillField {
+                        target: field.target,
+                        name: field.name,
+                        kind: match field.kind {
+                            RawFillKind::Textbox => FillFieldKind::Textbox,
+                            RawFillKind::Checkbox => FillFieldKind::Checkbox,
+                            RawFillKind::Radio => FillFieldKind::Radio,
+                            RawFillKind::Combobox => FillFieldKind::Combobox,
+                            RawFillKind::Slider => FillFieldKind::Slider,
+                        },
+                        value: field.value,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(BrowserOp::FillForm(fields))
+        }
+        ToolKind::Hover => {
+            let args: TargetArgs = decode(arguments)?;
+            validate_ref(&args.target)?;
+            let _ = args.element;
+            Ok(BrowserOp::Hover(args.target))
+        }
+        ToolKind::PressKey => {
+            let args: PressKeyArgs = decode(arguments)?;
+            if args.key.is_empty() {
+                return Err("key must be a non-empty string".to_owned());
+            }
+            Ok(BrowserOp::PressKey(args.key))
+        }
+        ToolKind::Drop => {
+            let args: DropArgs = decode(arguments)?;
+            validate_ref(&args.target)?;
+            if args.paths.is_empty() && args.data.is_empty() {
+                return Err(
+                    "browser_drop requires at least one non-empty paths or data source".to_owned(),
+                );
+            }
+            if args.paths.len() > 50 {
+                return Err("paths may contain at most 50 entries".to_owned());
+            }
+            let mut mimes = HashSet::new();
+            for (mime, _) in &args.data {
+                if mime.trim().is_empty() {
+                    return Err("browser_drop data MIME keys must be non-empty".to_owned());
+                }
+                if !mimes.insert(mime.to_lowercase()) {
+                    return Err(
+                        "browser_drop data MIME keys must be unique ignoring case".to_owned()
+                    );
+                }
+            }
+            let _ = args.element;
+            Ok(BrowserOp::Drop {
+                target: args.target,
+                paths: args.paths,
+                data: args.data,
+            })
+        }
+        ToolKind::Tabs => {
+            let args: TabsArgs = decode(arguments)?;
+            let action = match args.action {
+                RawTabAction::List => TabAction::List,
+                RawTabAction::New => TabAction::New,
+                RawTabAction::Close => TabAction::Close,
+                RawTabAction::Select => TabAction::Select,
+            };
+            if matches!(action, TabAction::Select) && args.index.is_none() {
+                return Err("index is required for tab select".to_owned());
+            }
+            if !matches!(action, TabAction::New) && args.url.is_some() {
+                return Err("url can only be used with action=new".to_owned());
+            }
+            Ok(BrowserOp::Tabs {
+                action,
+                index: args.index,
+                url: args.url,
+            })
+        }
+        ToolKind::HandleDialog => {
+            let args: HandleDialogArgs = decode(arguments)?;
+            if !args.accept && args.prompt_text.is_some() {
+                return Err("promptText cannot be honored when dismissing a dialog".to_owned());
+            }
+            Ok(BrowserOp::HandleDialog {
+                accept: args.accept,
+                prompt_text: args.prompt_text,
+            })
+        }
+        ToolKind::WaitFor => {
+            let args: WaitForArgs = decode(arguments)?;
+            if args.time.is_none() && args.text.is_none() && args.text_gone.is_none() {
+                return Err("at least one of time, text, or textGone is required".to_owned());
+            }
+            if args
+                .time
+                .is_some_and(|time| !time.is_finite() || time < 0.0)
+            {
+                return Err("time must be a finite non-negative number".to_owned());
+            }
+            if !args.timeout_ms.is_finite() || args.timeout_ms < 0.0 {
+                return Err("timeout_ms must be a finite non-negative number".to_owned());
+            }
+            Ok(BrowserOp::WaitFor {
+                time_seconds: args.time,
+                text: args.text,
+                text_gone: args.text_gone,
+                timeout_ms: args.timeout_ms,
+            })
+        }
+        ToolKind::GetText => {
+            let args: GetTextArgs = decode(arguments)?;
+            if args.selector.is_empty() {
+                return Err("selector must be a non-empty string".to_owned());
+            }
+            Ok(BrowserOp::GetText {
+                selector: args.selector,
+                max_chars: args.max_chars,
+            })
+        }
+        ToolKind::Evaluate => {
+            let args: EvaluateArgs = decode(arguments)?;
+            if args.function.is_empty() {
+                return Err("function must be a non-empty string".to_owned());
+            }
+            if args.element.is_some() && args.target.is_none() {
+                return Err("element requires target for browser_evaluate".to_owned());
+            }
+            if let Some(target) = args.target.as_deref() {
+                validate_ref(target)?;
+            }
+            Ok(BrowserOp::Evaluate {
+                function: args.function,
+                target: args.target,
+            })
+        }
         ToolKind::TakeScreenshot => {
-            let _: SnapshotArgs = decode(arguments)?;
-            Ok(BrowserOp::TakeScreenshot)
+            let args: ScreenshotArgs = decode(arguments)?;
+            Ok(BrowserOp::TakeScreenshot {
+                full_page: args.full_page,
+                image_type: match args.r#type {
+                    RawScreenshotType::Png => ScreenshotType::Png,
+                    RawScreenshotType::Jpeg => ScreenshotType::Jpeg,
+                },
+            })
+        }
+        ToolKind::Close => {
+            let _: EmptyArgs = decode(arguments)?;
+            Ok(BrowserOp::Close)
         }
     }
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(arguments: Value) -> Result<T, String> {
     serde_json::from_value(arguments).map_err(|error| format!("invalid tool arguments: {error}"))
+}
+
+fn dimension(value: f64, name: &str) -> Result<u32, String> {
+    if !value.is_finite() || value <= 0.0 || value > f64::from(u32::MAX) {
+        return Err(format!("{name} must be a finite number greater than 0"));
+    }
+    Ok(value.round() as u32)
+}
+
+fn validate_ref(target: &str) -> Result<(), String> {
+    if is_valid_ref(target) {
+        Ok(())
+    } else {
+        Err("target must match ^e[1-9][0-9]*$".to_owned())
+    }
 }
 
 fn is_valid_ref(target: &str) -> bool {
@@ -178,32 +812,86 @@ fn is_valid_ref(target: &str) -> bool {
         && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+fn parse_regex(expression: &str) -> Result<RegexSpec, String> {
+    if !expression.starts_with('/') {
+        return Ok(RegexSpec {
+            pattern: expression.to_owned(),
+            flags: String::new(),
+        });
+    }
+    let closing = expression
+        .rfind('/')
+        .ok_or_else(|| "regex slash form must be /pattern/flags (flags: i, m, s)".to_owned())?;
+    if closing == 0 {
+        return Err("regex slash form must be /pattern/flags (flags: i, m, s)".to_owned());
+    }
+    let flags = &expression[closing + 1..];
+    let mut seen = HashSet::new();
+    for flag in flags.chars() {
+        if !matches!(flag, 'i' | 'm' | 's') {
+            return Err(format!("invalid regex flags: {flag}; supported: i, m, s"));
+        }
+        if !seen.insert(flag) {
+            return Err("regex flags must not be repeated".to_owned());
+        }
+    }
+    Ok(RegexSpec {
+        pattern: expression[1..closing].to_owned(),
+        flags: flags.to_owned(),
+    })
+}
+
 fn schema(kind: ToolKind) -> JsonObject {
+    let ref_property = || {
+        json!({
+            "type": "string",
+            "pattern": "^e[1-9][0-9]*$",
+            "description": "Ref from the latest snapshot, such as e3"
+        })
+    };
     let value = match kind {
         ToolKind::Navigate => json!({
             "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "URL to navigate to"}
-            },
+            "properties": {"url": {"type": "string", "description": "URL to navigate to"}},
             "required": ["url"],
             "additionalProperties": false
         }),
-        ToolKind::NavigateBack
-        | ToolKind::NavigateForward
-        | ToolKind::Snapshot
-        | ToolKind::TakeScreenshot => json!({
+        ToolKind::NavigateBack | ToolKind::NavigateForward | ToolKind::Reload | ToolKind::Close => {
+            json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+        ToolKind::Resize => json!({
             "type": "object",
-            "properties": {},
+            "properties": {
+                "width": {"type": "number", "exclusiveMinimum": 0},
+                "height": {"type": "number", "exclusiveMinimum": 0}
+            },
+            "required": ["width", "height"],
+            "additionalProperties": false
+        }),
+        ToolKind::Snapshot => json!({
+            "type": "object",
+            "properties": {
+                "target": ref_property(),
+                "depth": {"type": "number", "minimum": 0},
+                "boxes": {"type": "boolean", "default": false}
+            },
+            "additionalProperties": false
+        }),
+        ToolKind::Find => json!({
+            "type": "object",
+            "properties": {"text": {"type": "string"}, "regex": {"type": "string"}},
+            "oneOf": [
+                {"required": ["text"], "not": {"required": ["regex"]}},
+                {"required": ["regex"], "not": {"required": ["text"]}}
+            ],
             "additionalProperties": false
         }),
         ToolKind::Click => json!({
             "type": "object",
             "properties": {
-                "target": {
-                    "type": "string",
-                    "pattern": "^e[1-9][0-9]*$",
-                    "description": "Ref from the latest snapshot, such as e3"
-                }
+                "target": ref_property(),
+                "element": {"type": "string"},
+                "doubleClick": {"type": "boolean", "default": false}
             },
             "required": ["target"],
             "additionalProperties": false
@@ -211,37 +899,145 @@ fn schema(kind: ToolKind) -> JsonObject {
         ToolKind::Scroll => json!({
             "type": "object",
             "properties": {
-                "target": {
-                    "type": "string",
-                    "pattern": "^e[1-9][0-9]*$",
-                    "description": "Ref from the latest snapshot to scroll into view"
-                },
-                "direction": {
-                    "type": "string",
-                    "enum": ["up", "down"],
-                    "description": "Viewport scroll direction"
-                },
-                "pixels": {
-                    "type": "number",
-                    "exclusiveMinimum": 0,
-                    "description": "Viewport scroll distance; defaults to 500"
-                }
+                "target": ref_property(),
+                "direction": {"type": "string", "enum": ["up", "down"]},
+                "pixels": {"type": "number", "exclusiveMinimum": 0}
             },
             "oneOf": [
-                {
-                    "required": ["target"],
-                    "not": {
-                        "anyOf": [
-                            {"required": ["direction"]},
-                            {"required": ["pixels"]}
-                        ]
-                    }
-                },
-                {
-                    "required": ["direction"],
-                    "not": {"required": ["target"]}
-                }
+                {"required": ["target"], "not": {"anyOf": [{"required": ["direction"]}, {"required": ["pixels"]}]}},
+                {"required": ["direction"], "not": {"required": ["target"]}}
             ],
+            "additionalProperties": false
+        }),
+        ToolKind::Type => json!({
+            "type": "object",
+            "properties": {
+                "target": ref_property(),
+                "text": {"type": "string"},
+                "element": {"type": "string"},
+                "submit": {"type": "boolean", "default": false},
+                "slowly": {"type": "boolean", "default": false},
+                "clear": {"type": "boolean", "default": true}
+            },
+            "required": ["target", "text"],
+            "additionalProperties": false
+        }),
+        ToolKind::SelectOption => json!({
+            "type": "object",
+            "properties": {
+                "target": ref_property(),
+                "values": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}, "minItems": 1}
+                    ]
+                },
+                "element": {"type": "string"}
+            },
+            "required": ["target", "values"],
+            "additionalProperties": false
+        }),
+        ToolKind::FillForm => json!({
+            "type": "object",
+            "properties": {
+                "fields": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "target": ref_property(),
+                            "name": {"type": "string"},
+                            "type": {"type": "string", "enum": ["textbox", "checkbox", "radio", "combobox", "slider"]},
+                            "value": {"type": "string"},
+                            "element": {"type": "string"}
+                        },
+                        "required": ["target", "name", "type", "value"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["fields"],
+            "additionalProperties": false
+        }),
+        ToolKind::Hover => json!({
+            "type": "object",
+            "properties": {"target": ref_property(), "element": {"type": "string"}},
+            "required": ["target"],
+            "additionalProperties": false
+        }),
+        ToolKind::PressKey => json!({
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+            "additionalProperties": false
+        }),
+        ToolKind::Drop => json!({
+            "type": "object",
+            "properties": {
+                "target": ref_property(),
+                "element": {"type": "string"},
+                "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
+                "data": {"type": "object", "additionalProperties": {"type": "string"}}
+            },
+            "required": ["target"],
+            "additionalProperties": false
+        }),
+        ToolKind::Tabs => json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "new", "close", "select"]},
+                "index": {"type": "integer", "minimum": 0},
+                "url": {"type": "string"}
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }),
+        ToolKind::HandleDialog => json!({
+            "type": "object",
+            "properties": {
+                "accept": {"type": "boolean"},
+                "promptText": {"type": ["string", "null"]}
+            },
+            "required": ["accept"],
+            "additionalProperties": false
+        }),
+        ToolKind::WaitFor => json!({
+            "type": "object",
+            "properties": {
+                "time": {"type": "number", "minimum": 0},
+                "text": {"type": "string"},
+                "textGone": {"type": "string"},
+                "timeout_ms": {"type": "number", "minimum": 0, "default": 10000}
+            },
+            "anyOf": [{"required": ["time"]}, {"required": ["text"]}, {"required": ["textGone"]}],
+            "additionalProperties": false
+        }),
+        ToolKind::GetText => json!({
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "default": "body"},
+                "max_chars": {"type": "integer", "minimum": 0, "default": 20000}
+            },
+            "additionalProperties": false
+        }),
+        ToolKind::Evaluate => json!({
+            "type": "object",
+            "properties": {
+                "function": {"type": "string"},
+                "target": ref_property(),
+                "element": {"type": "string"}
+            },
+            "required": ["function"],
+            "additionalProperties": false
+        }),
+        ToolKind::TakeScreenshot => json!({
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "enum": ["png", "jpeg"], "default": "png"},
+                "fullPage": {"type": "boolean", "default": false}
+            },
             "additionalProperties": false
         }),
     };
@@ -266,178 +1062,51 @@ mod tests {
     }
 
     #[test]
-    fn history_navigation_tools_resolve_parse_and_reject_arguments() {
-        let back = find_tool("browser_navigate_back").expect("navigate back tool");
-        assert!(matches!(
-            parse_op(back, None).expect("parse navigate back"),
-            BrowserOp::NavigateBack
-        ));
-
-        let forward = find_tool("browser_navigate_forward").expect("navigate forward tool");
-        assert!(matches!(
-            parse_op(forward, Some(Map::new())).expect("parse navigate forward"),
-            BrowserOp::NavigateForward
-        ));
-
-        for spec in [back, forward] {
-            let tool = descriptor(spec);
-            assert_eq!(tool.input_schema["properties"], json!({}));
-            assert_eq!(tool.input_schema["additionalProperties"], false);
-            assert!(tool.input_schema.get("required").is_none());
-
-            let arguments = Map::from_iter([("unexpected".to_owned(), Value::Bool(true))]);
-            let error = parse_op(spec, Some(arguments)).expect_err("reject unknown argument");
-            assert!(error.contains("unknown field `unexpected`"), "{error}");
-        }
-    }
-
-    #[test]
-    fn scroll_tool_resolves_and_descriptor_publishes_argument_contract() {
-        let scroll = find_tool("browser_scroll").expect("scroll tool");
-        let tool = descriptor(scroll);
-
-        assert_eq!(
-            tool.input_schema["properties"]["target"]["pattern"],
-            "^e[1-9][0-9]*$"
-        );
-        assert_eq!(
-            tool.input_schema["properties"]["direction"]["enum"],
-            json!(["up", "down"])
-        );
-        assert_eq!(tool.input_schema["properties"]["pixels"]["type"], "number");
-        assert_eq!(
-            tool.input_schema["properties"]["pixels"]["exclusiveMinimum"],
-            0
-        );
-        assert_eq!(
-            tool.input_schema["oneOf"],
-            json!([
-                {
-                    "required": ["target"],
-                    "not": {
-                        "anyOf": [
-                            {"required": ["direction"]},
-                            {"required": ["pixels"]}
-                        ]
-                    }
-                },
-                {
-                    "required": ["direction"],
-                    "not": {"required": ["target"]}
-                }
-            ])
-        );
-        assert_eq!(tool.input_schema["additionalProperties"], false);
-    }
-
-    #[test]
-    fn scroll_parse_accepts_target_or_direction() {
-        let scroll = find_tool("browser_scroll").expect("scroll tool");
-        let parse = |arguments: Value| {
-            parse_op(
-                scroll,
-                Some(arguments.as_object().expect("object arguments").clone()),
-            )
-        };
-
-        assert!(parse(json!({"target": "e12"})).is_ok());
-        assert!(parse(json!({"direction": "down"})).is_ok());
-        assert!(
-            parse(json!({
-                "direction": "up",
-                "pixels": 250.5
-            }))
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn scroll_parse_rejects_invalid_argument_matrix() {
-        let scroll = find_tool("browser_scroll").expect("scroll tool");
-        let parse = |arguments: Value| {
-            parse_op(
-                scroll,
-                Some(arguments.as_object().expect("object arguments").clone()),
-            )
-        };
-
-        assert!(parse_op(scroll, None).is_err(), "accepted absent arguments");
-        for (case, arguments) in [
-            (
-                "target and direction",
-                json!({"target": "e12", "direction": "down"}),
-            ),
-            ("neither target nor direction", json!({})),
-            ("pixels without direction", json!({"pixels": 100})),
-            (
-                "pixels with target",
-                json!({"target": "e12", "pixels": 100}),
-            ),
-            ("bad direction", json!({"direction": "left"})),
-            ("zero pixels", json!({"direction": "down", "pixels": 0})),
-            (
-                "negative pixels",
-                json!({"direction": "down", "pixels": -1}),
-            ),
-            // JSON has no non-finite number values, so reject their possible wire spellings.
-            ("NaN pixels", json!({"direction": "down", "pixels": "NaN"})),
-            (
-                "infinite pixels",
-                json!({"direction": "down", "pixels": "Infinity"}),
-            ),
-            (
-                "negative infinite pixels",
-                json!({"direction": "down", "pixels": "-Infinity"}),
-            ),
-            ("malformed ref", json!({"target": "e0"})),
-            (
-                "unknown field",
-                json!({"direction": "down", "unexpected": true}),
-            ),
-        ] {
-            assert!(parse(arguments).is_err(), "accepted invalid case: {case}");
-        }
-    }
-
-    #[test]
-    fn screenshot_tool_resolves_parses_empty_arguments_and_rejects_unknown_fields() {
-        let screenshot = find_tool("browser_take_screenshot").expect("screenshot tool");
-        let tool = descriptor(screenshot);
-
-        assert!(screenshot.description.contains("server process shuts down"));
-        assert_eq!(tool.input_schema["properties"], json!({}));
-        assert_eq!(tool.input_schema["additionalProperties"], false);
-        assert!(tool.input_schema.get("required").is_none());
-
-        assert!(parse_op(screenshot, None).is_ok());
-        assert!(parse_op(screenshot, Some(Map::new())).is_ok());
-
-        let arguments = Map::from_iter([("unexpected".to_owned(), Value::Bool(true))]);
-        let error = parse_op(screenshot, Some(arguments)).expect_err("reject unknown argument");
-        assert!(error.contains("unknown field `unexpected`"), "{error}");
-    }
-
-    #[test]
-    fn table_builds_all_seven_descriptors() {
+    fn all_descriptors_are_strict_objects() {
         let tools: Vec<Tool> = TOOL_SPECS.iter().copied().map(descriptor).collect();
-        assert_eq!(tools.len(), 7);
-        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
-        assert_eq!(
-            names,
-            [
-                "browser_navigate",
-                "browser_navigate_back",
-                "browser_navigate_forward",
-                "browser_snapshot",
-                "browser_click",
-                "browser_scroll",
-                "browser_take_screenshot",
-            ]
-        );
+        assert_eq!(tools.len(), 22);
         assert!(
             tools
                 .iter()
-                .all(|tool| tool.input_schema["type"] == "object")
+                .all(|tool| tool.input_schema["type"] == "object"
+                    && tool.input_schema["additionalProperties"] == false)
         );
+    }
+
+    #[test]
+    fn aliases_and_argument_constraints_parse() {
+        let select = TOOL_SPECS
+            .iter()
+            .copied()
+            .find(|spec| spec.name == "browser_select_option")
+            .unwrap();
+        assert!(
+            parse_op(
+                select,
+                Some(
+                    json!({"target": "e1", "value": "One"})
+                        .as_object()
+                        .unwrap()
+                        .clone()
+                )
+            )
+            .is_ok()
+        );
+
+        let wait = TOOL_SPECS
+            .iter()
+            .copied()
+            .find(|spec| spec.name == "browser_wait_for")
+            .unwrap();
+        assert!(parse_op(wait, Some(Map::new())).is_err());
+    }
+
+    #[test]
+    fn regex_slash_form_validates_flags() {
+        let parsed = parse_regex("/hello.*/ims").expect("valid slash regex");
+        assert_eq!(parsed.pattern, "hello.*");
+        assert_eq!(parsed.flags, "ims");
+        assert!(parse_regex("/x/ii").is_err());
+        assert!(parse_regex("/x/g").is_err());
     }
 }

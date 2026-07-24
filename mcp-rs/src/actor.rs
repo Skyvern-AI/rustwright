@@ -1,23 +1,96 @@
 use std::{
-    collections::{HashSet, VecDeque},
-    env, fmt,
+    collections::{HashMap, HashSet, VecDeque},
+    env, fmt, fs,
+    path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, Weak,
         atomic::{AtomicU8, Ordering},
+        mpsc::{TryRecvError, sync_channel},
     },
     thread,
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmcp::model::RequestId;
 use rustwright::{
-    ActionOptions, Browser, CancelToken, ConnectOptions, Error, GotoOptions, LaunchOptions, Page,
-    ScreenshotOptions, chromium,
+    ActionOptions, Browser, CancelToken, CloseOptions, ConnectOptions, Dialog, DialogKind, Error,
+    EventReceiver, GotoOptions, LaunchOptions, Page, PageEvent, ScreenshotOptions, chromium,
 };
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 const SNAPSHOT_JS: &str = include_str!("snapshot.js");
+const FIND_REGEX_JS: &str = r#"(input) => {
+  const expression = new RegExp(input.pattern, input.flags);
+  return input.lines
+    .map((line, index) => expression.test(line) ? index : null)
+    .filter((index) => index !== null);
+}"#;
+const WAIT_FOR_JS: &str = r#"async (options) => {
+  if (options.delayMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, options.delayMs));
+  }
+  if (options.text === null && options.textGone === null) return true;
+  const deadline = Date.now() + options.timeoutMs;
+  while (true) {
+    const visibleText = document.body ? (document.body.innerText || '') : '';
+    const textReady = options.text === null || visibleText.includes(options.text);
+    const goneReady = options.textGone === null || !visibleText.includes(options.textGone);
+    if (textReady && goneReady) return true;
+    if (Date.now() >= deadline) {
+      throw new Error('browser_wait_for timed out waiting for text state');
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}"#;
+const ELEMENT_EVALUATE_JS: &str = r#"async (input) => {
+  const target = document.querySelector(input.selector);
+  if (!target) throw new Error(`target not found: ${input.selector}`);
+  const callable = (0, eval)(`(${input.function})`);
+  return await callable(target);
+}"#;
+const SELECT_LABELS_JS: &str = r#"(input) => {
+  const target = document.querySelector(input.selector);
+  if (!(target instanceof HTMLSelectElement)) throw new Error('target is not a select element');
+  return input.labels.map((label) => {
+    const option = Array.from(target.options).find((candidate) => candidate.label === label);
+    if (!option) throw new Error(`option label not found: ${label}`);
+    return option.value;
+  });
+}"#;
+const SYNTHETIC_DROP_JS: &str = r#"async (input) => {
+  const target = document.querySelector(input.selector);
+  if (!target) throw new Error(`target not found: ${input.selector}`);
+  const transfer = new DataTransfer();
+  transfer.effectAllowed = 'copy';
+  transfer.dropEffect = 'copy';
+  for (const entry of input.files) {
+    const binary = atob(entry.base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    transfer.items.add(new File([bytes], entry.name, {
+      type: entry.mime,
+      lastModified: 0,
+    }));
+  }
+  for (const [mime, value] of input.data) transfer.setData(mime, value);
+  const bounds = target.getBoundingClientRect();
+  const eventOptions = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX: bounds.left + bounds.width / 2,
+    clientY: bounds.top + bounds.height / 2,
+    dataTransfer: transfer,
+  };
+  for (const type of ['dragenter', 'dragover', 'drop']) {
+    target.dispatchEvent(new DragEvent(type, eventOptions));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}"#;
 const REMOTE_UNREACHABLE: &str = "remote CDP session unreachable — restart or reconfigure";
 const DEFAULT_CDP_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_TOOL_TIMEOUT_MS: u64 = 60_000;
@@ -31,17 +104,136 @@ pub(crate) enum BrowserOp {
     Navigate(String),
     NavigateBack,
     NavigateForward,
-    Snapshot,
-    Click(String),
+    Reload,
+    Resize {
+        width: u32,
+        height: u32,
+    },
+    Snapshot {
+        target: Option<String>,
+        depth: Option<u32>,
+        boxes: bool,
+    },
+    Find {
+        text: Option<String>,
+        regex: Option<RegexSpec>,
+    },
+    Click {
+        target: String,
+        double_click: bool,
+    },
     ScrollTarget(String),
     ScrollViewport(f64),
-    TakeScreenshot,
+    Type {
+        target: String,
+        text: String,
+        submit: bool,
+        slowly: bool,
+        clear: bool,
+    },
+    SelectOption {
+        target: String,
+        values: Vec<String>,
+    },
+    FillForm(Vec<FillField>),
+    Hover(String),
+    PressKey(String),
+    Drop {
+        target: String,
+        paths: Vec<String>,
+        data: Vec<(String, String)>,
+    },
+    Tabs {
+        action: TabAction,
+        index: Option<usize>,
+        url: Option<String>,
+    },
+    HandleDialog {
+        accept: bool,
+        prompt_text: Option<String>,
+    },
+    WaitFor {
+        time_seconds: Option<f64>,
+        text: Option<String>,
+        text_gone: Option<String>,
+        timeout_ms: f64,
+    },
+    GetText {
+        selector: String,
+        max_chars: usize,
+    },
+    Evaluate {
+        function: String,
+        target: Option<String>,
+    },
+    TakeScreenshot {
+        full_page: bool,
+        image_type: ScreenshotType,
+    },
+    Close,
+}
+
+#[derive(Debug)]
+pub(crate) struct RegexSpec {
+    pub(crate) pattern: String,
+    pub(crate) flags: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct FillField {
+    pub(crate) target: String,
+    pub(crate) name: String,
+    pub(crate) kind: FillFieldKind,
+    pub(crate) value: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FillFieldKind {
+    Textbox,
+    Checkbox,
+    Radio,
+    Combobox,
+    Slider,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TabAction {
+    List,
+    New,
+    Close,
+    Select,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ScreenshotType {
+    Png,
+    Jpeg,
+}
+
+impl ScreenshotType {
+    pub(crate) fn mime(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+        }
+    }
+
+    fn engine_name(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BrowserOutput {
     Text(String),
-    Png(Vec<u8>),
+    Image {
+        bytes: Vec<u8>,
+        mime: &'static str,
+        extension: &'static str,
+    },
 }
 
 impl From<String> for BrowserOutput {
@@ -473,11 +665,26 @@ impl Drop for BrowserActor {
 struct BrowserState {
     browser: Option<Browser>,
     page: Option<Page>,
+    pages: HashMap<String, PageRuntime>,
+    tab_order: Vec<String>,
+    closing_targets: HashSet<String>,
     remote: bool,
     remote_options: Option<ConnectOptions>,
     startup_error: Option<&'static str>,
     next_ref: u64,
     current_refs: HashSet<String>,
+}
+
+struct PageRuntime {
+    events: EventReceiver,
+    pending_dialog: Option<PendingDialog>,
+    title: Option<String>,
+}
+
+struct PendingDialog {
+    kind: DialogKind,
+    message: String,
+    dialog: Dialog,
 }
 
 impl BrowserState {
@@ -527,6 +734,9 @@ impl BrowserState {
             })?;
         self.page = Some(page);
         self.browser = Some(browser);
+        if let Some(page) = self.page.clone() {
+            self.register_page(&page);
+        }
         Ok(())
     }
 
@@ -592,21 +802,134 @@ impl BrowserState {
             })?);
         }
         if self.page.is_none() {
-            let created = self
+            let remaining = Self::remaining(request)?;
+            let existing = self
                 .browser
                 .as_ref()
                 .expect("browser was initialized")
-                .new_page_with_cancel(Some(&request.cancellation.engine));
-            self.page = Some(created.map_err(|error| {
-                self.operation_error(
-                    "new page failed",
-                    error,
-                    &request.cancellation,
-                    request.timeout_ms,
+                .pages_with_cancel(
+                    remaining.saturating_add(ENGINE_TIMEOUT_CUSHION),
+                    Some(&request.cancellation.engine),
                 )
-            })?);
+                .map_err(|error| {
+                    self.operation_error(
+                        "initial page listing failed",
+                        error,
+                        &request.cancellation,
+                        request.timeout_ms,
+                    )
+                })?
+                .into_iter()
+                .next();
+            self.page = match existing {
+                Some(page) => Some(page),
+                None => {
+                    let created = self
+                        .browser
+                        .as_ref()
+                        .expect("browser was initialized")
+                        .new_page_with_cancel(Some(&request.cancellation.engine));
+                    Some(created.map_err(|error| {
+                        self.operation_error(
+                            "new page failed",
+                            error,
+                            &request.cancellation,
+                            request.timeout_ms,
+                        )
+                    })?)
+                }
+            };
+        }
+        if let Some(page) = self.page.clone() {
+            self.register_page(&page);
         }
         Ok(self.page.as_ref().expect("page was initialized"))
+    }
+
+    fn register_page(&mut self, page: &Page) {
+        let target_id = page.target_id();
+        if !self.pages.contains_key(&target_id) {
+            self.tab_order.push(target_id.clone());
+            self.pages.insert(
+                target_id,
+                PageRuntime {
+                    events: page.events(),
+                    pending_dialog: None,
+                    title: None,
+                },
+            );
+        }
+    }
+
+    fn poll_events(&mut self) {
+        for runtime in self.pages.values_mut() {
+            while let Some(event) = runtime.events.recv_timeout(Duration::ZERO) {
+                match event {
+                    PageEvent::Dialog {
+                        kind,
+                        message,
+                        dialog,
+                    } => {
+                        runtime.pending_dialog = Some(PendingDialog {
+                            kind,
+                            message,
+                            dialog,
+                        });
+                    }
+                    PageEvent::Closed | PageEvent::PageCrashed => {}
+                    PageEvent::Navigated { .. } | PageEvent::Download { .. } => {}
+                }
+            }
+        }
+    }
+
+    fn has_pending_dialog(&mut self) -> bool {
+        self.poll_events();
+        self.pages
+            .values()
+            .any(|runtime| runtime.pending_dialog.is_some())
+    }
+
+    fn dialog_kind_name(kind: &DialogKind) -> &str {
+        match kind {
+            DialogKind::Alert => "alert",
+            DialogKind::Confirm => "confirm",
+            DialogKind::Prompt => "prompt",
+            DialogKind::BeforeUnload => "beforeunload",
+            DialogKind::Other(value) => value.as_str(),
+        }
+    }
+
+    fn modal_response(&mut self, result: &str, _request: &ActorRequest) -> String {
+        self.poll_events();
+        let active_target = self.page.as_ref().map(Page::target_id);
+        let mut lines = Vec::new();
+        for target_id in &self.tab_order {
+            let Some(runtime) = self.pages.get(target_id) else {
+                continue;
+            };
+            if let Some(pending) = &runtime.pending_dialog {
+                // Browser-wide page enumeration can itself wait behind a
+                // JavaScript modal. Keep the modal response independent of
+                // renderer commands so every blocked operation returns
+                // promptly and directs the caller to the recovery tool.
+                let owner = if active_target.as_ref() == Some(target_id) {
+                    "Current tab"
+                } else {
+                    "Registered tab"
+                };
+                lines.push(format!(
+                    "- {owner}: Dialog pending: type={}; message={:?}. Call browser_handle_dialog.",
+                    Self::dialog_kind_name(&pending.kind),
+                    pending.message
+                ));
+            }
+        }
+        if lines.is_empty() {
+            result.to_owned()
+        } else {
+            format!("{result}\n\n### Modal\n{}", lines.join("\n"))
+        }
     }
 
     fn operation_error(
@@ -716,8 +1039,71 @@ impl BrowserState {
         self.snapshot(request)
     }
 
+    fn reload(&mut self, request: &ActorRequest) -> TextResult {
+        self.current_refs.clear();
+        let remaining = Self::remaining(request)?;
+        let result = self.ensure_page(request)?.reload_with_cancel(
+            GotoOptions::default()
+                .wait_until("load")
+                .timeout(Self::engine_timeout(remaining)),
+            Some(&request.cancellation.engine),
+        );
+        result.map_err(|error| {
+            self.operation_error(
+                "reload failed",
+                error,
+                &request.cancellation,
+                request.timeout_ms,
+            )
+        })?;
+        self.snapshot(request)
+    }
+
+    fn resize(&mut self, width: u32, height: u32, request: &ActorRequest) -> TextResult {
+        let result = self.ensure_page(request)?.set_viewport_size(width, height);
+        result.map_err(|error| {
+            self.operation_error(
+                "viewport resize failed",
+                error,
+                &request.cancellation,
+                request.timeout_ms,
+            )
+        })?;
+        self.current_refs.clear();
+        self.snapshot(request)
+    }
+
     fn snapshot(&mut self, request: &ActorRequest) -> TextResult {
-        self.snapshot_with_cancel(request, Some(&request.cancellation.engine))
+        self.snapshot_options(
+            request,
+            None,
+            None,
+            false,
+            Some(&request.cancellation.engine),
+        )
+    }
+
+    fn targeted_snapshot(
+        &mut self,
+        target: Option<&str>,
+        depth: Option<u32>,
+        boxes: bool,
+        request: &ActorRequest,
+    ) -> TextResult {
+        if let Some(target) = target
+            && !self.current_refs.contains(target)
+        {
+            return Err(BrowserError::Message(format!(
+                "unknown or stale ref {target}; call browser_snapshot and use its latest refs"
+            )));
+        }
+        self.snapshot_options(
+            request,
+            target,
+            depth,
+            boxes,
+            Some(&request.cancellation.engine),
+        )
     }
 
     fn snapshot_with_cancel(
@@ -725,11 +1111,33 @@ impl BrowserState {
         request: &ActorRequest,
         cancel: Option<&CancelToken>,
     ) -> TextResult {
+        self.snapshot_options(request, None, None, false, cancel)
+    }
+
+    fn snapshot_options(
+        &mut self,
+        request: &ActorRequest,
+        target: Option<&str>,
+        depth: Option<u32>,
+        boxes: bool,
+        cancel: Option<&CancelToken>,
+    ) -> TextResult {
+        if self.has_pending_dialog() {
+            return Ok(self.modal_response(
+                "Snapshot deferred until the pending modal is handled.",
+                request,
+            ));
+        }
         let start_ref = self.next_ref.max(1);
         let remaining = Self::remaining(request)?;
         let result = self.ensure_page(request)?.evaluate_with_cancel(
             SNAPSHOT_JS,
-            Some(&json!(start_ref)),
+            Some(&json!({
+                "startRef": start_ref,
+                "target": target.map(|target| format!(r#"[data-mcp-ref="{target}"]"#)),
+                "maxDepth": depth,
+                "boxes": boxes,
+            })),
             ActionOptions::timeout(Self::engine_timeout(remaining)),
             cancel,
         );
@@ -757,9 +1165,71 @@ impl BrowserState {
                 "snapshot ref counter regressed from {start_ref} to {next_ref}"
             )));
         }
-        self.current_refs = (start_ref..next_ref).map(|n| format!("e{n}")).collect();
+        self.current_refs = value
+            .get("refs")
+            .and_then(Value::as_array)
+            .map(|refs| {
+                refs.iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_else(|| (start_ref..next_ref).map(|n| format!("e{n}")).collect());
         self.next_ref = next_ref;
         Ok(outline)
+    }
+
+    fn find(
+        &mut self,
+        text: Option<&str>,
+        regex: Option<&RegexSpec>,
+        request: &ActorRequest,
+    ) -> TextResult {
+        let outline = self.snapshot(request)?;
+        if self.has_pending_dialog() {
+            return Ok(outline);
+        }
+        let lines = outline.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
+        let matching_indices = if let Some(text) = text {
+            let needle = text.to_lowercase();
+            lines
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| line.to_lowercase().contains(&needle).then_some(index))
+                .collect::<Vec<_>>()
+        } else if let Some(regex) = regex {
+            let remaining = Self::remaining(request)?;
+            let value = self.ensure_page(request)?.evaluate_with_cancel(
+                FIND_REGEX_JS,
+                Some(&json!({
+                    "lines": lines,
+                    "pattern": regex.pattern,
+                    "flags": regex.flags,
+                })),
+                ActionOptions::timeout(Self::engine_timeout(remaining)),
+                Some(&request.cancellation.engine),
+            );
+            value
+                .map_err(|error| {
+                    self.operation_error(
+                        "find regex failed",
+                        error,
+                        &request.cancellation,
+                        request.timeout_ms,
+                    )
+                })?
+                .as_array()
+                .ok_or_else(|| {
+                    BrowserError::Message("find regex returned no match indices".to_owned())
+                })?
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|index| index as usize)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(render_find_matches(&lines, &matching_indices))
     }
 
     fn dispatch_ref_action<Action, PostSnapshot>(
@@ -782,26 +1252,62 @@ impl BrowserState {
         post_snapshot(self)
     }
 
-    fn click(&mut self, target: &str, request: &ActorRequest) -> TextResult {
+    fn click(&mut self, target: &str, double_click: bool, request: &ActorRequest) -> TextResult {
         let selector = format!(r#"[data-mcp-ref="{target}"]"#);
         self.dispatch_ref_action(
             target,
             |state| {
                 let remaining = Self::remaining(request)?;
-                let result = state.ensure_page(request)?.click_with_cancel(
-                    &selector,
-                    ActionOptions::timeout(Self::engine_timeout(remaining)),
-                    Some(&request.cancellation.engine),
-                );
-                result.map_err(|error| {
-                    state.operation_error(
-                        &format!("click failed for {target}"),
-                        error,
-                        &request.cancellation,
-                        request.timeout_ms,
-                    )
-                })?;
-                Ok(())
+                // A JavaScript dialog can stall the engine's post-dispatch
+                // action wait. Run the physical click on a worker so this actor
+                // can surface the already-subscribed modal event as soon as
+                // Chromium emits it. The committed click worker still owns its
+                // release cleanup and is not cancelled or abandoned mid-input.
+                let page = state.ensure_page(request)?.clone();
+                let selector = selector.clone();
+                let cancellation = request.cancellation.engine.clone();
+                let options = ActionOptions::timeout(Self::engine_timeout(remaining));
+                let (result_tx, result_rx) = sync_channel(1);
+                thread::Builder::new()
+                    .name("mcp-browser-click".to_owned())
+                    .spawn(move || {
+                        let result = if double_click {
+                            page.dblclick_with_cancel(&selector, options, Some(&cancellation))
+                        } else {
+                            page.click_with_cancel(&selector, options, Some(&cancellation))
+                        };
+                        let _ = result_tx.send(result);
+                    })
+                    .map_err(|error| {
+                        BrowserError::Message(format!("failed to start click worker: {error}"))
+                    })?;
+                loop {
+                    if state.has_pending_dialog() {
+                        return Ok(());
+                    }
+                    match result_rx.try_recv() {
+                        Ok(Ok(())) => return Ok(()),
+                        Ok(Err(error)) => {
+                            if state.has_pending_dialog() {
+                                return Ok(());
+                            }
+                            return Err(state.operation_error(
+                                &format!("click failed for {target}"),
+                                error,
+                                &request.cancellation,
+                                request.timeout_ms,
+                            ));
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            return Err(BrowserError::Message(
+                                "click worker stopped without a result".to_owned(),
+                            ));
+                        }
+                        Err(TryRecvError::Empty) => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                    }
+                }
             },
             // The physical click has committed, so cancellation is too late:
             // finish the post-click snapshot and preserve its owned result.
@@ -852,44 +1358,840 @@ impl BrowserState {
         self.snapshot(request)
     }
 
-    fn take_screenshot(&mut self, request: &ActorRequest) -> Result<Vec<u8>, BrowserError> {
+    fn type_text(
+        &mut self,
+        target: &str,
+        text: &str,
+        submit: bool,
+        slowly: bool,
+        clear: bool,
+        request: &ActorRequest,
+    ) -> TextResult {
+        let selector = format!(r#"[data-mcp-ref="{target}"]"#);
+        self.dispatch_ref_action(
+            target,
+            |state| {
+                let remaining = Self::remaining(request)?;
+                let options = ActionOptions::timeout(Self::engine_timeout(remaining));
+                let page = state.ensure_page(request)?.clone();
+                let result = if clear && !slowly {
+                    page.fill_with_cancel(
+                        &selector,
+                        text,
+                        options,
+                        Some(&request.cancellation.engine),
+                    )
+                } else {
+                    if clear {
+                        page.fill_with_cancel(
+                            &selector,
+                            "",
+                            options,
+                            Some(&request.cancellation.engine),
+                        )
+                        .map_err(|error| {
+                            state.operation_error(
+                                &format!("clear failed for {target}"),
+                                error,
+                                &request.cancellation,
+                                request.timeout_ms,
+                            )
+                        })?;
+                    }
+                    page.type_text_with_cancel(
+                        &selector,
+                        text,
+                        slowly.then_some(Duration::from_millis(50)),
+                        Some(&request.cancellation.engine),
+                    )
+                };
+                result.map_err(|error| {
+                    state.operation_error(
+                        &format!("type failed for {target}"),
+                        error,
+                        &request.cancellation,
+                        request.timeout_ms,
+                    )
+                })?;
+                if submit {
+                    state
+                        .ensure_page(request)?
+                        .press_key(Some(&selector), "Enter")
+                        .map_err(|error| {
+                            state.operation_error(
+                                &format!("submit failed for {target}"),
+                                error,
+                                &request.cancellation,
+                                request.timeout_ms,
+                            )
+                        })?;
+                }
+                Ok(())
+            },
+            |state| state.snapshot_with_cancel(request, None),
+        )
+    }
+
+    fn resolve_select_values(
+        &mut self,
+        selector: &str,
+        labels: &[String],
+        request: &ActorRequest,
+    ) -> Result<Vec<String>, BrowserError> {
+        let remaining = Self::remaining(request)?;
+        let value = self.ensure_page(request)?.evaluate_with_cancel(
+            SELECT_LABELS_JS,
+            Some(&json!({"selector": selector, "labels": labels})),
+            ActionOptions::timeout(Self::engine_timeout(remaining)),
+            Some(&request.cancellation.engine),
+        );
+        value
+            .map_err(|error| {
+                self.operation_error(
+                    "select option label resolution failed",
+                    error,
+                    &request.cancellation,
+                    request.timeout_ms,
+                )
+            })?
+            .as_array()
+            .ok_or_else(|| {
+                BrowserError::Message(
+                    "select option label resolution returned no values".to_owned(),
+                )
+            })?
+            .iter()
+            .map(|value| {
+                value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    BrowserError::Message(
+                        "select option label resolution returned a non-string".to_owned(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn select_option(
+        &mut self,
+        target: &str,
+        values: &[String],
+        request: &ActorRequest,
+    ) -> TextResult {
+        let selector = format!(r#"[data-mcp-ref="{target}"]"#);
+        self.dispatch_ref_action(
+            target,
+            |state| {
+                let first = state.ensure_page(request)?.select_options_with_cancel(
+                    &selector,
+                    values,
+                    Some(&request.cancellation.engine),
+                );
+                if first.is_ok() {
+                    return Ok(());
+                }
+                let resolved = state.resolve_select_values(&selector, values, request)?;
+                state
+                    .ensure_page(request)?
+                    .select_options_with_cancel(
+                        &selector,
+                        &resolved,
+                        Some(&request.cancellation.engine),
+                    )
+                    .map_err(|error| {
+                        state.operation_error(
+                            &format!("select option failed for {target}"),
+                            error,
+                            &request.cancellation,
+                            request.timeout_ms,
+                        )
+                    })?;
+                Ok(())
+            },
+            |state| state.snapshot(request),
+        )
+    }
+
+    fn fill_form(&mut self, fields: &[FillField], request: &ActorRequest) -> TextResult {
+        for field in fields {
+            if !self.current_refs.contains(&field.target) {
+                return Err(BrowserError::Message(format!(
+                    "Field {:?} failed: unknown or stale ref {}; call browser_snapshot and use its latest refs",
+                    field.name, field.target
+                )));
+            }
+            let selector = format!(r#"[data-mcp-ref="{}"]"#, field.target);
+            let remaining = Self::remaining(request)?;
+            let options = ActionOptions::timeout(Self::engine_timeout(remaining));
+            let result = match field.kind {
+                FillFieldKind::Textbox | FillFieldKind::Slider => self
+                    .ensure_page(request)?
+                    .fill_with_cancel(
+                        &selector,
+                        &field.value,
+                        options,
+                        Some(&request.cancellation.engine),
+                    )
+                    .map(|_| ()),
+                FillFieldKind::Checkbox => match field.value.as_str() {
+                    "true" => self.ensure_page(request)?.check_with_cancel(
+                        &selector,
+                        options,
+                        Some(&request.cancellation.engine),
+                    ),
+                    "false" => self.ensure_page(request)?.uncheck_with_cancel(
+                        &selector,
+                        options,
+                        Some(&request.cancellation.engine),
+                    ),
+                    _ => {
+                        return Err(BrowserError::Message(format!(
+                            "Field {:?} failed: checkbox value must be 'true' or 'false'",
+                            field.name
+                        )));
+                    }
+                },
+                FillFieldKind::Radio => {
+                    if field.value != "true" {
+                        let detail = if field.value == "false" {
+                            "unchecking a radio is not supported"
+                        } else {
+                            "radio value must be 'true'"
+                        };
+                        return Err(BrowserError::Message(format!(
+                            "Field {:?} failed: {detail}",
+                            field.name
+                        )));
+                    }
+                    self.ensure_page(request)?.check_with_cancel(
+                        &selector,
+                        options,
+                        Some(&request.cancellation.engine),
+                    )
+                }
+                FillFieldKind::Combobox => {
+                    let values = [field.value.clone()];
+                    let first = self.ensure_page(request)?.select_options_with_cancel(
+                        &selector,
+                        &values,
+                        Some(&request.cancellation.engine),
+                    );
+                    if first.is_ok() {
+                        Ok(())
+                    } else {
+                        let resolved = self.resolve_select_values(&selector, &values, request)?;
+                        self.ensure_page(request)?
+                            .select_options_with_cancel(
+                                &selector,
+                                &resolved,
+                                Some(&request.cancellation.engine),
+                            )
+                            .map(|_| ())
+                    }
+                }
+            };
+            result.map_err(|error| {
+                BrowserError::Message(format!("Field {:?} failed: {error}", field.name))
+            })?;
+        }
+        self.current_refs.clear();
+        self.snapshot(request)
+    }
+
+    fn hover(&mut self, target: &str, request: &ActorRequest) -> TextResult {
+        let selector = format!(r#"[data-mcp-ref="{target}"]"#);
+        self.dispatch_ref_action(
+            target,
+            |state| {
+                let remaining = Self::remaining(request)?;
+                state
+                    .ensure_page(request)?
+                    .hover_with_options_and_cancel(
+                        &selector,
+                        ActionOptions::timeout(Self::engine_timeout(remaining)),
+                        Some(&request.cancellation.engine),
+                    )
+                    .map_err(|error| {
+                        state.operation_error(
+                            &format!("hover failed for {target}"),
+                            error,
+                            &request.cancellation,
+                            request.timeout_ms,
+                        )
+                    })
+            },
+            |state| state.snapshot(request),
+        )
+    }
+
+    fn press_key(&mut self, key: &str, request: &ActorRequest) -> TextResult {
+        self.current_refs.clear();
+        self.ensure_page(request)?
+            .press_key(None, key)
+            .map_err(|error| {
+                self.operation_error(
+                    "key press failed",
+                    error,
+                    &request.cancellation,
+                    request.timeout_ms,
+                )
+            })?;
+        self.snapshot_with_cancel(request, None)
+    }
+
+    fn drop_data(
+        &mut self,
+        target: &str,
+        paths: &[String],
+        data: &[(String, String)],
+        request: &ActorRequest,
+    ) -> TextResult {
+        if !self.current_refs.contains(target) {
+            return Err(BrowserError::Message(format!(
+                "unknown or stale ref {target}; call browser_snapshot and use its latest refs"
+            )));
+        }
+        let files = read_drop_files(paths)?;
+        let selector = format!(r#"[data-mcp-ref="{target}"]"#);
+        let remaining = Self::remaining(request)?;
+        self.ensure_page(request)?
+            .evaluate_with_cancel(
+                SYNTHETIC_DROP_JS,
+                Some(&json!({
+                    "selector": selector,
+                    "files": files,
+                    "data": data,
+                })),
+                ActionOptions::timeout(Self::engine_timeout(remaining)),
+                Some(&request.cancellation.engine),
+            )
+            .map_err(|error| {
+                self.operation_error(
+                    &format!("drop failed for {target}"),
+                    error,
+                    &request.cancellation,
+                    request.timeout_ms,
+                )
+            })?;
+        self.current_refs.clear();
+        self.snapshot(request)
+    }
+
+    fn list_pages(&mut self, request: &ActorRequest) -> Result<Vec<Page>, BrowserError> {
+        let remaining = Self::remaining(request)?;
+        let discovered = self
+            .browser
+            .as_ref()
+            .ok_or_else(|| BrowserError::Message("browser is not initialized".to_owned()))?
+            .pages_with_cancel(
+                remaining.saturating_add(ENGINE_TIMEOUT_CUSHION),
+                Some(&request.cancellation.engine),
+            )
+            .map_err(|error| {
+                self.operation_error(
+                    "tab listing failed",
+                    error,
+                    &request.cancellation,
+                    request.timeout_ms,
+                )
+            })?;
+        let browser_targets = discovered
+            .iter()
+            .map(Page::target_id)
+            .collect::<HashSet<_>>();
+        self.closing_targets
+            .retain(|target_id| browser_targets.contains(target_id));
+        let discovered = discovered
+            .into_iter()
+            .filter(|page| !self.closing_targets.contains(&page.target_id()))
+            .collect::<Vec<_>>();
+        let discovered_targets = discovered
+            .iter()
+            .map(Page::target_id)
+            .collect::<HashSet<_>>();
+        self.tab_order
+            .retain(|target_id| discovered_targets.contains(target_id));
+        self.pages
+            .retain(|target_id, _| discovered_targets.contains(target_id));
+        for page in &discovered {
+            self.register_page(page);
+        }
+        let mut by_target = discovered
+            .into_iter()
+            .map(|page| (page.target_id(), page))
+            .collect::<HashMap<_, _>>();
+        Ok(self
+            .tab_order
+            .iter()
+            .filter_map(|target_id| by_target.remove(target_id))
+            .collect())
+    }
+
+    fn render_tabs(&mut self, pages: &[Page], request: &ActorRequest) -> String {
+        self.poll_events();
+        let active_target = self.page.as_ref().map(Page::target_id);
+        let mut lines = Vec::new();
+        for (index, page) in pages.iter().enumerate() {
+            let target_id = page.target_id();
+            let pending = self
+                .pages
+                .get(&target_id)
+                .is_some_and(|runtime| runtime.pending_dialog.is_some());
+            let cached = self
+                .pages
+                .get(&target_id)
+                .and_then(|runtime| runtime.title.clone());
+            let title = if pending {
+                cached.unwrap_or_else(|| "(dialog pending)".to_owned())
+            } else {
+                let remaining = Self::remaining(request).ok();
+                let title = remaining
+                    .and_then(|remaining| {
+                        page.title(ActionOptions::timeout(Self::engine_timeout(remaining)))
+                            .ok()
+                    })
+                    .or(cached)
+                    .unwrap_or_else(|| "(unavailable)".to_owned());
+                if let Some(runtime) = self.pages.get_mut(&target_id) {
+                    runtime.title = Some(title.clone());
+                }
+                title
+            };
+            let marker = (Some(target_id) == active_target)
+                .then_some(" (active)")
+                .unwrap_or("");
+            lines.push(format!("- {index}: {title} — {}{marker}", page.url()));
+        }
+        format!("### Tabs\n{}", lines.join("\n"))
+    }
+
+    fn tabs(
+        &mut self,
+        action: TabAction,
+        index: Option<usize>,
+        url: Option<&str>,
+        request: &ActorRequest,
+    ) -> TextResult {
+        self.ensure_page(request)?;
+        let mut pages = self.list_pages(request)?;
+        let mut snapshot = None;
+        match action {
+            TabAction::List => {}
+            TabAction::New => {
+                let page = self
+                    .browser
+                    .as_ref()
+                    .expect("browser initialized")
+                    .new_page_with_cancel(Some(&request.cancellation.engine))
+                    .map_err(|error| {
+                        self.operation_error(
+                            "new tab failed",
+                            error,
+                            &request.cancellation,
+                            request.timeout_ms,
+                        )
+                    })?;
+                self.register_page(&page);
+                self.page = Some(page.clone());
+                if let Some(url) = url {
+                    let remaining = Self::remaining(request)?;
+                    page.goto_with_cancel(
+                        url,
+                        GotoOptions::default()
+                            .wait_until("load")
+                            .timeout(Self::engine_timeout(remaining)),
+                        Some(&request.cancellation.engine),
+                    )
+                    .map_err(|error| {
+                        self.operation_error(
+                            "new tab navigation failed",
+                            error,
+                            &request.cancellation,
+                            request.timeout_ms,
+                        )
+                    })?;
+                }
+                self.current_refs.clear();
+                snapshot = Some(self.snapshot(request)?);
+                pages = self.list_pages(request)?;
+            }
+            TabAction::Select => {
+                let index = index.ok_or_else(|| {
+                    BrowserError::Message("index is required for tab select".to_owned())
+                })?;
+                let page = pages.get(index).cloned().ok_or_else(|| {
+                    BrowserError::Message(format!(
+                        "Invalid tab index {index}; expected 0 through {}",
+                        pages.len().saturating_sub(1)
+                    ))
+                })?;
+                self.page = Some(page);
+                self.current_refs.clear();
+                snapshot = Some(self.snapshot(request)?);
+            }
+            TabAction::Close => {
+                let active_target = self
+                    .page
+                    .as_ref()
+                    .map(Page::target_id)
+                    .ok_or_else(|| BrowserError::Message("no active tab".to_owned()))?;
+                let closing_index = index.unwrap_or_else(|| {
+                    pages
+                        .iter()
+                        .position(|page| page.target_id() == active_target)
+                        .unwrap_or(0)
+                });
+                let closing = pages.get(closing_index).cloned().ok_or_else(|| {
+                    BrowserError::Message(format!(
+                        "Invalid tab index {closing_index}; expected 0 through {}",
+                        pages.len().saturating_sub(1)
+                    ))
+                })?;
+                let target_id = closing.target_id();
+                self.poll_events();
+                if self
+                    .pages
+                    .get(&target_id)
+                    .is_some_and(|runtime| runtime.pending_dialog.is_some())
+                {
+                    return Err(BrowserError::Message(format!(
+                        "Tab {closing_index} has a pending modal; handle it before closing."
+                    )));
+                }
+                closing.close(CloseOptions::default()).map_err(|error| {
+                    self.operation_error(
+                        "tab close failed",
+                        error,
+                        &request.cancellation,
+                        request.timeout_ms,
+                    )
+                })?;
+                self.closing_targets.insert(target_id.clone());
+                self.pages.remove(&target_id);
+                self.tab_order.retain(|registered| registered != &target_id);
+                pages = self.list_pages(request)?;
+                if pages.is_empty() {
+                    let page = self
+                        .browser
+                        .as_ref()
+                        .expect("browser initialized")
+                        .new_page_with_cancel(Some(&request.cancellation.engine))
+                        .map_err(|error| {
+                            self.operation_error(
+                                "replacement tab failed",
+                                error,
+                                &request.cancellation,
+                                request.timeout_ms,
+                            )
+                        })?;
+                    self.register_page(&page);
+                    pages.push(page);
+                }
+                if target_id == active_target {
+                    self.page = Some(pages[closing_index.min(pages.len() - 1)].clone());
+                }
+                self.current_refs.clear();
+                snapshot = Some(self.snapshot(request)?);
+            }
+        }
+        let tabs = self.render_tabs(&pages, request);
+        Ok(snapshot.map_or(tabs.clone(), |snapshot| {
+            format!("{tabs}\n\n### Snapshot\n{snapshot}")
+        }))
+    }
+
+    fn handle_dialog(
+        &mut self,
+        accept: bool,
+        prompt_text: Option<&str>,
+        request: &ActorRequest,
+    ) -> TextResult {
+        self.poll_events();
+        let active_target = self.page.as_ref().map(Page::target_id);
+        let pending_target = active_target
+            .filter(|target_id| {
+                self.pages
+                    .get(target_id)
+                    .is_some_and(|runtime| runtime.pending_dialog.is_some())
+            })
+            .or_else(|| {
+                self.tab_order.iter().find_map(|target_id| {
+                    self.pages
+                        .get(target_id)
+                        .is_some_and(|runtime| runtime.pending_dialog.is_some())
+                        .then_some(target_id.clone())
+                })
+            })
+            .ok_or_else(|| BrowserError::Message("no dialog is pending".to_owned()))?;
+        if !accept && prompt_text.is_some() {
+            return Err(BrowserError::Message(
+                "promptText cannot be honored when dismissing a dialog".to_owned(),
+            ));
+        }
+        let pending = self
+            .pages
+            .get_mut(&pending_target)
+            .and_then(|runtime| runtime.pending_dialog.take())
+            .expect("pending dialog disappeared");
+        let result = if accept {
+            pending.dialog.accept(prompt_text)
+        } else {
+            pending.dialog.dismiss()
+        };
+        result.map_err(|error| {
+            self.operation_error(
+                "dialog handling failed",
+                error,
+                &request.cancellation,
+                request.timeout_ms,
+            )
+        })?;
+        let action = if accept { "Accepted" } else { "Dismissed" };
+        Ok(format!("{action} the pending dialog."))
+    }
+
+    fn wait_for(
+        &mut self,
+        time_seconds: Option<f64>,
+        text: Option<&str>,
+        text_gone: Option<&str>,
+        timeout_ms: f64,
+        request: &ActorRequest,
+    ) -> TextResult {
+        let remaining = Self::remaining(request)?;
+        self.ensure_page(request)?
+            .evaluate_with_cancel(
+                WAIT_FOR_JS,
+                Some(&json!({
+                    "delayMs": time_seconds.unwrap_or_default().min(30.0) * 1000.0,
+                    "text": text,
+                    "textGone": text_gone,
+                    "timeoutMs": timeout_ms,
+                })),
+                ActionOptions::timeout(Self::engine_timeout(remaining)),
+                Some(&request.cancellation.engine),
+            )
+            .map_err(|error| {
+                self.operation_error(
+                    "wait failed",
+                    error,
+                    &request.cancellation,
+                    request.timeout_ms,
+                )
+            })?;
+        self.current_refs.clear();
+        self.snapshot(request)
+    }
+
+    fn get_text(&mut self, selector: &str, max_chars: usize, request: &ActorRequest) -> TextResult {
+        let text = self
+            .ensure_page(request)?
+            .inner_text(selector)
+            .map_err(|error| {
+                self.operation_error(
+                    "get text failed",
+                    error,
+                    &request.cancellation,
+                    request.timeout_ms,
+                )
+            })?
+            .unwrap_or_default();
+        Ok(text.chars().take(max_chars).collect())
+    }
+
+    fn evaluate(
+        &mut self,
+        function: &str,
+        target: Option<&str>,
+        request: &ActorRequest,
+    ) -> TextResult {
+        let remaining = Self::remaining(request)?;
+        let value = if let Some(target) = target {
+            if !self.current_refs.contains(target) {
+                return Err(BrowserError::Message(format!(
+                    "unknown or stale ref {target}; call browser_snapshot and use its latest refs"
+                )));
+            }
+            let selector = format!(r#"[data-mcp-ref="{target}"]"#);
+            self.ensure_page(request)?.evaluate_with_cancel(
+                ELEMENT_EVALUATE_JS,
+                Some(&json!({"selector": selector, "function": function})),
+                ActionOptions::timeout(Self::engine_timeout(remaining)),
+                Some(&request.cancellation.engine),
+            )
+        } else {
+            self.ensure_page(request)?.evaluate_with_cancel(
+                function,
+                None,
+                ActionOptions::timeout(Self::engine_timeout(remaining)),
+                Some(&request.cancellation.engine),
+            )
+        };
+        let value = value.map_err(|error| {
+            self.operation_error(
+                "evaluation failed",
+                error,
+                &request.cancellation,
+                request.timeout_ms,
+            )
+        })?;
+        let serialized = serde_json::to_string(&value).map_err(|error| {
+            BrowserError::Message(format!("evaluation serialization failed: {error}"))
+        })?;
+        self.current_refs.clear();
+        let snapshot = self.snapshot(request)?;
+        Ok(format!("{serialized}\n\n### Snapshot\n{snapshot}"))
+    }
+
+    fn take_screenshot(
+        &mut self,
+        full_page: bool,
+        image_type: ScreenshotType,
+        request: &ActorRequest,
+    ) -> Result<BrowserOutput, BrowserError> {
         let remaining = Self::remaining(request)?;
         let result = self.ensure_page(request)?.screenshot_with_cancel(
             ScreenshotOptions {
                 timeout: Some(Self::engine_timeout(remaining)),
-                image_type: Some("png".to_owned()),
+                full_page: Some(full_page),
+                image_type: Some(image_type.engine_name().to_owned()),
                 ..ScreenshotOptions::default()
             },
             Some(&request.cancellation.engine),
         );
-        result.map_err(|error| {
+        let bytes = result.map_err(|error| {
             self.operation_error(
                 "screenshot failed",
                 error,
                 &request.cancellation,
                 request.timeout_ms,
             )
+        })?;
+        Ok(BrowserOutput::Image {
+            bytes,
+            mime: image_type.mime(),
+            extension: image_type.engine_name(),
         })
     }
 
     fn run(&mut self, request: &ActorRequest) -> BrowserResult {
+        if !matches!(
+            request.op,
+            BrowserOp::HandleDialog { .. } | BrowserOp::Tabs { .. } | BrowserOp::Close
+        ) && self.has_pending_dialog()
+        {
+            return Ok(BrowserOutput::Text(self.modal_response(
+                &format!(
+                    "{} deferred until the pending modal is handled.",
+                    browser_op_name(&request.op)
+                ),
+                request,
+            )));
+        }
         match &request.op {
             BrowserOp::Navigate(url) => self.navigate(url, request).map(BrowserOutput::Text),
             BrowserOp::NavigateBack => self.navigate_back(request).map(BrowserOutput::Text),
             BrowserOp::NavigateForward => self.navigate_forward(request).map(BrowserOutput::Text),
-            BrowserOp::Snapshot => self.snapshot(request).map(BrowserOutput::Text),
-            BrowserOp::Click(target) => self.click(target, request).map(BrowserOutput::Text),
+            BrowserOp::Reload => self.reload(request).map(BrowserOutput::Text),
+            BrowserOp::Resize { width, height } => self
+                .resize(*width, *height, request)
+                .map(BrowserOutput::Text),
+            BrowserOp::Snapshot {
+                target,
+                depth,
+                boxes,
+            } => self
+                .targeted_snapshot(target.as_deref(), *depth, *boxes, request)
+                .map(BrowserOutput::Text),
+            BrowserOp::Find { text, regex } => self
+                .find(text.as_deref(), regex.as_ref(), request)
+                .map(BrowserOutput::Text),
+            BrowserOp::Click {
+                target,
+                double_click,
+            } => self
+                .click(target, *double_click, request)
+                .map(BrowserOutput::Text),
             BrowserOp::ScrollTarget(target) => {
                 self.scroll_target(target, request).map(BrowserOutput::Text)
             }
             BrowserOp::ScrollViewport(delta_y) => self
                 .scroll_viewport(*delta_y, request)
                 .map(BrowserOutput::Text),
-            BrowserOp::TakeScreenshot => self.take_screenshot(request).map(BrowserOutput::Png),
+            BrowserOp::Type {
+                target,
+                text,
+                submit,
+                slowly,
+                clear,
+            } => self
+                .type_text(target, text, *submit, *slowly, *clear, request)
+                .map(BrowserOutput::Text),
+            BrowserOp::SelectOption { target, values } => self
+                .select_option(target, values, request)
+                .map(BrowserOutput::Text),
+            BrowserOp::FillForm(fields) => self.fill_form(fields, request).map(BrowserOutput::Text),
+            BrowserOp::Hover(target) => self.hover(target, request).map(BrowserOutput::Text),
+            BrowserOp::PressKey(key) => self.press_key(key, request).map(BrowserOutput::Text),
+            BrowserOp::Drop {
+                target,
+                paths,
+                data,
+            } => self
+                .drop_data(target, paths, data, request)
+                .map(BrowserOutput::Text),
+            BrowserOp::Tabs { action, index, url } => self
+                .tabs(*action, *index, url.as_deref(), request)
+                .map(BrowserOutput::Text),
+            BrowserOp::HandleDialog {
+                accept,
+                prompt_text,
+            } => self
+                .handle_dialog(*accept, prompt_text.as_deref(), request)
+                .map(BrowserOutput::Text),
+            BrowserOp::WaitFor {
+                time_seconds,
+                text,
+                text_gone,
+                timeout_ms,
+            } => self
+                .wait_for(
+                    *time_seconds,
+                    text.as_deref(),
+                    text_gone.as_deref(),
+                    *timeout_ms,
+                    request,
+                )
+                .map(BrowserOutput::Text),
+            BrowserOp::GetText {
+                selector,
+                max_chars,
+            } => self
+                .get_text(selector, *max_chars, request)
+                .map(BrowserOutput::Text),
+            BrowserOp::Evaluate { function, target } => self
+                .evaluate(function, target.as_deref(), request)
+                .map(BrowserOutput::Text),
+            BrowserOp::TakeScreenshot {
+                full_page,
+                image_type,
+            } => self.take_screenshot(*full_page, *image_type, request),
+            BrowserOp::Close => {
+                let had_browser = self.browser.is_some();
+                self.close();
+                Ok(BrowserOutput::Text(if had_browser {
+                    "Browser closed.".to_owned()
+                } else {
+                    "No browser session was open.".to_owned()
+                }))
+            }
         }
     }
 
     fn close(&mut self) {
+        self.current_refs.clear();
+        self.pages.clear();
+        self.tab_order.clear();
+        self.closing_targets.clear();
         if let Some(page) = self.page.take()
             && !self.remote
             && let Err(error) = page.close(Default::default())
@@ -901,6 +2203,195 @@ impl BrowserState {
         {
             eprintln!("browser actor: browser close failed: {error}");
         }
+    }
+}
+
+fn browser_op_name(op: &BrowserOp) -> &'static str {
+    match op {
+        BrowserOp::Navigate(_) => "browser_navigate",
+        BrowserOp::NavigateBack => "browser_navigate_back",
+        BrowserOp::NavigateForward => "browser_navigate_forward",
+        BrowserOp::Reload => "browser_reload",
+        BrowserOp::Resize { .. } => "browser_resize",
+        BrowserOp::Snapshot { .. } => "browser_snapshot",
+        BrowserOp::Find { .. } => "browser_find",
+        BrowserOp::Click { .. } => "browser_click",
+        BrowserOp::ScrollTarget(_) | BrowserOp::ScrollViewport(_) => "browser_scroll",
+        BrowserOp::Type { .. } => "browser_type",
+        BrowserOp::SelectOption { .. } => "browser_select_option",
+        BrowserOp::FillForm(_) => "browser_fill_form",
+        BrowserOp::Hover(_) => "browser_hover",
+        BrowserOp::PressKey(_) => "browser_press_key",
+        BrowserOp::Drop { .. } => "browser_drop",
+        BrowserOp::Tabs { .. } => "browser_tabs",
+        BrowserOp::HandleDialog { .. } => "browser_handle_dialog",
+        BrowserOp::WaitFor { .. } => "browser_wait_for",
+        BrowserOp::GetText { .. } => "browser_get_text",
+        BrowserOp::Evaluate { .. } => "browser_evaluate",
+        BrowserOp::TakeScreenshot { .. } => "browser_take_screenshot",
+        BrowserOp::Close => "browser_close",
+    }
+}
+
+fn render_find_matches(lines: &[String], matching_indices: &[usize]) -> String {
+    const LIMIT: usize = 20;
+    if matching_indices.is_empty() {
+        return "No matches in the current snapshot outline.".to_owned();
+    }
+    let mut rendered = Vec::new();
+    for (match_number, &index) in matching_indices.iter().take(LIMIT).enumerate() {
+        let indent = outline_indent(&lines[index]);
+        let mut ancestors = Vec::new();
+        let mut wanted_indent = indent.checked_sub(2);
+        for candidate in (0..index).rev() {
+            let candidate_indent = outline_indent(&lines[candidate]);
+            if Some(candidate_indent) == wanted_indent {
+                ancestors.push(lines[candidate].trim().to_owned());
+                wanted_indent = candidate_indent.checked_sub(2);
+                if wanted_indent.is_none() {
+                    break;
+                }
+            }
+        }
+        ancestors.reverse();
+        let path = if ancestors.is_empty() {
+            "(root)".to_owned()
+        } else {
+            ancestors.join(" > ")
+        };
+        let mut context = vec![index];
+        for direction in [-1_isize, 1] {
+            let mut candidate = index as isize + direction;
+            while candidate >= 0 && (candidate as usize) < lines.len() {
+                let candidate_index = candidate as usize;
+                let candidate_indent = outline_indent(&lines[candidate_index]);
+                if candidate_indent < indent {
+                    break;
+                }
+                if candidate_indent == indent {
+                    context.push(candidate_index);
+                    break;
+                }
+                candidate += direction;
+            }
+        }
+        context.sort_unstable();
+        context.dedup();
+        let snippets = context
+            .into_iter()
+            .map(|candidate| {
+                let prefix = if candidate == index { "> " } else { "  " };
+                format!("{prefix}{}", lines[candidate])
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        rendered.push(format!(
+            "Match {}\nPath: {path}\n{snippets}",
+            match_number + 1
+        ));
+    }
+    let truncated = matching_indices.len().saturating_sub(LIMIT);
+    let mut result = rendered.join("\n\n");
+    if truncated > 0 {
+        result.push_str(&format!("\n\n… {truncated} additional matches truncated."));
+    }
+    result
+}
+
+fn outline_indent(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+fn read_drop_files(paths: &[String]) -> Result<Vec<Value>, BrowserError> {
+    const MAX_FILES: usize = 50;
+    const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
+    if paths.len() > MAX_FILES {
+        return Err(BrowserError::Message(format!(
+            "drop paths are limited to {MAX_FILES} files"
+        )));
+    }
+    let workspace = env::var_os("RUSTWRIGHT_MCP_WORKSPACE")
+        .ok_or_else(|| {
+            BrowserError::Message(
+                "RUSTWRIGHT_MCP_WORKSPACE must be set for file-backed drops".to_owned(),
+            )
+        })
+        .map(PathBuf::from);
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workspace = workspace?;
+    if !workspace.is_absolute() {
+        return Err(BrowserError::Message(
+            "RUSTWRIGHT_MCP_WORKSPACE must be an absolute path".to_owned(),
+        ));
+    }
+    let workspace = workspace.canonicalize().map_err(|error| {
+        BrowserError::Message(format!("RUSTWRIGHT_MCP_WORKSPACE is unavailable: {error}"))
+    })?;
+    let mut files = Vec::with_capacity(paths.len());
+    for requested in paths {
+        let path = Path::new(requested);
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workspace.join(path)
+        };
+        let resolved = candidate.canonicalize().map_err(|error| {
+            BrowserError::Message(format!("drop input is unavailable: {requested}: {error}"))
+        })?;
+        if !resolved.starts_with(&workspace) {
+            return Err(BrowserError::Message(format!(
+                "drop inputs are confined to RUSTWRIGHT_MCP_WORKSPACE ({}); got {requested}",
+                workspace.display()
+            )));
+        }
+        let metadata = resolved.metadata().map_err(|error| {
+            BrowserError::Message(format!("drop input metadata failed: {requested}: {error}"))
+        })?;
+        if !metadata.is_file() {
+            return Err(BrowserError::Message(format!(
+                "drop input is not a regular file: {requested}"
+            )));
+        }
+        if metadata.len() > MAX_FILE_BYTES {
+            return Err(BrowserError::Message(format!(
+                "drop input exceeds the {MAX_FILE_BYTES}-byte per-file cap: {requested}"
+            )));
+        }
+        let bytes = fs::read(&resolved).map_err(|error| {
+            BrowserError::Message(format!("drop input read failed: {requested}: {error}"))
+        })?;
+        let name = resolved
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("upload.bin");
+        files.push(json!({
+            "name": name,
+            "mime": mime_for_path(&resolved),
+            "base64": STANDARD.encode(bytes),
+        }));
+    }
+    Ok(files)
+}
+
+fn mime_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "txt" => "text/plain",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
     }
 }
 
@@ -1503,8 +2994,8 @@ mod tests {
     fn output_text(output: &BrowserOutput) -> &str {
         match output {
             BrowserOutput::Text(text) => text,
-            BrowserOutput::Png(bytes) => {
-                panic!("expected a text output, got {} PNG bytes", bytes.len())
+            BrowserOutput::Image { bytes, mime, .. } => {
+                panic!("expected a text output, got {} {mime} bytes", bytes.len())
             }
         }
     }
@@ -1545,7 +3036,15 @@ mod tests {
         }
         let actor = Arc::new(BrowserActor::spawn());
         actor
-            .execute_with_timeout(request_id(0), BrowserOp::Snapshot, Duration::from_secs(30))
+            .execute_with_timeout(
+                request_id(0),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(30),
+            )
             .await
             .expect("warm browser actor");
         Some(actor)
@@ -1692,7 +3191,15 @@ mod tests {
         let snapshot_actor = Arc::clone(&actor);
         let snapshot = tokio::spawn(async move {
             snapshot_actor
-                .execute_with_timeout(request_id(2), BrowserOp::Snapshot, Duration::from_secs(30))
+                .execute_with_timeout(
+                    request_id(2),
+                    BrowserOp::Snapshot {
+                        target: None,
+                        depth: None,
+                        boxes: false,
+                    },
+                    Duration::from_secs(30),
+                )
                 .await
         });
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -1741,7 +3248,15 @@ mod tests {
             "cancel latency was {latency:?}"
         );
         actor
-            .execute_with_timeout(request_id(11), BrowserOp::Snapshot, Duration::from_secs(5))
+            .execute_with_timeout(
+                request_id(11),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
             .await
             .expect("snapshot should succeed after cancellation");
     }
@@ -1764,7 +3279,15 @@ mod tests {
         assert_eq!(result, Err(BrowserError::Timeout(100)));
         assert!(started.elapsed() < Duration::from_secs(1));
         actor
-            .execute_with_timeout(request_id(21), BrowserOp::Snapshot, Duration::from_secs(5))
+            .execute_with_timeout(
+                request_id(21),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
             .await
             .expect("snapshot should succeed after deadline");
     }
@@ -1804,7 +3327,15 @@ mod tests {
         ));
         let started = Instant::now();
         let result = actor
-            .execute_with_timeout(request_id(22), BrowserOp::Snapshot, Duration::from_secs(1))
+            .execute_with_timeout(
+                request_id(22),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(1),
+            )
             .await;
         assert_eq!(result, Err(BrowserError::Timeout(1_000)));
         assert!(
@@ -1817,7 +3348,15 @@ mod tests {
         );
 
         actor
-            .execute_with_timeout(request_id(23), BrowserOp::Snapshot, Duration::from_secs(10))
+            .execute_with_timeout(
+                request_id(23),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(10),
+            )
             .await
             .expect("actor should recover after a remote page-listing deadline");
 
@@ -1842,13 +3381,25 @@ mod tests {
         let result = actor
             .execute_with_timeout(
                 request_id(25),
-                BrowserOp::Snapshot,
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
                 Duration::from_millis(100),
             )
             .await;
         assert_eq!(result, Err(BrowserError::Timeout(100)));
         actor
-            .execute_with_timeout(request_id(26), BrowserOp::Snapshot, Duration::from_secs(30))
+            .execute_with_timeout(
+                request_id(26),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(30),
+            )
             .await
             .expect("actor should recover after a cold-start deadline");
     }
@@ -1879,7 +3430,11 @@ mod tests {
                 queued_actor
                     .execute_with_timeout(
                         request_id(100 + offset),
-                        BrowserOp::Snapshot,
+                        BrowserOp::Snapshot {
+                            target: None,
+                            depth: None,
+                            boxes: false,
+                        },
                         Duration::from_secs(30),
                     )
                     .await
@@ -1898,7 +3453,11 @@ mod tests {
             actor
                 .execute_with_timeout(
                     request_id(999),
-                    BrowserOp::Snapshot,
+                    BrowserOp::Snapshot {
+                        target: None,
+                        depth: None,
+                        boxes: false
+                    },
                     Duration::from_secs(30),
                 )
                 .await,
@@ -1923,12 +3482,28 @@ mod tests {
             return;
         };
         actor
-            .execute_with_timeout(request_id(40), BrowserOp::Snapshot, Duration::from_secs(5))
+            .execute_with_timeout(
+                request_id(40),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
             .await
             .expect("completed snapshot");
         assert!(!actor.cancel(&request_id(40)));
         actor
-            .execute_with_timeout(request_id(41), BrowserOp::Snapshot, Duration::from_secs(5))
+            .execute_with_timeout(
+                request_id(41),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
             .await
             .expect("actor should remain healthy");
     }
@@ -1946,7 +3521,11 @@ mod tests {
             actor
                 .execute_with_timeout(
                     request_id(2_000 + cycle),
-                    BrowserOp::Snapshot,
+                    BrowserOp::Snapshot {
+                        target: None,
+                        depth: None,
+                        boxes: false,
+                    },
                     Duration::from_secs(5),
                 )
                 .await
@@ -1993,7 +3572,11 @@ mod tests {
             actor
                 .execute_with_timeout(
                     request_id(20_000 + cycle),
-                    BrowserOp::Snapshot,
+                    BrowserOp::Snapshot {
+                        target: None,
+                        depth: None,
+                        boxes: false,
+                    },
                     Duration::from_secs(5),
                 )
                 .await
@@ -2047,7 +3630,11 @@ mod tests {
             shared
                 .submit(ActorRequest {
                     request_id: id.clone(),
-                    op: BrowserOp::Snapshot,
+                    op: BrowserOp::Snapshot {
+                        target: None,
+                        depth: None,
+                        boxes: false,
+                    },
                     cancellation,
                     deadline: Instant::now() + Duration::from_secs(1),
                     timeout_ms: 1_000,
@@ -2120,7 +3707,11 @@ mod tests {
                     queued_actor
                         .execute_with_timeout(
                             request_id(40_100 + offset as i64),
-                            BrowserOp::Snapshot,
+                            BrowserOp::Snapshot {
+                                target: None,
+                                depth: None,
+                                boxes: false,
+                            },
                             Duration::from_millis(timeout_ms),
                         )
                         .await
@@ -2140,7 +3731,11 @@ mod tests {
         actor
             .execute_with_timeout(
                 request_id(40_200),
-                BrowserOp::Snapshot,
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
                 Duration::from_secs(5),
             )
             .await
@@ -2174,7 +3769,11 @@ mod tests {
                 queued_actor
                     .execute_with_timeout(
                         request_id(50_100 + offset),
-                        BrowserOp::Snapshot,
+                        BrowserOp::Snapshot {
+                            target: None,
+                            depth: None,
+                            boxes: false,
+                        },
                         Duration::from_secs(30),
                     )
                     .await
@@ -2192,7 +3791,11 @@ mod tests {
             actor
                 .execute_with_timeout(
                     request_id(50_999),
-                    BrowserOp::Snapshot,
+                    BrowserOp::Snapshot {
+                        target: None,
+                        depth: None,
+                        boxes: false
+                    },
                     Duration::from_secs(30),
                 )
                 .await,
@@ -2218,7 +3821,11 @@ mod tests {
         actor
             .execute_with_timeout(
                 request_id(51_000),
-                BrowserOp::Snapshot,
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
                 Duration::from_secs(5),
             )
             .await
@@ -2783,7 +4390,10 @@ mod tests {
             click_actor
                 .execute_with_timeout(
                     click_request_id,
-                    BrowserOp::Click("e1".to_owned()),
+                    BrowserOp::Click {
+                        target: "e1".to_owned(),
+                        double_click: false,
+                    },
                     Duration::from_secs(5),
                 )
                 .await

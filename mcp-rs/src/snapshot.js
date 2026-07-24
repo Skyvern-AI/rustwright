@@ -1,8 +1,16 @@
-(startRef) => {
+(options) => {
   const MAX_NAME = 120;
   const MAX_LINES = 1200;
+  const {
+    startRef,
+    target = null,
+    maxDepth = null,
+    boxes = false,
+  } = options;
+  const root = target === null ? document.body : document.querySelector(target);
   let refCounter = startRef;
   const lines = [];
+  const refs = [];
 
   for (const el of document.querySelectorAll('[data-mcp-ref]')) {
     el.removeAttribute('data-mcp-ref');
@@ -68,24 +76,34 @@
       'slider', 'option', 'tab', 'menuitem', 'switch'].includes(role)
     || el.hasAttribute('onclick') || el.tabIndex >= 0;
 
-  const walk = (el, depth) => {
+  const enclosingBox = (rect) => {
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const left = Math.floor(rect.left);
+    const top = Math.floor(rect.top);
+    const right = Math.ceil(rect.right);
+    const bottom = Math.ceil(rect.bottom);
+    return [left, top, right - left, bottom - top];
+  };
+
+  const walk = (el, treeDepth) => {
     if (lines.length >= MAX_LINES) return;
+    if (maxDepth !== null && treeDepth > maxDepth) return;
     const tag = String(el.tagName || '').toUpperCase();
     if (SKIP_TAGS.has(tag) || el.namespaceURI === 'http://www.w3.org/2000/svg') return;
     if (!isVisible(el)) return;
     if (tag === 'IFRAME' || tag === 'FRAME') {
       const label = el.getAttribute('title') || el.getAttribute('name')
         || el.getAttribute('src') || '';
-      lines.push(`${'  '.repeat(depth)}- iframe "${label.slice(0, MAX_NAME)}" (content not captured)`);
+      lines.push(`${'  '.repeat(treeDepth)}- iframe "${label.slice(0, MAX_NAME)}" (content not captured)`);
       return;
     }
 
     const role = roleOf(el);
-    let emittedDepth = depth;
+    let childDepth = treeDepth;
     if (role) {
       let name = nameOf(el);
       if (name.length > MAX_NAME) name = `${name.slice(0, MAX_NAME)}…`;
-      const parts = [`${'  '.repeat(depth)}- ${role}`];
+      const parts = [`${'  '.repeat(treeDepth)}- ${role}`];
       if (name) parts.push(`"${name}"`);
       if (/^H[1-6]$/.test(el.tagName)) parts.push(`[level=${el.tagName[1]}]`);
       if (el.tagName === 'A' && el.href) parts.push(`[href=${el.getAttribute('href')}]`);
@@ -102,26 +120,37 @@
         const ref = `e${refCounter}`;
         refCounter += 1;
         el.setAttribute('data-mcp-ref', ref);
+        refs.push(ref);
         parts.push(`[ref=${ref}]`);
       }
+      if (boxes) {
+        const box = enclosingBox(el.getBoundingClientRect());
+        if (box) parts.push(`[box=${box.join(',')}]`);
+      }
       lines.push(parts.join(' '));
-      emittedDepth = depth + 1;
+      childDepth = treeDepth + 1;
       const hasElementChildren = el.children.length > 0;
       if (!hasElementChildren || ['link', 'button', 'heading', 'option', 'label'].includes(role)) {
         return;
       }
     } else if (el.children.length === 0) {
       const text = (el.textContent || '').trim().replace(/\s+/g, ' ');
-      if (text) lines.push(`${'  '.repeat(depth)}- text: ${text.slice(0, MAX_NAME)}`);
+      if (text) lines.push(`${'  '.repeat(treeDepth)}- text: ${text.slice(0, MAX_NAME)}`);
       return;
     }
-    for (const child of el.children) walk(child, emittedDepth);
+    for (const child of el.children) walk(child, childDepth);
   };
 
-  if (!document.body) {
-    return { outline: '- (page has no body yet)', nextRef: refCounter };
+  if (!root) {
+    return {
+      outline: target === null
+        ? '- (page has no body yet)'
+        : '- (snapshot target is no longer available)',
+      nextRef: refCounter,
+      refs,
+    };
   }
-  walk(document.body, 0);
+  walk(root, 0);
   if (lines.length >= MAX_LINES) lines.push('- … (snapshot truncated)');
-  return { outline: lines.join('\n'), nextRef: refCounter };
+  return { outline: lines.join('\n'), nextRef: refCounter, refs };
 }

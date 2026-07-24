@@ -20,7 +20,7 @@ use rmcp::{
 
 use crate::{
     actor::{BrowserActor, BrowserError, BrowserOutput},
-    tools::{TOOL_SPECS, descriptor, find_tool, parse_op},
+    tools::{descriptor, enabled_tool_specs, find_tool, parse_op, validate_tool_configuration},
 };
 
 const DEFAULT_SCREENSHOT_MAX_BYTES: usize = 5 * 1024 * 1024;
@@ -36,6 +36,8 @@ pub(crate) struct BrowserServer {
 
 impl BrowserServer {
     pub(crate) fn new() -> io::Result<Self> {
+        validate_tool_configuration()
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
         let screenshot_temp_dir = ScreenshotTempDir::new()?;
         Ok(Self {
             actor: Arc::new(BrowserActor::spawn()),
@@ -103,13 +105,17 @@ fn screenshot_max_bytes_from_env() -> usize {
         .clamp(1, MAX_SCREENSHOT_MAX_BYTES)
 }
 
-fn write_temp_png(temp_dir: &Path, bytes: &[u8]) -> Result<PathBuf, BrowserError> {
+fn write_temp_image(
+    temp_dir: &Path,
+    bytes: &[u8],
+    extension: &str,
+) -> Result<PathBuf, BrowserError> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
     for _ in 0..100 {
         let sequence = NEXT_SCREENSHOT_FILE.fetch_add(1, Ordering::Relaxed);
-        let path = temp_dir.join(format!("screenshot-{sequence}.png"));
+        let path = temp_dir.join(format!("screenshot-{sequence}.{extension}"));
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -145,14 +151,18 @@ fn output_content(
 ) -> Result<ContentBlock, BrowserError> {
     match output {
         BrowserOutput::Text(text) => Ok(ContentBlock::text(text)),
-        BrowserOutput::Png(bytes) => {
+        BrowserOutput::Image {
+            bytes,
+            mime,
+            extension,
+        } => {
             let payload_bytes = encoded_len(bytes.len(), true).unwrap_or(usize::MAX);
             if payload_bytes <= screenshot_max_bytes {
-                return Ok(ContentBlock::image(STANDARD.encode(bytes), "image/png"));
+                return Ok(ContentBlock::image(STANDARD.encode(bytes), mime));
             }
-            let path = write_temp_png(screenshot_temp_dir, &bytes)?;
+            let path = write_temp_image(screenshot_temp_dir, &bytes, extension)?;
             Ok(ContentBlock::text(format!(
-                "Screenshot exceeded the inline size cap ({payload_bytes} > {screenshot_max_bytes} bytes); PNG saved to `{}`.",
+                "Screenshot exceeded the inline size cap ({payload_bytes} > {screenshot_max_bytes} bytes); image saved to `{}`.",
                 path.display()
             )))
         }
@@ -175,7 +185,7 @@ impl ServerHandler for BrowserServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
         std::future::ready(Ok(ListToolsResult::with_all_items(
-            TOOL_SPECS.iter().copied().map(descriptor).collect(),
+            enabled_tool_specs().into_iter().map(descriptor).collect(),
         )))
     }
 
