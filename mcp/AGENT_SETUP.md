@@ -1,5 +1,12 @@
 # Rustwright MCP agent setup
 
+> **Deprecated:** these instructions install the legacy Python server. The
+> canonical server is now the native `rustwright-mcp` in
+> [`mcp-rs/`](../mcp-rs/); prefer
+> `https://raw.githubusercontent.com/Skyvern-AI/rustwright/HEAD/mcp-rs/README.md`
+> for setup. The Python server remains available until the native tool set
+> reaches full parity.
+
 These are official instructions from the Rustwright project for connecting an
 AI coding agent to the Rustwright MCP browser-automation server. If you are an
 AI agent reading this because a user asked you to set up Rustwright: complete

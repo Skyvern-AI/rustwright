@@ -11,6 +11,17 @@ Skyvern-AI/rustwright-cloud:
   - source: benchmarks/
     dest: benchmarks/
     deleteOrphaned: true
+  # The native agent CLI (cli/) and the native MCP server (mcp-rs/) are
+  # standalone Cargo workspaces developed in both repos; they are mapped here
+  # so external contributions back-sync to the cloud repo like the rest of the
+  # shared tree. Both directories must exist on this repo's main before these
+  # entries (deleteOrphaned would otherwise propagate their absence).
+  - source: cli/
+    dest: cli/
+    deleteOrphaned: true
+  - source: mcp-rs/
+    dest: mcp-rs/
+    deleteOrphaned: true
   # capi/ and rust-native/ are Cargo workspace members referenced by the synced
   # root Cargo.toml; they must mirror together or the target repo's workspace
   # breaks (as happened when Cargo.toml gained these members before the dirs

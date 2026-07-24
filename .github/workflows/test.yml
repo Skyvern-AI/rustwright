@@ -43,6 +43,9 @@ jobs:
       - name: Install Chromium
         run: python -m rustwright install chromium
 
+      - name: Run standalone native MCP tests
+        run: cargo test --manifest-path mcp-rs/Cargo.toml --locked
+
       - name: Run fast representative pytest subset
         run: >-
           pytest tests/test_rustwright_sync_api.py

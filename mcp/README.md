@@ -1,5 +1,11 @@
 # Rustwright MCP server
 
+> **Deprecated:** this Python server has been superseded by the native Rust
+> server in [`mcp-rs/`](../mcp-rs/) — the canonical `rustwright-mcp`
+> implementation, where all new tools land. This server remains available
+> until the native tool set reaches full parity, after which it will be
+> removed. See [`mcp-rs/README.md`](../mcp-rs/README.md) for setup.
+
 Give any MCP client `browser_*` tools over stdio with no clone or browser download.
 
 ## Install
