@@ -7,7 +7,10 @@ on:
 jobs:
   test:
     name: cargo and fast pytest
-    runs-on: ubuntu-latest
+    # Matches the development repo's runner. The mcp-rs suite includes
+    # Chromium race/stability tests that hold green on this runner class but
+    # produce false failures on ubuntu-latest.
+    runs-on: blacksmith-2vcpu-ubuntu-2404
 
     steps:
       - name: Check out repository
