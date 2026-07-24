@@ -73,6 +73,26 @@ See the network-independent [`examples/quickstart.js`](examples/quickstart.js) e
 
 Only a subset of the API surface is bridged — see [Limitations](#limitations).
 
+**CLI** (agent-focused)
+
+Install the native `rustwright-cli` with one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Skyvern-AI/rustwright/main/install.sh | sh
+```
+
+Then drive a persistent Chromium session from your shell or an agent loop:
+
+```bash
+rustwright-cli open https://example.com
+rustwright-cli snapshot          # compact page tree with @eN refs
+rustwright-cli click @e1
+rustwright-cli close
+```
+
+See [`cli/README.md`](cli/README.md) for the full command surface. For a Model Context Protocol
+server, use the standalone [`rustwright-mcp`](mcp-rs/) package.
+
 ## Why Rustwright?
 
 <div align="center">
