@@ -1,0 +1,22 @@
+{
+  "darwin-arm64": {
+    "package": "@skyvernai/rustwright-mcp-darwin-arm64",
+    "binary": "mcp-rs"
+  },
+  "darwin-x64": {
+    "package": "@skyvernai/rustwright-mcp-darwin-x64",
+    "binary": "mcp-rs"
+  },
+  "linux-x64": {
+    "package": "@skyvernai/rustwright-mcp-linux-x64-gnu",
+    "binary": "mcp-rs"
+  },
+  "linux-arm64": {
+    "package": "@skyvernai/rustwright-mcp-linux-arm64-gnu",
+    "binary": "mcp-rs"
+  },
+  "win32-x64": {
+    "package": "@skyvernai/rustwright-mcp-win32-x64",
+    "binary": "mcp-rs.exe"
+  }
+}

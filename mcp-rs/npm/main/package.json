@@ -1,0 +1,33 @@
+{
+  "name": "rustwright-mcp",
+  "version": "0.1.0",
+  "description": "Native Rustwright Model Context Protocol server",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Skyvern-AI/rustwright.git",
+    "directory": "mcp-rs/npm"
+  },
+  "type": "commonjs",
+  "bin": {
+    "rustwright-mcp": "bin/rustwright-mcp.js"
+  },
+  "files": [
+    "bin",
+    "platforms.json",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@skyvernai/rustwright-mcp-darwin-arm64": "0.1.0",
+    "@skyvernai/rustwright-mcp-darwin-x64": "0.1.0",
+    "@skyvernai/rustwright-mcp-linux-x64-gnu": "0.1.0",
+    "@skyvernai/rustwright-mcp-linux-arm64-gnu": "0.1.0",
+    "@skyvernai/rustwright-mcp-win32-x64": "0.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

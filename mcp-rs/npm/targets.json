@@ -1,0 +1,63 @@
+[
+  {
+    "id": "darwin-arm64",
+    "runtimeKey": "darwin-arm64",
+    "rustTarget": "aarch64-apple-darwin",
+    "os": "darwin",
+    "cpu": "arm64",
+    "binary": "mcp-rs",
+    "package": "@skyvernai/rustwright-mcp-darwin-arm64",
+    "runner": "macos-15",
+    "cross": false
+  },
+  {
+    "id": "darwin-x64",
+    "runtimeKey": "darwin-x64",
+    "rustTarget": "x86_64-apple-darwin",
+    "os": "darwin",
+    "cpu": "x64",
+    "binary": "mcp-rs",
+    "package": "@skyvernai/rustwright-mcp-darwin-x64",
+    "runner": "macos-15-intel",
+    "cross": false
+  },
+  {
+    "id": "linux-x64-gnu",
+    "runtimeKey": "linux-x64",
+    "rustTarget": "x86_64-unknown-linux-gnu",
+    "os": "linux",
+    "cpu": "x64",
+    "libc": "glibc",
+    "binary": "mcp-rs",
+    "package": "@skyvernai/rustwright-mcp-linux-x64-gnu",
+    "runner": "ubuntu-24.04",
+    "zig": true,
+    "zigTarget": "x86_64-unknown-linux-gnu.2.17",
+    "cross": true
+  },
+  {
+    "id": "linux-arm64-gnu",
+    "runtimeKey": "linux-arm64",
+    "rustTarget": "aarch64-unknown-linux-gnu",
+    "os": "linux",
+    "cpu": "arm64",
+    "libc": "glibc",
+    "binary": "mcp-rs",
+    "package": "@skyvernai/rustwright-mcp-linux-arm64-gnu",
+    "runner": "ubuntu-24.04",
+    "zig": true,
+    "zigTarget": "aarch64-unknown-linux-gnu.2.17",
+    "cross": true
+  },
+  {
+    "id": "win32-x64",
+    "runtimeKey": "win32-x64",
+    "rustTarget": "x86_64-pc-windows-msvc",
+    "os": "win32",
+    "cpu": "x64",
+    "binary": "mcp-rs.exe",
+    "package": "@skyvernai/rustwright-mcp-win32-x64",
+    "runner": "windows-2022",
+    "cross": false
+  }
+]
