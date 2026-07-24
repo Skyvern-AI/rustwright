@@ -14,6 +14,11 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 - Moved actionability waits for supported, optionless `AsyncPage.click()` and `AsyncPage.fill()` calls into the Rust core while preserving trusted browser input and a single action deadline.
 - Centralized evaluation value decoding in the Rust core for the Go/C-ABI and native Rust surfaces, and added structured timeout, closed, crashed, and disconnected errors for the Python API.
+- Promoted the native Rust MCP server (`mcp-rs/`) into the open-source tree as the canonical `rustwright-mcp` implementation; documentation now targets it.
+
+### Deprecated
+
+- Deprecated the Python MCP server; it remains available until the native server reaches full tool parity, after which it will be removed.
 
 ### Fixed
 
