@@ -175,7 +175,7 @@ struct ServerProcess {
 
 impl ServerProcess {
     fn spawn_remote(endpoint: &str, headers: &Value) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_mcp-rs"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rustwright-mcp"))
             .env_remove("RUSTWRIGHT_MCP_CDP_ENDPOINT")
             .env_remove("RUSTWRIGHT_MCP_CDP_HEADERS")
             .env_remove("RUSTWRIGHT_MCP_CDP_TIMEOUT_MS")

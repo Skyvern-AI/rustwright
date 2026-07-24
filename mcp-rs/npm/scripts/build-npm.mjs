@@ -28,7 +28,7 @@ function crateVersion() {
   const manifest = fs.readFileSync(path.join(crateDirectory, 'Cargo.toml'), 'utf8');
   const packageSection = manifest.match(/\[package\]([\s\S]*?)(?=\n\[|$)/);
   const version = packageSection?.[1].match(/^version\s*=\s*"([^"]+)"\s*$/m)?.[1];
-  if (!version) fail('could not read the mcp-rs package version from Cargo.toml');
+  if (!version) fail('could not read the rustwright-mcp package version from Cargo.toml');
   return version;
 }
 

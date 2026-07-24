@@ -351,7 +351,7 @@ impl ServerProcess {
         remote: Option<(&str, &Value, u64)>,
         environment: &[(&str, &str)],
     ) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_mcp-rs"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rustwright-mcp"));
         command
             .env_remove("RUSTWRIGHT_MCP_CDP_ENDPOINT")
             .env_remove("RUSTWRIGHT_MCP_CDP_HEADERS")

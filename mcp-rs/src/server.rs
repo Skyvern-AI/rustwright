@@ -162,7 +162,10 @@ fn output_content(
 impl ServerHandler for BrowserServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("mcp-rs", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new(
+                "rustwright-mcp",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_instructions("Browser commands execute in order on one dedicated owner thread.")
     }
 

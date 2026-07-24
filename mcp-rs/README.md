@@ -15,10 +15,10 @@ new capabilities land here only.
 From source (needs a Rust toolchain):
 
 ```bash
-cargo install --git https://github.com/Skyvern-AI/rustwright mcp-rs
+cargo install --git https://github.com/Skyvern-AI/rustwright rustwright-mcp
 ```
 
-The server binary is installed as `mcp-rs`. An npm distribution
+The server binary is installed as `rustwright-mcp`. An npm distribution
 (`rustwright-mcp`, prebuilt per-platform binaries, run with
 `npx rustwright-mcp`) is prepared under [`npm/`](npm/) and is on the way.
 
@@ -48,7 +48,7 @@ other MCP client:
 {
   "mcpServers": {
     "rustwright": {
-      "command": "mcp-rs",
+      "command": "rustwright-mcp",
       "env": {
         "RUSTWRIGHT_CHROMIUM": "/path/to/chrome-or-chromium"
       }
