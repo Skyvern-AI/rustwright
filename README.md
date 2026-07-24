@@ -120,19 +120,33 @@ Give an agent or shell script a browser through compact accessibility snapshots 
 
 ### MCP server — give your agent a browser
 
-`rustwright-mcp` gives any MCP client `browser_*` tools over stdio.
+`rustwright-mcp` is a native Rust MCP server (no Python or Node runtime in the
+serving path) that gives any MCP client `browser_*` tools over stdio, with
+compact accessibility snapshots and inline PNG screenshots. It lives in
+[`mcp-rs/`](mcp-rs/) and is the canonical Rustwright MCP server.
+
+#### Install
+
+From source (needs a Rust toolchain):
+
+```bash
+cargo install --git https://github.com/Skyvern-AI/rustwright mcp-rs
+```
+
+This installs the server binary as `mcp-rs`. An npm package (`rustwright-mcp`,
+prebuilt binaries via `npx rustwright-mcp`) is on the way.
+
+If Chrome or Chromium is already installed, point Rustwright at it with
+`RUSTWRIGHT_CHROMIUM` (or `CHROME` / `CHROMIUM`). Otherwise download one with
+`pip install rustwright && python -m rustwright install chromium`.
 
 #### Fastest path
 
 ##### Claude Code
 
 ```bash
-claude mcp add rustwright \
-  --env RUSTWRIGHT_MCP_CHANNEL=chrome \
-  -- uvx --from 'git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp' rustwright-mcp
+claude mcp add rustwright -- mcp-rs
 ```
-
-Uses the Chrome you already have — no browser download.
 
 ##### Claude Desktop
 
@@ -142,15 +156,7 @@ Open `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS 
 {
   "mcpServers": {
     "rustwright": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp",
-        "rustwright-mcp"
-      ],
-      "env": {
-        "RUSTWRIGHT_MCP_CHANNEL": "chrome"
-      }
+      "command": "mcp-rs"
     }
   }
 }
@@ -162,15 +168,7 @@ Open `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS 
 {
   "mcpServers": {
     "rustwright": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp",
-        "rustwright-mcp"
-      ],
-      "env": {
-        "RUSTWRIGHT_MCP_CHANNEL": "chrome"
-      }
+      "command": "mcp-rs"
     }
   }
 }
@@ -178,19 +176,18 @@ Open `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS 
 
 | If... | Do this |
 |---|---|
-| You do not have Chrome installed | Drop `RUSTWRIGHT_MCP_CHANNEL`, then run `uvx --from 'git+https://github.com/Skyvern-AI/rustwright#subdirectory=mcp' python -m rustwright install chromium`. |
-| You want a visible browser | Set `RUSTWRIGHT_MCP_HEADLESS=0`. |
-| You want to disable page evaluation | Set `RUSTWRIGHT_MCP_ALLOW_EVAL=0`; see [Security & scope](mcp/README.md#security--scope). |
+| You already have Chrome/Chromium | Set `RUSTWRIGHT_CHROMIUM` (or `CHROME` / `CHROMIUM`) to its executable in the server's `env`. |
+| You do not have a browser installed | `pip install rustwright && python -m rustwright install chromium` — the server finds the downloaded browser automatically. |
+| Screenshots are too large to inline | Tune `RUSTWRIGHT_MCP_SCREENSHOT_MAX_BYTES`; oversized captures fall back to a temp-file path instead of inline image content. |
 
-PyPI package coming soon — the command shrinks to `uvx rustwright-mcp`.
+See [`mcp-rs/README.md`](mcp-rs/README.md) for the full tool list and
+configuration. Setting up via an AI agent? Tell it to fetch
+`https://raw.githubusercontent.com/Skyvern-AI/rustwright/HEAD/mcp-rs/README.md`
+and follow it.
 
-See [the MCP guide](mcp/README.md) for the full tool list and configuration.
-
-Setting up via an AI agent? Point it at the one-page instructions in
-[mcp/AGENT_SETUP.md](mcp/AGENT_SETUP.md): telling the agent "Fetch
-`https://raw.githubusercontent.com/Skyvern-AI/rustwright/HEAD/mcp/AGENT_SETUP.md`
-and follow it" installs the server in any major MCP client and walks through
-verification.
+> The earlier Python MCP server is deprecated: it stays in place until the
+> native server reaches full tool parity, but new capabilities land in
+> `mcp-rs/` only.
 
 ### CLI — drive a browser from your shell
 
