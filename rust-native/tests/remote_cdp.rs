@@ -154,7 +154,29 @@ fn attach_adopts_pages_promotes_navigation_and_detaches_without_killing() {
     assert!(owner.is_connected());
     assert_eq!(owner_page.title(Default::default()).unwrap(), "Page one");
 
+    let dropped = chromium()
+        .connect_over_cdp(ConnectOptions::new(owner.ws_endpoint()).timeout(Duration::from_secs(10)))
+        .expect("attach browser for unexpected transport-drop check");
     owner.close().expect("close owned remote Chromium");
+    let local_closed_error = match owner.pages() {
+        Ok(_) => panic!("closed local browser unexpectedly listed pages"),
+        Err(error) => error,
+    };
+    assert!(matches!(local_closed_error, Error::Closed));
+
+    let disconnect_deadline = Instant::now() + Duration::from_secs(5);
+    while dropped.is_connected() && Instant::now() < disconnect_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !dropped.is_connected(),
+        "remote attachment did not observe the owner transport closing"
+    );
+    let disconnected_error = match dropped.pages() {
+        Ok(_) => panic!("disconnected attachment unexpectedly listed pages"),
+        Err(error) => error,
+    };
+    assert!(matches!(disconnected_error, Error::Disconnected));
 }
 
 #[test]
