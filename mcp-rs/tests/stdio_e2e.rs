@@ -1111,9 +1111,14 @@ fn real_stdio_viewport_scroll_completes_when_hidden_page_has_no_animation_frames
 
     let endpoint = owner.ws_endpoint();
     let headers = json!({});
+    // The regression this guards is a settle that waits on animation frames a
+    // page reporting itself hidden never delivers, which surfaces as the
+    // scroll consuming the entire tool timeout. Keep the timeout generous and
+    // the elapsed bound at half of it so a loaded runner cannot produce a
+    // false failure: a genuine frame wait still blows through the bound.
     let mut server = ServerProcess::spawn_with_options(
         Some((&endpoint, &headers, 10_000)),
-        &[("RUSTWRIGHT_MCP_TOOL_TIMEOUT_MS", "3000")],
+        &[("RUSTWRIGHT_MCP_TOOL_TIMEOUT_MS", "10000")],
     );
     server.initialize();
 
@@ -1137,13 +1142,39 @@ fn real_stdio_viewport_scroll_completes_when_hidden_page_has_no_animation_frames
     let elapsed = started.elapsed();
     let scrolled_snapshot = result_text(&scrolled).to_owned();
     assert!(
-        elapsed < Duration::from_secs(2),
-        "hidden-page viewport scroll approached the 3-second tool timeout: {elapsed:?}"
+        elapsed < Duration::from_secs(5),
+        "hidden-page viewport scroll ran toward the 10-second tool timeout, \
+         which means the settle waited on animation frames: {elapsed:?}"
     );
     assert!(
-        scroll_y(&scrolled_snapshot).abs_diff(600) <= 75,
-        "hidden-page viewport did not scroll near 600:\n{scrolled_snapshot}"
+        scrolled_snapshot.contains("Scroll Y: "),
+        "post-scroll snapshot lost the scroll readout:\n{scrolled_snapshot}"
     );
+
+    // The fixture readout is updated by the page's own scroll listener, which
+    // runs at the renderer's next rendering step. A page that claims to be
+    // hidden gets a zero-length settle by design (real hidden pages produce no
+    // frames, so waiting would recreate the hang this test guards against), so
+    // the scroll response cannot promise the listener has run yet. Assert the
+    // readout converges instead of asserting one unguaranteed interleaving.
+    let mut readout = scroll_y(&scrolled_snapshot);
+    let mut next_id = 37;
+    let convergence_deadline = Instant::now() + Duration::from_secs(15);
+    while readout.abs_diff(600) > 75 {
+        assert!(
+            Instant::now() < convergence_deadline,
+            "hidden-page viewport scroll never became visible to the page's \
+             scroll listener; last readout {readout}"
+        );
+        thread::sleep(Duration::from_millis(100));
+        server.send(json!({
+            "jsonrpc":"2.0","id":next_id,"method":"tools/call",
+            "params":{"name":"browser_snapshot","arguments":{}}
+        }));
+        let refreshed = server.receive();
+        readout = scroll_y(result_text(&refreshed));
+        next_id += 1;
+    }
 
     server.finish();
     owner
