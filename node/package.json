@@ -44,12 +44,15 @@
     "test": "node --test"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.4"
+    "@napi-rs/cli": "^3.7.4"
   },
   "napi": {
-    "name": "rustwright",
-    "triples": {
-      "defaults": true
-    }
+    "binaryName": "rustwright",
+    "targets": [
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc",
+      "x86_64-unknown-linux-gnu"
+    ]
   }
 }
