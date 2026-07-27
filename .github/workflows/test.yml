@@ -7,7 +7,7 @@ on:
 jobs:
   test:
     name: cargo and fast pytest
-    # Matches the development repo's runner. The mcp-rs suite includes
+    # Matches the development repo's runner. The mcp suite includes
     # Chromium race/stability tests that hold green on this runner class but
     # produce false failures on ubuntu-latest.
     runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -47,7 +47,7 @@ jobs:
         run: python -m rustwright install chromium
 
       - name: Run standalone native MCP tests
-        run: cargo test --manifest-path mcp-rs/Cargo.toml --locked
+        run: cargo test --manifest-path mcp/Cargo.toml --locked
 
       - name: Run fast representative pytest subset
         run: >-
