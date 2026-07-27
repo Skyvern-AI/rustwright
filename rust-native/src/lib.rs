@@ -887,13 +887,74 @@ impl Page {
         delay: Option<Duration>,
         cancel: Option<&CancelToken>,
     ) -> Result<()> {
+        self.type_text_with_options_and_cancel(
+            selector,
+            text,
+            delay,
+            ActionOptions::default(),
+            cancel,
+        )
+    }
+
+    /// Type with an operation timeout.
+    pub fn type_text_with_options(
+        &self,
+        selector: &str,
+        text: &str,
+        delay: Option<Duration>,
+        options: ActionOptions,
+    ) -> Result<()> {
+        self.type_text_with_options_and_cancel(selector, text, delay, options, None)
+    }
+
+    /// Type with an operation timeout and optional cancellation signal.
+    pub fn type_text_with_options_and_cancel(
+        &self,
+        selector: &str,
+        text: &str,
+        delay: Option<Duration>,
+        options: ActionOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
         self.inner
-            .type_text_with_cancel(selector, text, delay, cancel)
+            .type_text_with_timeout_and_cancel(selector, text, delay, options.timeout, cancel)
     }
 
     /// Press a native key, optionally after focusing an element.
     pub fn press_key(&self, selector: Option<&str>, key: &str) -> Result<()> {
-        self.inner.press_key(selector, key)
+        self.press_key_with_cancel(selector, key, None)
+    }
+
+    /// Press a native key with an optional cancellation signal.
+    pub fn press_key_with_cancel(
+        &self,
+        selector: Option<&str>,
+        key: &str,
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
+        self.press_key_with_options_and_cancel(selector, key, ActionOptions::default(), cancel)
+    }
+
+    /// Press a native key with an operation timeout.
+    pub fn press_key_with_options(
+        &self,
+        selector: Option<&str>,
+        key: &str,
+        options: ActionOptions,
+    ) -> Result<()> {
+        self.press_key_with_options_and_cancel(selector, key, options, None)
+    }
+
+    /// Press a native key with an operation timeout and optional cancellation signal.
+    pub fn press_key_with_options_and_cancel(
+        &self,
+        selector: Option<&str>,
+        key: &str,
+        options: ActionOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
+        self.inner
+            .press_key_with_timeout_and_cancel(selector, key, options.timeout, cancel)
     }
 
     /// Select option values through the DOM and return the resulting values.
@@ -909,6 +970,10 @@ impl Page {
     }
 
     /// Select values with an optional cancellation signal.
+    ///
+    /// Matches option values only. Use
+    /// [`Self::select_options_by_value_or_label_with_cancel`] when a visible
+    /// label should also match.
     pub fn select_options_with_cancel<S: AsRef<str>>(
         &self,
         selector: &str,
@@ -921,6 +986,33 @@ impl Page {
             .collect::<Vec<_>>();
         self.inner
             .select_options_with_cancel(selector, &values, cancel)
+    }
+
+    /// Select exact values or visible labels in DOM order and return the resulting values.
+    ///
+    /// Unlike [`Self::select_options`], this treats value and label matches
+    /// alike. For a single-select, the first matching option in DOM order wins.
+    pub fn select_options_by_value_or_label<S: AsRef<str>>(
+        &self,
+        selector: &str,
+        values: &[S],
+    ) -> Result<Vec<String>> {
+        self.select_options_by_value_or_label_with_cancel(selector, values, None)
+    }
+
+    /// Select exact values or visible labels in DOM order with cancellation.
+    pub fn select_options_by_value_or_label_with_cancel<S: AsRef<str>>(
+        &self,
+        selector: &str,
+        values: &[S],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<String>> {
+        let values = values
+            .iter()
+            .map(|value| value.as_ref().to_string())
+            .collect::<Vec<_>>();
+        self.inner
+            .select_options_by_value_or_label_with_cancel(selector, &values, cancel)
     }
 
     /// Move Chromium's native mouse to the element center.
