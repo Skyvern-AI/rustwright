@@ -54,15 +54,6 @@ const ELEMENT_EVALUATE_JS: &str = r#"async (input) => {
   const callable = (0, eval)(`(${input.function})`);
   return await callable(target);
 }"#;
-const SELECT_LABELS_JS: &str = r#"(input) => {
-  const target = document.querySelector(input.selector);
-  if (!(target instanceof HTMLSelectElement)) throw new Error('target is not a select element');
-  return input.labels.map((label) => {
-    const option = Array.from(target.options).find((candidate) => candidate.label === label);
-    if (!option) throw new Error(`option label not found: ${label}`);
-    return option.value;
-  });
-}"#;
 const SYNTHETIC_DROP_JS: &str = r#"async (input) => {
   const target = document.querySelector(input.selector);
   if (!target) throw new Error(`target not found: ${input.selector}`);
@@ -143,7 +134,10 @@ pub(crate) enum BrowserOp {
     },
     FillForm(Vec<FillField>),
     Hover(String),
-    PressKey(String),
+    PressKey {
+        target: Option<String>,
+        key: String,
+    },
     Drag {
         start_target: String,
         end_target: String,
@@ -450,7 +444,12 @@ impl ActorShared {
         {
             queue.in_flight.take();
         }
-        if request.cancellation.is_committed() {
+        // A successful type owns its result without claiming request-level
+        // physical commitment: the dispatched type path remains cancellable
+        // between characters, but returns `Ok` only after delivering them all.
+        if request.cancellation.is_committed()
+            || (result.is_ok() && matches!(&request.op, BrowserOp::Type { .. }))
+        {
             result
         } else {
             request
@@ -1168,6 +1167,20 @@ impl BrowserState {
         self.snapshot_options(request, None, None, false, cancel)
     }
 
+    // The post-action snapshot of a committed physical action is an OBSERVATION,
+    // not part of the action. Passing `None` for the cancel token keeps a late
+    // cancel from killing it, but the snapshot still consults the request
+    // deadline, so an action that commits just before the deadline would report
+    // `Timeout` for a key press the page has already processed -- exactly the
+    // failure mode committed-action semantics exist to prevent, arriving through
+    // the deadline instead of through cancellation. Callers reach the
+    // post-snapshot only after the action returned `Ok`, so the degradation in
+    // `committed_snapshot_result` is always applied to an action that already
+    // succeeded.
+    fn committed_post_action_snapshot(&mut self, request: &ActorRequest) -> TextResult {
+        committed_snapshot_result(self.snapshot_with_cancel(request, None))
+    }
+
     fn snapshot_options(
         &mut self,
         request: &ActorRequest,
@@ -1389,7 +1402,7 @@ impl BrowserState {
             },
             // The physical click has committed, so cancellation is too late:
             // finish the post-click snapshot and preserve its owned result.
-            |state| state.snapshot_with_cancel(request, None),
+            |state| state.committed_post_action_snapshot(request),
         )
     }
 
@@ -1456,7 +1469,11 @@ impl BrowserState {
                     }
                 }
             },
-            |state| state.snapshot_with_cancel(request, None),
+            // Drag commits physical pointer input: by the time this post-action
+            // snapshot runs the drop has already landed, so route it through the
+            // committed-action helper. A failed observation must degrade to a
+            // truthful success instead of reporting the committed drag as failed.
+            |state| state.committed_post_action_snapshot(request),
         )?;
         Ok(render_drag_result(&start_display, &end_display, &snapshot))
     }
@@ -1544,10 +1561,12 @@ impl BrowserState {
                             )
                         })?;
                     }
-                    page.type_text_with_cancel(
+                    let typing_budget = Self::remaining(request)?;
+                    page.type_text_with_options_and_cancel(
                         &selector,
                         text,
                         slowly.then_some(Duration::from_millis(50)),
+                        ActionOptions::timeout(Self::engine_timeout(typing_budget)),
                         Some(&request.cancellation.engine),
                     )
                 };
@@ -1560,9 +1579,15 @@ impl BrowserState {
                     )
                 })?;
                 if submit {
+                    let submit_budget = Self::remaining(request)?;
                     state
                         .ensure_page(request)?
-                        .press_key(Some(&selector), "Enter")
+                        .press_key_with_options_and_cancel(
+                            Some(&selector),
+                            "Enter",
+                            ActionOptions::timeout(Self::engine_timeout(submit_budget)),
+                            Some(&request.cancellation.engine),
+                        )
                         .map_err(|error| {
                             state.operation_error(
                                 &format!("submit failed for {target}"),
@@ -1574,47 +1599,11 @@ impl BrowserState {
                 }
                 Ok(())
             },
-            |state| state.snapshot_with_cancel(request, None),
+            // Reaching the post-action snapshot proves that fill/type and the
+            // optional submit all returned `Ok`; cancellation after that point
+            // is too late to relabel the completed type as failed.
+            |state| state.committed_post_action_snapshot(request),
         )
-    }
-
-    fn resolve_select_values(
-        &mut self,
-        selector: &str,
-        labels: &[String],
-        request: &ActorRequest,
-    ) -> Result<Vec<String>, BrowserError> {
-        let remaining = Self::remaining(request)?;
-        let value = self.ensure_page(request)?.evaluate_with_cancel(
-            SELECT_LABELS_JS,
-            Some(&json!({"selector": selector, "labels": labels})),
-            ActionOptions::timeout(Self::engine_timeout(remaining)),
-            Some(&request.cancellation.engine),
-        );
-        value
-            .map_err(|error| {
-                self.operation_error(
-                    "select option label resolution failed",
-                    error,
-                    &request.cancellation,
-                    request.timeout_ms,
-                )
-            })?
-            .as_array()
-            .ok_or_else(|| {
-                BrowserError::Message(
-                    "select option label resolution returned no values".to_owned(),
-                )
-            })?
-            .iter()
-            .map(|value| {
-                value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
-                    BrowserError::Message(
-                        "select option label resolution returned a non-string".to_owned(),
-                    )
-                })
-            })
-            .collect()
     }
 
     fn select_option(
@@ -1627,20 +1616,11 @@ impl BrowserState {
         self.dispatch_ref_action(
             target,
             |state| {
-                let first = state.ensure_page(request)?.select_options_with_cancel(
-                    &selector,
-                    values,
-                    Some(&request.cancellation.engine),
-                );
-                if first.is_ok() {
-                    return Ok(());
-                }
-                let resolved = state.resolve_select_values(&selector, values, request)?;
                 state
                     .ensure_page(request)?
-                    .select_options_with_cancel(
+                    .select_options_by_value_or_label_with_cancel(
                         &selector,
-                        &resolved,
+                        values,
                         Some(&request.cancellation.engine),
                     )
                     .map_err(|error| {
@@ -1716,23 +1696,13 @@ impl BrowserState {
                 }
                 FillFieldKind::Combobox => {
                     let values = [field.value.clone()];
-                    let first = self.ensure_page(request)?.select_options_with_cancel(
-                        &selector,
-                        &values,
-                        Some(&request.cancellation.engine),
-                    );
-                    if first.is_ok() {
-                        Ok(())
-                    } else {
-                        let resolved = self.resolve_select_values(&selector, &values, request)?;
-                        self.ensure_page(request)?
-                            .select_options_with_cancel(
-                                &selector,
-                                &resolved,
-                                Some(&request.cancellation.engine),
-                            )
-                            .map(|_| ())
-                    }
+                    self.ensure_page(request)?
+                        .select_options_by_value_or_label_with_cancel(
+                            &selector,
+                            &values,
+                            Some(&request.cancellation.engine),
+                        )
+                        .map(|_| ())
                 }
             };
             result.map_err(|error| {
@@ -1765,23 +1735,55 @@ impl BrowserState {
                         )
                     })
             },
-            |state| state.snapshot(request),
+            // Hover dispatches committed physical pointer input; like click,
+            // its post-action snapshot must survive cancellation.
+            |state| state.committed_post_action_snapshot(request),
         )
     }
 
-    fn press_key(&mut self, key: &str, request: &ActorRequest) -> TextResult {
+    fn press_key_on_page(
+        &mut self,
+        selector: Option<&str>,
+        key: &str,
+        context: &str,
+        request: &ActorRequest,
+    ) -> Result<(), BrowserError> {
+        let remaining = Self::remaining(request)?;
+        let result = self
+            .ensure_page(request)?
+            .press_key_with_options_and_cancel(
+                selector,
+                key,
+                ActionOptions::timeout(Self::engine_timeout(remaining)),
+                Some(&request.cancellation.engine),
+            );
+        result.map_err(|error| {
+            self.operation_error(context, error, &request.cancellation, request.timeout_ms)
+        })
+    }
+
+    fn press_key(&mut self, target: Option<&str>, key: &str, request: &ActorRequest) -> TextResult {
+        if let Some(target) = target {
+            let selector = format!(r#"[data-mcp-ref="{target}"]"#);
+            return self.dispatch_ref_action(
+                target,
+                |state| {
+                    state.press_key_on_page(
+                        Some(&selector),
+                        key,
+                        &format!("key press failed for {target}"),
+                        request,
+                    )
+                },
+                // The key-down dispatch has committed, so cancellation is too
+                // late for both the key-up cleanup and post-action snapshot.
+                |state| state.committed_post_action_snapshot(request),
+            );
+        }
+
         self.current_refs.clear();
-        self.ensure_page(request)?
-            .press_key(None, key)
-            .map_err(|error| {
-                self.operation_error(
-                    "key press failed",
-                    error,
-                    &request.cancellation,
-                    request.timeout_ms,
-                )
-            })?;
-        self.snapshot_with_cancel(request, None)
+        self.press_key_on_page(None, key, "key press failed", request)?;
+        self.committed_post_action_snapshot(request)
     }
 
     fn drop_data(
@@ -2627,7 +2629,9 @@ impl BrowserState {
                 .map(BrowserOutput::Text),
             BrowserOp::FillForm(fields) => self.fill_form(fields, request).map(BrowserOutput::Text),
             BrowserOp::Hover(target) => self.hover(target, request).map(BrowserOutput::Text),
-            BrowserOp::PressKey(key) => self.press_key(key, request).map(BrowserOutput::Text),
+            BrowserOp::PressKey { target, key } => self
+                .press_key(target.as_deref(), key, request)
+                .map(BrowserOutput::Text),
             BrowserOp::Drag {
                 start_target,
                 end_target,
@@ -2745,6 +2749,25 @@ impl BrowserState {
     }
 }
 
+/// Degrade a failed post-action observation into a successful response.
+///
+/// A committed physical action has already changed the page by the time its
+/// post-action snapshot runs, so reporting the snapshot's error as the action's
+/// error would tell the caller a key press or click failed when the page has
+/// already processed it. The caller learns the state is unavailable instead,
+/// and `dispatch_ref_action` has already cleared `current_refs`, so the stale
+/// refs cannot be reused -- the response fails closed on refs while staying
+/// truthful about the action.
+fn committed_snapshot_result(snapshot: TextResult) -> TextResult {
+    match snapshot {
+        Ok(text) => Ok(text),
+        Err(error) => Ok(format!(
+            "Action completed, but the page state could not be captured: {error}\n\
+             Call browser_snapshot for the current page state."
+        )),
+    }
+}
+
 fn render_drag_result(start_display: &str, end_display: &str, snapshot: &str) -> String {
     format!("### Result\nDragged {start_display} to {end_display}.\n\n### Snapshot\n{snapshot}")
 }
@@ -2764,7 +2787,7 @@ fn browser_op_name(op: &BrowserOp) -> &'static str {
         BrowserOp::SelectOption { .. } => "browser_select_option",
         BrowserOp::FillForm(_) => "browser_fill_form",
         BrowserOp::Hover(_) => "browser_hover",
-        BrowserOp::PressKey(_) => "browser_press_key",
+        BrowserOp::PressKey { .. } => "browser_press_key",
         BrowserOp::Drag { .. } => "browser_drag",
         BrowserOp::Drop { .. } => "browser_drop",
         BrowserOp::ConsoleMessages { .. } => "browser_console_messages",
@@ -3994,6 +4017,17 @@ mod tests {
         RequestId::Number(value)
     }
 
+    fn snapshot_ref(snapshot: &str, role: &str, name: &str) -> String {
+        let line = snapshot
+            .lines()
+            .find(|line| line.contains(&format!("- {role}")) && line.contains(name))
+            .unwrap_or_else(|| panic!("{role} {name:?} missing from snapshot:\n{snapshot}"));
+        let marker = "[ref=";
+        let start = line.find(marker).expect("snapshot ref start") + marker.len();
+        let end = line[start..].find(']').expect("snapshot ref end") + start;
+        line[start..end].to_owned()
+    }
+
     fn output_text(output: &BrowserOutput) -> &str {
         match output {
             BrowserOutput::Text(text) => text,
@@ -4241,6 +4275,14 @@ mod tests {
     }
 
     #[test]
+    fn engine_timeout_preserves_request_budget_above_thirty_seconds() {
+        assert_eq!(
+            BrowserState::engine_timeout(Duration::from_secs(45)),
+            46_000.0
+        );
+    }
+
+    #[test]
     fn failed_post_click_snapshot_leaves_old_ref_stale() {
         let mut state = BrowserState::default();
         state.current_refs.insert("e7".to_owned());
@@ -4282,6 +4324,96 @@ mod tests {
             dispatches.get(),
             1,
             "stale retry must not re-dispatch click"
+        );
+    }
+
+    #[test]
+    fn committed_action_survives_a_failed_post_action_snapshot() {
+        assert_eq!(
+            committed_snapshot_result(Ok("- page snapshot".to_owned())),
+            Ok("- page snapshot".to_owned()),
+            "a successful observation must pass through untouched"
+        );
+
+        // `Timeout` is the failure this exists for. The post-action snapshot
+        // passes `None` for the cancel token, so a late cancel cannot reach it,
+        // but `BrowserState::remaining` still turns an elapsed request budget
+        // into `Timeout` -- so a key press that commits microseconds before the
+        // deadline used to be reported as a failed key press.
+        let degraded = committed_snapshot_result(Err(BrowserError::Timeout(5_000)))
+            .expect("a committed action must not fail because its observation did");
+        assert!(
+            degraded.contains("Action completed"),
+            "response must say the action succeeded: {degraded}"
+        );
+        assert!(
+            degraded.contains("browser command timed out after 5000 ms"),
+            "response must keep the observation's cause: {degraded}"
+        );
+        assert!(
+            degraded.contains("browser_snapshot"),
+            "response must tell the caller how to recover state: {degraded}"
+        );
+
+        assert!(
+            committed_snapshot_result(Err(BrowserError::Cancelled)).is_ok(),
+            "cancellation is equally too late once the action has committed"
+        );
+    }
+
+    #[test]
+    fn every_committed_input_tool_takes_its_post_action_snapshot_through_the_helper() {
+        // `committed_snapshot_result` is only worth anything if the committed
+        // tools actually route through it, and that wiring is what a later
+        // refactor would quietly undo -- the degradation itself would keep
+        // passing its own test while a key press committing just before its
+        // deadline went back to reporting `Timeout`. Asserting over the source
+        // pins the wiring without a browser.
+        //
+        // Split at the test module so the literals below -- which live in it --
+        // cannot match themselves. That self-match is exactly what made an
+        // earlier attempt at this test count two phantom call sites.
+        //
+        // Match the whole unindented module header, not a bare `#[cfg(test)]`:
+        // there is a test-only field earlier in the file carrying that
+        // attribute, and splitting on it silently truncated production to a
+        // prefix holding none of the call sites -- which reads as "zero
+        // bypasses" for the assertion below rather than as a broken test.
+        const TEST_MODULE: &str = "\n#[cfg(test)]\nmod tests {";
+        let source = include_str!("actor.rs");
+        assert_eq!(
+            source.matches(TEST_MODULE).count(),
+            1,
+            "the production/test split point must be unambiguous"
+        );
+        let production = source
+            .split_once(TEST_MODULE)
+            .expect("actor.rs must have a test module to split on")
+            .0;
+
+        // Only the helper is allowed to take a post-action snapshot that ignores
+        // the cancel token. A tool that reached past it would have to spell this
+        // out itself, which shows up here as a second occurrence.
+        assert_eq!(
+            production
+                .matches("snapshot_with_cancel(request, None)")
+                .count(),
+            1,
+            "an uncancellable post-action snapshot must only be taken inside \
+             committed_post_action_snapshot"
+        );
+
+        // The other way to bypass the helper is to call the cancellable snapshot
+        // directly, which leaves this count short instead. Six committed
+        // physical actions: click, type-with-submit, hover, drag, and press_key
+        // in both its targeted and untargeted forms. A seventh committed tool
+        // should fail here until someone confirms it wants the same treatment.
+        assert_eq!(
+            production
+                .matches("committed_post_action_snapshot(request)")
+                .count(),
+            6,
+            "every committed physical action must observe through the helper"
         );
     }
 
@@ -5088,6 +5220,7 @@ mod tests {
         let body = match path {
             "/actionability" => actionability_fixture(),
             "/cancel" => cancellation_fixture(),
+            "/input" => input_fixture(),
             "/atomic-click" => atomic_click_fixture(),
             "/physical" => physical_fixture(),
             "/oopif-top" => oopif_top_fixture(port),
@@ -5270,6 +5403,125 @@ mod tests {
     }));
   }
   fetch('/capture?events=physical-ready');
+</script>"#
+            .to_owned()
+    }
+
+    fn input_fixture() -> String {
+        r#"<!doctype html>
+<label for="type-target">Type target</label>
+<input id="type-target" value="old value">
+<label for="secret-target">Secret input</label>
+<input id="secret-target" type="password">
+<div id="secret-length-readout" role="status">Secret length: 0</div>
+<div id="type-readout" role="status">Typed value: old value</div>
+<div id="type-change-readout" role="status">Type change value: none</div>
+<div id="key-readout" role="status">Key pressed: none</div>
+<div id="submit-readout" role="status">Submit effects: 0</div>
+<button id="hover-target">Hover target</button>
+<div id="hover-readout" role="status">Hover observed: false</div>
+<label for="select-target">Select target</label>
+<select id="select-target">
+  <option value="alpha">Alpha</option>
+  <option value="beta">Beta</option>
+</select>
+<div id="select-readout" role="status">Selected value: alpha; changes: 0</div>
+<label for="multi-select-target">Multi select target</label>
+<select id="multi-select-target" multiple>
+  <option value="alpha" selected>Alpha</option>
+  <option value="beta" selected>Beta</option>
+</select>
+<div id="multi-select-readout" role="status">Selected values: alpha,beta; changes: 0</div>
+<label for="ambiguous-select-target">Ambiguous select target</label>
+<select id="ambiguous-select-target">
+  <option value="other">X</option>
+  <option value="X">Y</option>
+</select>
+<div id="ambiguous-select-readout" role="status">Ambiguous selected value: other; changes: 0</div>
+<label for="ambiguous-multi-select-target">Ambiguous multi select target</label>
+<select id="ambiguous-multi-select-target" multiple>
+  <option value="other">X</option>
+  <option value="X">Y</option>
+</select>
+<div id="ambiguous-multi-select-readout" role="status">Ambiguous selected values: none; changes: 0</div>
+<script>
+  const typeTarget = document.querySelector('#type-target');
+  const secretTarget = document.querySelector('#secret-target');
+  const typeReadout = document.querySelector('#type-readout');
+  const typeChangeReadout = document.querySelector('#type-change-readout');
+  const keyReadout = document.querySelector('#key-readout');
+  const submitReadout = document.querySelector('#submit-readout');
+  const updateSecretLength = () => {
+    document.querySelector('#secret-length-readout').textContent =
+      `Secret length: ${secretTarget.value.length}`;
+  };
+  secretTarget.addEventListener('input', updateSecretLength);
+  secretTarget.addEventListener('change', updateSecretLength);
+  typeTarget.addEventListener('input', () => {
+    typeReadout.textContent = `Typed value: ${typeTarget.value}`;
+  });
+  typeTarget.addEventListener('change', () => {
+    typeChangeReadout.textContent =
+      `Type change value: ${typeTarget.value || '(empty)'}`;
+  });
+  let keyEffects = 0;
+  let submitEffects = 0;
+  typeTarget.addEventListener('keydown', event => {
+    keyEffects += 1;
+    if (event.key === 'Enter') {
+      submitEffects += 1;
+      submitReadout.textContent = `Submit effects: ${submitEffects}`;
+    }
+    keyReadout.textContent = `Key pressed: ${event.key}; trusted: ${event.isTrusted}`;
+    const signal = new XMLHttpRequest();
+    signal.open('GET', '/capture?events=input-keydown', false);
+    signal.send();
+    const releaseWindow = performance.now() + 500;
+    while (performance.now() < releaseWindow) {}
+  });
+  typeTarget.addEventListener('keyup', event => {
+    keyReadout.textContent =
+      `Key pressed: ${event.key}; trusted: ${event.isTrusted}; state: up; effects: ${keyEffects}`;
+  });
+  document.querySelector('#hover-target').addEventListener('mouseover', event => {
+    document.querySelector('#hover-readout').textContent =
+      `Hover observed: true; trusted: ${event.isTrusted}`;
+  });
+  let changes = 0;
+  const selectTarget = document.querySelector('#select-target');
+  selectTarget.addEventListener('change', () => {
+    changes += 1;
+    document.querySelector('#select-readout').textContent =
+      `Selected value: ${selectTarget.value}; changes: ${changes}`;
+  });
+  let multiChanges = 0;
+  const multiSelectTarget = document.querySelector('#multi-select-target');
+  multiSelectTarget.addEventListener('change', () => {
+    multiChanges += 1;
+    const selected = Array.from(multiSelectTarget.selectedOptions)
+      .map(option => option.value)
+      .join(',') || 'none';
+    document.querySelector('#multi-select-readout').textContent =
+      `Selected values: ${selected}; changes: ${multiChanges}`;
+  });
+  let ambiguousChanges = 0;
+  const ambiguousSelectTarget = document.querySelector('#ambiguous-select-target');
+  ambiguousSelectTarget.addEventListener('change', () => {
+    ambiguousChanges += 1;
+    document.querySelector('#ambiguous-select-readout').textContent =
+      `Ambiguous selected value: ${ambiguousSelectTarget.value}; changes: ${ambiguousChanges}`;
+  });
+  let ambiguousMultiChanges = 0;
+  const ambiguousMultiSelectTarget =
+    document.querySelector('#ambiguous-multi-select-target');
+  ambiguousMultiSelectTarget.addEventListener('change', () => {
+    ambiguousMultiChanges += 1;
+    const selected = Array.from(ambiguousMultiSelectTarget.selectedOptions)
+      .map(option => option.value)
+      .join(',') || 'none';
+    document.querySelector('#ambiguous-multi-select-readout').textContent =
+      `Ambiguous selected values: ${selected}; changes: ${ambiguousMultiChanges}`;
+  });
 </script>"#
             .to_owned()
     }
@@ -5574,6 +5826,655 @@ mod tests {
             "the post-click snapshot must observe exactly one effect: {result}"
         );
         assert!(!actor.cancel(&click_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_tool_type_password_snapshot_masks_new_sentinel() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(61_000),
+                BrowserOp::Navigate(server.url("/input")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to input fixture");
+        let snapshot_text = output_text(&snapshot);
+        assert!(!snapshot_text.contains("[value=••••••]"), "{snapshot_text}");
+        assert!(
+            snapshot_text.contains("Secret length: 0"),
+            "{snapshot_text}"
+        );
+        let target = snapshot_ref(snapshot_text, "textbox", "Secret input");
+        let sentinel = "actor-password-sentinel-61001";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(61_001),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into snapshot ref");
+        let typed = output_text(&typed);
+        assert!(typed.contains("[value=••••••]"), "{typed}");
+        assert!(
+            typed.contains(&format!("Secret length: {}", sentinel.chars().count())),
+            "{typed}"
+        );
+        assert!(!typed.contains(sentinel), "{typed}");
+        assert!(!typed.contains("do-not-render"), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_tool_default_clear_type_fills_without_empty_change() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(61_100),
+                BrowserOp::Navigate(server.url("/input")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to input fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Type target");
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(61_101),
+                BrowserOp::Type {
+                    target,
+                    text: "typed value".to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("fill snapshot ref");
+        let typed = output_text(&typed);
+        assert!(typed.contains(r#"[value="typed value"]"#), "{typed}");
+        assert!(typed.contains("Typed value: typed value"), "{typed}");
+        assert!(typed.contains("Type change value: typed value"), "{typed}");
+        assert!(!typed.contains("Type change value: (empty)"), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_during_slow_type_stops_between_characters_and_before_submit() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(61_200),
+                BrowserOp::Navigate(server.url("/input")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to input fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Type target");
+
+        let type_id = request_id(61_201);
+        let type_actor = Arc::clone(&actor);
+        let type_request_id = type_id.clone();
+        let typed = tokio::spawn(async move {
+            type_actor
+                .execute_with_timeout(
+                    type_request_id,
+                    BrowserOp::Type {
+                        target,
+                        text: "slow".to_owned(),
+                        submit: true,
+                        slowly: true,
+                        clear: true,
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+        wait_until_in_flight(&actor, &type_id).await;
+        assert_eq!(server.capture(), "input-keydown");
+        assert!(
+            actor.cancel(&type_id),
+            "typing characters must not claim request-level commitment"
+        );
+        assert_eq!(
+            typed.await.expect("join cancelled slow type"),
+            Err(BrowserError::Cancelled)
+        );
+
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(61_202),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("snapshot after cancelled slow type");
+        let snapshot = output_text(&snapshot);
+        assert!(snapshot.contains(r#"[value="s"]"#), "{snapshot}");
+        assert!(snapshot.contains("Typed value: s"), "{snapshot}");
+        assert!(snapshot.contains("Submit effects: 0"), "{snapshot}");
+    }
+
+    #[test]
+    fn cancel_during_final_type_character_reports_success_without_commit() {
+        let shared = Arc::new(ActorShared::new());
+        let type_id = request_id(61_251);
+        let (reply, _response) = oneshot::channel();
+        shared
+            .submit(ActorRequest {
+                request_id: type_id.clone(),
+                op: BrowserOp::Type {
+                    target: "e1".to_owned(),
+                    text: "z".to_owned(),
+                    submit: false,
+                    slowly: true,
+                    clear: true,
+                },
+                cancellation: Arc::new(CommandCancellation::new()),
+                deadline: Instant::now() + Duration::from_secs(5),
+                timeout_ms: 5_000,
+                reply,
+            })
+            .expect("submit final-character type");
+        let request = shared.next().expect("take final-character type");
+        let mut state = BrowserState::default();
+        state.current_refs.insert("e1".to_owned());
+        let full_text_delivered = std::cell::Cell::new(false);
+        let cancellation_won = std::cell::Cell::new(false);
+
+        let result = state.dispatch_ref_action(
+            "e1",
+            |_| {
+                full_text_delivered.set(true);
+                Ok(())
+            },
+            |state| {
+                assert!(
+                    full_text_delivered.get(),
+                    "post-action snapshot must follow the completed type"
+                );
+                cancellation_won.set(shared.cancel(&type_id, CancellationReason::Cancelled));
+                state.committed_post_action_snapshot(&request)
+            },
+        );
+        assert!(
+            cancellation_won.get(),
+            "the final typing character must not claim request-level commitment"
+        );
+        assert!(
+            !request.cancellation.is_committed(),
+            "typing must not set request-level physical commitment"
+        );
+
+        let completed = shared.complete(&request, result);
+        assert!(
+            completed.is_ok(),
+            "a fully delivered type must not report cancellation: {completed:?}"
+        );
+
+        const TEST_MODULE: &str = "\n#[cfg(test)]\nmod tests {";
+        let production = include_str!("actor.rs")
+            .split_once(TEST_MODULE)
+            .expect("actor.rs must have a test module")
+            .0;
+        let type_path = production
+            .split_once("    fn type_text(")
+            .expect("actor type path must exist")
+            .1
+            .split_once("    fn select_option(")
+            .expect("actor type path must end before select_option")
+            .0;
+        assert!(
+            type_path.contains("|state| state.committed_post_action_snapshot(request)"),
+            "completed typing must use the completed-action snapshot path"
+        );
+        assert!(
+            !type_path.contains("state.snapshot(request)"),
+            "completed typing must not return to a cancellable snapshot"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_during_append_type_stops_between_characters() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(61_300),
+                BrowserOp::Navigate(server.url("/input")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to input fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Type target");
+
+        let type_id = request_id(61_301);
+        let type_actor = Arc::clone(&actor);
+        let type_request_id = type_id.clone();
+        let typed = tokio::spawn(async move {
+            type_actor
+                .execute_with_timeout(
+                    type_request_id,
+                    BrowserOp::Type {
+                        target,
+                        text: "append".to_owned(),
+                        submit: false,
+                        slowly: false,
+                        clear: false,
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+        wait_until_in_flight(&actor, &type_id).await;
+        assert_eq!(server.capture(), "input-keydown");
+        assert!(
+            actor.cancel(&type_id),
+            "append typing must remain request-cancellable"
+        );
+        assert_eq!(
+            typed.await.expect("join cancelled append type"),
+            Err(BrowserError::Cancelled)
+        );
+
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(61_302),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("snapshot after cancelled append type");
+        let snapshot = output_text(&snapshot);
+        // Cancellation between characters must leave exactly the one key
+        // effect that had already dispatched; caret placement after focus is
+        // engine behavior this test does not pin down.
+        assert!(
+            snapshot.contains("Key pressed: a; trusted: true; state: up; effects: 1"),
+            "{snapshot}"
+        );
+        assert!(!snapshot.contains(r#"[value="old value"]"#), "{snapshot}");
+        assert!(snapshot.contains("Submit effects: 0"), "{snapshot}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_tool_press_key_targets_ref_and_snapshot_observes_trusted_listener() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(62_000),
+                BrowserOp::Navigate(server.url("/input")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to input fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Type target");
+
+        let pressed = actor
+            .execute_with_timeout(
+                request_id(62_001),
+                BrowserOp::PressKey {
+                    target: Some(target),
+                    key: "Enter".to_owned(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("press key on snapshot ref");
+        let pressed = output_text(&pressed);
+        assert!(
+            pressed.contains("Key pressed: Enter; trusted: true"),
+            "{pressed}"
+        );
+        assert!(pressed.contains("state: up; effects: 1"), "{pressed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_after_committed_key_press_reports_success_and_releases_key() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(62_100),
+                BrowserOp::Navigate(server.url("/input")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to input fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Type target");
+
+        let press_id = request_id(62_101);
+        let press_actor = Arc::clone(&actor);
+        let press_request_id = press_id.clone();
+        let press = tokio::spawn(async move {
+            press_actor
+                .execute_with_timeout(
+                    press_request_id,
+                    BrowserOp::PressKey {
+                        target: Some(target),
+                        key: "Enter".to_owned(),
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+        wait_until_in_flight(&actor, &press_id).await;
+        assert_eq!(server.capture(), "input-keydown");
+        assert!(
+            !actor.cancel(&press_id),
+            "cancellation after key-down must be a no-op-too-late"
+        );
+
+        let pressed = press
+            .await
+            .expect("join committed actor key press")
+            .expect("a committed key press must not report cancellation");
+        let pressed = output_text(&pressed);
+        assert!(pressed.contains("state: up; effects: 1"), "{pressed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_after_committed_type_submit_reports_success_once() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(62_200),
+                BrowserOp::Navigate(server.url("/input")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to input fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Type target");
+
+        let type_id = request_id(62_201);
+        let type_actor = Arc::clone(&actor);
+        let type_request_id = type_id.clone();
+        let typed = tokio::spawn(async move {
+            type_actor
+                .execute_with_timeout(
+                    type_request_id,
+                    BrowserOp::Type {
+                        target,
+                        text: "submit once".to_owned(),
+                        submit: true,
+                        slowly: false,
+                        clear: true,
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+        wait_until_in_flight(&actor, &type_id).await;
+        assert_eq!(server.capture(), "input-keydown");
+        assert!(
+            !actor.cancel(&type_id),
+            "cancellation after submit key-down must be a no-op-too-late"
+        );
+
+        let typed = typed
+            .await
+            .expect("join committed actor type submit")
+            .expect("a committed type submit must not report cancellation");
+        let typed = output_text(&typed);
+        assert!(typed.contains(r#"[value="submit once"]"#), "{typed}");
+        assert!(typed.contains("state: up; effects: 1"), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_tool_hover_snapshot_observes_mouseover_listener() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(63_000),
+                BrowserOp::Navigate(server.url("/input")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to input fixture");
+        let target = snapshot_ref(output_text(&snapshot), "button", "Hover target");
+
+        let hovered = actor
+            .execute_with_timeout(
+                request_id(63_001),
+                BrowserOp::Hover(target),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("hover snapshot ref");
+        let hovered = output_text(&hovered);
+        assert!(
+            hovered.contains("Hover observed: true; trusted: true"),
+            "{hovered}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_tool_select_option_matches_visible_label() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(64_000),
+                BrowserOp::Navigate(server.url("/input")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to input fixture");
+        let target = snapshot_ref(output_text(&snapshot), "combobox", "Select target");
+
+        let selected = actor
+            .execute_with_timeout(
+                request_id(64_001),
+                BrowserOp::SelectOption {
+                    target,
+                    values: vec!["Beta".to_owned()],
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("select option by snapshot ref");
+        let selected = output_text(&selected);
+        assert!(
+            selected.contains("Selected value: beta; changes: 1"),
+            "{selected}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_tool_single_select_ambiguity_uses_first_dom_value_or_label_match() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(64_100),
+                BrowserOp::Navigate(server.url("/input")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to input fixture");
+        let target = snapshot_ref(
+            output_text(&snapshot),
+            "combobox",
+            "Ambiguous select target",
+        );
+
+        let selected = actor
+            .execute_with_timeout(
+                request_id(64_101),
+                BrowserOp::SelectOption {
+                    target,
+                    values: vec!["X".to_owned()],
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("select ambiguous single option");
+        let selected = output_text(&selected);
+        assert!(
+            selected.contains("Ambiguous selected value: other; changes: 1"),
+            "{selected}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_tool_multiple_select_ambiguity_selects_all_dom_value_or_label_matches() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(64_200),
+                BrowserOp::Navigate(server.url("/input")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to input fixture");
+        let target = snapshot_ref(
+            output_text(&snapshot),
+            "combobox",
+            "Ambiguous multi select target",
+        );
+
+        let selected = actor
+            .execute_with_timeout(
+                request_id(64_201),
+                BrowserOp::SelectOption {
+                    target,
+                    values: vec!["X".to_owned()],
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("select ambiguous multiple options");
+        let selected = output_text(&selected);
+        assert!(
+            selected.contains("Ambiguous selected values: other,X; changes: 1"),
+            "{selected}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_tool_empty_values_clear_multi_select() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(64_300),
+                BrowserOp::Navigate(server.url("/input")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to input fixture");
+        let target = snapshot_ref(output_text(&snapshot), "combobox", "Multi select target");
+
+        let selected = actor
+            .execute_with_timeout(
+                request_id(64_301),
+                BrowserOp::SelectOption {
+                    target,
+                    values: Vec::new(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("clear multi-select by snapshot ref");
+        let selected = output_text(&selected);
+        assert!(
+            selected.contains("Selected values: none; changes: 1"),
+            "{selected}"
+        );
+    }
+
+    #[test]
+    fn input_tool_type_rejects_unknown_and_stale_refs() {
+        let mut state = BrowserState::default();
+        state.current_refs.insert("e1".to_owned());
+        let (reply, _response) = oneshot::channel();
+        let request = ActorRequest {
+            request_id: request_id(65_000),
+            op: BrowserOp::Type {
+                target: "e1".to_owned(),
+                text: "not typed".to_owned(),
+                submit: false,
+                slowly: false,
+                clear: true,
+            },
+            cancellation: Arc::new(CommandCancellation::new()),
+            deadline: Instant::now() + Duration::from_secs(5),
+            timeout_ms: 5_000,
+            reply,
+        };
+
+        let unknown = state.type_text("e999999", "not typed", false, false, true, &request);
+        assert!(matches!(
+            unknown,
+            Err(BrowserError::Message(message))
+                if message.contains("unknown or stale ref e999999")
+        ));
+
+        state.current_refs = HashSet::from(["e2".to_owned()]);
+        let stale = state.type_text("e1", "not typed", false, false, true, &request);
+        assert!(matches!(
+            stale,
+            Err(BrowserError::Message(message))
+                if message.contains("unknown or stale ref e1")
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
