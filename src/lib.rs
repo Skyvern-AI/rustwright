@@ -71,7 +71,7 @@ impl CancelToken {
         let _ = self.try_cancel();
     }
 
-    /// Attempt to cancel before a physical pointer action commits.
+    /// Attempt to cancel before a physical input action commits.
     ///
     /// Returns `false` if cancellation already won or physical dispatch has
     /// committed, making the cancellation boundary atomic for callers that
@@ -100,7 +100,7 @@ impl CancelToken {
         self.inner.cancelled.load(Ordering::SeqCst)
     }
 
-    /// Whether any physical pointer action has crossed its cancellation boundary.
+    /// Whether any physical input action has crossed its cancellation boundary.
     ///
     /// This observation remains true for request-level result ownership. The
     /// separate per-action arbitration state is reset after each dispatch.
@@ -2506,8 +2506,135 @@ multiline-compatible = """4.5.6"""
     }
 
     #[test]
+    fn typing_cancelled_during_final_character_returns_success_without_commit() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(4);
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let (alive_tx, _) = watch::channel(true);
+        let client = Arc::new(CdpClient {
+            write_tx,
+            pending: Arc::clone(&pending),
+            events: events.clone(),
+            event_log: Arc::clone(&event_log),
+            next_id: AtomicU64::new(1),
+            sent_runtime_enable_count: AtomicU64::new(0),
+            sent_target_close_count: AtomicU64::new(0),
+            sent_context_dispose_count: AtomicU64::new(0),
+            alive: Arc::new(AtomicBool::new(true)),
+            alive_tx,
+        });
+        let browser = Arc::new(BrowserInner {
+            runtime: OwnedRuntime::new(runtime),
+            client: Arc::clone(&client),
+            process: Mutex::new(None),
+            profile_dir: Mutex::new(None),
+            owned: false,
+            ws_endpoint: "ws://test.invalid".to_string(),
+            stealth_user_agent_override: Mutex::new(None),
+            single_process_fallback: false,
+            lifecycle: Arc::new(CloseLifecycle::new()),
+            attached_pages: AttachedPageRegistry::default(),
+            next_native_network_index: AtomicU64::new(1),
+        });
+        let page = RustwrightPage {
+            inner: Arc::new(PageInner {
+                browser: Arc::clone(&browser),
+                target_id: "test-target".to_string(),
+                registry_generation: 0,
+                session_id: "test-session".to_string(),
+                context_id: None,
+                main_frame_id: Mutex::new(None),
+                frame_state: Mutex::new(PageFrameState::new("test-session".to_string())),
+                network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
+                event_stream_start_cursor: 0,
+                background_override_active: Arc::new(AtomicBool::new(false)),
+                screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+                mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+                default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
+                lifecycle: Arc::new(CloseLifecycle::new()),
+                target_closed: AtomicBool::new(false),
+                crashed: AtomicBool::new(false),
+                close_target_on_drop: AtomicBool::new(false),
+                console_records: Mutex::new(ConsoleRecordStore::default()),
+                console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
+            }),
+        };
+        let token = CancelToken::new();
+        let dispatch_token = token.clone();
+        let responder = browser.runtime.handle().spawn(async move {
+            let mut cancellation_won = None;
+            loop {
+                let command = match write_rx.recv().await.unwrap() {
+                    CdpOutgoing::Text(payload) => serde_json::from_str::<Value>(&payload).unwrap(),
+                    CdpOutgoing::Close => panic!("unexpected transport close"),
+                };
+                let method = command["method"].as_str().unwrap();
+                let result = match method {
+                    "Page.getFrameTree" => json!({}),
+                    "Runtime.evaluate" => {
+                        json!({ "result": { "type": "boolean", "value": true } })
+                    }
+                    "Input.dispatchKeyEvent" => json!({}),
+                    other => panic!("unexpected CDP command: {other}"),
+                };
+                let key_up =
+                    method == "Input.dispatchKeyEvent" && command["params"]["type"] == "keyUp";
+                if method == "Input.dispatchKeyEvent" && command["params"]["type"] == "keyDown" {
+                    cancellation_won = Some(dispatch_token.try_cancel());
+                }
+                dispatch_cdp_payload(
+                    json!({ "id": command["id"], "result": result }),
+                    Arc::clone(&pending),
+                    events.clone(),
+                    Arc::clone(&event_log),
+                );
+                if key_up {
+                    return cancellation_won;
+                }
+            }
+        });
+
+        let result = page.type_text_with_timeout_and_cancel(
+            "#target",
+            "a",
+            None,
+            Some(1_000.0),
+            Some(&token),
+        );
+        let cancellation_won = browser.block_on_raw(responder).unwrap().unwrap();
+
+        assert!(
+            cancellation_won,
+            "typing must remain request-cancellable while the final character is in flight"
+        );
+        assert!(
+            result.is_ok(),
+            "a fully dispatched type must not be reported as cancelled: {result:?}"
+        );
+        assert!(
+            !token.is_physical_action_committed(),
+            "typing must not claim request-level physical commitment"
+        );
+    }
+
+    #[test]
     fn command_timeout_without_override_is_thirty_seconds() {
         assert_eq!(BrowserInner::command_timeout(None), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn native_input_timeout_honors_budget_larger_than_thirty_seconds() {
+        assert_eq!(
+            native_input_timeout(Some(45_000.0)),
+            Duration::from_secs(45)
+        );
     }
 
     #[test]
@@ -2519,6 +2646,118 @@ multiline-compatible = """4.5.6"""
             Err(RwError::Timeout(5_000))
         )
         .is_ok());
+    }
+
+    #[test]
+    fn committed_key_press_preserves_action_result_after_cleanup_failure() {
+        assert_eq!(KEY_RELEASE_CLEANUP_TIMEOUT, Duration::from_secs(5));
+        assert!(committed_key_dispatch_result(
+            Ok(()),
+            vec![RwError::Timeout(
+                KEY_RELEASE_CLEANUP_TIMEOUT.as_millis() as u64
+            )],
+        )
+        .is_ok());
+        assert!(matches!(
+            committed_key_dispatch_result(
+                Err(RwError::InvalidInput("unsupported key".to_owned())),
+                Vec::new(),
+            ),
+            Err(RwError::InvalidInput(message)) if message == "unsupported key"
+        ));
+    }
+
+    fn chord_shape(key: &str) -> (Vec<String>, i64, String) {
+        let chord = parse_key_chord(key).unwrap_or_else(|error| panic!("{key:?}: {error}"));
+        let names = chord
+            .modifiers
+            .iter()
+            .map(|(descriptor, _)| descriptor.key.clone())
+            .collect();
+        let mask = chord
+            .modifiers
+            .iter()
+            .fold(0, |mask, (_, held)| mask | held);
+        (names, mask, chord.base.key.clone())
+    }
+
+    #[test]
+    fn key_chord_parsing_matches_the_dispatch_shape() {
+        assert_eq!(chord_shape("a"), (Vec::new(), 0, "a".to_owned()));
+        assert_eq!(
+            chord_shape("Control+a"),
+            (vec!["Control".to_owned()], 2, "a".to_owned())
+        );
+        // `+` is the chord separator, so a bare `+` has to stay addressable as a
+        // base key rather than parsing as two empty parts.
+        assert_eq!(chord_shape("+"), (Vec::new(), 0, "+".to_owned()));
+        assert_eq!(
+            chord_shape("Control+Shift+Alt+Meta+a"),
+            (
+                vec![
+                    "Control".to_owned(),
+                    "Shift".to_owned(),
+                    "Alt".to_owned(),
+                    "Meta".to_owned(),
+                ],
+                2 | 8 | 1 | 4,
+                "a".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn key_chord_parsing_deduplicates_repeated_modifiers() {
+        // Holding a held modifier is a no-op for the page but not for us: each
+        // repeat costs another key-down dispatch and another key-up that must be
+        // cleaned up under its own budget after the press commits. Without the
+        // dedup, a caller-supplied string scales that work linearly.
+        let (names, mask, base) = chord_shape("Control+Control+Control+Shift+Shift+a");
+        assert_eq!(names, vec!["Control".to_owned(), "Shift".to_owned()]);
+        assert_eq!(base, "a");
+        // The mask a repeated modifier produces is the mask it produces once, so
+        // deduplicating cannot change what the page sees.
+        assert_eq!(mask, chord_shape("Control+Shift+a").1);
+        // `Control` and `ControlLeft` are the same physical key, so the second
+        // one is the redundant repeat the dedup is for.
+        assert_eq!(chord_shape("ControlLeft+Control+a").0.len(), 1);
+
+        // Left and right modifiers share a mask but are different keys: a page
+        // reading `event.code` can tell them apart, so both key-downs still go
+        // out. Deduplicating by mask instead of by code would silently drop one.
+        let paired = parse_key_chord("ControlLeft+ControlRight+a").expect("paired chord");
+        assert_eq!(
+            paired
+                .modifiers
+                .iter()
+                .map(|(descriptor, _)| descriptor.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ControlLeft", "ControlRight"]
+        );
+    }
+
+    #[test]
+    fn key_chord_parsing_rejects_unusable_keys_before_any_dispatch() {
+        // Every one of these used to be discovered after the caller's target had
+        // already been focused -- and, for a bad base key behind a good modifier,
+        // after that modifier's key-down had already been dispatched.
+        for key in ["", "Control+", "+a", "a++b"] {
+            assert!(
+                matches!(
+                    parse_key_chord(key),
+                    Err(RwError::InvalidInput(message)) if message.starts_with("unsupported key:")
+                ),
+                "{key:?} should be rejected as an empty chord part"
+            );
+        }
+        assert!(matches!(
+            parse_key_chord("Hyper+a"),
+            Err(RwError::InvalidInput(message)) if message == "unsupported key modifier: Hyper"
+        ));
+        assert!(
+            parse_key_chord("Control+NoSuchKey").is_err(),
+            "an unknown base key must fail before its modifier is pressed"
+        );
     }
 
     #[test]
@@ -8392,6 +8631,10 @@ async fn evaluate_expression_for_page_async(
 struct OperationDeadline {
     at: tokio::time::Instant,
     timeout: Duration,
+}
+
+fn native_input_timeout(timeout_ms: Option<f64>) -> Duration {
+    BrowserInner::command_timeout(timeout_ms)
 }
 
 impl OperationDeadline {
@@ -17308,6 +17551,7 @@ return true;
         self.type_text_with_cancel(selector, text, delay, None)
     }
 
+    /// Type with an optional cancellation signal and the page's default timeout.
     pub fn type_text_with_cancel(
         &self,
         selector: &str,
@@ -17315,14 +17559,34 @@ return true;
         delay: Option<Duration>,
         cancel: Option<&CancelToken>,
     ) -> RwResult<()> {
+        self.type_text_with_timeout_and_cancel(selector, text, delay, None, cancel)
+    }
+
+    /// Type with an explicit timeout and optional cancellation signal.
+    pub fn type_text_with_timeout_and_cancel(
+        &self,
+        selector: &str,
+        text: &str,
+        delay: Option<Duration>,
+        timeout_ms: Option<f64>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
         let locator_json = selector_to_locator_json(selector)?;
+        let timeout_ms = self.resolve_timeout(timeout_ms, false);
         let page = Arc::clone(&self.inner);
         let text = text.to_string();
+        let timeout = native_input_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
-        browser.block_on_raw(cancelable(cancel.cloned(), async move {
-            let deadline = OperationDeadline::new(Duration::from_secs(30));
-            let resolution = focus_locator_for_native_input(&page, &locator_json, deadline).await?;
+        browser.block_on_raw(async move {
+            let deadline = OperationDeadline::new(timeout);
+            let resolution = cancelable(
+                cancel.cloned(),
+                focus_locator_for_native_input(&page, &locator_json, deadline),
+            )
+            .await?;
+            ensure_not_cancelled(cancel)?;
             for character in text.chars() {
+                ensure_not_cancelled(cancel)?;
                 dispatch_typed_character(
                     &page.browser.client,
                     &resolution.session_id,
@@ -17333,30 +17597,72 @@ return true;
                 .await?;
             }
             Ok(())
-        }))
+        })
     }
 
     /// Press a key through Chromium's input domain, optionally focusing a selector first.
     pub fn press_key(&self, selector: Option<&str>, key: &str) -> RwResult<()> {
+        self.press_key_with_cancel(selector, key, None)
+    }
+
+    /// Press a key with an optional cancellation signal and the page's default timeout.
+    pub fn press_key_with_cancel(
+        &self,
+        selector: Option<&str>,
+        key: &str,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
+        self.press_key_with_timeout_and_cancel(selector, key, None, cancel)
+    }
+
+    /// Press a key with an explicit timeout and optional cancellation signal.
+    pub fn press_key_with_timeout_and_cancel(
+        &self,
+        selector: Option<&str>,
+        key: &str,
+        timeout_ms: Option<f64>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
         let locator_json = selector.map(selector_to_locator_json).transpose()?;
+        // Reject an unusable key before anything touches the page. Focusing the
+        // target runs the page's focus/blur handlers, so validating afterwards
+        // would mutate page state on a call that then returns InvalidInput. The
+        // parse is pure and cheap, and `dispatch_key_press` re-derives the same
+        // chord through the same parser, so there is one definition of valid.
+        parse_key_chord(key)?;
+        let timeout_ms = self.resolve_timeout(timeout_ms, false);
         let page = Arc::clone(&self.inner);
         let key = key.to_string();
+        let timeout = native_input_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
         browser.block_on_raw(async move {
-            let deadline = OperationDeadline::new(Duration::from_secs(30));
-            let session_id = match locator_json {
-                Some(locator_json) => {
-                    focus_locator_for_native_input(&page, &locator_json, deadline)
-                        .await?
-                        .session_id
+            let deadline = OperationDeadline::new(timeout);
+            let session_id = cancelable(cancel.cloned(), async {
+                match locator_json {
+                    Some(locator_json) => {
+                        Ok(
+                            focus_locator_for_native_input(&page, &locator_json, deadline)
+                                .await?
+                                .session_id,
+                        )
+                    }
+                    None => Ok(page.session_id.clone()),
                 }
-                None => page.session_id.clone(),
-            };
-            dispatch_key_press(&page.browser.client, &session_id, &key, None, deadline).await
+            })
+            .await?;
+            dispatch_key_press(
+                &page.browser.client,
+                &session_id,
+                &key,
+                None,
+                deadline,
+                cancel,
+            )
+            .await
         })
     }
 
-    /// Select options by value using the page DOM and return the resulting values.
+    /// Select options by value and return the resulting values.
     pub fn select_options(&self, selector: &str, values: &[String]) -> RwResult<Vec<String>> {
         self.select_options_with_cancel(selector, values, None)
     }
@@ -17379,6 +17685,53 @@ const matched = options.filter(option => requested.includes(option.value));
 const found = new Set(matched.map(option => option.value));
 const missing = requested.filter(value => !found.has(value));
 if (missing.length) throw new Error(`Select option values not found: ${{missing.join(', ')}}`);
+for (const option of options) option.selected = false;
+if (el.multiple) {{
+  for (const option of matched) option.selected = true;
+}} else if (matched.length) {{
+  matched[0].selected = true;
+}}
+el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value));
+"#
+        );
+        let json = self.evaluate_locator_json_cancelable(locator_json, 0, body, None, cancel)?;
+        let selected_json: String = serde_json::from_str(&json)?;
+        Ok(serde_json::from_str(&selected_json)?)
+    }
+
+    /// Select exact values or visible labels in DOM order and return the resulting values.
+    pub fn select_options_by_value_or_label(
+        &self,
+        selector: &str,
+        values: &[String],
+    ) -> RwResult<Vec<String>> {
+        self.select_options_by_value_or_label_with_cancel(selector, values, None)
+    }
+
+    pub fn select_options_by_value_or_label_with_cancel(
+        &self,
+        selector: &str,
+        values: &[String],
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<Vec<String>> {
+        let locator_json = selector_to_locator_json(selector)?;
+        let values_json = serde_json::to_string(values)?;
+        let body = format!(
+            r#"
+if (!el) throw new Error('No element matches locator');
+if (!(el instanceof HTMLSelectElement)) throw new Error('Element is not a <select> element');
+const requested = {values_json};
+const options = Array.from(el.options);
+const optionRequested = option => requested.some(
+  value => option.value === value || option.label === value
+);
+const matched = options.filter(optionRequested);
+const missing = requested.filter(value => !options.some(
+  option => option.value === value || option.label === value
+));
+if (missing.length) throw new Error(`Select options not found by value or label: ${{missing.join(', ')}}`);
 for (const option of options) option.selected = false;
 if (el.multiple) {{
   for (const option of matched) option.selected = true;
@@ -18130,6 +18483,14 @@ async fn wait_input_delay(delay: Option<Duration>, deadline: OperationDeadline) 
     Ok(())
 }
 
+fn ensure_not_cancelled(cancel: Option<&CancelToken>) -> RwResult<()> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(RwError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 async fn dispatch_typed_character(
     client: &CdpClient,
     session_id: &str,
@@ -18138,26 +18499,39 @@ async fn dispatch_typed_character(
     deadline: OperationDeadline,
 ) -> RwResult<()> {
     if !character.is_ascii() || character.is_ascii_control() {
+        let dispatch_timeout = deadline.remaining()?;
         client
             .send(
                 "Input.insertText",
                 json!({ "text": character.to_string() }),
                 Some(session_id),
-                deadline.remaining()?,
+                dispatch_timeout,
             )
             .await?;
         return wait_input_delay(delay, deadline).await;
     }
-    dispatch_key_press(client, session_id, &character.to_string(), delay, deadline).await
+    dispatch_key_press(
+        client,
+        session_id,
+        &character.to_string(),
+        delay,
+        deadline,
+        None,
+    )
+    .await
 }
 
-async fn dispatch_key_press(
-    client: &CdpClient,
-    session_id: &str,
-    key: &str,
-    delay: Option<Duration>,
-    deadline: OperationDeadline,
-) -> RwResult<()> {
+struct KeyChord {
+    modifiers: Vec<(NativeKeyDescriptor, i64)>,
+    base: NativeKeyDescriptor,
+}
+
+// Parsing a chord is pure string work with no page effect, which is what lets
+// callers validate a key BEFORE resolving or focusing a target. Doing it after
+// focus would let `press_key(target, "Nonsense")` fire the target's focus/blur
+// handlers and only then report InvalidInput, mutating the page on a call that
+// is reported as rejected.
+fn parse_key_chord(key: &str) -> RwResult<KeyChord> {
     let parts = if key == "+" {
         vec![key]
     } else {
@@ -18171,64 +18545,171 @@ async fn dispatch_key_press(
         .first()
         .copied()
         .ok_or_else(|| RwError::InvalidInput("key must not be empty".to_string()))?;
-    let mut modifiers = 0_i64;
-    let mut pressed_modifiers = Vec::new();
+    let mut modifiers: Vec<(NativeKeyDescriptor, i64)> = Vec::new();
     for modifier_name in modifier_names {
         let mask = native_modifier_mask(modifier_name).ok_or_else(|| {
             RwError::InvalidInput(format!("unsupported key modifier: {modifier_name}"))
         })?;
         let descriptor = native_key_descriptor(modifier_name)?;
-        modifiers |= mask;
-        client
-            .send(
-                "Input.dispatchKeyEvent",
-                native_key_event_params(&descriptor, "rawKeyDown", modifiers, false),
-                Some(session_id),
-                deadline.remaining()?,
-            )
-            .await?;
-        pressed_modifiers.push((descriptor, mask));
+        // Holding a modifier that is already held is a no-op, so a repeat adds
+        // nothing but another key-down to dispatch and another key-up to clean
+        // up. Without this, "Control+Control+...+a" scales both the dispatch
+        // work and the post-commit cleanup wait linearly with a caller-supplied
+        // string.
+        //
+        // Deduplicate on the physical key code, not the modifier mask:
+        // ControlLeft and ControlRight share a mask but are distinct keys a page
+        // can tell apart through `event.code`, so collapsing them by mask would
+        // drop a key-down the caller asked for. There are only eight modifier
+        // codes, so the chord stays bounded either way.
+        if modifiers
+            .iter()
+            .any(|(held, _)| held.code == descriptor.code)
+        {
+            continue;
+        }
+        modifiers.push((descriptor, mask));
     }
     let base = native_key_descriptor(base_name)?;
-    let include_text = base.text.is_some() && modifiers & (1 | 2 | 4) == 0;
-    client
-        .send(
-            "Input.dispatchKeyEvent",
-            native_key_event_params(
-                &base,
-                if include_text {
-                    "keyDown"
-                } else {
-                    "rawKeyDown"
-                },
-                modifiers,
-                include_text,
-            ),
-            Some(session_id),
-            deadline.remaining()?,
-        )
-        .await?;
-    wait_input_delay(delay, deadline).await?;
-    client
-        .send(
-            "Input.dispatchKeyEvent",
-            native_key_event_params(&base, "keyUp", modifiers, false),
-            Some(session_id),
-            deadline.remaining()?,
-        )
-        .await?;
-    for (descriptor, mask) in pressed_modifiers.into_iter().rev() {
-        modifiers &= !mask;
-        client
-            .send(
-                "Input.dispatchKeyEvent",
-                native_key_event_params(&descriptor, "keyUp", modifiers, false),
-                Some(session_id),
-                deadline.remaining()?,
-            )
-            .await?;
+    Ok(KeyChord { modifiers, base })
+}
+
+async fn dispatch_key_press(
+    client: &CdpClient,
+    session_id: &str,
+    key: &str,
+    delay: Option<Duration>,
+    deadline: OperationDeadline,
+    cancel: Option<&CancelToken>,
+) -> RwResult<()> {
+    let KeyChord {
+        modifiers: resolved_modifiers,
+        base,
+    } = parse_key_chord(key)?;
+    let first_dispatch_timeout = deadline.remaining()?;
+
+    // All validation and timeout checks that can fail without input happen
+    // before this boundary. From the first key-down attempt onward, Chromium
+    // may have accepted an irreversible event, so cancellation loses and every
+    // attempted key-down receives an independent-budget key-up cleanup.
+    dispatch_committed_physical_action(cancel, async {
+        let mut modifiers = 0_i64;
+        let mut attempted_modifiers = Vec::new();
+        let mut base_attempted = false;
+        let mut action_result = Ok(());
+
+        for (index, (descriptor, mask)) in resolved_modifiers.iter().enumerate() {
+            let dispatch_timeout = if index == 0 {
+                first_dispatch_timeout
+            } else {
+                match deadline.remaining() {
+                    Ok(remaining) => remaining,
+                    Err(error) => {
+                        action_result = Err(error);
+                        break;
+                    }
+                }
+            };
+            modifiers |= mask;
+            attempted_modifiers.push((descriptor, *mask));
+            if let Err(error) = client
+                .send(
+                    "Input.dispatchKeyEvent",
+                    native_key_event_params(descriptor, "rawKeyDown", modifiers, false),
+                    Some(session_id),
+                    dispatch_timeout,
+                )
+                .await
+            {
+                action_result = Err(error);
+                break;
+            }
+        }
+
+        if action_result.is_ok() {
+            let include_text = base.text.is_some() && modifiers & (1 | 2 | 4) == 0;
+            let dispatch_timeout = if resolved_modifiers.is_empty() {
+                Ok(first_dispatch_timeout)
+            } else {
+                deadline.remaining()
+            };
+            match dispatch_timeout {
+                Ok(dispatch_timeout) => {
+                    base_attempted = true;
+                    if let Err(error) = client
+                        .send(
+                            "Input.dispatchKeyEvent",
+                            native_key_event_params(
+                                &base,
+                                if include_text {
+                                    "keyDown"
+                                } else {
+                                    "rawKeyDown"
+                                },
+                                modifiers,
+                                include_text,
+                            ),
+                            Some(session_id),
+                            dispatch_timeout,
+                        )
+                        .await
+                    {
+                        action_result = Err(error);
+                    }
+                }
+                Err(error) => action_result = Err(error),
+            }
+        }
+
+        if action_result.is_ok() {
+            action_result = wait_input_delay(delay, deadline).await;
+        }
+
+        let mut cleanup_errors = Vec::new();
+        if base_attempted {
+            if let Err(error) = client
+                .send(
+                    "Input.dispatchKeyEvent",
+                    native_key_event_params(&base, "keyUp", modifiers, false),
+                    Some(session_id),
+                    KEY_RELEASE_CLEANUP_TIMEOUT,
+                )
+                .await
+            {
+                cleanup_errors.push(error);
+            }
+        }
+        for (descriptor, mask) in attempted_modifiers.into_iter().rev() {
+            modifiers &= !mask;
+            if let Err(error) = client
+                .send(
+                    "Input.dispatchKeyEvent",
+                    native_key_event_params(descriptor, "keyUp", modifiers, false),
+                    Some(session_id),
+                    KEY_RELEASE_CLEANUP_TIMEOUT,
+                )
+                .await
+            {
+                cleanup_errors.push(error);
+            }
+        }
+        committed_key_dispatch_result(action_result, cleanup_errors)
+    })
+    .await
+}
+
+const KEY_RELEASE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn committed_key_dispatch_result(
+    action_result: RwResult<()>,
+    cleanup_errors: Vec<RwError>,
+) -> RwResult<()> {
+    for error in cleanup_errors {
+        eprintln!(
+            "rustwright: key-up cleanup received no confirmation after committed key press: {error}"
+        );
     }
-    Ok(())
+    action_result
 }
 
 fn is_page_not_attached_error(error: &RwError) -> bool {
