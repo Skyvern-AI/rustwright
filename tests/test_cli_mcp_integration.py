@@ -15,21 +15,20 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 
 
 def _native_server_binary():
-    found = shutil.which("rustwright-mcp") or shutil.which("mcp-rs")
+    found = shutil.which("rustwright-mcp")
     if found:
         return Path(found)
     for profile in ("debug", "release"):
-        for name in ("rustwright-mcp", "mcp-rs"):
-            candidate = REPOSITORY / "mcp-rs" / "target" / profile / name
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return candidate
+        candidate = REPOSITORY / "mcp" / "target" / profile / "rustwright-mcp"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
     return None
 
 
 requires_native_server = pytest.mark.skipif(
     _native_server_binary() is None,
     reason="requires the native rustwright-mcp server binary "
-    "(cargo build --manifest-path mcp-rs/Cargo.toml)",
+    "(cargo build --manifest-path mcp/Cargo.toml)",
 )
 
 
