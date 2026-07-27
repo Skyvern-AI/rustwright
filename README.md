@@ -91,7 +91,7 @@ rustwright-cli close
 ```
 
 See [`cli/README.md`](cli/README.md) for the full command surface. For a Model Context Protocol
-server, use the standalone [`rustwright-mcp`](mcp-rs/) package.
+server, use the standalone [`rustwright-mcp`](mcp/) package.
 
 ## Why Rustwright?
 
@@ -123,7 +123,7 @@ Give an agent or shell script a browser through compact accessibility snapshots 
 `rustwright-mcp` is a native Rust MCP server (no Python or Node runtime in the
 serving path) that gives any MCP client `browser_*` tools over stdio, with
 compact accessibility snapshots and inline PNG screenshots. It lives in
-[`mcp-rs/`](mcp-rs/) and is the canonical Rustwright MCP server.
+[`mcp/`](mcp/) and is the canonical Rustwright MCP server.
 
 #### Install
 
@@ -145,7 +145,7 @@ If Chrome or Chromium is already installed, point Rustwright at it with
 ##### Claude Code
 
 ```bash
-claude mcp add rustwright -- mcp-rs
+claude mcp add rustwright -- rustwright-mcp
 ```
 
 ##### Claude Desktop
@@ -180,14 +180,14 @@ Open `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS 
 | You do not have a browser installed | `pip install rustwright && python -m rustwright install chromium` — the server finds the downloaded browser automatically. |
 | Screenshots are too large to inline | Tune `RUSTWRIGHT_MCP_SCREENSHOT_MAX_BYTES`; oversized captures fall back to a temp-file path instead of inline image content. |
 
-See [`mcp-rs/README.md`](mcp-rs/README.md) for the full tool list and
+See [`mcp/README.md`](mcp/README.md) for the full tool list and
 configuration. Setting up via an AI agent? Tell it to fetch
-`https://raw.githubusercontent.com/Skyvern-AI/rustwright/HEAD/mcp-rs/README.md`
+`https://raw.githubusercontent.com/Skyvern-AI/rustwright/HEAD/mcp/README.md`
 and follow it.
 
 > The earlier Python MCP server is deprecated: it stays in place until the
 > native server reaches full tool parity, but new capabilities land in
-> `mcp-rs/` only.
+> `mcp/` only.
 
 ### CLI — drive a browser from your shell
 
@@ -311,7 +311,7 @@ See [`LIMITATIONS.md`](LIMITATIONS.md) for detail.
 
 - [ ] **Kotlin binding** — idiomatic Kotlin wrapper (Kotlin/JVM can already consume the Java FFM binding)
 - [ ] Grow the new language bindings beyond the alpha subset (contexts, routing, locators)
-- [x] **Rustwright MCP server** — expose browser automation as tools for MCP-compatible AI agents ([mcp-rs/](mcp-rs/))
+- [x] **Rustwright MCP server** — expose browser automation as tools for MCP-compatible AI agents ([mcp/](mcp/))
 - [ ] CI / Testbox-backed benchmark evidence
 - [ ] Broaden the Node.js surface (contexts, routing, locators)
 - [ ] Close remaining OOPIF gaps
