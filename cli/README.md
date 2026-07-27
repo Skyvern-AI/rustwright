@@ -54,5 +54,5 @@ observe DOM attribute changes can detect those markers.
 ## MCP server
 
 Looking for an MCP server? Rustwright ships a dedicated, standalone MCP server as the
-`rustwright-mcp` package (see [`mcp-rs/`](../mcp-rs)). This CLI focuses on the interactive agent
+`rustwright-mcp` package (see [`mcp/`](../mcp)). This CLI focuses on the interactive agent
 command surface; the two share the same Rustwright CDP engine.
