@@ -38,20 +38,12 @@ def test_mcp_spawns_binary_with_verbatim_argv_and_exit_code(tmp_path, monkeypatc
     assert _recorded_argv(record) == ["--caps=files,network", "extra"]
 
 
-def test_mcp_prefers_rustwright_mcp_over_mcp_rs_on_path(tmp_path, monkeypatch):
-    preferred = _install_stub_binary(tmp_path, monkeypatch, exit_code=7)
-    fallback = _install_stub_binary(tmp_path, monkeypatch, exit_code=9, name="mcp-rs")
+def test_mcp_ignores_legacy_mcp_rs_binary(tmp_path, monkeypatch, capsys):
+    _install_stub_binary(tmp_path, monkeypatch, exit_code=5, name="mcp-rs")
 
-    assert cli.main(["mcp"], program="rustwright") == 7
-    assert preferred.exists()
-    assert not fallback.exists()
-
-
-def test_mcp_falls_back_to_cargo_installed_binary_name(tmp_path, monkeypatch):
-    record = _install_stub_binary(tmp_path, monkeypatch, exit_code=5, name="mcp-rs")
-
-    assert cli.main(["mcp", "arg"], program="rustwright") == 5
-    assert _recorded_argv(record) == ["arg"]
+    assert cli.main(["mcp", "arg"], program="rustwright") == 1
+    captured = capsys.readouterr()
+    assert "rustwright-mcp" in captured.err
 
 
 def test_mcp_missing_binary_prints_install_help_without_traceback(
