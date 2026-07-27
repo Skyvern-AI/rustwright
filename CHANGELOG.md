@@ -8,6 +8,10 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 - Added a persistent `rustwright` CLI for browser sessions, accessibility snapshots, and element-reference actions.
 - Added `rustwright-mcp`, an MCP stdio server that exposes browser automation tools to MCP clients.
+- Added native console-message capture and the mirror-profile `browser_console_messages` MCP tool.
+- Added native network-record capture and the mirror-profile `browser_network_requests` and `browser_network_request` MCP tools.
+- Added native pending-file-chooser events and mirror-profile MCP file upload and cancellation with workspace-confined paths.
+- Added native physical element dragging and the mirror-profile `browser_drag` MCP tool.
 - Added alpha bindings for Go, Java, C#/.NET, Ruby, and PHP, plus a native Rust API, backed by the shared Rust engine.
 
 ### Changed

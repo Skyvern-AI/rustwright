@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, fmt, fs,
+    io::Write as _,
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, Weak,
@@ -15,10 +16,13 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmcp::model::RequestId;
 use rustwright::{
     ActionOptions, Browser, CancelToken, CloseOptions, ConnectOptions, Dialog, DialogKind, Error,
-    EventReceiver, GotoOptions, LaunchOptions, Page, PageEvent, ScreenshotOptions, chromium,
+    EventReceiver, FileChooser, GotoOptions, LaunchOptions, NetworkBody, Page, PageEvent,
+    ScreenshotOptions, chromium,
 };
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
+
+use crate::tools::{ConsoleLevel, NetworkPart};
 
 const SNAPSHOT_JS: &str = include_str!("snapshot.js");
 const FIND_REGEX_JS: &str = r#"(input) => {
@@ -97,6 +101,8 @@ const DEFAULT_TOOL_TIMEOUT_MS: u64 = 60_000;
 const MIN_TOOL_TIMEOUT_MS: u64 = 1_000;
 const MAX_TOOL_TIMEOUT_MS: u64 = 600_000;
 const ENGINE_TIMEOUT_CUSHION: Duration = Duration::from_secs(1);
+const MAX_FILE_INPUTS: usize = 50;
+const MAX_FILE_INPUT_BYTES: u64 = 20 * 1024 * 1024;
 pub(crate) const COMMAND_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug)]
@@ -138,10 +144,31 @@ pub(crate) enum BrowserOp {
     FillForm(Vec<FillField>),
     Hover(String),
     PressKey(String),
+    Drag {
+        start_target: String,
+        end_target: String,
+        start_element: Option<String>,
+        end_element: Option<String>,
+    },
     Drop {
         target: String,
         paths: Vec<String>,
         data: Vec<(String, String)>,
+    },
+    ConsoleMessages {
+        level: ConsoleLevel,
+        all: bool,
+        filename: Option<String>,
+    },
+    NetworkRequests {
+        include_static: bool,
+        filter: Option<String>,
+        filename: Option<String>,
+    },
+    NetworkRequest {
+        index: u64,
+        part: Option<NetworkPart>,
+        filename: Option<String>,
     },
     Tabs {
         action: TabAction,
@@ -152,6 +179,7 @@ pub(crate) enum BrowserOp {
         accept: bool,
         prompt_text: Option<String>,
     },
+    FileUpload(Vec<String>),
     WaitFor {
         time_seconds: Option<f64>,
         text: Option<String>,
@@ -678,6 +706,7 @@ struct BrowserState {
 struct PageRuntime {
     events: EventReceiver,
     pending_dialog: Option<PendingDialog>,
+    pending_file_chooser: Option<PendingFileChooser>,
     title: Option<String>,
 }
 
@@ -685,6 +714,11 @@ struct PendingDialog {
     kind: DialogKind,
     message: String,
     dialog: Dialog,
+}
+
+struct PendingFileChooser {
+    multiple: bool,
+    chooser: FileChooser,
 }
 
 impl BrowserState {
@@ -855,6 +889,7 @@ impl BrowserState {
                 PageRuntime {
                     events: page.events(),
                     pending_dialog: None,
+                    pending_file_chooser: None,
                     title: None,
                 },
             );
@@ -876,6 +911,10 @@ impl BrowserState {
                             dialog,
                         });
                     }
+                    PageEvent::FileChooser { multiple, chooser } => {
+                        runtime.pending_file_chooser =
+                            Some(PendingFileChooser { multiple, chooser });
+                    }
                     PageEvent::Closed | PageEvent::PageCrashed => {}
                     PageEvent::Navigated { .. } | PageEvent::Download { .. } => {}
                 }
@@ -883,11 +922,11 @@ impl BrowserState {
         }
     }
 
-    fn has_pending_dialog(&mut self) -> bool {
+    fn has_pending_modal(&mut self) -> bool {
         self.poll_events();
-        self.pages
-            .values()
-            .any(|runtime| runtime.pending_dialog.is_some())
+        self.pages.values().any(|runtime| {
+            runtime.pending_dialog.is_some() || runtime.pending_file_chooser.is_some()
+        })
     }
 
     fn dialog_kind_name(kind: &DialogKind) -> &str {
@@ -922,6 +961,21 @@ impl BrowserState {
                     "- {owner}: Dialog pending: type={}; message={:?}. Call browser_handle_dialog.",
                     Self::dialog_kind_name(&pending.kind),
                     pending.message
+                ));
+            }
+            if let Some(pending) = &runtime.pending_file_chooser {
+                let owner = if active_target.as_ref() == Some(target_id) {
+                    "Current tab"
+                } else {
+                    "Registered tab"
+                };
+                let hint = if pending.multiple {
+                    "multiple files allowed"
+                } else {
+                    "single file only"
+                };
+                lines.push(format!(
+                    "- {owner}: File chooser pending: {hint}. Call browser_file_upload."
                 ));
             }
         }
@@ -1122,7 +1176,7 @@ impl BrowserState {
         boxes: bool,
         cancel: Option<&CancelToken>,
     ) -> TextResult {
-        if self.has_pending_dialog() {
+        if self.has_pending_modal() {
             return Ok(self.modal_response(
                 "Snapshot deferred until the pending modal is handled.",
                 request,
@@ -1186,7 +1240,7 @@ impl BrowserState {
         request: &ActorRequest,
     ) -> TextResult {
         let outline = self.snapshot(request)?;
-        if self.has_pending_dialog() {
+        if self.has_pending_modal() {
             return Ok(outline);
         }
         let lines = outline.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
@@ -1252,17 +1306,41 @@ impl BrowserState {
         post_snapshot(self)
     }
 
+    fn dispatch_ref_pair_action<Action, PostSnapshot>(
+        &mut self,
+        start_target: &str,
+        end_target: &str,
+        action: Action,
+        post_snapshot: PostSnapshot,
+    ) -> TextResult
+    where
+        Action: FnOnce(&mut Self) -> Result<(), BrowserError>,
+        PostSnapshot: FnOnce(&mut Self) -> TextResult,
+    {
+        for target in [start_target, end_target] {
+            if !self.current_refs.contains(target) {
+                return Err(BrowserError::Message(format!(
+                    "unknown or stale ref {target}; call browser_snapshot and use its latest refs"
+                )));
+            }
+        }
+        self.current_refs.clear();
+        action(self)?;
+        post_snapshot(self)
+    }
+
     fn click(&mut self, target: &str, double_click: bool, request: &ActorRequest) -> TextResult {
         let selector = format!(r#"[data-mcp-ref="{target}"]"#);
         self.dispatch_ref_action(
             target,
             |state| {
                 let remaining = Self::remaining(request)?;
-                // A JavaScript dialog can stall the engine's post-dispatch
-                // action wait. Run the physical click on a worker so this actor
-                // can surface the already-subscribed modal event as soon as
-                // Chromium emits it. The committed click worker still owns its
-                // release cleanup and is not cancelled or abandoned mid-input.
+                // A JavaScript dialog or intercepted file chooser can stall the
+                // engine's post-dispatch action wait. Run the physical click on
+                // a worker so this actor can surface the already-subscribed
+                // modal event as soon as Chromium emits it. The committed click
+                // worker still owns its release cleanup and is not cancelled or
+                // abandoned mid-input.
                 let page = state.ensure_page(request)?.clone();
                 let selector = selector.clone();
                 let cancellation = request.cancellation.engine.clone();
@@ -1282,13 +1360,13 @@ impl BrowserState {
                         BrowserError::Message(format!("failed to start click worker: {error}"))
                     })?;
                 loop {
-                    if state.has_pending_dialog() {
+                    if state.has_pending_modal() {
                         return Ok(());
                     }
                     match result_rx.try_recv() {
                         Ok(Ok(())) => return Ok(()),
                         Ok(Err(error)) => {
-                            if state.has_pending_dialog() {
+                            if state.has_pending_modal() {
                                 return Ok(());
                             }
                             return Err(state.operation_error(
@@ -1313,6 +1391,74 @@ impl BrowserState {
             // finish the post-click snapshot and preserve its owned result.
             |state| state.snapshot_with_cancel(request, None),
         )
+    }
+
+    fn drag(
+        &mut self,
+        start_target: &str,
+        end_target: &str,
+        start_element: Option<&str>,
+        end_element: Option<&str>,
+        request: &ActorRequest,
+    ) -> TextResult {
+        let start_selector = format!(r#"[data-mcp-ref="{start_target}"]"#);
+        let end_selector = format!(r#"[data-mcp-ref="{end_target}"]"#);
+        let start_display = start_element.unwrap_or(start_target).to_owned();
+        let end_display = end_element.unwrap_or(end_target).to_owned();
+        let snapshot = self.dispatch_ref_pair_action(
+            start_target,
+            end_target,
+            |state| {
+                let remaining = Self::remaining(request)?;
+                let page = state.ensure_page(request)?.clone();
+                let cancellation = request.cancellation.engine.clone();
+                let options = ActionOptions::timeout(Self::engine_timeout(remaining));
+                let (result_tx, result_rx) = sync_channel(1);
+                thread::Builder::new()
+                    .name("mcp-browser-drag".to_owned())
+                    .spawn(move || {
+                        let result = page.drag_and_drop_with_cancel(
+                            &start_selector,
+                            &end_selector,
+                            options,
+                            Some(&cancellation),
+                        );
+                        let _ = result_tx.send(result);
+                    })
+                    .map_err(|error| {
+                        BrowserError::Message(format!("failed to start drag worker: {error}"))
+                    })?;
+                loop {
+                    if state.has_pending_modal() {
+                        return Ok(());
+                    }
+                    match result_rx.try_recv() {
+                        Ok(Ok(())) => return Ok(()),
+                        Ok(Err(error)) => {
+                            if state.has_pending_modal() {
+                                return Ok(());
+                            }
+                            return Err(state.operation_error(
+                                &format!("drag failed from {start_target} to {end_target}"),
+                                error,
+                                &request.cancellation,
+                                request.timeout_ms,
+                            ));
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            return Err(BrowserError::Message(
+                                "drag worker stopped without a result".to_owned(),
+                            ));
+                        }
+                        Err(TryRecvError::Empty) => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                    }
+                }
+            },
+            |state| state.snapshot_with_cancel(request, None),
+        )?;
+        Ok(render_drag_result(&start_display, &end_display, &snapshot))
     }
 
     fn scroll_target(&mut self, target: &str, request: &ActorRequest) -> TextResult {
@@ -1676,6 +1822,281 @@ impl BrowserState {
         self.snapshot(request)
     }
 
+    fn console_messages(
+        &mut self,
+        level: ConsoleLevel,
+        all: bool,
+        filename: Option<&str>,
+        request: &ActorRequest,
+    ) -> TextResult {
+        let page = self.ensure_page(request)?.clone();
+        let records = page.console_records(all, false).map_err(|error| {
+            self.operation_error(
+                "console capture failed",
+                error,
+                &request.cancellation,
+                request.timeout_ms,
+            )
+        })?;
+        let threshold = console_level_rank(level);
+        let mut lines = records
+            .records
+            .iter()
+            .filter(|record| console_message_rank(&record.message_type) <= threshold)
+            .map(|record| {
+                let level = console_level_name(&record.message_type);
+                let location = record.location.as_ref().map_or_else(
+                    || "(unknown)".to_owned(),
+                    |location| {
+                        let url = if location.url.is_empty() {
+                            "(unknown)"
+                        } else {
+                            &location.url
+                        };
+                        format!("{url}:{}", location.line_number)
+                    },
+                );
+                format!(
+                    "{level} {location} {}",
+                    record.text.replace(['\r', '\n'], " ")
+                )
+            })
+            .collect::<Vec<_>>();
+        if records.evicted > 0 {
+            lines.push(format!(
+                "(console ring buffer evicted {} earlier matching-scope records)",
+                records.evicted
+            ));
+        }
+        let content = if lines.is_empty() {
+            "(no console messages)".to_owned()
+        } else {
+            lines.join("\n")
+        };
+        if let Some(filename) = filename {
+            let artifact = write_text_output(&content, filename, "console")?;
+            Ok(format!(
+                "Console messages written to `{}`.",
+                artifact.display()
+            ))
+        } else {
+            Ok(content)
+        }
+    }
+
+    fn network_requests(
+        &mut self,
+        include_static: bool,
+        filter: Option<&str>,
+        filename: Option<&str>,
+        request: &ActorRequest,
+    ) -> TextResult {
+        let records = self.ensure_page(request)?.network_records(false, false);
+        let filter = filter
+            .map(NetworkRegex::compile)
+            .transpose()
+            .map_err(|message| {
+                BrowserError::Message(format!("invalid network filter regex: {message}"))
+            })?;
+        let mut lines = Vec::new();
+        for record in &records.records {
+            let successful_static = matches!(
+                record.resource_type.as_str(),
+                "image" | "media" | "font" | "stylesheet"
+            ) && record
+                .response_status
+                .is_some_and(|status| (200..400).contains(&status));
+            if !include_static && successful_static {
+                continue;
+            }
+            if filter
+                .as_ref()
+                .is_some_and(|filter| !filter.is_match(&record.url))
+            {
+                continue;
+            }
+            let status = record.response_status.map_or_else(
+                || {
+                    if record.failure.is_some() {
+                        "FAILED".to_owned()
+                    } else {
+                        "PENDING".to_owned()
+                    }
+                },
+                |status| status.to_string(),
+            );
+            lines.push(format!(
+                "[{}] {} {status} {} ({})",
+                record.index, record.method, record.url, record.resource_type
+            ));
+        }
+        if records.evicted > 0 {
+            lines.push(format!(
+                "(network ring buffer evicted {} earlier current-epoch records)",
+                records.evicted
+            ));
+        }
+        let content = if lines.is_empty() {
+            "(no matching network requests)".to_owned()
+        } else {
+            lines.join("\n")
+        };
+        if let Some(filename) = filename {
+            let artifact = write_text_output(&content, filename, "network")?;
+            Ok(format!(
+                "Network requests written to `{}`.",
+                artifact.display()
+            ))
+        } else {
+            Ok(content)
+        }
+    }
+
+    fn network_request(
+        &mut self,
+        index: u64,
+        part: Option<NetworkPart>,
+        filename: Option<&str>,
+        request: &ActorRequest,
+    ) -> TextResult {
+        const INLINE_BODY_BYTES: usize = 64 * 1024;
+        const FILE_BODY_BYTES: usize = 20 * 1024 * 1024;
+
+        let page = self.ensure_page(request)?.clone();
+        let current = page.network_records(false, false);
+        let Some(record) = current.records.iter().find(|record| record.index == index) else {
+            let all = page.network_records(true, false);
+            let valid = current
+                .records
+                .first()
+                .zip(current.records.last())
+                .map_or_else(
+                    || "none".to_owned(),
+                    |(first, last)| format!("{}-{}", first.index, last.index),
+                );
+            if index < current.navigation_start_index
+                || all.records.iter().any(|record| record.index == index)
+            {
+                return Err(BrowserError::Message(format!(
+                    "Request index {index} is from a previous navigation; current requests are {valid} (current navigation epoch)."
+                )));
+            }
+            return Err(BrowserError::Message(format!(
+                "Network request index {index} is unavailable in the current navigation epoch; valid range: {valid}."
+            )));
+        };
+
+        let parts = part.map_or_else(
+            || {
+                vec![
+                    NetworkPart::RequestHeaders,
+                    NetworkPart::RequestBody,
+                    NetworkPart::ResponseHeaders,
+                    NetworkPart::ResponseBody,
+                ]
+            },
+            |part| vec![part],
+        );
+        let mut rendered = Vec::new();
+        for selected in parts {
+            let (name, value) = match selected {
+                NetworkPart::RequestHeaders => {
+                    ("request-headers", headers_json(&record.request_headers))
+                }
+                NetworkPart::RequestBody => (
+                    "request-body",
+                    record
+                        .request_body
+                        .as_deref()
+                        .filter(|body| !body.is_empty())
+                        .map(|body| {
+                            bounded_network_detail_text(
+                                body,
+                                if filename.is_some() {
+                                    FILE_BODY_BYTES
+                                } else {
+                                    INLINE_BODY_BYTES
+                                },
+                                "request body",
+                                filename.is_none(),
+                            )
+                        })
+                        .unwrap_or_else(|| "(empty request body)".to_owned()),
+                ),
+                NetworkPart::ResponseHeaders => (
+                    "response-headers",
+                    if record.response_status.is_none() {
+                        "(response not received)".to_owned()
+                    } else {
+                        headers_json(&record.response_headers)
+                    },
+                ),
+                NetworkPart::ResponseBody => {
+                    let max_bytes = if filename.is_some() {
+                        FILE_BODY_BYTES
+                    } else {
+                        INLINE_BODY_BYTES
+                    };
+                    let body = page
+                        .network_response_body(index, max_bytes)
+                        .map_err(|error| {
+                            self.operation_error(
+                                "network response body failed",
+                                error,
+                                &request.cancellation,
+                                request.timeout_ms,
+                            )
+                        })?;
+                    let value = match body {
+                        NetworkBody::Text {
+                            text,
+                            total_bytes,
+                            truncated,
+                        } => {
+                            let mut value = if text.is_empty() {
+                                "(empty response body)".to_owned()
+                            } else {
+                                text
+                            };
+                            if truncated {
+                                if filename.is_some() {
+                                    value.push_str(&format!(
+                                        "\n(response body truncated to {max_bytes} of {total_bytes} bytes)"
+                                    ));
+                                } else {
+                                    value.push_str(&format!(
+                                        "\n(response body truncated to {max_bytes} bytes inline; use filename for a larger bounded body)"
+                                    ));
+                                }
+                            }
+                            value
+                        }
+                        NetworkBody::Unavailable { reason }
+                            if reason == "response not received" =>
+                        {
+                            "(response not received)".to_owned()
+                        }
+                        NetworkBody::Unavailable { reason } => {
+                            format!("(body unavailable: {reason})")
+                        }
+                    };
+                    ("response-body", value)
+                }
+            };
+            rendered.push(format!("#### {name}\n{value}"));
+        }
+        let content = rendered.join("\n\n");
+        if let Some(filename) = filename {
+            let artifact = write_text_output(&content, filename, "network-request")?;
+            Ok(format!(
+                "Network request {index} written to `{}`.",
+                artifact.display()
+            ))
+        } else {
+            Ok(content)
+        }
+    }
+
     fn list_pages(&mut self, request: &ActorRequest) -> Result<Vec<Page>, BrowserError> {
         let remaining = Self::remaining(request)?;
         let discovered = self
@@ -1732,16 +2153,15 @@ impl BrowserState {
         let mut lines = Vec::new();
         for (index, page) in pages.iter().enumerate() {
             let target_id = page.target_id();
-            let pending = self
-                .pages
-                .get(&target_id)
-                .is_some_and(|runtime| runtime.pending_dialog.is_some());
+            let pending = self.pages.get(&target_id).is_some_and(|runtime| {
+                runtime.pending_dialog.is_some() || runtime.pending_file_chooser.is_some()
+            });
             let cached = self
                 .pages
                 .get(&target_id)
                 .and_then(|runtime| runtime.title.clone());
             let title = if pending {
-                cached.unwrap_or_else(|| "(dialog pending)".to_owned())
+                cached.unwrap_or_else(|| "(modal pending)".to_owned())
             } else {
                 let remaining = Self::remaining(request).ok();
                 let title = remaining
@@ -1848,11 +2268,9 @@ impl BrowserState {
                 })?;
                 let target_id = closing.target_id();
                 self.poll_events();
-                if self
-                    .pages
-                    .get(&target_id)
-                    .is_some_and(|runtime| runtime.pending_dialog.is_some())
-                {
+                if self.pages.get(&target_id).is_some_and(|runtime| {
+                    runtime.pending_dialog.is_some() || runtime.pending_file_chooser.is_some()
+                }) {
                     return Err(BrowserError::Message(format!(
                         "Tab {closing_index} has a pending modal; handle it before closing."
                     )));
@@ -1947,6 +2365,78 @@ impl BrowserState {
         })?;
         let action = if accept { "Accepted" } else { "Dismissed" };
         Ok(format!("{action} the pending dialog."))
+    }
+
+    fn file_upload(&mut self, paths: &[String], request: &ActorRequest) -> TextResult {
+        self.poll_events();
+        let active_target = self.page.as_ref().map(Page::target_id);
+        let pending_target = active_target
+            .filter(|target_id| {
+                self.pages
+                    .get(target_id)
+                    .is_some_and(|runtime| runtime.pending_file_chooser.is_some())
+            })
+            .or_else(|| {
+                self.tab_order.iter().find_map(|target_id| {
+                    self.pages
+                        .get(target_id)
+                        .is_some_and(|runtime| runtime.pending_file_chooser.is_some())
+                        .then_some(target_id.clone())
+                })
+            });
+        let multiple = pending_target.as_ref().and_then(|target_id| {
+            self.pages
+                .get(target_id)
+                .and_then(|runtime| runtime.pending_file_chooser.as_ref())
+                .map(|pending| pending.multiple)
+        });
+        let dialog_pending = self
+            .pages
+            .values()
+            .any(|runtime| runtime.pending_dialog.is_some());
+        let multiple = validate_file_upload_preconditions(multiple, dialog_pending)?;
+        let pending = self
+            .pages
+            .get_mut(pending_target.as_ref().expect("validated chooser target"))
+            .and_then(|runtime| runtime.pending_file_chooser.take())
+            .expect("pending file chooser disappeared");
+
+        let confined = validate_file_upload_multiplicity(multiple, paths.len())
+            .and_then(|()| confine_workspace_files(paths));
+        let confined = match confined {
+            Ok(confined) => confined,
+            Err(error) => {
+                let _ = pending.chooser.cancel();
+                return Err(file_upload_retry_error(error));
+            }
+        };
+        let result = if confined.is_empty() {
+            pending.chooser.cancel()
+        } else {
+            pending.chooser.set_files(&confined)
+        };
+        if let Err(error) = result {
+            let error = self.operation_error(
+                "file chooser handling failed",
+                error,
+                &request.cancellation,
+                request.timeout_ms,
+            );
+            let _ = pending.chooser.cancel();
+            return Err(file_upload_retry_error(error));
+        }
+
+        self.current_refs.clear();
+        let snapshot = self.snapshot(request)?;
+        let result = if confined.is_empty() {
+            "Cancelled the pending file chooser.".to_owned()
+        } else {
+            format!(
+                "Uploaded {} file(s) through the pending chooser.",
+                confined.len()
+            )
+        };
+        Ok(format!("{result}\n\n### Snapshot\n{snapshot}"))
     }
 
     fn wait_for(
@@ -2076,8 +2566,14 @@ impl BrowserState {
     fn run(&mut self, request: &ActorRequest) -> BrowserResult {
         if !matches!(
             request.op,
-            BrowserOp::HandleDialog { .. } | BrowserOp::Tabs { .. } | BrowserOp::Close
-        ) && self.has_pending_dialog()
+            BrowserOp::HandleDialog { .. }
+                | BrowserOp::FileUpload(_)
+                | BrowserOp::ConsoleMessages { .. }
+                | BrowserOp::NetworkRequests { .. }
+                | BrowserOp::NetworkRequest { .. }
+                | BrowserOp::Tabs { .. }
+                | BrowserOp::Close
+        ) && self.has_pending_modal()
         {
             return Ok(BrowserOutput::Text(self.modal_response(
                 &format!(
@@ -2132,12 +2628,52 @@ impl BrowserState {
             BrowserOp::FillForm(fields) => self.fill_form(fields, request).map(BrowserOutput::Text),
             BrowserOp::Hover(target) => self.hover(target, request).map(BrowserOutput::Text),
             BrowserOp::PressKey(key) => self.press_key(key, request).map(BrowserOutput::Text),
+            BrowserOp::Drag {
+                start_target,
+                end_target,
+                start_element,
+                end_element,
+            } => self
+                .drag(
+                    start_target,
+                    end_target,
+                    start_element.as_deref(),
+                    end_element.as_deref(),
+                    request,
+                )
+                .map(BrowserOutput::Text),
             BrowserOp::Drop {
                 target,
                 paths,
                 data,
             } => self
                 .drop_data(target, paths, data, request)
+                .map(BrowserOutput::Text),
+            BrowserOp::ConsoleMessages {
+                level,
+                all,
+                filename,
+            } => self
+                .console_messages(*level, *all, filename.as_deref(), request)
+                .map(BrowserOutput::Text),
+            BrowserOp::NetworkRequests {
+                include_static,
+                filter,
+                filename,
+            } => self
+                .network_requests(
+                    *include_static,
+                    filter.as_deref(),
+                    filename.as_deref(),
+                    request,
+                )
+                .map(BrowserOutput::Text),
+            BrowserOp::NetworkRequest {
+                index,
+                part,
+                filename,
+            } => self
+                .network_request(*index, *part, filename.as_deref(), request)
                 .map(BrowserOutput::Text),
             BrowserOp::Tabs { action, index, url } => self
                 .tabs(*action, *index, url.as_deref(), request)
@@ -2148,6 +2684,9 @@ impl BrowserState {
             } => self
                 .handle_dialog(*accept, prompt_text.as_deref(), request)
                 .map(BrowserOutput::Text),
+            BrowserOp::FileUpload(paths) => {
+                self.file_upload(paths, request).map(BrowserOutput::Text)
+            }
             BrowserOp::WaitFor {
                 time_seconds,
                 text,
@@ -2206,6 +2745,10 @@ impl BrowserState {
     }
 }
 
+fn render_drag_result(start_display: &str, end_display: &str, snapshot: &str) -> String {
+    format!("### Result\nDragged {start_display} to {end_display}.\n\n### Snapshot\n{snapshot}")
+}
+
 fn browser_op_name(op: &BrowserOp) -> &'static str {
     match op {
         BrowserOp::Navigate(_) => "browser_navigate",
@@ -2222,15 +2765,52 @@ fn browser_op_name(op: &BrowserOp) -> &'static str {
         BrowserOp::FillForm(_) => "browser_fill_form",
         BrowserOp::Hover(_) => "browser_hover",
         BrowserOp::PressKey(_) => "browser_press_key",
+        BrowserOp::Drag { .. } => "browser_drag",
         BrowserOp::Drop { .. } => "browser_drop",
+        BrowserOp::ConsoleMessages { .. } => "browser_console_messages",
+        BrowserOp::NetworkRequests { .. } => "browser_network_requests",
+        BrowserOp::NetworkRequest { .. } => "browser_network_request",
         BrowserOp::Tabs { .. } => "browser_tabs",
         BrowserOp::HandleDialog { .. } => "browser_handle_dialog",
+        BrowserOp::FileUpload(_) => "browser_file_upload",
         BrowserOp::WaitFor { .. } => "browser_wait_for",
         BrowserOp::GetText { .. } => "browser_get_text",
         BrowserOp::Evaluate { .. } => "browser_evaluate",
         BrowserOp::TakeScreenshot { .. } => "browser_take_screenshot",
         BrowserOp::Close => "browser_close",
     }
+}
+
+fn validate_file_upload_preconditions(
+    chooser_multiple: Option<bool>,
+    dialog_pending: bool,
+) -> Result<bool, BrowserError> {
+    let multiple = chooser_multiple
+        .ok_or_else(|| BrowserError::Message("no file chooser is pending".to_owned()))?;
+    if dialog_pending {
+        return Err(BrowserError::Message(
+            "a dialog is pending; handle it before the file chooser".to_owned(),
+        ));
+    }
+    Ok(multiple)
+}
+
+fn validate_file_upload_multiplicity(
+    multiple: bool,
+    path_count: usize,
+) -> Result<(), BrowserError> {
+    if path_count > 1 && !multiple {
+        return Err(BrowserError::Message(
+            "the pending file chooser accepts only one file".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn file_upload_retry_error(error: BrowserError) -> BrowserError {
+    BrowserError::Message(format!(
+        "{error} Retry by clicking the same file input again."
+    ))
 }
 
 fn render_find_matches(lines: &[String], matching_indices: &[usize]) -> String {
@@ -2302,25 +2882,373 @@ fn outline_indent(line: &str) -> usize {
     line.len() - line.trim_start_matches(' ').len()
 }
 
-fn read_drop_files(paths: &[String]) -> Result<Vec<Value>, BrowserError> {
-    const MAX_FILES: usize = 50;
-    const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
-    if paths.len() > MAX_FILES {
+fn console_level_rank(level: ConsoleLevel) -> u8 {
+    match level {
+        ConsoleLevel::Error => 0,
+        ConsoleLevel::Warning => 1,
+        ConsoleLevel::Info => 2,
+        ConsoleLevel::Debug => 3,
+    }
+}
+
+fn console_message_rank(message_type: &str) -> u8 {
+    match message_type.to_ascii_lowercase().as_str() {
+        "error" => 0,
+        "warning" | "warn" => 1,
+        "debug" => 3,
+        _ => 2,
+    }
+}
+
+fn console_level_name(message_type: &str) -> &'static str {
+    match console_message_rank(message_type) {
+        0 => "ERROR",
+        1 => "WARNING",
+        3 => "DEBUG",
+        _ => "INFO",
+    }
+}
+
+fn headers_json(headers: &[(String, String)]) -> String {
+    let headers = headers
+        .iter()
+        .map(|(name, value)| (name.clone(), Value::String(value.clone())))
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::to_string_pretty(&Value::Object(headers))
+        .expect("string-only network headers must serialize")
+}
+
+fn bounded_network_detail_text(text: &str, max_bytes: usize, label: &str, inline: bool) -> String {
+    let bytes = text.as_bytes();
+    if bytes.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut rendered = String::from_utf8_lossy(&bytes[..max_bytes]).into_owned();
+    if inline {
+        rendered.push_str(&format!(
+            "\n({label} truncated to {max_bytes} bytes inline; use filename for a larger bounded body)"
+        ));
+    } else {
+        rendered.push_str(&format!(
+            "\n({label} truncated to {max_bytes} of {} bytes)",
+            bytes.len()
+        ));
+    }
+    rendered
+}
+
+#[derive(Clone)]
+enum NetworkRegexAtom {
+    Literal(char),
+    Any,
+    Digit,
+    Word,
+    Space,
+    Class {
+        negated: bool,
+        ranges: Vec<(char, char)>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum NetworkRegexQuantifier {
+    One,
+    ZeroOrOne,
+    ZeroOrMore,
+    OneOrMore,
+}
+
+#[derive(Clone)]
+struct NetworkRegexToken {
+    atom: NetworkRegexAtom,
+    quantifier: NetworkRegexQuantifier,
+}
+
+struct NetworkRegexBranch {
+    tokens: Vec<NetworkRegexToken>,
+    start_anchor: bool,
+    end_anchor: bool,
+}
+
+struct NetworkRegex {
+    branches: Vec<NetworkRegexBranch>,
+    case_insensitive: bool,
+}
+
+impl NetworkRegex {
+    fn compile(pattern: &str) -> Result<Self, String> {
+        let (pattern, case_insensitive) = pattern
+            .strip_prefix("(?i)")
+            .map_or((pattern, false), |pattern| (pattern, true));
+        let pattern = if case_insensitive {
+            pattern.to_ascii_lowercase()
+        } else {
+            pattern.to_owned()
+        };
+        let branches = split_network_regex_alternatives(&pattern)?
+            .into_iter()
+            .map(|branch| parse_network_regex_branch(&branch))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            branches,
+            case_insensitive,
+        })
+    }
+
+    fn is_match(&self, text: &str) -> bool {
+        let text = if self.case_insensitive {
+            text.to_ascii_lowercase()
+        } else {
+            text.to_owned()
+        };
+        self.branches
+            .iter()
+            .any(|branch| network_regex_branch_matches(branch, &text))
+    }
+}
+
+fn split_network_regex_alternatives(pattern: &str) -> Result<Vec<String>, String> {
+    let mut alternatives = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    let mut in_class = false;
+    for character in pattern.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => {
+                current.push(character);
+                escaped = true;
+            }
+            '[' => {
+                in_class = true;
+                current.push(character);
+            }
+            ']' if in_class => {
+                in_class = false;
+                current.push(character);
+            }
+            '|' if !in_class => alternatives.push(std::mem::take(&mut current)),
+            '(' | ')' if !in_class => {
+                return Err("groups and lookarounds are not supported".to_owned());
+            }
+            _ => current.push(character),
+        }
+    }
+    if escaped {
+        return Err("trailing escape".to_owned());
+    }
+    if in_class {
+        return Err("unterminated character class".to_owned());
+    }
+    alternatives.push(current);
+    Ok(alternatives)
+}
+
+fn parse_network_regex_branch(pattern: &str) -> Result<NetworkRegexBranch, String> {
+    let mut chars = pattern.chars().peekable();
+    let start_anchor = chars.next_if_eq(&'^').is_some();
+    let mut tokens = Vec::new();
+    let mut end_anchor = false;
+    while let Some(character) = chars.next() {
+        if character == '$' && chars.peek().is_none() {
+            end_anchor = true;
+            break;
+        }
+        let atom = match character {
+            '.' => NetworkRegexAtom::Any,
+            '\\' => match chars.next().ok_or_else(|| "trailing escape".to_owned())? {
+                'd' => NetworkRegexAtom::Digit,
+                'w' => NetworkRegexAtom::Word,
+                's' => NetworkRegexAtom::Space,
+                unsupported if unsupported.is_ascii_alphanumeric() => {
+                    return Err(format!("escape \\{unsupported} is not supported"));
+                }
+                escaped => NetworkRegexAtom::Literal(escaped),
+            },
+            '[' => parse_network_regex_class(&mut chars)?,
+            '*' | '+' | '?' => {
+                return Err(format!("quantifier {character:?} has no preceding atom"));
+            }
+            '{' | '}' => {
+                return Err("counted quantifiers are not supported".to_owned());
+            }
+            '^' | '$' => {
+                return Err("anchors are only supported at branch boundaries".to_owned());
+            }
+            literal => NetworkRegexAtom::Literal(literal),
+        };
+        let quantifier = match chars.peek().copied() {
+            Some('*') => {
+                chars.next();
+                NetworkRegexQuantifier::ZeroOrMore
+            }
+            Some('+') => {
+                chars.next();
+                NetworkRegexQuantifier::OneOrMore
+            }
+            Some('?') => {
+                chars.next();
+                NetworkRegexQuantifier::ZeroOrOne
+            }
+            _ => NetworkRegexQuantifier::One,
+        };
+        tokens.push(NetworkRegexToken { atom, quantifier });
+    }
+    Ok(NetworkRegexBranch {
+        tokens,
+        start_anchor,
+        end_anchor,
+    })
+}
+
+fn parse_network_regex_class(
+    chars: &mut std::iter::Peekable<impl Iterator<Item = char>>,
+) -> Result<NetworkRegexAtom, String> {
+    let negated = chars.next_if_eq(&'^').is_some();
+    let mut values = Vec::new();
+    let mut closed = false;
+    while let Some(character) = chars.next() {
+        if character == ']' && !values.is_empty() {
+            closed = true;
+            break;
+        }
+        let character = if character == '\\' {
+            let escaped = chars
+                .next()
+                .ok_or_else(|| "trailing escape in character class".to_owned())?;
+            if escaped.is_ascii_alphanumeric() {
+                return Err(format!(
+                    "escape \\{escaped} in a character class is not supported"
+                ));
+            }
+            escaped
+        } else {
+            character
+        };
+        values.push(character);
+    }
+    if !closed {
+        return Err("unterminated or empty character class".to_owned());
+    }
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < values.len() {
+        if index + 2 < values.len() && values[index + 1] == '-' {
+            if values[index] > values[index + 2] {
+                return Err("character class range is reversed".to_owned());
+            }
+            ranges.push((values[index], values[index + 2]));
+            index += 3;
+        } else {
+            ranges.push((values[index], values[index]));
+            index += 1;
+        }
+    }
+    Ok(NetworkRegexAtom::Class { negated, ranges })
+}
+
+fn network_regex_branch_matches(branch: &NetworkRegexBranch, text: &str) -> bool {
+    let chars = text.chars().collect::<Vec<_>>();
+    let starts: Box<dyn Iterator<Item = usize>> = if branch.start_anchor {
+        Box::new(std::iter::once(0))
+    } else {
+        Box::new(0..=chars.len())
+    };
+    starts.into_iter().any(|start| {
+        match_network_regex_tokens(&branch.tokens, 0, &chars, start, branch.end_anchor)
+    })
+}
+
+fn match_network_regex_tokens(
+    tokens: &[NetworkRegexToken],
+    token_index: usize,
+    text: &[char],
+    text_index: usize,
+    end_anchor: bool,
+) -> bool {
+    if token_index == tokens.len() {
+        return !end_anchor || text_index == text.len();
+    }
+    let token = &tokens[token_index];
+    let matches_one = |index: usize| {
+        text.get(index)
+            .is_some_and(|character| network_regex_atom_matches(&token.atom, *character))
+    };
+    match token.quantifier {
+        NetworkRegexQuantifier::One => {
+            matches_one(text_index)
+                && match_network_regex_tokens(
+                    tokens,
+                    token_index + 1,
+                    text,
+                    text_index + 1,
+                    end_anchor,
+                )
+        }
+        NetworkRegexQuantifier::ZeroOrOne => {
+            match_network_regex_tokens(tokens, token_index + 1, text, text_index, end_anchor)
+                || (matches_one(text_index)
+                    && match_network_regex_tokens(
+                        tokens,
+                        token_index + 1,
+                        text,
+                        text_index + 1,
+                        end_anchor,
+                    ))
+        }
+        NetworkRegexQuantifier::ZeroOrMore | NetworkRegexQuantifier::OneOrMore => {
+            let minimum = matches!(token.quantifier, NetworkRegexQuantifier::OneOrMore) as usize;
+            let mut end = text_index;
+            while matches_one(end) {
+                end += 1;
+            }
+            if end.saturating_sub(text_index) < minimum {
+                return false;
+            }
+            (text_index + minimum..=end).rev().any(|next| {
+                match_network_regex_tokens(tokens, token_index + 1, text, next, end_anchor)
+            })
+        }
+    }
+}
+
+fn network_regex_atom_matches(atom: &NetworkRegexAtom, character: char) -> bool {
+    match atom {
+        NetworkRegexAtom::Literal(literal) => character == *literal,
+        NetworkRegexAtom::Any => character != '\n',
+        NetworkRegexAtom::Digit => character.is_ascii_digit(),
+        NetworkRegexAtom::Word => character.is_ascii_alphanumeric() || character == '_',
+        NetworkRegexAtom::Space => character.is_whitespace(),
+        NetworkRegexAtom::Class { negated, ranges } => {
+            let contained = ranges
+                .iter()
+                .any(|(start, end)| (*start..=*end).contains(&character));
+            contained != *negated
+        }
+    }
+}
+
+fn write_text_output(
+    content: &str,
+    filename: &str,
+    purpose: &str,
+) -> Result<PathBuf, BrowserError> {
+    if filename.is_empty() {
         return Err(BrowserError::Message(format!(
-            "drop paths are limited to {MAX_FILES} files"
+            "{purpose} filename must be non-empty"
         )));
     }
     let workspace = env::var_os("RUSTWRIGHT_MCP_WORKSPACE")
         .ok_or_else(|| {
-            BrowserError::Message(
-                "RUSTWRIGHT_MCP_WORKSPACE must be set for file-backed drops".to_owned(),
-            )
+            BrowserError::Message(format!(
+                "RUSTWRIGHT_MCP_WORKSPACE must be set for {purpose} file output"
+            ))
         })
-        .map(PathBuf::from);
-    if paths.is_empty() {
-        return Ok(Vec::new());
-    }
-    let workspace = workspace?;
+        .map(PathBuf::from)?;
     if !workspace.is_absolute() {
         return Err(BrowserError::Message(
             "RUSTWRIGHT_MCP_WORKSPACE must be an absolute path".to_owned(),
@@ -2329,38 +3257,56 @@ fn read_drop_files(paths: &[String]) -> Result<Vec<Value>, BrowserError> {
     let workspace = workspace.canonicalize().map_err(|error| {
         BrowserError::Message(format!("RUSTWRIGHT_MCP_WORKSPACE is unavailable: {error}"))
     })?;
+    let requested = Path::new(filename);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        workspace.join(requested)
+    };
+    let file_name = candidate
+        .file_name()
+        .ok_or_else(|| BrowserError::Message(format!("{purpose} filename must name a file")))?;
+    let parent = candidate.parent().ok_or_else(|| {
+        BrowserError::Message(format!("{purpose} filename must have a parent directory"))
+    })?;
+    let parent = parent.canonicalize().map_err(|error| {
+        BrowserError::Message(format!(
+            "{purpose} output directory is unavailable: {error}"
+        ))
+    })?;
+    if !parent.starts_with(&workspace) {
+        return Err(BrowserError::Message(format!(
+            "{purpose} output is confined to RUSTWRIGHT_MCP_WORKSPACE ({})",
+            workspace.display()
+        )));
+    }
+    let resolved = parent.join(file_name);
+    if resolved.symlink_metadata().is_ok() {
+        return Err(BrowserError::Message(format!(
+            "{purpose} output file already exists"
+        )));
+    }
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&resolved)
+        .map_err(|error| BrowserError::Message(format!("{purpose} output failed: {error}")))?;
+    if let Err(error) = output.write_all(content.as_bytes()) {
+        drop(output);
+        let _ = fs::remove_file(&resolved);
+        return Err(BrowserError::Message(format!(
+            "{purpose} output failed: {error}"
+        )));
+    }
+    Ok(resolved)
+}
+
+fn read_drop_files(paths: &[String]) -> Result<Vec<Value>, BrowserError> {
+    let confined = confine_workspace_files(paths)?;
     let mut files = Vec::with_capacity(paths.len());
-    for requested in paths {
-        let path = Path::new(requested);
-        let candidate = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            workspace.join(path)
-        };
-        let resolved = candidate.canonicalize().map_err(|error| {
-            BrowserError::Message(format!("drop input is unavailable: {requested}: {error}"))
-        })?;
-        if !resolved.starts_with(&workspace) {
-            return Err(BrowserError::Message(format!(
-                "drop inputs are confined to RUSTWRIGHT_MCP_WORKSPACE ({}); got {requested}",
-                workspace.display()
-            )));
-        }
-        let metadata = resolved.metadata().map_err(|error| {
-            BrowserError::Message(format!("drop input metadata failed: {requested}: {error}"))
-        })?;
-        if !metadata.is_file() {
-            return Err(BrowserError::Message(format!(
-                "drop input is not a regular file: {requested}"
-            )));
-        }
-        if metadata.len() > MAX_FILE_BYTES {
-            return Err(BrowserError::Message(format!(
-                "drop input exceeds the {MAX_FILE_BYTES}-byte per-file cap: {requested}"
-            )));
-        }
+    for (requested, resolved) in paths.iter().zip(confined) {
         let bytes = fs::read(&resolved).map_err(|error| {
-            BrowserError::Message(format!("drop input read failed: {requested}: {error}"))
+            BrowserError::Message(format!("file input read failed: {requested}: {error}"))
         })?;
         let name = resolved
             .file_name()
@@ -2373,6 +3319,63 @@ fn read_drop_files(paths: &[String]) -> Result<Vec<Value>, BrowserError> {
         }));
     }
     Ok(files)
+}
+
+fn confine_workspace_files(paths: &[String]) -> Result<Vec<PathBuf>, BrowserError> {
+    if paths.len() > MAX_FILE_INPUTS {
+        return Err(BrowserError::Message(format!(
+            "file paths are limited to {MAX_FILE_INPUTS} files"
+        )));
+    }
+    paths
+        .iter()
+        .map(|requested| confine_workspace_file(requested))
+        .collect()
+}
+
+fn confine_workspace_file(requested: &str) -> Result<PathBuf, BrowserError> {
+    let workspace = env::var_os("RUSTWRIGHT_MCP_WORKSPACE")
+        .ok_or_else(|| {
+            BrowserError::Message("RUSTWRIGHT_MCP_WORKSPACE must be set for file inputs".to_owned())
+        })
+        .map(PathBuf::from)?;
+    if !workspace.is_absolute() {
+        return Err(BrowserError::Message(
+            "RUSTWRIGHT_MCP_WORKSPACE must be an absolute path".to_owned(),
+        ));
+    }
+    let workspace = workspace.canonicalize().map_err(|error| {
+        BrowserError::Message(format!("RUSTWRIGHT_MCP_WORKSPACE is unavailable: {error}"))
+    })?;
+    let path = Path::new(requested);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    };
+    let resolved = candidate.canonicalize().map_err(|error| {
+        BrowserError::Message(format!("file input is unavailable: {requested}: {error}"))
+    })?;
+    if !resolved.starts_with(&workspace) {
+        return Err(BrowserError::Message(format!(
+            "file inputs are confined to RUSTWRIGHT_MCP_WORKSPACE ({}); got {requested}",
+            workspace.display()
+        )));
+    }
+    let metadata = resolved.metadata().map_err(|error| {
+        BrowserError::Message(format!("file input metadata failed: {requested}: {error}"))
+    })?;
+    if !metadata.is_file() {
+        return Err(BrowserError::Message(format!(
+            "file input is not a regular file: {requested}"
+        )));
+    }
+    if metadata.len() > MAX_FILE_INPUT_BYTES {
+        return Err(BrowserError::Message(format!(
+            "file input exceeds the {MAX_FILE_INPUT_BYTES}-byte per-file cap: {requested}"
+        )));
+    }
+    Ok(resolved)
 }
 
 fn mime_for_path(path: &Path) -> &'static str {
@@ -2413,7 +3416,7 @@ mod tests {
         io::{Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
         process::Command,
-        sync::{OnceLock, atomic::AtomicBool, mpsc},
+        sync::{OnceLock, atomic::AtomicBool, atomic::AtomicUsize, mpsc},
     };
 
     use super::*;
@@ -3000,6 +4003,120 @@ mod tests {
         }
     }
 
+    #[test]
+    fn network_detail_text_bounding_reports_inline_and_file_caps() {
+        let inline = bounded_network_detail_text("éclair", 2, "request body", true);
+        assert_eq!(
+            inline,
+            "é\n(request body truncated to 2 bytes inline; use filename for a larger bounded body)"
+        );
+        let file = bounded_network_detail_text("abcdef", 3, "request body", false);
+        assert_eq!(file, "abc\n(request body truncated to 3 of 6 bytes)");
+    }
+
+    #[test]
+    fn network_filter_compiles_once_and_matches_supported_regex_surface() {
+        let regex = NetworkRegex::compile("(?i)api/data$|large-text$").unwrap();
+        assert!(regex.is_match("https://example.test/API/DATA"));
+        assert!(regex.is_match("https://example.test/large-text"));
+        assert!(!regex.is_match("https://example.test/image.png"));
+        assert!(NetworkRegex::compile("[").is_err());
+        assert!(NetworkRegex::compile("(group)").is_err());
+        assert!(NetworkRegex::compile(r"\bapi\b").is_err());
+        assert!(NetworkRegex::compile("api{2}").is_err());
+    }
+
+    #[test]
+    fn file_upload_preconditions_preserve_error_precedence_and_multiplicity() {
+        assert_eq!(
+            validate_file_upload_preconditions(None, true)
+                .unwrap_err()
+                .to_string(),
+            "no file chooser is pending"
+        );
+        assert_eq!(
+            validate_file_upload_preconditions(Some(false), true)
+                .unwrap_err()
+                .to_string(),
+            "a dialog is pending; handle it before the file chooser"
+        );
+        assert_eq!(
+            validate_file_upload_multiplicity(false, 2)
+                .unwrap_err()
+                .to_string(),
+            "the pending file chooser accepts only one file"
+        );
+        assert!(validate_file_upload_multiplicity(false, 1).is_ok());
+        assert!(validate_file_upload_multiplicity(true, 2).is_ok());
+    }
+
+    #[test]
+    fn file_input_confinement_rejects_outside_non_file_oversized_and_too_many() {
+        static WORKSPACE_ENV_LOCK: Mutex<()> = Mutex::new(());
+        static COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+        let _environment = WORKSPACE_ENV_LOCK.lock().unwrap();
+        let root = env::temp_dir().join(format!(
+            "rustwright-mcp-confinement-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(workspace.join("directory")).expect("create confinement workspace");
+        fs::write(workspace.join("valid.txt"), b"confined").expect("write confined file");
+        fs::write(root.join("outside.txt"), b"outside").expect("write outside file");
+        let oversized = fs::File::create(workspace.join("oversized.bin"))
+            .expect("create oversized sparse file");
+        oversized
+            .set_len(MAX_FILE_INPUT_BYTES + 1)
+            .expect("size oversized sparse file");
+        drop(oversized);
+
+        let previous = env::var_os("RUSTWRIGHT_MCP_WORKSPACE");
+        // SAFETY: this test holds its dedicated process-wide environment lock,
+        // and no other actor unit test reads or writes this variable.
+        unsafe { env::set_var("RUSTWRIGHT_MCP_WORKSPACE", &workspace) };
+
+        assert_eq!(
+            confine_workspace_file("valid.txt").unwrap(),
+            workspace.join("valid.txt").canonicalize().unwrap()
+        );
+        assert!(
+            confine_workspace_file(root.join("outside.txt").to_str().unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("confined to RUSTWRIGHT_MCP_WORKSPACE")
+        );
+        assert!(
+            confine_workspace_file("directory")
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file")
+        );
+        assert!(
+            confine_workspace_file("oversized.bin")
+                .unwrap_err()
+                .to_string()
+                .contains("per-file cap")
+        );
+        assert!(
+            confine_workspace_files(&vec!["valid.txt".to_owned(); MAX_FILE_INPUTS + 1])
+                .unwrap_err()
+                .to_string()
+                .contains("limited to 50 files")
+        );
+
+        // SAFETY: the same dedicated lock remains held until restoration.
+        unsafe {
+            if let Some(previous) = previous {
+                env::set_var("RUSTWRIGHT_MCP_WORKSPACE", previous);
+            } else {
+                env::remove_var("RUSTWRIGHT_MCP_WORKSPACE");
+            }
+        }
+        fs::remove_dir_all(root).expect("remove confinement fixture");
+    }
+
     fn process_rows() -> Vec<(u32, u32)> {
         let output = Command::new("ps")
             .args(["-axo", "pid=,ppid="])
@@ -3168,6 +4285,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn drag_ref_pair_rejects_stale_start_and_end_before_dispatch() {
+        for (start, end, stale) in [("e9", "e2", "e9"), ("e1", "e9", "e9")] {
+            let mut state = BrowserState::default();
+            state
+                .current_refs
+                .extend(["e1".to_owned(), "e2".to_owned()]);
+            let dispatches = std::cell::Cell::new(0);
+            let result = state.dispatch_ref_pair_action(
+                start,
+                end,
+                |_| {
+                    dispatches.set(dispatches.get() + 1);
+                    Ok(())
+                },
+                |_| Ok("unexpected snapshot".to_owned()),
+            );
+            assert!(matches!(
+                result,
+                Err(BrowserError::Message(message))
+                    if message.contains(&format!("unknown or stale ref {stale}"))
+            ));
+            assert_eq!(dispatches.get(), 0);
+            assert_eq!(
+                state.current_refs,
+                HashSet::from(["e1".to_owned(), "e2".to_owned()])
+            );
+        }
+    }
+
+    #[test]
+    fn drag_result_uses_endpoint_descriptions_or_refs_and_includes_snapshot() {
+        assert_eq!(
+            render_drag_result("Source card", "Destination lane", "- status \"done\""),
+            "### Result\nDragged Source card to Destination lane.\n\n### Snapshot\n- status \"done\""
+        );
+        assert_eq!(
+            render_drag_result("e4", "e7", "- status \"done\""),
+            "### Result\nDragged e4 to e7.\n\n### Snapshot\n- status \"done\""
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn queued_cancel_removes_command_immediately_without_touching_navigation() {
         let _guard = browser_test_lock().lock().await;
@@ -3273,10 +4432,10 @@ mod tests {
             .execute_with_timeout(
                 request_id(20),
                 BrowserOp::Navigate(server.url()),
-                Duration::from_millis(100),
+                Duration::from_millis(1),
             )
             .await;
-        assert_eq!(result, Err(BrowserError::Timeout(100)));
+        assert_eq!(result, Err(BrowserError::Timeout(1)));
         assert!(started.elapsed() < Duration::from_secs(1));
         actor
             .execute_with_timeout(

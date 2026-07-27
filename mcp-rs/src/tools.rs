@@ -22,9 +22,14 @@ pub(crate) enum ToolKind {
     FillForm,
     Hover,
     PressKey,
+    Drag,
     Drop,
+    ConsoleMessages,
+    NetworkRequests,
+    NetworkRequest,
     Tabs,
     HandleDialog,
+    FileUpload,
     WaitFor,
     GetText,
     Evaluate,
@@ -111,9 +116,29 @@ pub(crate) const TOOL_SPECS: &[ToolSpec] = &[
         description: "Press a native browser key on the active page and return a fresh snapshot.",
     },
     ToolSpec {
+        kind: ToolKind::Drag,
+        name: "browser_drag",
+        description: "Physically drag one snapshot ref to another through Chromium's native mouse input.",
+    },
+    ToolSpec {
         kind: ToolKind::Drop,
         name: "browser_drop",
         description: "Synthesize a DataTransfer drop of confined files and/or MIME strings on a snapshot ref.",
+    },
+    ToolSpec {
+        kind: ToolKind::ConsoleMessages,
+        name: "browser_console_messages",
+        description: "List bounded console records at a severity threshold.",
+    },
+    ToolSpec {
+        kind: ToolKind::NetworkRequests,
+        name: "browser_network_requests",
+        description: "List bounded current-navigation network lifecycle records.",
+    },
+    ToolSpec {
+        kind: ToolKind::NetworkRequest,
+        name: "browser_network_request",
+        description: "Return request/response details and a bounded lazy response body by stable index.",
     },
     ToolSpec {
         kind: ToolKind::Tabs,
@@ -124,6 +149,11 @@ pub(crate) const TOOL_SPECS: &[ToolSpec] = &[
         kind: ToolKind::HandleDialog,
         name: "browser_handle_dialog",
         description: "Accept or dismiss the JavaScript dialog that is pending now.",
+    },
+    ToolSpec {
+        kind: ToolKind::FileUpload,
+        name: "browser_file_upload",
+        description: "Resolve the pending file chooser with confined local files, or cancel it.",
     },
     ToolSpec {
         kind: ToolKind::WaitFor,
@@ -322,6 +352,18 @@ struct PressKeyArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct DragArgs {
+    start_target: String,
+    end_target: String,
+    #[serde(default)]
+    start_element: Option<String>,
+    #[serde(default)]
+    end_element: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DropArgs {
     target: String,
     #[serde(default)]
@@ -330,6 +372,55 @@ struct DropArgs {
     paths: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_data_map")]
     data: Vec<(String, String)>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ConsoleLevel {
+    Error,
+    Warning,
+    Info,
+    Debug,
+}
+
+fn default_console_level() -> ConsoleLevel {
+    ConsoleLevel::Info
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsoleMessagesArgs {
+    #[serde(default = "default_console_level")]
+    level: ConsoleLevel,
+    #[serde(default)]
+    all: bool,
+    filename: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkRequestsArgs {
+    #[serde(default, rename = "static")]
+    include_static: bool,
+    filter: Option<String>,
+    filename: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum NetworkPart {
+    RequestHeaders,
+    RequestBody,
+    ResponseHeaders,
+    ResponseBody,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkRequestArgs {
+    index: u64,
+    part: Option<NetworkPart>,
+    filename: Option<String>,
 }
 
 fn deserialize_data_map<'de, D>(deserializer: D) -> Result<Vec<(String, String)>, D::Error>
@@ -371,6 +462,12 @@ struct HandleDialogArgs {
     accept: bool,
     #[serde(default, alias = "prompt_text")]
     prompt_text: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileUploadArgs {
+    paths: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -661,6 +758,17 @@ pub(crate) fn parse_op(
             }
             Ok(BrowserOp::PressKey(args.key))
         }
+        ToolKind::Drag => {
+            let args: DragArgs = decode(arguments)?;
+            validate_ref(&args.start_target)?;
+            validate_ref(&args.end_target)?;
+            Ok(BrowserOp::Drag {
+                start_target: args.start_target,
+                end_target: args.end_target,
+                start_element: args.start_element,
+                end_element: args.end_element,
+            })
+        }
         ToolKind::Drop => {
             let args: DropArgs = decode(arguments)?;
             validate_ref(&args.target)?;
@@ -688,6 +796,33 @@ pub(crate) fn parse_op(
                 target: args.target,
                 paths: args.paths,
                 data: args.data,
+            })
+        }
+        ToolKind::ConsoleMessages => {
+            let args: ConsoleMessagesArgs = decode(arguments)?;
+            Ok(BrowserOp::ConsoleMessages {
+                level: args.level,
+                all: args.all,
+                filename: args.filename,
+            })
+        }
+        ToolKind::NetworkRequests => {
+            let args: NetworkRequestsArgs = decode(arguments)?;
+            Ok(BrowserOp::NetworkRequests {
+                include_static: args.include_static,
+                filter: args.filter,
+                filename: args.filename,
+            })
+        }
+        ToolKind::NetworkRequest => {
+            let args: NetworkRequestArgs = decode(arguments)?;
+            if args.index == 0 {
+                return Err("index must be greater than or equal to 1".to_owned());
+            }
+            Ok(BrowserOp::NetworkRequest {
+                index: args.index,
+                part: args.part,
+                filename: args.filename,
             })
         }
         ToolKind::Tabs => {
@@ -719,6 +854,10 @@ pub(crate) fn parse_op(
                 accept: args.accept,
                 prompt_text: args.prompt_text,
             })
+        }
+        ToolKind::FileUpload => {
+            let args: FileUploadArgs = decode(arguments)?;
+            Ok(BrowserOp::FileUpload(args.paths.unwrap_or_default()))
         }
         ToolKind::WaitFor => {
             let args: WaitForArgs = decode(arguments)?;
@@ -973,6 +1112,17 @@ fn schema(kind: ToolKind) -> JsonObject {
             "required": ["key"],
             "additionalProperties": false
         }),
+        ToolKind::Drag => json!({
+            "type": "object",
+            "properties": {
+                "startTarget": {"type": "string"},
+                "endTarget": {"type": "string"},
+                "startElement": {"type": ["string", "null"]},
+                "endElement": {"type": ["string", "null"]}
+            },
+            "required": ["startTarget", "endTarget"],
+            "additionalProperties": false
+        }),
         ToolKind::Drop => json!({
             "type": "object",
             "properties": {
@@ -982,6 +1132,47 @@ fn schema(kind: ToolKind) -> JsonObject {
                 "data": {"type": "object", "additionalProperties": {"type": "string"}}
             },
             "required": ["target"],
+            "additionalProperties": false
+        }),
+        ToolKind::ConsoleMessages => json!({
+            "type": "object",
+            "properties": {
+                "level": {
+                    "type": "string",
+                    "enum": ["error", "warning", "info", "debug"],
+                    "default": "info"
+                },
+                "all": {"type": "boolean", "default": false},
+                "filename": {"type": ["string", "null"]}
+            },
+            "additionalProperties": false
+        }),
+        ToolKind::NetworkRequests => json!({
+            "type": "object",
+            "properties": {
+                "static": {"type": "boolean", "default": false},
+                "filter": {"type": ["string", "null"]},
+                "filename": {"type": ["string", "null"]}
+            },
+            "additionalProperties": false
+        }),
+        ToolKind::NetworkRequest => json!({
+            "type": "object",
+            "properties": {
+                "index": {"type": "integer", "minimum": 1},
+                "part": {
+                    "type": ["string", "null"],
+                    "enum": [
+                        "request-headers",
+                        "request-body",
+                        "response-headers",
+                        "response-body",
+                        null
+                    ]
+                },
+                "filename": {"type": ["string", "null"]}
+            },
+            "required": ["index"],
             "additionalProperties": false
         }),
         ToolKind::Tabs => json!({
@@ -1001,6 +1192,16 @@ fn schema(kind: ToolKind) -> JsonObject {
                 "promptText": {"type": ["string", "null"]}
             },
             "required": ["accept"],
+            "additionalProperties": false
+        }),
+        ToolKind::FileUpload => json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"}
+                }
+            },
             "additionalProperties": false
         }),
         ToolKind::WaitFor => json!({
@@ -1064,13 +1265,74 @@ mod tests {
     #[test]
     fn all_descriptors_are_strict_objects() {
         let tools: Vec<Tool> = TOOL_SPECS.iter().copied().map(descriptor).collect();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 27);
         assert!(
             tools
                 .iter()
                 .all(|tool| tool.input_schema["type"] == "object"
                     && tool.input_schema["additionalProperties"] == false)
         );
+    }
+
+    #[test]
+    fn physical_drag_schema_and_arguments_are_strict_and_nullable() {
+        let drag = TOOL_SPECS
+            .iter()
+            .copied()
+            .find(|spec| spec.name == "browser_drag")
+            .unwrap();
+        let descriptor = descriptor(drag);
+        let expected_schema = json!({
+            "type": "object",
+            "properties": {
+                "startTarget": {"type": "string"},
+                "endTarget": {"type": "string"},
+                "startElement": {"type": ["string", "null"]},
+                "endElement": {"type": ["string", "null"]}
+            },
+            "required": ["startTarget", "endTarget"],
+            "additionalProperties": false
+        });
+        assert_eq!(
+            descriptor.input_schema.as_ref(),
+            expected_schema.as_object().unwrap()
+        );
+        for valid in [
+            json!({"startTarget": "e1", "endTarget": "e2"}),
+            json!({
+                "startTarget": "e1",
+                "endTarget": "e2",
+                "startElement": null,
+                "endElement": null
+            }),
+            json!({
+                "startTarget": "e1",
+                "endTarget": "e2",
+                "startElement": "Source card",
+                "endElement": "Destination lane"
+            }),
+        ] {
+            assert!(
+                matches!(
+                    parse_op(drag, Some(valid.as_object().unwrap().clone())),
+                    Ok(BrowserOp::Drag { .. })
+                ),
+                "{valid}"
+            );
+        }
+        for invalid in [
+            json!({"endTarget": "e2"}),
+            json!({"startTarget": "e1"}),
+            json!({"startTarget": "source", "endTarget": "e2"}),
+            json!({"startTarget": "e1", "endTarget": "target"}),
+            json!({"startTarget": "e1", "endTarget": "e2", "startElement": 1}),
+            json!({"startTarget": "e1", "endTarget": "e2", "unknown": true}),
+        ] {
+            assert!(
+                parse_op(drag, Some(invalid.as_object().unwrap().clone())).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
@@ -1108,5 +1370,100 @@ mod tests {
         assert_eq!(parsed.flags, "ims");
         assert!(parse_regex("/x/ii").is_err());
         assert!(parse_regex("/x/g").is_err());
+    }
+
+    #[test]
+    fn network_arguments_enforce_the_strict_published_surface() {
+        let requests = TOOL_SPECS
+            .iter()
+            .copied()
+            .find(|spec| spec.name == "browser_network_requests")
+            .unwrap();
+        assert!(
+            parse_op(
+                requests,
+                Some(
+                    json!({"static": true, "filter": "api/one$|api/two$"})
+                        .as_object()
+                        .unwrap()
+                        .clone()
+                )
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_op(
+                requests,
+                Some(json!({"all": true}).as_object().unwrap().clone())
+            )
+            .is_err()
+        );
+
+        let request = TOOL_SPECS
+            .iter()
+            .copied()
+            .find(|spec| spec.name == "browser_network_request")
+            .unwrap();
+        assert!(
+            parse_op(
+                request,
+                Some(
+                    json!({"index": 1, "part": "response-body"})
+                        .as_object()
+                        .unwrap()
+                        .clone()
+                )
+            )
+            .is_ok()
+        );
+        for invalid in [
+            json!({"index": 0}),
+            json!({"index": 1, "part": "body"}),
+            json!({"index": 1, "unknown": true}),
+        ] {
+            assert!(
+                parse_op(request, Some(invalid.as_object().unwrap().clone())).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_upload_schema_and_arguments_are_strict_and_nullable() {
+        let upload = TOOL_SPECS
+            .iter()
+            .copied()
+            .find(|spec| spec.name == "browser_file_upload")
+            .unwrap();
+        let descriptor = descriptor(upload);
+        assert_eq!(
+            descriptor.input_schema["properties"]["paths"],
+            json!({
+                "type": ["array", "null"],
+                "items": {"type": "string"}
+            })
+        );
+        assert_eq!(descriptor.input_schema["additionalProperties"], false);
+        for valid in [
+            json!({}),
+            json!({"paths": null}),
+            json!({"paths": []}),
+            json!({"paths": ["one.txt", "two.txt"]}),
+        ] {
+            assert!(
+                parse_op(upload, Some(valid.as_object().unwrap().clone())).is_ok(),
+                "{valid}"
+            );
+        }
+        for invalid in [
+            json!({"paths": "one.txt"}),
+            json!({"paths": [1]}),
+            json!({"paths": [], "unknown": true}),
+        ] {
+            assert!(
+                parse_op(upload, Some(invalid.as_object().unwrap().clone())).is_err(),
+                "{invalid}"
+            );
+        }
     }
 }
