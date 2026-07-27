@@ -1477,7 +1477,7 @@ def _agent_main(argv: Sequence[str]) -> int:
 
 
 def _mcp_main(argv: Sequence[str], *, program: str) -> int:
-    binary = shutil.which("rustwright-mcp") or shutil.which("mcp-rs")
+    binary = shutil.which("rustwright-mcp")
     if binary is None:
         print(
             "rustwright mcp requires the native rustwright-mcp server binary; "
