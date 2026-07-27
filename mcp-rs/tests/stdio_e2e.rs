@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 
 const REMOTE_UNREACHABLE: &str = "remote CDP session unreachable — restart or reconfigure";
 static STDIO_SERVER_LOCK: Mutex<()> = Mutex::new(());
+static STDIO_WORKSPACE_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
 const PAGE_HTML: &str = r#"<!doctype html>
 <html><head><title>MCP test page</title></head>
@@ -51,11 +52,15 @@ const PARITY_PAGE_HTML: &str = r#"<!doctype html>
     <input id="range" type="range" value="10">
     <button id="hover">Hover target</button>
     <button id="dialog">Dialog target</button>
+    <label for="upload">Upload target</label>
+    <input id="upload" type="file">
     <div id="drop" role="button" tabindex="0">Drop target</div>
     <div id="status" role="status">Status waiting</div>
     <div id="delayed" role="status">Delayed absent</div>
   </main>
   <script>
+    console.error('Parity console error');
+    console.info('Parity console info');
     const status = document.getElementById('status');
     document.getElementById('hover').addEventListener('mouseover', () => {
       status.textContent = 'Hover observed';
@@ -64,9 +69,105 @@ const PARITY_PAGE_HTML: &str = r#"<!doctype html>
       alert('Parity dialog');
       status.textContent = 'Dialog handled';
     });
+    document.getElementById('upload').addEventListener('change', (event) => {
+      const files = Array.from(event.target.files);
+      status.textContent = files.length
+        ? `Uploaded ${files.map((file) => file.name).join(', ')}`
+        : 'Upload empty';
+    });
     document.getElementById('drop').addEventListener('drop', (event) => {
       event.preventDefault();
       status.textContent = `Dropped ${event.dataTransfer.getData('text/plain')}`;
+    });
+  </script>
+</body></html>"#;
+
+const DRAG_PAGE_HTML: &str = r#"<!doctype html>
+<html><head><title>Physical drag</title>
+<style>
+  #drag-row { display: flex; align-items: center; gap: 180px; padding: 80px; }
+  #drag-source, #drag-target {
+    width: 180px;
+    height: 80px;
+    border: 2px solid black;
+    display: grid;
+    place-items: center;
+    user-select: none;
+  }
+  #drag-source { background: lightblue; }
+  #drag-target { background: lightgoldenrodyellow; }
+</style>
+</head>
+<body>
+  <main>
+    <h1>Physical drag controls</h1>
+    <div id="drag-row">
+      <div id="drag-source" role="button" draggable="true">Draggable card</div>
+      <div id="drag-target" role="button">Physical drop zone</div>
+    </div>
+    <div id="drag-status" role="status">Not dropped</div>
+  </main>
+  <script>
+    const source = document.getElementById('drag-source');
+    const target = document.getElementById('drag-target');
+    const status = document.getElementById('drag-status');
+    source.addEventListener('dragstart', (event) => {
+      event.dataTransfer.setData('text/plain', 'physical-card');
+    });
+    target.addEventListener('dragover', (event) => event.preventDefault());
+    target.addEventListener('drop', (event) => {
+      event.preventDefault();
+      status.textContent =
+        `Physically dropped ${event.dataTransfer.getData('text/plain')}; trusted=${event.isTrusted}`;
+    });
+
+    const ambiguous = new URLSearchParams(location.search).get('ambiguous');
+    const duplicateId =
+      ambiguous === 'start' ? 'drag-source' :
+      ambiguous === 'end' ? 'drag-target' :
+      null;
+    if (duplicateId) {
+      const observer = new MutationObserver((records) => {
+        const stamped = records
+          .map((record) => record.target)
+          .find((element) =>
+            element.id === duplicateId && element.hasAttribute('data-mcp-ref')
+          );
+        if (!stamped) return;
+        observer.disconnect();
+        const duplicate = stamped.cloneNode(true);
+        duplicate.removeAttribute('id');
+        stamped.after(duplicate);
+      });
+      observer.observe(document.body, {
+        attributes: true,
+        subtree: true,
+        attributeFilter: ['data-mcp-ref'],
+      });
+    }
+  </script>
+</body></html>"#;
+
+const NETWORK_PAGE_HTML: &str = r#"<!doctype html>
+<html><head><title>Network records</title></head>
+<body>
+  <main>
+    <h1>Network records</h1>
+    <div id="network-status" role="status">Network pending</div>
+    <img src="/network-static.svg" alt="Network static asset">
+  </main>
+  <script>
+    Promise.all([
+      fetch('/api/data', {
+        method: 'POST',
+        headers: { 'X-Network-Request': 'captured' },
+        body: 'request-payload-123'
+      }).then(async (response) => `${response.status} ${await response.text()}`),
+      fetch('/large-text').then((response) => response.text())
+    ]).then(([api]) => {
+      document.getElementById('network-status').textContent = `Network ready: ${api}`;
+    }).catch((error) => {
+      document.getElementById('network-status').textContent = `Network failed: ${error}`;
     });
   </script>
 </body></html>"#;
@@ -283,7 +384,22 @@ impl PageServer {
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => serve_connection(stream),
+                    Ok((stream, _)) => {
+                        // Serve each connection on its own thread. Under full-suite load
+                        // Chromium opens speculative/preconnect sockets that never send a
+                        // request; on a single serial accept loop such a socket blocks the
+                        // loop for its whole read timeout, the OS accept backlog overflows,
+                        // and the real navigation's SYN is dropped -- surfacing as
+                        // ERR_SOCKET_NOT_CONNECTED / ERR_CONNECTION_RESET. A per-connection
+                        // thread drains the backlog immediately so one idle client can never
+                        // starve the others; catch_unwind still contains any panic so a
+                        // misbehaving connection can't abort the process.
+                        thread::spawn(move || {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                serve_connection(stream);
+                            }));
+                        });
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -325,6 +441,18 @@ impl PageServer {
     fn parity_url(&self) -> String {
         format!("http://{}/parity", self.addr)
     }
+
+    fn network_url(&self) -> String {
+        format!("http://{}/network", self.addr)
+    }
+
+    fn drag_url(&self) -> String {
+        format!("http://{}/drag", self.addr)
+    }
+
+    fn ambiguous_drag_url(&self, endpoint: &str) -> String {
+        format!("{}?ambiguous={endpoint}", self.drag_url())
+    }
 }
 
 impl Drop for PageServer {
@@ -338,9 +466,25 @@ impl Drop for PageServer {
 }
 
 fn serve_connection(mut stream: TcpStream) {
-    stream
+    // The listener runs non-blocking so the accept loop can poll its stop flag, but on
+    // macOS/BSD an accepted socket inherits O_NONBLOCK from that listener and Rust does not
+    // clear it. Left non-blocking, the read below returns `WouldBlock` before Chromium's
+    // request bytes have landed, so we read an empty request, send no response, and the
+    // navigation fails with ERR_SOCKET_NOT_CONNECTED -- intermittently, as a scheduling
+    // race that worsens under full-suite load. Force the connection blocking so the read
+    // timeout actually governs and we wait for the request.
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
+    // The client (Chromium) frequently opens speculative/preconnect sockets under load
+    // and abandons them; treat every client-side I/O failure as "this connection went
+    // away" and return quietly rather than panicking the shared accept loop.
+    if stream
         .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set request read timeout");
+        .is_err()
+    {
+        return;
+    }
     let mut request = Vec::new();
     let mut buffer = [0_u8; 2048];
     while request.len() < 8192 {
@@ -354,7 +498,9 @@ fn serve_connection(mut stream: TcpStream) {
         }
     }
     let request = String::from_utf8_lossy(&request);
-    let request_target = request.split_whitespace().nth(1).unwrap_or("/");
+    let Some(request_target) = request.split_whitespace().nth(1) else {
+        return;
+    };
     let path = request_target
         .strip_prefix("http://")
         .and_then(|rest| rest.find('/').map(|offset| &rest[offset..]))
@@ -365,31 +511,89 @@ fn serve_connection(mut stream: TcpStream) {
     if path == "/slow" {
         thread::sleep(Duration::from_millis(450));
     }
-    let body = if path == "/history-a" {
-        HISTORY_PAGE_A_HTML
+    let (content_type, extra_headers, body) = if path == "/api/data" {
+        (
+            "application/json; charset=utf-8",
+            "X-Network-Response: captured\r\n",
+            br#"{"message":"network-response-body"}"#.to_vec(),
+        )
+    } else if path == "/large-text" {
+        ("text/plain; charset=utf-8", "", vec![b'x'; 70 * 1024])
+    } else if path == "/network-static.svg" {
+        (
+            "image/svg+xml",
+            "",
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>"#.to_vec(),
+        )
+    } else if path == "/history-a" {
+        (
+            "text/html; charset=utf-8",
+            "",
+            HISTORY_PAGE_A_HTML.as_bytes().to_vec(),
+        )
     } else if path == "/history-b" {
-        HISTORY_PAGE_B_HTML
+        (
+            "text/html; charset=utf-8",
+            "",
+            HISTORY_PAGE_B_HTML.as_bytes().to_vec(),
+        )
     } else if path == "/history-spa" {
-        SPA_HISTORY_PAGE_HTML
+        (
+            "text/html; charset=utf-8",
+            "",
+            SPA_HISTORY_PAGE_HTML.as_bytes().to_vec(),
+        )
     } else if path == "/history-hash" {
-        HASH_HISTORY_PAGE_HTML
+        (
+            "text/html; charset=utf-8",
+            "",
+            HASH_HISTORY_PAGE_HTML.as_bytes().to_vec(),
+        )
     } else if path == "/background-scroll" {
-        BACKGROUND_SCROLL_PAGE_HTML
+        (
+            "text/html; charset=utf-8",
+            "",
+            BACKGROUND_SCROLL_PAGE_HTML.as_bytes().to_vec(),
+        )
     } else if path == "/scroll" {
-        SCROLL_PAGE_HTML
+        (
+            "text/html; charset=utf-8",
+            "",
+            SCROLL_PAGE_HTML.as_bytes().to_vec(),
+        )
     } else if path == "/parity" {
-        PARITY_PAGE_HTML
+        (
+            "text/html; charset=utf-8",
+            "",
+            PARITY_PAGE_HTML.as_bytes().to_vec(),
+        )
+    } else if path == "/network" {
+        (
+            "text/html; charset=utf-8",
+            "",
+            NETWORK_PAGE_HTML.as_bytes().to_vec(),
+        )
+    } else if path == "/drag" {
+        (
+            "text/html; charset=utf-8",
+            "",
+            DRAG_PAGE_HTML.as_bytes().to_vec(),
+        )
     } else {
-        PAGE_HTML
+        (
+            "text/html; charset=utf-8",
+            "",
+            PAGE_HTML.as_bytes().to_vec(),
+        )
     };
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+    let response_headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len(),
-        body
     );
-    stream
-        .write_all(response.as_bytes())
-        .expect("write test page");
+    if stream.write_all(response_headers.as_bytes()).is_err() {
+        return;
+    }
+    let _ = stream.write_all(&body);
 }
 
 struct ServerProcess {
@@ -789,7 +993,7 @@ fn real_stdio_snapshot_click_monotonic_refs_and_clean_shutdown() {
     server.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}));
     let listed = server.receive();
     let tools = listed["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 22);
+    assert_eq!(tools.len(), 27);
     assert_eq!(
         tools
             .iter()
@@ -810,9 +1014,14 @@ fn real_stdio_snapshot_click_monotonic_refs_and_clean_shutdown() {
             "browser_fill_form",
             "browser_hover",
             "browser_press_key",
+            "browser_drag",
             "browser_drop",
+            "browser_console_messages",
+            "browser_network_requests",
+            "browser_network_request",
             "browser_tabs",
             "browser_handle_dialog",
+            "browser_file_upload",
             "browser_wait_for",
             "browser_get_text",
             "browser_evaluate",
@@ -853,6 +1062,43 @@ fn real_stdio_snapshot_click_monotonic_refs_and_clean_shutdown() {
     assert_eq!(
         tool("browser_take_screenshot")["inputSchema"]["properties"]["type"]["enum"],
         json!(["png", "jpeg"])
+    );
+    assert_eq!(
+        tool("browser_network_requests")["inputSchema"]["properties"]["static"]["default"],
+        false
+    );
+    assert_eq!(
+        tool("browser_drag")["inputSchema"]["required"],
+        json!(["startTarget", "endTarget"])
+    );
+    assert_eq!(
+        tool("browser_drag")["inputSchema"]["properties"]["startElement"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        tool("browser_network_request")["inputSchema"]["required"],
+        json!(["index"])
+    );
+    assert_eq!(
+        tool("browser_network_request")["inputSchema"]["properties"]["index"]["minimum"],
+        1
+    );
+    assert_eq!(
+        tool("browser_network_request")["inputSchema"]["properties"]["part"]["enum"],
+        json!([
+            "request-headers",
+            "request-body",
+            "response-headers",
+            "response-body",
+            null
+        ])
+    );
+    assert_eq!(
+        tool("browser_file_upload")["inputSchema"]["properties"]["paths"],
+        json!({
+            "type": ["array", "null"],
+            "items": {"type": "string"}
+        })
     );
     assert!(
         tools
@@ -948,13 +1194,23 @@ fn real_stdio_tool_profiles_and_evaluation_gate_match_contract() {
     }
 
     let mirror = names(&[("RUSTWRIGHT_MCP_TOOLSET", "mirror")]);
-    assert_eq!(mirror.len(), 22);
+    assert_eq!(mirror.len(), 27);
     assert!(mirror.contains(&"browser_fill_form".to_owned()));
+    assert!(mirror.contains(&"browser_console_messages".to_owned()));
+    assert!(mirror.contains(&"browser_network_requests".to_owned()));
+    assert!(mirror.contains(&"browser_network_request".to_owned()));
+    assert!(mirror.contains(&"browser_file_upload".to_owned()));
+    assert!(mirror.contains(&"browser_drag".to_owned()));
     assert!(mirror.contains(&"browser_evaluate".to_owned()));
 
     let lean = names(&[("RUSTWRIGHT_MCP_TOOLSET", "lean")]);
     assert_eq!(lean.len(), 17);
     assert!(!lean.contains(&"browser_fill_form".to_owned()));
+    assert!(!lean.contains(&"browser_console_messages".to_owned()));
+    assert!(!lean.contains(&"browser_network_requests".to_owned()));
+    assert!(!lean.contains(&"browser_network_request".to_owned()));
+    assert!(!lean.contains(&"browser_file_upload".to_owned()));
+    assert!(!lean.contains(&"browser_drag".to_owned()));
     assert!(lean.contains(&"browser_evaluate".to_owned()));
 
     let no_eval = names(&[
@@ -963,6 +1219,99 @@ fn real_stdio_tool_profiles_and_evaluation_gate_match_contract() {
     ]);
     assert_eq!(no_eval.len(), 16);
     assert!(!no_eval.contains(&"browser_evaluate".to_owned()));
+}
+
+#[test]
+fn real_stdio_physical_drag_is_trusted_strict_and_updates_live_dom() {
+    if chromium().executable_path().is_none() {
+        eprintln!("skipping physical drag MCP test: Chromium executable unavailable");
+        return;
+    }
+
+    let page_server = PageServer::start();
+    let mut server = ServerProcess::spawn();
+    server.initialize();
+
+    let navigated = call_tool(
+        &mut server,
+        170,
+        "browser_navigate",
+        json!({"url": page_server.drag_url()}),
+    );
+    let snapshot = result_text(&navigated).to_owned();
+    let start = named_ref(&snapshot, "button", "Draggable card");
+    let end = named_ref(&snapshot, "button", "Physical drop zone");
+
+    let stale_start = call_tool(
+        &mut server,
+        171,
+        "browser_drag",
+        json!({"startTarget": "e999999", "endTarget": end.clone()}),
+    );
+    assert!(
+        error_result_text(&stale_start).contains("unknown or stale ref e999999"),
+        "{stale_start}"
+    );
+    let stale_end = call_tool(
+        &mut server,
+        172,
+        "browser_drag",
+        json!({"startTarget": start.clone(), "endTarget": "e999999"}),
+    );
+    assert!(
+        error_result_text(&stale_end).contains("unknown or stale ref e999999"),
+        "{stale_end}"
+    );
+
+    let dragged = call_tool(
+        &mut server,
+        173,
+        "browser_drag",
+        json!({
+            "startTarget": start,
+            "endTarget": end,
+            "startElement": "Draggable card",
+            "endElement": "Physical drop zone"
+        }),
+    );
+    let dragged = result_text(&dragged);
+    assert!(
+        dragged.contains("### Result\nDragged Draggable card to Physical drop zone."),
+        "{dragged}"
+    );
+    assert!(dragged.contains("### Snapshot"), "{dragged}");
+    assert!(
+        dragged.contains("Physically dropped physical-card; trusted=true"),
+        "{dragged}"
+    );
+
+    for (id, endpoint) in [(174, "start"), (176, "end")] {
+        let navigated = call_tool(
+            &mut server,
+            id,
+            "browser_navigate",
+            json!({"url": page_server.ambiguous_drag_url(endpoint)}),
+        );
+        let snapshot = result_text(&navigated);
+        let start = named_ref(snapshot, "button", "Draggable card");
+        let end = named_ref(snapshot, "button", "Physical drop zone");
+        let ambiguous = call_tool(
+            &mut server,
+            id + 1,
+            "browser_drag",
+            json!({"startTarget": start, "endTarget": end}),
+        );
+        let error = error_result_text(&ambiguous);
+        assert!(
+            error.contains("strict mode violation")
+                && error.contains("2 elements")
+                && error.contains("trying to drag"),
+            "{endpoint} endpoint ambiguity did not preserve strict resolution: {error}"
+        );
+    }
+
+    let (_, diagnostics) = server.finish();
+    assert!(diagnostics.contains("browser actor: stopped"));
 }
 
 #[test]
@@ -1156,6 +1505,334 @@ fn real_stdio_parity_actions_inspection_wait_reload_and_close() {
 }
 
 #[test]
+fn real_stdio_console_messages_filter_and_file_output_converge() {
+    if chromium().executable_path().is_none() {
+        eprintln!("skipping console MCP test: Chromium executable unavailable");
+        return;
+    }
+
+    let page_server = PageServer::start();
+    let workspace = std::env::temp_dir().join(format!(
+        "rustwright-mcp-console-{}-{}",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    fs::create_dir(&workspace).expect("create console workspace");
+    let workspace_text = workspace.to_string_lossy().to_string();
+    let mut server =
+        ServerProcess::spawn_with_env(&[("RUSTWRIGHT_MCP_WORKSPACE", &workspace_text)]);
+    server.initialize();
+    let _ = call_tool(
+        &mut server,
+        250,
+        "browser_navigate",
+        json!({"url": page_server.parity_url()}),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut request_id = 251;
+    let errors = loop {
+        let response = call_tool(
+            &mut server,
+            request_id,
+            "browser_console_messages",
+            json!({"level": "error"}),
+        );
+        request_id += 1;
+        if result_text(&response).contains("Parity console error") {
+            break response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "console records did not converge: {}",
+            result_text(&response)
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        !result_text(&errors).contains("Parity console info"),
+        "{}",
+        result_text(&errors)
+    );
+
+    let all_visible = call_tool(
+        &mut server,
+        request_id,
+        "browser_console_messages",
+        json!({"level": "info"}),
+    );
+    request_id += 1;
+    assert!(
+        result_text(&all_visible).contains("ERROR")
+            && result_text(&all_visible).contains("Parity console error")
+            && result_text(&all_visible).contains("Parity console info"),
+        "{}",
+        result_text(&all_visible)
+    );
+
+    let written = call_tool(
+        &mut server,
+        request_id,
+        "browser_console_messages",
+        json!({"level": "info", "filename": "console.txt"}),
+    );
+    assert!(
+        result_text(&written).contains("Console messages written"),
+        "{}",
+        result_text(&written)
+    );
+    let artifact = fs::read_to_string(workspace.join("console.txt")).expect("read console output");
+    assert!(artifact.contains("Parity console error"), "{artifact}");
+    server.finish();
+    fs::remove_file(workspace.join("console.txt")).expect("remove console output");
+    fs::remove_dir(workspace).expect("remove console workspace");
+}
+
+#[test]
+fn real_stdio_network_list_detail_body_bounds_and_file_output_converge() {
+    if chromium().executable_path().is_none() {
+        eprintln!("skipping network MCP test: Chromium executable unavailable");
+        return;
+    }
+
+    let page_server = PageServer::start();
+    let workspace = std::env::temp_dir().join(format!(
+        "rustwright-mcp-network-{}-{}",
+        std::process::id(),
+        STDIO_WORKSPACE_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir(&workspace).expect("create network workspace");
+    let workspace_text = workspace.to_string_lossy().to_string();
+    let mut server =
+        ServerProcess::spawn_with_env(&[("RUSTWRIGHT_MCP_WORKSPACE", &workspace_text)]);
+    server.initialize();
+    let navigated = call_tool(
+        &mut server,
+        270,
+        "browser_navigate",
+        json!({"url": page_server.network_url()}),
+    );
+    assert!(
+        result_text(&navigated).contains("Network records"),
+        "{}",
+        result_text(&navigated)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut request_id = 271;
+    let all_requests = loop {
+        let response = call_tool(
+            &mut server,
+            request_id,
+            "browser_network_requests",
+            json!({"static": true}),
+        );
+        request_id += 1;
+        let text = result_text(&response);
+        if text
+            .lines()
+            .any(|line| line.contains(" 200 ") && line.contains("/network-static.svg"))
+            && text
+                .lines()
+                .any(|line| line.contains(" 200 ") && line.contains("/api/data"))
+            && text
+                .lines()
+                .any(|line| line.contains(" 200 ") && line.contains("/large-text"))
+        {
+            break response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "network records did not converge: {text}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    let all_text = result_text(&all_requests);
+    let index_for = |needle: &str| {
+        all_text
+            .lines()
+            .find(|line| line.contains(needle))
+            .and_then(|line| line.strip_prefix('['))
+            .and_then(|line| line.split_once(']'))
+            .and_then(|(index, _)| index.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("missing network index for {needle}: {all_text}"))
+    };
+    let api_index = index_for("/api/data");
+    let large_index = index_for("/large-text");
+
+    let filtered = call_tool(
+        &mut server,
+        request_id,
+        "browser_network_requests",
+        json!({"filter": "api/data$|large-text$"}),
+    );
+    request_id += 1;
+    let filtered_text = result_text(&filtered);
+    assert!(filtered_text.contains("/api/data"), "{filtered_text}");
+    assert!(filtered_text.contains("/large-text"), "{filtered_text}");
+    assert!(
+        !filtered_text.contains("/network-static.svg"),
+        "{filtered_text}"
+    );
+
+    let without_static = call_tool(
+        &mut server,
+        request_id,
+        "browser_network_requests",
+        json!({}),
+    );
+    request_id += 1;
+    assert!(
+        !result_text(&without_static).contains("/network-static.svg"),
+        "{}",
+        result_text(&without_static)
+    );
+
+    let invalid_filter = call_tool(
+        &mut server,
+        request_id,
+        "browser_network_requests",
+        json!({"filter": "["}),
+    );
+    request_id += 1;
+    assert!(
+        error_result_text(&invalid_filter).contains("invalid network filter regex"),
+        "{}",
+        error_result_text(&invalid_filter)
+    );
+
+    let detail = loop {
+        let response = call_tool(
+            &mut server,
+            request_id,
+            "browser_network_request",
+            json!({"index": api_index}),
+        );
+        request_id += 1;
+        if result_text(&response).contains("network-response-body") {
+            break response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "network detail did not converge: {}",
+            result_text(&response)
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    let detail_text = result_text(&detail);
+    let detail_lower = detail_text.to_ascii_lowercase();
+    assert!(
+        detail_text.contains("#### request-headers"),
+        "{detail_text}"
+    );
+    assert!(
+        detail_lower.contains("x-network-request") && detail_text.contains("request-payload-123"),
+        "{detail_text}"
+    );
+    assert!(
+        detail_text.contains("#### response-headers")
+            && detail_lower.contains("x-network-response"),
+        "{detail_text}"
+    );
+    assert!(
+        detail_text.contains("#### response-body") && detail_text.contains("network-response-body"),
+        "{detail_text}"
+    );
+
+    let bounded = loop {
+        let response = call_tool(
+            &mut server,
+            request_id,
+            "browser_network_request",
+            json!({"index": large_index, "part": "response-body"}),
+        );
+        request_id += 1;
+        if result_text(&response).contains("truncated to 65536 bytes inline") {
+            break response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bounded network body did not converge: {}",
+            result_text(&response)
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    let bounded_text = result_text(&bounded);
+    assert!(bounded_text.starts_with("#### response-body\n"));
+    assert!(
+        bounded_text.len() < 66 * 1024,
+        "inline body was not bounded"
+    );
+
+    let written_list = call_tool(
+        &mut server,
+        request_id,
+        "browser_network_requests",
+        json!({"static": true, "filename": "network-list.txt"}),
+    );
+    request_id += 1;
+    assert!(
+        result_text(&written_list).contains("Network requests written"),
+        "{}",
+        result_text(&written_list)
+    );
+    let list_artifact =
+        fs::read_to_string(workspace.join("network-list.txt")).expect("read network list output");
+    assert!(list_artifact.contains("/api/data"), "{list_artifact}");
+    assert!(
+        list_artifact.contains("/network-static.svg"),
+        "{list_artifact}"
+    );
+
+    let written_detail = call_tool(
+        &mut server,
+        request_id,
+        "browser_network_request",
+        json!({
+            "index": large_index,
+            "part": "response-body",
+            "filename": "network-detail.txt"
+        }),
+    );
+    request_id += 1;
+    assert!(
+        result_text(&written_detail).contains("Network request"),
+        "{}",
+        result_text(&written_detail)
+    );
+    let detail_artifact = fs::read_to_string(workspace.join("network-detail.txt"))
+        .expect("read network detail output");
+    assert!(
+        detail_artifact.len() > 70 * 1024 && !detail_artifact.contains("truncated"),
+        "filename body should contain the complete 70 KiB fixture"
+    );
+
+    let _ = call_tool(
+        &mut server,
+        request_id,
+        "browser_navigate",
+        json!({"url": page_server.history_url("a")}),
+    );
+    request_id += 1;
+    let previous = call_tool(
+        &mut server,
+        request_id,
+        "browser_network_request",
+        json!({"index": api_index, "part": "request-headers"}),
+    );
+    assert!(
+        error_result_text(&previous).contains("from a previous navigation"),
+        "{}",
+        error_result_text(&previous)
+    );
+
+    server.finish();
+    fs::remove_file(workspace.join("network-list.txt")).expect("remove network list output");
+    fs::remove_file(workspace.join("network-detail.txt")).expect("remove network detail output");
+    fs::remove_dir(workspace).expect("remove network workspace");
+}
+
+#[test]
 fn real_stdio_dialog_returns_fast_surfaces_modal_and_converges_after_accept() {
     if chromium().executable_path().is_none() {
         eprintln!("skipping dialog MCP test: Chromium executable unavailable");
@@ -1225,6 +1902,152 @@ fn real_stdio_dialog_returns_fast_surfaces_modal_and_converges_after_accept() {
         thread::sleep(Duration::from_millis(25));
     }
     server.finish();
+}
+
+#[test]
+fn real_stdio_file_upload_sets_confined_file_releases_failure_and_cancels_with_empty_list() {
+    if chromium().executable_path().is_none() {
+        eprintln!("skipping file-upload MCP test: Chromium executable unavailable");
+        return;
+    }
+
+    let page_server = PageServer::start();
+    let workspace = std::env::temp_dir().join(format!(
+        "rustwright-mcp-upload-{}-{}",
+        std::process::id(),
+        STDIO_WORKSPACE_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir(&workspace).expect("create upload workspace");
+    fs::write(workspace.join("upload.txt"), b"uploaded through chooser")
+        .expect("write upload fixture");
+    fs::write(workspace.join("second.txt"), b"second chooser file")
+        .expect("write second upload fixture");
+    let workspace_text = workspace.to_string_lossy().to_string();
+    let mut server =
+        ServerProcess::spawn_with_env(&[("RUSTWRIGHT_MCP_WORKSPACE", &workspace_text)]);
+    server.initialize();
+    let navigated = call_tool(
+        &mut server,
+        330,
+        "browser_navigate",
+        json!({"url": page_server.parity_url()}),
+    );
+    let upload_ref = named_ref(result_text(&navigated), "textbox", "Upload target");
+
+    let clicked = call_tool(
+        &mut server,
+        331,
+        "browser_click",
+        json!({"target": upload_ref}),
+    );
+    assert!(
+        result_text(&clicked).contains("File chooser pending: single file only"),
+        "{}",
+        result_text(&clicked)
+    );
+
+    let multiplicity = call_tool(
+        &mut server,
+        332,
+        "browser_file_upload",
+        json!({"paths": ["upload.txt", "second.txt"]}),
+    );
+    assert!(
+        error_result_text(&multiplicity)
+            .starts_with("the pending file chooser accepts only one file"),
+        "{}",
+        error_result_text(&multiplicity)
+    );
+
+    let after_failure = call_tool(&mut server, 333, "browser_snapshot", json!({}));
+    let upload_ref = named_ref(result_text(&after_failure), "textbox", "Upload target");
+    let reopened = call_tool(
+        &mut server,
+        334,
+        "browser_click",
+        json!({"target": upload_ref}),
+    );
+    assert!(
+        result_text(&reopened).contains("Call browser_file_upload"),
+        "{}",
+        result_text(&reopened)
+    );
+    let uploaded = call_tool(
+        &mut server,
+        335,
+        "browser_file_upload",
+        json!({"paths": ["upload.txt"]}),
+    );
+    assert!(
+        result_text(&uploaded).starts_with("Uploaded 1 file(s) through the pending chooser."),
+        "{}",
+        result_text(&uploaded)
+    );
+    let received = call_tool(
+        &mut server,
+        336,
+        "browser_evaluate",
+        json!({
+            "function": "() => { const files = document.querySelector('#upload').files; return { count: files.length, name: files[0] && files[0].name }; }"
+        }),
+    );
+    assert!(
+        result_text(&received).starts_with(r#"{"count":1,"name":"upload.txt"}"#),
+        "{}",
+        result_text(&received)
+    );
+
+    let upload_ref = named_ref(result_text(&received), "textbox", "Upload target");
+    let cancel_opened = call_tool(
+        &mut server,
+        337,
+        "browser_click",
+        json!({"target": upload_ref}),
+    );
+    assert!(
+        result_text(&cancel_opened).contains("File chooser pending"),
+        "{}",
+        result_text(&cancel_opened)
+    );
+    let cancelled = call_tool(
+        &mut server,
+        338,
+        "browser_file_upload",
+        json!({"paths": []}),
+    );
+    assert!(
+        result_text(&cancelled).starts_with("Cancelled the pending file chooser."),
+        "{}",
+        result_text(&cancelled)
+    );
+    let upload_ref = named_ref(result_text(&cancelled), "textbox", "Upload target");
+    let reopened_after_cancel = call_tool(
+        &mut server,
+        339,
+        "browser_click",
+        json!({"target": upload_ref}),
+    );
+    assert!(
+        result_text(&reopened_after_cancel).contains("File chooser pending"),
+        "{}",
+        result_text(&reopened_after_cancel)
+    );
+    let cancelled_again = call_tool(
+        &mut server,
+        340,
+        "browser_file_upload",
+        json!({"paths": null}),
+    );
+    assert!(
+        result_text(&cancelled_again).starts_with("Cancelled the pending file chooser."),
+        "{}",
+        result_text(&cancelled_again)
+    );
+
+    server.finish();
+    fs::remove_file(workspace.join("upload.txt")).expect("remove upload fixture");
+    fs::remove_file(workspace.join("second.txt")).expect("remove second upload fixture");
+    fs::remove_dir(workspace).expect("remove upload workspace");
 }
 
 #[test]
