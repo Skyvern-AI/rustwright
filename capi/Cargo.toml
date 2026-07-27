@@ -9,7 +9,7 @@ name = "rustwright_capi"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-libc = "=0.2.186"
+libc = "=0.2.189"
 rustwright_core = { package = "rustwright-core", path = "..", default-features = false }
 serde = { version = "=1.0.194", features = ["derive"] }
-serde_json = "=1.0.127"
+serde_json = "=1.0.143"
