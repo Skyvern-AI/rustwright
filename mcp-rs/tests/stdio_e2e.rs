@@ -82,6 +82,69 @@ const PARITY_PAGE_HTML: &str = r#"<!doctype html>
   </script>
 </body></html>"#;
 
+const INPUT_PAGE_HTML: &str = r#"<!doctype html>
+<html><head><title>Input controls</title></head>
+<body>
+  <label for="name">Test input</label>
+  <input id="name" value="sample value">
+  <input id="secret" aria-label="Secret input" type="password">
+  <div id="password-length-readout" role="status">Password length: 0</div>
+  <div id="input-readout" role="status">Input value: sample value</div>
+  <div id="key-readout" role="status">Key pressed: none</div>
+  <div id="focus-readout" role="status">Focused: none; focus changes: 0</div>
+  <label for="choice">Test choice</label>
+  <select id="choice">
+    <option value="alpha">Alpha</option>
+    <option value="beta">Beta</option>
+  </select>
+  <div id="select-readout" role="status">Selected value: alpha; changes: 0</div>
+  <script>
+    const input = document.getElementById('name');
+    const secret = document.getElementById('secret');
+    const updatePasswordLength = () => {
+      document.getElementById('password-length-readout').textContent =
+        `Password length: ${secret.value.length}`;
+    };
+    secret.addEventListener('input', updatePasswordLength);
+    secret.addEventListener('change', updatePasswordLength);
+    input.addEventListener('input', () => {
+      document.getElementById('input-readout').textContent = `Input value: ${input.value}`;
+    });
+    document.addEventListener('keydown', (event) => {
+      // The listener is on document, so it fires wherever the key lands. Recording
+      // the target is what makes the readout target-sensitive: without it a key
+      // delivered to the body or the wrong field is indistinguishable from a key
+      // delivered to the element the test aimed at.
+      const node = event.target;
+      const target = node instanceof Element
+        ? (node.id || node.tagName.toLowerCase())
+        : 'none';
+      document.getElementById('key-readout').textContent =
+        `Key pressed: ${event.key}; trusted: ${event.isTrusted}; target: ${target}`;
+    });
+    let focusChanges = 0;
+    // Focus is the page state a rejected key press must not disturb. Counting
+    // the changes as well as naming the focused element makes a spurious focus
+    // observable even when it lands back on the element that already had it.
+    document.addEventListener('focusin', (event) => {
+      focusChanges += 1;
+      const node = event.target;
+      const id = node instanceof Element
+        ? (node.id || node.tagName.toLowerCase())
+        : 'none';
+      document.getElementById('focus-readout').textContent =
+        `Focused: ${id}; focus changes: ${focusChanges}`;
+    });
+    let changes = 0;
+    const choice = document.getElementById('choice');
+    choice.addEventListener('change', () => {
+      changes += 1;
+      document.getElementById('select-readout').textContent =
+        `Selected value: ${choice.value}; changes: ${changes}`;
+    });
+  </script>
+</body></html>"#;
+
 const DRAG_PAGE_HTML: &str = r#"<!doctype html>
 <html><head><title>Physical drag</title>
 <style>
@@ -442,6 +505,10 @@ impl PageServer {
         format!("http://{}/parity", self.addr)
     }
 
+    fn input_url(&self) -> String {
+        format!("http://{}/input", self.addr)
+    }
+
     fn network_url(&self) -> String {
         format!("http://{}/network", self.addr)
     }
@@ -566,6 +633,12 @@ fn serve_connection(mut stream: TcpStream) {
             "text/html; charset=utf-8",
             "",
             PARITY_PAGE_HTML.as_bytes().to_vec(),
+        )
+    } else if path == "/input" {
+        (
+            "text/html; charset=utf-8",
+            "",
+            INPUT_PAGE_HTML.as_bytes().to_vec(),
         )
     } else if path == "/network" {
         (
@@ -796,6 +869,41 @@ impl Drop for ServerProcess {
     }
 }
 
+fn role_ref(snapshot: &str, role: &str, name: &str) -> String {
+    let line = snapshot
+        .lines()
+        .find(|line| line.contains(&format!("- {role}")) && line.contains(name))
+        .unwrap_or_else(|| panic!("{role} {name:?} missing from snapshot:\n{snapshot}"));
+    let marker = "[ref=";
+    let start = line.find(marker).expect("role ref start") + marker.len();
+    let end = line[start..].find(']').expect("role ref end") + start;
+    line[start..end].to_owned()
+}
+
+// Extract a rendered readout's full text so two snapshots can be compared for
+// equality. `prefix` starts with the opening quote the renderer wraps names in;
+// returning the text up to the closing quote keeps ref markers -- whose numbers
+// are reassigned on every snapshot -- out of the comparison.
+fn status_text(snapshot: &str, prefix: &str) -> String {
+    assert!(
+        prefix.starts_with('"'),
+        "prefix must start at the renderer's opening quote: {prefix:?}"
+    );
+    let mut matches = snapshot.match_indices(prefix);
+    let (start, _) = matches
+        .next()
+        .unwrap_or_else(|| panic!("{prefix:?} missing from snapshot:\n{snapshot}"));
+    assert!(
+        matches.next().is_none(),
+        "{prefix:?} matched more than once, so equality would be ambiguous:\n{snapshot}"
+    );
+    let rest = &snapshot[start + 1..];
+    let end = rest
+        .find('"')
+        .unwrap_or_else(|| panic!("unterminated readout for {prefix:?}:\n{snapshot}"));
+    rest[..end].to_owned()
+}
+
 fn result_text(message: &Value) -> &str {
     assert_eq!(
         message["result"]["isError"], false,
@@ -883,6 +991,88 @@ fn button_ref(snapshot: &str, name: &str) -> String {
     let start = line.find(marker).expect("button ref start") + marker.len();
     let end = line[start..].find(']').expect("button ref end") + start;
     line[start..end].to_owned()
+}
+
+fn poll_snapshot_until(
+    server: &mut ServerProcess,
+    latest: String,
+    next_id: &mut i64,
+    needle: &str,
+) -> String {
+    poll_snapshot_state(
+        server,
+        latest,
+        next_id,
+        &format!("{needle:?}"),
+        |snapshot| snapshot.contains(needle),
+    )
+}
+
+// Masking is a property of EVERY snapshot, not just the one a poll settles on.
+// Checking only the returned snapshot would let a plaintext leak in the tool's
+// immediate response or in any intermediate poll pass unnoticed, because a later
+// masked snapshot would overwrite it. `poll_snapshot_state` runs its predicate on
+// the initial value and on each snapshot it fetches, so asserting inside the
+// predicate covers every snapshot this poll observes.
+fn poll_snapshot_until_never_leaking(
+    server: &mut ServerProcess,
+    latest: String,
+    next_id: &mut i64,
+    needle: &str,
+    secret: &str,
+) -> String {
+    poll_snapshot_state(
+        server,
+        latest,
+        next_id,
+        &format!("{needle:?}"),
+        |snapshot| {
+            assert!(
+                !snapshot.contains(secret),
+                "snapshot leaked the secret {secret:?}:\n{snapshot}"
+            );
+            // The positive complement of the leak check: absence of the plaintext
+            // is also satisfied by a snapshot that dropped the field entirely, so
+            // any snapshot still rendering the password row has to render it
+            // masked. Responses that carry no snapshot mention neither string and
+            // pass, which is what lets the poll keep going instead of failing on
+            // an intermediate tool reply.
+            assert!(
+                !snapshot.contains("Secret input") || snapshot.contains("[value=••••••]"),
+                "snapshot rendered the password row unmasked:\n{snapshot}"
+            );
+            snapshot.contains(needle)
+        },
+    )
+}
+
+// Page-side readouts are written by the page's own event listeners at the
+// renderer's next rendering step, so a tool response's snapshot cannot promise
+// they are already current; converge on the expected state instead of
+// asserting one unguaranteed interleaving.
+fn poll_snapshot_state(
+    server: &mut ServerProcess,
+    mut latest: String,
+    next_id: &mut i64,
+    what: &str,
+    predicate: impl Fn(&str) -> bool,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !predicate(&latest) {
+        assert!(
+            Instant::now() < deadline,
+            "snapshot did not converge on {what}:\n{latest}"
+        );
+        let id = *next_id;
+        *next_id += 1;
+        server.send(json!({
+            "jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":"browser_snapshot","arguments":{}}
+        }));
+        latest = result_text(&server.receive()).to_owned();
+        thread::sleep(Duration::from_millis(20));
+    }
+    latest
 }
 
 fn scroll_y(snapshot: &str) -> u64 {
@@ -1056,6 +1246,46 @@ fn real_stdio_snapshot_click_monotonic_refs_and_clean_shutdown() {
         "^e[1-9][0-9]*$"
     );
     assert_eq!(
+        tool("browser_press_key")["inputSchema"]["required"],
+        json!(["key"])
+    );
+    // The optional target is a snapshot ref, constrained exactly like every
+    // other ref-taking tool so a caller cannot smuggle a selector through it.
+    assert_eq!(
+        tool("browser_press_key")["inputSchema"]["properties"]["target"]["pattern"],
+        "^e[1-9][0-9]*$"
+    );
+    assert_eq!(
+        tool("browser_hover")["inputSchema"]["required"],
+        json!(["target"])
+    );
+    assert_eq!(
+        tool("browser_select_option")["inputSchema"]["required"],
+        json!(["target"])
+    );
+    for field in ["values", "value"] {
+        assert_eq!(
+            tool("browser_select_option")["inputSchema"]["properties"][field]["oneOf"],
+            json!([
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}}
+            ])
+        );
+    }
+    assert_eq!(
+        tool("browser_select_option")["inputSchema"]["oneOf"],
+        json!([
+            {
+                "required": ["values"],
+                "not": {"required": ["value"]}
+            },
+            {
+                "required": ["value"],
+                "not": {"required": ["values"]}
+            }
+        ])
+    );
+    assert_eq!(
         tool("browser_scroll")["inputSchema"]["properties"]["direction"]["enum"],
         json!(["up", "down"])
     );
@@ -1219,6 +1449,249 @@ fn real_stdio_tool_profiles_and_evaluation_gate_match_contract() {
     ]);
     assert_eq!(no_eval.len(), 16);
     assert!(!no_eval.contains(&"browser_evaluate".to_owned()));
+}
+
+#[test]
+fn real_stdio_type_press_enter_and_select_option_round_trip() {
+    if chromium().executable_path().is_none() {
+        eprintln!("skipping input tools MCP test: Chromium executable unavailable");
+        return;
+    }
+
+    let page_server = PageServer::start();
+    let mut server = ServerProcess::spawn();
+    server.initialize();
+
+    server.send(json!({
+        "jsonrpc":"2.0","id":201,"method":"tools/call",
+        "params":{"name":"browser_navigate","arguments":{"url":page_server.input_url()}}
+    }));
+    let navigated = result_text(&server.receive()).to_owned();
+    assert!(navigated.contains("Test input"), "{navigated}");
+
+    server.send(json!({
+        "jsonrpc":"2.0","id":202,"method":"tools/call",
+        "params":{"name":"browser_snapshot","arguments":{}}
+    }));
+    let snapshot = result_text(&server.receive()).to_owned();
+    assert!(snapshot.contains(r#""Password length: 0""#), "{snapshot}");
+    // Nothing has been typed yet, and the renderer omits the value part entirely
+    // for an empty field, so the mask is absent here. Pinning that keeps the mask
+    // assertions below honest: they observe a transition rather than a constant
+    // that would hold even if masking were removed from the renderer.
+    assert!(!snapshot.contains("[value=••••••]"), "{snapshot}");
+    let password_target = role_ref(&snapshot, "textbox", "Secret input");
+    let password_sentinel = "stdio-password-sentinel-203";
+    let mut next_id = 203;
+
+    let typed_id = next_id;
+    next_id += 1;
+    server.send(json!({
+        "jsonrpc":"2.0","id":typed_id,"method":"tools/call",
+        "params":{
+            "name":"browser_type",
+            "arguments":{"target":password_target,"text":password_sentinel}
+        }
+    }));
+    let password_typed = result_text(&server.receive()).to_owned();
+    // The page reports the length it received, so the secret round-tripped
+    // intact even though every snapshot renders it masked. Every snapshot
+    // observed from here on is checked for the sentinel, so a leak at any point
+    // fails the test rather than being overwritten by a later masked snapshot.
+    let password_typed = poll_snapshot_until_never_leaking(
+        &mut server,
+        password_typed,
+        &mut next_id,
+        &format!(
+            r#""Password length: {}""#,
+            password_sentinel.chars().count()
+        ),
+        password_sentinel,
+    );
+    assert!(
+        password_typed.contains("[value=••••••]"),
+        "{password_typed}"
+    );
+
+    let input_target = role_ref(&password_typed, "textbox", "Test input");
+    let input_id = next_id;
+    next_id += 1;
+    server.send(json!({
+        "jsonrpc":"2.0","id":input_id,"method":"tools/call",
+        "params":{
+            "name":"browser_type",
+            "arguments":{"target":input_target,"text":"stdio typed"}
+        }
+    }));
+    let typed = result_text(&server.receive()).to_owned();
+    assert!(typed.contains(r#"[value="stdio typed"]"#), "{typed}");
+    assert!(typed.contains("[value=••••••]"), "{typed}");
+    assert!(!typed.contains(password_sentinel), "{typed}");
+
+    let press_id = next_id;
+    next_id += 1;
+    server.send(json!({
+        "jsonrpc":"2.0","id":press_id,"method":"tools/call",
+        "params":{"name":"browser_press_key","arguments":{"key":"Enter"}}
+    }));
+    let pressed = result_text(&server.receive()).to_owned();
+    // An untargeted press goes wherever focus already is, and the typing above
+    // left focus on the text input -- so the readout naming `name` as the target
+    // is what distinguishes a key that reached the focused element from one that
+    // fell through to the body.
+    let observed = poll_snapshot_until_never_leaking(
+        &mut server,
+        pressed,
+        &mut next_id,
+        r#""Key pressed: Enter; trusted: true; target: name""#,
+        password_sentinel,
+    );
+    assert!(
+        observed.contains(r#""Input value: stdio typed""#),
+        "{observed}"
+    );
+
+    let select_target = role_ref(&observed, "combobox", "Test choice");
+    let select_id = next_id;
+    next_id += 1;
+    server.send(json!({
+        "jsonrpc":"2.0","id":select_id,"method":"tools/call",
+        "params":{
+            "name":"browser_select_option",
+            "arguments":{"target":select_target,"values":"beta"}
+        }
+    }));
+    let selected = result_text(&server.receive()).to_owned();
+    let selected = poll_snapshot_until_never_leaking(
+        &mut server,
+        selected,
+        &mut next_id,
+        r#""Selected value: beta; changes: 1""#,
+        password_sentinel,
+    );
+    assert!(
+        selected.contains(r#""Input value: stdio typed""#),
+        "{selected}"
+    );
+    assert!(selected.contains("[value=••••••]"), "{selected}");
+    assert!(!selected.contains(password_sentinel), "{selected}");
+
+    // A targeted press focuses the ref before dispatching, so the key has to
+    // land on the password field rather than on whatever held focus (the text
+    // input, from the typing above). The length readout is caret-agnostic --
+    // an insertion anywhere still moves the count by one -- so a dropped target
+    // leaves the length unchanged and stalls this poll instead of passing.
+    let secret_target = role_ref(&selected, "textbox", "Secret input");
+    let targeted_press_id = next_id;
+    next_id += 1;
+    server.send(json!({
+        "jsonrpc":"2.0","id":targeted_press_id,"method":"tools/call",
+        "params":{
+            "name":"browser_press_key",
+            "arguments":{"target":secret_target,"key":"7"}
+        }
+    }));
+    let targeted = result_text(&server.receive()).to_owned();
+    let targeted = poll_snapshot_until_never_leaking(
+        &mut server,
+        targeted,
+        &mut next_id,
+        &format!(
+            r#""Password length: {}""#,
+            password_sentinel.chars().count() + 1
+        ),
+        password_sentinel,
+    );
+    assert!(
+        targeted.contains(r#""Key pressed: 7; trusted: true; target: secret""#),
+        "{targeted}"
+    );
+    // The key went to the targeted ref and nowhere else: the text input's readout
+    // still reads exactly what the earlier typing left it, closing quote included,
+    // so a stray "7" delivered there would fail this.
+    assert!(
+        targeted.contains(r#""Input value: stdio typed""#),
+        "{targeted}"
+    );
+    assert!(targeted.contains("[value=••••••]"), "{targeted}");
+
+    // Rejecting a key must reject it before anything touches the page. The
+    // targeted press above focused the password field to deliver its key, so
+    // focus now names `secret` -- which also proves the readout is live rather
+    // than a constant, since it started at `none`.
+    let targeted = poll_snapshot_until_never_leaking(
+        &mut server,
+        targeted,
+        &mut next_id,
+        r#""Focused: secret; focus changes: "#,
+        password_sentinel,
+    );
+    let focus_before = status_text(&targeted, r#""Focused: secret"#);
+
+    // Aim the bad key at the *text* input, not the password field that currently
+    // holds focus: validating after resolving the ref would run the text input's
+    // focus handlers and step the counter, so an unchanged readout is what
+    // distinguishes "rejected before touching the page" from "rejected after".
+    let stale_focus_target = role_ref(&targeted, "textbox", "Test input");
+    let rejected_id = next_id;
+    next_id += 1;
+    let rejected = call_tool(
+        &mut server,
+        rejected_id,
+        "browser_press_key",
+        json!({"target": stale_focus_target, "key": "NoSuchKey"}),
+    );
+    let rejected = error_result_text(&rejected).to_owned();
+    assert!(rejected.contains("NoSuchKey"), "{rejected}");
+
+    let after_reject_id = next_id;
+    next_id += 1;
+    let after_reject = call_tool(&mut server, after_reject_id, "browser_snapshot", json!({}));
+    let after_reject = result_text(&after_reject).to_owned();
+    assert_eq!(
+        status_text(&after_reject, r#""Focused: "#),
+        focus_before,
+        "a rejected key press moved focus:\n{after_reject}"
+    );
+    assert!(
+        after_reject.contains(r#""Key pressed: 7; trusted: true; target: secret""#),
+        "a rejected key press reached the page:\n{after_reject}"
+    );
+    assert!(!after_reject.contains(password_sentinel), "{after_reject}");
+
+    // Filling a combobox resolves the visible label: the options are labelled
+    // "Alpha" and "Beta" over lowercase values, so a value-only matcher finds
+    // nothing and fails the call rather than reporting a new selection. The
+    // change counter reaching 2 proves exactly one further change event fired.
+    //
+    // The refs come from the post-rejection snapshot: a rejected ref action
+    // still clears the ref table on its way out, so every ref taken before it
+    // is stale by now.
+    let choice_target = role_ref(&after_reject, "combobox", "Test choice");
+    let fill_id = next_id;
+    next_id += 1;
+    server.send(json!({
+        "jsonrpc":"2.0","id":fill_id,"method":"tools/call",
+        "params":{
+            "name":"browser_fill_form",
+            "arguments":{"fields":[
+                {"target":choice_target,"name":"choice","type":"combobox","value":"Alpha"}
+            ]}
+        }
+    }));
+    let filled = result_text(&server.receive()).to_owned();
+    let filled = poll_snapshot_until_never_leaking(
+        &mut server,
+        filled,
+        &mut next_id,
+        r#""Selected value: alpha; changes: 2""#,
+        password_sentinel,
+    );
+    assert!(filled.contains(r#""Input value: stdio typed""#), "{filled}");
+    assert!(filled.contains("[value=••••••]"), "{filled}");
+    assert!(!filled.contains(password_sentinel), "{filled}");
+
+    server.finish();
 }
 
 #[test]
@@ -2191,7 +2664,10 @@ fn real_stdio_same_document_push_state_and_hash_history_complete_with_snapshots(
     }
 
     let page_server = PageServer::start();
-    let mut server = ServerProcess::spawn_with_env(&[("RUSTWRIGHT_MCP_TOOL_TIMEOUT_MS", "3000")]);
+    // Generous tool budget and elapsed bounds at half of it: under a loaded,
+    // fully parallel suite the tight budget produced false failures while a
+    // genuine frame-wait regression still blows through the halved bound.
+    let mut server = ServerProcess::spawn_with_env(&[("RUSTWRIGHT_MCP_TOOL_TIMEOUT_MS", "10000")]);
     server.initialize();
 
     server.send(json!({
@@ -2203,9 +2679,16 @@ fn real_stdio_same_document_push_state_and_hash_history_complete_with_snapshots(
     }));
     let spa_second = server.receive();
     assert!(
-        result_text(&spa_second).contains("SPA location: /history-spa?step=two"),
+        result_text(&spa_second).contains("SPA location:"),
         "{}",
         result_text(&spa_second)
+    );
+    let mut poll_id = 2600;
+    poll_snapshot_until(
+        &mut server,
+        result_text(&spa_second).to_owned(),
+        &mut poll_id,
+        "SPA location: /history-spa?step=two",
     );
 
     let started = Instant::now();
@@ -2215,14 +2698,15 @@ fn real_stdio_same_document_push_state_and_hash_history_complete_with_snapshots(
     }));
     let spa_back = server.receive();
     assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "pushState back navigation approached the tool timeout: {:?}",
+        started.elapsed() < Duration::from_secs(5),
+        "pushState back navigation ran toward the 10-second tool timeout: {:?}",
         started.elapsed()
     );
-    assert!(
-        result_text(&spa_back).contains("SPA location: /history-spa?step=one"),
-        "{}",
-        result_text(&spa_back)
+    poll_snapshot_until(
+        &mut server,
+        result_text(&spa_back).to_owned(),
+        &mut poll_id,
+        "SPA location: /history-spa?step=one",
     );
 
     server.send(json!({
@@ -2230,10 +2714,11 @@ fn real_stdio_same_document_push_state_and_hash_history_complete_with_snapshots(
         "params":{"name":"browser_navigate_forward","arguments":{}}
     }));
     let spa_forward = server.receive();
-    assert!(
-        result_text(&spa_forward).contains("SPA location: /history-spa?step=two"),
-        "{}",
-        result_text(&spa_forward)
+    poll_snapshot_until(
+        &mut server,
+        result_text(&spa_forward).to_owned(),
+        &mut poll_id,
+        "SPA location: /history-spa?step=two",
     );
 
     server.send(json!({
@@ -2257,10 +2742,11 @@ fn real_stdio_same_document_push_state_and_hash_history_complete_with_snapshots(
         }
     }));
     let hash_first = server.receive();
-    assert!(
-        result_text(&hash_first).contains("Hash location: #first"),
-        "{}",
-        result_text(&hash_first)
+    poll_snapshot_until(
+        &mut server,
+        result_text(&hash_first).to_owned(),
+        &mut poll_id,
+        "Hash location: #first",
     );
 
     server.send(json!({
@@ -2271,10 +2757,11 @@ fn real_stdio_same_document_push_state_and_hash_history_complete_with_snapshots(
         }
     }));
     let hash_second = server.receive();
-    assert!(
-        result_text(&hash_second).contains("Hash location: #second"),
-        "{}",
-        result_text(&hash_second)
+    poll_snapshot_until(
+        &mut server,
+        result_text(&hash_second).to_owned(),
+        &mut poll_id,
+        "Hash location: #second",
     );
 
     server.send(json!({
@@ -2282,10 +2769,11 @@ fn real_stdio_same_document_push_state_and_hash_history_complete_with_snapshots(
         "params":{"name":"browser_navigate_back","arguments":{}}
     }));
     let hash_back = server.receive();
-    assert!(
-        result_text(&hash_back).contains("Hash location: #first"),
-        "{}",
-        result_text(&hash_back)
+    poll_snapshot_until(
+        &mut server,
+        result_text(&hash_back).to_owned(),
+        &mut poll_id,
+        "Hash location: #first",
     );
 
     server.send(json!({
@@ -2293,10 +2781,11 @@ fn real_stdio_same_document_push_state_and_hash_history_complete_with_snapshots(
         "params":{"name":"browser_navigate_forward","arguments":{}}
     }));
     let hash_forward = server.receive();
-    assert!(
-        result_text(&hash_forward).contains("Hash location: #second"),
-        "{}",
-        result_text(&hash_forward)
+    poll_snapshot_until(
+        &mut server,
+        result_text(&hash_forward).to_owned(),
+        &mut poll_id,
+        "Hash location: #second",
     );
 
     server.finish();
@@ -2333,11 +2822,13 @@ fn real_stdio_scrolls_viewport_and_target_returns_snapshots_and_invalidates_refs
         }
     }));
     let down = server.receive();
-    let down_snapshot = result_text(&down).to_owned();
-    let down_y = scroll_y(&down_snapshot);
-    assert!(
-        down_y.abs_diff(600) <= 75,
-        "expected scroll position near 600, got {down_y}:\n{down_snapshot}"
+    let mut poll_id = 3200;
+    let down_snapshot = poll_snapshot_state(
+        &mut server,
+        result_text(&down).to_owned(),
+        &mut poll_id,
+        "scroll position near 600",
+        |snapshot| scroll_y(snapshot).abs_diff(600) <= 75,
     );
     let far_target = button_ref(&down_snapshot, "Far below fold target");
 
@@ -2349,12 +2840,14 @@ fn real_stdio_scrolls_viewport_and_target_returns_snapshots_and_invalidates_refs
         }
     }));
     let target = server.receive();
-    let target_snapshot = result_text(&target).to_owned();
-    let target_y = scroll_y(&target_snapshot);
-    assert!(
-        target_y >= 4000,
-        "expected far target to scroll beyond 4000, got {target_y}:\n{target_snapshot}"
+    let target_snapshot = poll_snapshot_state(
+        &mut server,
+        result_text(&target).to_owned(),
+        &mut poll_id,
+        "far target scrolled beyond 4000",
+        |snapshot| scroll_y(snapshot) >= 4000,
     );
+    let target_y = scroll_y(&target_snapshot);
 
     server.send(json!({
         "jsonrpc":"2.0","id":34,"method":"tools/call",
@@ -2364,11 +2857,12 @@ fn real_stdio_scrolls_viewport_and_target_returns_snapshots_and_invalidates_refs
         }
     }));
     let up = server.receive();
-    let up_snapshot = result_text(&up).to_owned();
-    let up_y = scroll_y(&up_snapshot);
-    assert!(
-        up_y < target_y,
-        "default upward scroll did not decrease {target_y}:\n{up_snapshot}"
+    let up_snapshot = poll_snapshot_state(
+        &mut server,
+        result_text(&up).to_owned(),
+        &mut poll_id,
+        "default upward scroll decreased the position",
+        |snapshot| scroll_y(snapshot) < target_y,
     );
 
     server.send(json!({

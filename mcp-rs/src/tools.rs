@@ -113,7 +113,7 @@ pub(crate) const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         kind: ToolKind::PressKey,
         name: "browser_press_key",
-        description: "Press a native browser key on the active page and return a fresh snapshot.",
+        description: "Press a native browser key, optionally focusing a snapshot ref first, and return a fresh snapshot.",
     },
     ToolSpec {
         kind: ToolKind::Drag,
@@ -348,6 +348,8 @@ struct TargetArgs {
 #[serde(deny_unknown_fields)]
 struct PressKeyArgs {
     key: String,
+    #[serde(default)]
+    target: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -708,10 +710,9 @@ pub(crate) fn parse_op(
         ToolKind::SelectOption => {
             let args: SelectOptionArgs = decode(arguments)?;
             validate_ref(&args.target)?;
+            // An empty list is a deliberate request: it clears every selected
+            // option, which is the only way to deselect a multi-select.
             let values = args.values.into_vec();
-            if values.is_empty() {
-                return Err("values must contain at least one string".to_owned());
-            }
             let _ = args.element;
             Ok(BrowserOp::SelectOption {
                 target: args.target,
@@ -756,7 +757,13 @@ pub(crate) fn parse_op(
             if args.key.is_empty() {
                 return Err("key must be a non-empty string".to_owned());
             }
-            Ok(BrowserOp::PressKey(args.key))
+            if let Some(target) = &args.target {
+                validate_ref(target)?;
+            }
+            Ok(BrowserOp::PressKey {
+                target: args.target,
+                key: args.key,
+            })
         }
         ToolKind::Drag => {
             let args: DragArgs = decode(arguments)?;
@@ -1068,12 +1075,22 @@ fn schema(kind: ToolKind) -> JsonObject {
                 "values": {
                     "oneOf": [
                         {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}, "minItems": 1}
+                        {"type": "array", "items": {"type": "string"}}
+                    ]
+                },
+                "value": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}}
                     ]
                 },
                 "element": {"type": "string"}
             },
-            "required": ["target", "values"],
+            "required": ["target"],
+            "oneOf": [
+                {"required": ["values"], "not": {"required": ["value"]}},
+                {"required": ["value"], "not": {"required": ["values"]}}
+            ],
             "additionalProperties": false
         }),
         ToolKind::FillForm => json!({
@@ -1108,7 +1125,10 @@ fn schema(kind: ToolKind) -> JsonObject {
         }),
         ToolKind::PressKey => json!({
             "type": "object",
-            "properties": {"key": {"type": "string"}},
+            "properties": {
+                "key": {"type": "string"},
+                "target": ref_property()
+            },
             "required": ["key"],
             "additionalProperties": false
         }),
