@@ -3569,6 +3569,7 @@ multiline-compatible = """4.5.6"""
                 single_process_fallback: false,
                 lifecycle: Arc::new(CloseLifecycle::new()),
                 attached_pages: AttachedPageRegistry::default(),
+                next_native_network_index: AtomicU64::new(1),
             });
             (RustwrightBrowser { inner }, write_rx)
         };
@@ -3597,6 +3598,88 @@ multiline-compatible = """4.5.6"""
             Err(RwError::Disconnected)
         ));
         assert!(disconnected_writes.try_recv().is_err());
+    }
+
+    #[test]
+    fn native_file_chooser_event_carries_multiplicity_and_backend_node() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel();
+        let (events, _) = broadcast::channel(4);
+        let (alive_tx, _) = watch::channel(true);
+        let browser = Arc::new(BrowserInner {
+            runtime: OwnedRuntime::new(runtime),
+            client: Arc::new(CdpClient {
+                write_tx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                events,
+                event_log: Arc::new(Mutex::new(CdpEventLog::new())),
+                next_id: AtomicU64::new(1),
+                sent_runtime_enable_count: AtomicU64::new(0),
+                sent_target_close_count: AtomicU64::new(0),
+                sent_context_dispose_count: AtomicU64::new(0),
+                alive: Arc::new(AtomicBool::new(true)),
+                alive_tx,
+            }),
+            process: Mutex::new(None),
+            profile_dir: Mutex::new(None),
+            owned: false,
+            ws_endpoint: "ws://test.invalid".to_string(),
+            stealth_user_agent_override: Mutex::new(None),
+            single_process_fallback: false,
+            lifecycle: Arc::new(CloseLifecycle::new()),
+            attached_pages: AttachedPageRegistry::default(),
+            next_native_network_index: AtomicU64::new(1),
+        });
+        let mut frame_state = PageFrameState::new("root-session".to_string());
+        frame_state.record_session_for_frame("child-frame", "child-session");
+        let page = Arc::new(PageInner {
+            browser: Arc::clone(&browser),
+            target_id: "target".to_string(),
+            registry_generation: 1,
+            session_id: "root-session".to_string(),
+            context_id: None,
+            main_frame_id: Mutex::new(None),
+            frame_state: Mutex::new(frame_state),
+            network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
+            console_records: Mutex::new(ConsoleRecordStore::default()),
+            console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+            native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
+            event_stream_start_cursor: 0,
+            background_override_active: Arc::new(AtomicBool::new(false)),
+            screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+            mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+            default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
+            lifecycle: Arc::new(CloseLifecycle::new()),
+            target_closed: AtomicBool::new(false),
+            crashed: AtomicBool::new(false),
+            close_target_on_drop: AtomicBool::new(false),
+        });
+        let event = json!({
+            "sessionId": "child-session",
+            "method": "Page.fileChooserOpened",
+            "params": {
+                "frameId": "child-frame",
+                "backendNodeId": 42,
+                "mode": "selectMultiple",
+            },
+        });
+
+        let (event, terminal) =
+            native_page_event_from_cdp(&page, &event).expect("owned chooser event");
+        assert!(!terminal);
+        match event {
+            RustwrightPageEvent::FileChooser { multiple, chooser } => {
+                assert!(multiple);
+                assert!(chooser.is_multiple());
+                assert_eq!(chooser.backend_node_id, 42);
+                assert_eq!(chooser.session_id, "child-session");
+            }
+            other => panic!("unexpected page event: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3674,6 +3757,155 @@ multiline-compatible = """4.5.6"""
         assert!(write_rx.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn physical_drag_emits_move_press_stepped_moves_and_release_in_order() {
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(4);
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let (alive_tx, _) = watch::channel(true);
+        let client = CdpClient {
+            write_tx,
+            pending: Arc::clone(&pending),
+            events: events.clone(),
+            event_log: Arc::clone(&event_log),
+            next_id: AtomicU64::new(1),
+            sent_runtime_enable_count: AtomicU64::new(0),
+            sent_target_close_count: AtomicU64::new(0),
+            sent_context_dispose_count: AtomicU64::new(0),
+            alive: Arc::new(AtomicBool::new(true)),
+            alive_tx,
+        };
+
+        let (result, commands) = tokio::join!(
+            dispatch_physical_drag_sequence_in_session(
+                &client,
+                "root-session",
+                "pointer-session",
+                10.0,
+                20.0,
+                110.0,
+                220.0,
+                0,
+                OperationDeadline::new(Duration::from_millis(500)),
+            ),
+            async {
+                let mut commands = Vec::new();
+                for _ in 0..14 {
+                    let command = match write_rx.recv().await.unwrap() {
+                        CdpOutgoing::Text(payload) => {
+                            serde_json::from_str::<Value>(&payload).unwrap()
+                        }
+                        CdpOutgoing::Close => panic!("unexpected transport close"),
+                    };
+                    dispatch_cdp_payload(
+                        json!({ "id": command["id"], "result": {} }),
+                        Arc::clone(&pending),
+                        events.clone(),
+                        Arc::clone(&event_log),
+                    );
+                    commands.push(command);
+                }
+                commands
+            },
+        );
+
+        result.unwrap();
+        assert_eq!(commands[0]["method"], "Input.setInterceptDrags");
+        assert_eq!(commands[0]["params"]["enabled"], false);
+        let mouse = commands
+            .iter()
+            .skip(1)
+            .map(|command| {
+                assert_eq!(command["method"], "Input.dispatchMouseEvent");
+                command["params"].clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(mouse.len(), 13);
+        assert_eq!(mouse[0]["type"], "mouseMoved");
+        assert_eq!(mouse[0]["x"], 10.0);
+        assert_eq!(mouse[0]["y"], 20.0);
+        assert_eq!(mouse[1]["type"], "mousePressed");
+        assert_eq!(mouse[1]["buttons"], 1);
+        assert!(mouse[2..12]
+            .iter()
+            .all(|params| params["type"] == "mouseMoved" && params["buttons"] == 1));
+        assert_eq!(mouse[11]["x"], 110.0);
+        assert_eq!(mouse[11]["y"], 220.0);
+        assert_eq!(mouse[12]["type"], "mouseReleased");
+        assert_eq!(mouse[12]["buttons"], 0);
+        assert_eq!(mouse[12]["x"], 110.0);
+        assert_eq!(mouse[12]["y"], 220.0);
+        assert!(write_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn physical_drag_target_move_timeout_still_releases_mouse() {
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(4);
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let (alive_tx, _) = watch::channel(true);
+        let client = CdpClient {
+            write_tx,
+            pending: Arc::clone(&pending),
+            events: events.clone(),
+            event_log: Arc::clone(&event_log),
+            next_id: AtomicU64::new(1),
+            sent_runtime_enable_count: AtomicU64::new(0),
+            sent_target_close_count: AtomicU64::new(0),
+            sent_context_dispose_count: AtomicU64::new(0),
+            alive: Arc::new(AtomicBool::new(true)),
+            alive_tx,
+        };
+
+        let (result, commands) = tokio::join!(
+            dispatch_physical_drag_sequence_in_session(
+                &client,
+                "root-session",
+                "pointer-session",
+                10.0,
+                20.0,
+                110.0,
+                220.0,
+                0,
+                OperationDeadline::new(Duration::from_millis(20)),
+            ),
+            async {
+                let mut commands = Vec::new();
+                for index in 0..5 {
+                    let command = match write_rx.recv().await.unwrap() {
+                        CdpOutgoing::Text(payload) => {
+                            serde_json::from_str::<Value>(&payload).unwrap()
+                        }
+                        CdpOutgoing::Close => panic!("unexpected transport close"),
+                    };
+                    if index != 3 {
+                        dispatch_cdp_payload(
+                            json!({ "id": command["id"], "result": {} }),
+                            Arc::clone(&pending),
+                            events.clone(),
+                            Arc::clone(&event_log),
+                        );
+                    }
+                    commands.push(command);
+                }
+                commands
+            },
+        );
+
+        assert!(matches!(result, Err(RwError::Timeout(_))));
+        assert_eq!(commands[3]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(commands[3]["params"]["type"], "mouseMoved");
+        assert_eq!(commands[3]["params"]["buttons"], 1);
+        assert_eq!(commands[4]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(commands[4]["params"]["type"], "mouseReleased");
+        assert_eq!(commands[4]["params"]["buttons"], 0);
+        assert_eq!(commands[4]["params"]["x"], 110.0);
+        assert_eq!(commands[4]["params"]["y"], 220.0);
+        assert!(write_rx.try_recv().is_err());
+    }
+
     #[test]
     fn cancelled_create_target_round_trip_closes_orphan_without_closing_success() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -3709,6 +3941,7 @@ multiline-compatible = """4.5.6"""
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
+            next_native_network_index: AtomicU64::new(1),
         });
 
         let test_browser = Arc::clone(&browser);
@@ -3869,6 +4102,7 @@ multiline-compatible = """4.5.6"""
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
+            next_native_network_index: AtomicU64::new(1),
         });
         let make_page = |generation| {
             Arc::new(PageInner {
@@ -3880,6 +4114,9 @@ multiline-compatible = """4.5.6"""
                 main_frame_id: Mutex::new(None),
                 frame_state: Mutex::new(PageFrameState::new(format!("session-{generation}"))),
                 network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
+                console_records: Mutex::new(ConsoleRecordStore::default()),
+                console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
                 event_stream_start_cursor: 0,
                 background_override_active: Arc::new(AtomicBool::new(false)),
                 screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -5624,6 +5861,7 @@ struct BrowserInner {
     single_process_fallback: bool,
     lifecycle: Arc<CloseLifecycle>,
     attached_pages: AttachedPageRegistry,
+    next_native_network_index: AtomicU64,
 }
 
 #[derive(Default)]
@@ -6144,6 +6382,9 @@ struct PageInner {
     main_frame_id: Mutex<Option<String>>,
     frame_state: Mutex<PageFrameState>,
     network_requests: Arc<Mutex<NetworkRequestStore>>,
+    console_records: Mutex<ConsoleRecordStore>,
+    console_capture: tokio::sync::Mutex<ConsoleCaptureState>,
+    native_network_records: Mutex<NativeNetworkRecordStore>,
     event_stream_start_cursor: u64,
     background_override_active: Arc<AtomicBool>,
     screenshot_lock: Arc<tokio::sync::Mutex<()>>,
@@ -6153,6 +6394,12 @@ struct PageInner {
     target_closed: AtomicBool,
     crashed: AtomicBool,
     close_target_on_drop: AtomicBool,
+}
+
+#[derive(Default)]
+struct ConsoleCaptureState {
+    requested: bool,
+    enabled_sessions: HashSet<String>,
 }
 
 struct CreatedTargetGuard {
@@ -6521,6 +6768,342 @@ impl NetworkRequestStore {
 impl Default for NetworkRequestStore {
     fn default() -> Self {
         Self::new(0)
+    }
+}
+
+#[derive(Default)]
+struct ConsoleRecordStore {
+    navigation_epoch: u64,
+    records: VecDeque<RustwrightConsoleRecord>,
+    evictions_by_epoch: HashMap<u64, u64>,
+    evictions_total: u64,
+}
+
+impl ConsoleRecordStore {
+    fn advance_navigation(&mut self) {
+        self.navigation_epoch = self.navigation_epoch.saturating_add(1);
+    }
+
+    fn push(&mut self, mut record: RustwrightConsoleRecord) {
+        record.navigation_epoch = self.navigation_epoch;
+        if self.records.len() == NATIVE_CONSOLE_RECORD_CAPACITY {
+            if let Some(evicted) = self.records.pop_front() {
+                *self
+                    .evictions_by_epoch
+                    .entry(evicted.navigation_epoch)
+                    .or_default() += 1;
+                self.evictions_total = self.evictions_total.saturating_add(1);
+            }
+        }
+        self.records.push_back(record);
+    }
+
+    fn read(
+        &mut self,
+        include_previous_navigations: bool,
+        clear: bool,
+    ) -> RustwrightConsoleRecords {
+        let navigation_epoch = self.navigation_epoch;
+        let records = self
+            .records
+            .iter()
+            .filter(|record| {
+                include_previous_navigations || record.navigation_epoch == navigation_epoch
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let evicted = if include_previous_navigations {
+            self.evictions_total
+        } else {
+            self.evictions_by_epoch
+                .get(&navigation_epoch)
+                .copied()
+                .unwrap_or(0)
+        };
+        if clear {
+            if include_previous_navigations {
+                self.records.clear();
+                self.evictions_by_epoch.clear();
+                self.evictions_total = 0;
+            } else {
+                self.records
+                    .retain(|record| record.navigation_epoch != navigation_epoch);
+                let removed = self
+                    .evictions_by_epoch
+                    .remove(&navigation_epoch)
+                    .unwrap_or(0);
+                self.evictions_total = self.evictions_total.saturating_sub(removed);
+            }
+        }
+        RustwrightConsoleRecords {
+            records,
+            navigation_epoch,
+            evicted,
+        }
+    }
+}
+
+struct NativeNetworkRecordStore {
+    navigation_epoch: u64,
+    navigation_start_index: u64,
+    current_loader_id: Option<String>,
+    records: VecDeque<NativeNetworkEntry>,
+    active_by_request: HashMap<(String, String), u64>,
+    evictions_by_epoch: HashMap<u64, u64>,
+}
+
+#[derive(Clone)]
+struct NativeNetworkEntry {
+    record: RustwrightNetworkRecord,
+    request_id: String,
+    session_id: String,
+    content_type: String,
+    body_unavailable_reason: Option<String>,
+}
+
+struct NativeNetworkBodyRef {
+    request_id: String,
+    session_id: String,
+    content_type: String,
+    unavailable_reason: Option<String>,
+    response_status: Option<u16>,
+    completed: bool,
+}
+
+impl NativeNetworkRecordStore {
+    fn new(navigation_start_index: u64) -> Self {
+        Self {
+            navigation_epoch: 0,
+            navigation_start_index,
+            current_loader_id: None,
+            records: VecDeque::with_capacity(NATIVE_NETWORK_RECORD_CAPACITY),
+            active_by_request: HashMap::new(),
+            evictions_by_epoch: HashMap::new(),
+        }
+    }
+
+    fn begin_document_navigation(&mut self, loader_id: Option<&str>, start_index: u64) -> bool {
+        if loader_id.is_some() && self.current_loader_id.as_deref() == loader_id {
+            return false;
+        }
+        self.navigation_epoch = self.navigation_epoch.saturating_add(1);
+        self.navigation_start_index = start_index;
+        self.current_loader_id = loader_id.map(ToString::to_string);
+        true
+    }
+
+    fn begin_same_document_navigation(&mut self, start_index: u64) {
+        self.navigation_epoch = self.navigation_epoch.saturating_add(1);
+        self.navigation_start_index = start_index;
+    }
+
+    fn push(&mut self, entry: NativeNetworkEntry) {
+        if self.records.len() == NATIVE_NETWORK_RECORD_CAPACITY {
+            if let Some(evicted) = self.records.pop_front() {
+                let key = (evicted.session_id, evicted.request_id);
+                if self.active_by_request.get(&key) == Some(&evicted.record.index) {
+                    self.active_by_request.remove(&key);
+                }
+                *self
+                    .evictions_by_epoch
+                    .entry(evicted.record.navigation_epoch)
+                    .or_default() += 1;
+            }
+        }
+        let key = (entry.session_id.clone(), entry.request_id.clone());
+        self.active_by_request.insert(key, entry.record.index);
+        self.records.push_back(entry);
+    }
+
+    fn active_mut(
+        &mut self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Option<&mut NativeNetworkEntry> {
+        let index = self
+            .active_by_request
+            .get(&(session_id.to_owned(), request_id.to_owned()))
+            .copied()?;
+        self.records
+            .iter_mut()
+            .find(|entry| entry.record.index == index)
+    }
+
+    fn finish_redirect(&mut self, session_id: &str, request_id: &str, response: &Value) {
+        if let Some(entry) = self.active_mut(session_id, request_id) {
+            apply_native_network_response(entry, response);
+            entry.record.completed = true;
+            entry.body_unavailable_reason =
+                Some("redirect response body is unavailable".to_owned());
+        }
+    }
+
+    fn read(
+        &mut self,
+        include_previous_navigations: bool,
+        clear: bool,
+    ) -> RustwrightNetworkRecords {
+        let navigation_epoch = self.navigation_epoch;
+        let records = self
+            .records
+            .iter()
+            .filter(|entry| {
+                include_previous_navigations || entry.record.navigation_epoch == navigation_epoch
+            })
+            .map(|entry| entry.record.clone())
+            .collect::<Vec<_>>();
+        let evicted = if include_previous_navigations {
+            self.evictions_by_epoch.values().copied().sum()
+        } else {
+            self.evictions_by_epoch
+                .get(&navigation_epoch)
+                .copied()
+                .unwrap_or(0)
+        };
+        if clear {
+            if include_previous_navigations {
+                self.records.clear();
+                self.active_by_request.clear();
+                self.evictions_by_epoch.clear();
+            } else {
+                let removed = self
+                    .records
+                    .iter()
+                    .filter(|entry| entry.record.navigation_epoch == navigation_epoch)
+                    .map(|entry| {
+                        (
+                            (entry.session_id.clone(), entry.request_id.clone()),
+                            entry.record.index,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                self.records
+                    .retain(|entry| entry.record.navigation_epoch != navigation_epoch);
+                for (key, index) in removed {
+                    if self.active_by_request.get(&key) == Some(&index) {
+                        self.active_by_request.remove(&key);
+                    }
+                }
+                self.evictions_by_epoch.remove(&navigation_epoch);
+            }
+        }
+        RustwrightNetworkRecords {
+            records,
+            navigation_epoch,
+            navigation_start_index: self.navigation_start_index,
+            evicted,
+        }
+    }
+
+    fn body_ref(&self, index: u64) -> Option<NativeNetworkBodyRef> {
+        self.records
+            .iter()
+            .find(|entry| entry.record.index == index)
+            .map(|entry| NativeNetworkBodyRef {
+                request_id: entry.request_id.clone(),
+                session_id: entry.session_id.clone(),
+                content_type: entry.content_type.clone(),
+                unavailable_reason: entry.body_unavailable_reason.clone(),
+                response_status: entry.record.response_status,
+                completed: entry.record.completed,
+            })
+    }
+}
+
+fn metadata_headers(value: Option<&Value>) -> Vec<(String, String)> {
+    let Some(headers) = value.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                value
+                    .as_str()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| value.to_string()),
+            )
+        })
+        .collect()
+}
+
+fn header_content_type(headers: &[(String, String)]) -> String {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default()
+}
+
+fn is_text_content_type(content_type: &str) -> bool {
+    content_type.starts_with("text/")
+        || content_type.ends_with("+json")
+        || content_type.ends_with("+xml")
+        || matches!(
+            content_type,
+            "application/json"
+                | "application/xml"
+                | "application/javascript"
+                | "application/x-javascript"
+                | "application/x-www-form-urlencoded"
+        )
+}
+
+fn bounded_network_text_body(bytes: &[u8], max_bytes: usize) -> RustwrightNetworkBody {
+    let total_bytes = bytes.len();
+    let delivered_bytes = total_bytes
+        .min(max_bytes)
+        .min(NATIVE_NETWORK_BODY_MAX_BYTES);
+    RustwrightNetworkBody::Text {
+        text: String::from_utf8_lossy(&bytes[..delivered_bytes]).into_owned(),
+        total_bytes,
+        truncated: delivered_bytes < total_bytes,
+    }
+}
+
+fn apply_native_network_response(entry: &mut NativeNetworkEntry, response: &Value) {
+    entry.record.response_status =
+        response
+            .get("status")
+            .and_then(Value::as_f64)
+            .and_then(|status| {
+                (0.0..=f64::from(u16::MAX))
+                    .contains(&status)
+                    .then_some(status as u16)
+            });
+    entry.record.response_headers = metadata_headers(response.get("headers"));
+    entry.content_type = header_content_type(&entry.record.response_headers);
+    if entry.content_type.is_empty() {
+        entry.content_type = response
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+    }
+}
+
+fn apply_native_network_response_extra_info(entry: &mut NativeNetworkEntry, params: &Value) {
+    entry.record.response_status =
+        params
+            .get("statusCode")
+            .and_then(Value::as_f64)
+            .and_then(|status| {
+                (0.0..=f64::from(u16::MAX))
+                    .contains(&status)
+                    .then_some(status as u16)
+            });
+    entry.record.response_headers = metadata_headers(params.get("headers"));
+    let content_type = header_content_type(&entry.record.response_headers);
+    if !content_type.is_empty() {
+        entry.content_type = content_type;
     }
 }
 
@@ -6934,6 +7517,7 @@ struct PyNetworkEventWaiter {
 #[cfg(feature = "python")]
 #[pyclass(name = "_PageEventStream")]
 struct PyPageEventStream {
+    page: Arc<PageInner>,
     browser: Arc<BrowserInner>,
     receiver: Arc<Mutex<Option<broadcast::Receiver<Value>>>>,
     event_log: Arc<Mutex<CdpEventLog>>,
@@ -6944,7 +7528,6 @@ struct PyPageEventStream {
     pending_batch: Arc<Mutex<Option<PendingPageEventBatch>>>,
     close_tx: watch::Sender<bool>,
     closed: Arc<AtomicBool>,
-    runtime_enabled: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -7872,6 +8455,7 @@ struct HitTestedLocatorPoint {
 #[derive(Clone, Copy, Debug)]
 enum PhysicalPointerAction {
     Click { click_count: i64 },
+    Drag,
     Hover,
 }
 
@@ -7880,6 +8464,7 @@ impl PhysicalPointerAction {
         match self {
             Self::Click { click_count: 2 } => "double click",
             Self::Click { .. } => "click",
+            Self::Drag => "drag",
             Self::Hover => "hover",
         }
     }
@@ -8501,6 +9086,11 @@ async fn dispatch_actionable_pointer_action(
             )
             .await?;
         }
+        PhysicalPointerAction::Drag => {
+            return Err(RwError::Message(
+                "drag requires both a source and target locator".to_string(),
+            ));
+        }
         PhysicalPointerAction::Hover => {
             dispatch_mouse_move_sequence_in_session(
                 &page.browser.client,
@@ -8555,6 +9145,71 @@ async fn page_pointer_actionable_async(
         cancel.as_ref(),
         dispatch_actionable_pointer_action(&page, &resolved, action, deadline),
     )
+    .await
+}
+
+async fn page_drag_and_drop_actionable_async(
+    page: Arc<PageInner>,
+    start_locator_json: String,
+    end_locator_json: String,
+    timeout: Duration,
+    cancel: Option<CancelToken>,
+) -> RwResult<()> {
+    let deadline = OperationDeadline::new(timeout);
+    let action = PhysicalPointerAction::Drag;
+    let (start, end) = cancelable(cancel.clone(), async {
+        let start = wait_for_actionable_locator_point(
+            Arc::clone(&page),
+            &start_locator_json,
+            0,
+            None,
+            None,
+            timeout,
+            true,
+            action,
+            deadline,
+        )
+        .await?;
+        let end = wait_for_actionable_locator_point(
+            Arc::clone(&page),
+            &end_locator_json,
+            0,
+            None,
+            None,
+            timeout,
+            true,
+            action,
+            deadline,
+        )
+        .await?;
+        if start.session_id != end.session_id {
+            return Err(RwError::Message(
+                "drag source and target must belong to the same CDP target".to_string(),
+            ));
+        }
+        Ok((start, end))
+    })
+    .await?;
+
+    // Both endpoints and the physical input sequence share one deadline.
+    // Cancellation is too late once this owned mouse phase commits: the helper
+    // disables drag interception and releases the button on every exit.
+    dispatch_committed_physical_action(cancel.as_ref(), async {
+        let mut events = page.browser.client.subscribe();
+        dispatch_physical_drag_sequence_in_session(
+            &page.browser.client,
+            &page.session_id,
+            &start.session_id,
+            start.x,
+            start.y,
+            end.x,
+            end.y,
+            0,
+            deadline,
+        )
+        .await?;
+        settle_after_pointer_action(&page, &start.session_id, &mut events, deadline).await
+    })
     .await
 }
 
@@ -8707,25 +9362,93 @@ where
         Ok(drag_data) => complete(drag_data).await,
         Err(error) => Err(error),
     };
-    if result.is_err() {
-        let _ = client
-            .send(
-                "Input.dispatchMouseEvent",
-                mouse_event_payload(
-                    "mouseReleased",
-                    release_x,
-                    release_y,
-                    "left",
-                    0,
-                    1,
-                    modifiers,
-                ),
-                Some(pointer_session_id),
-                CLEANUP_TIMEOUT,
-            )
-            .await;
+    if let Err(error) = client
+        .send(
+            "Input.dispatchMouseEvent",
+            mouse_event_payload(
+                "mouseReleased",
+                release_x,
+                release_y,
+                "left",
+                0,
+                1,
+                modifiers,
+            ),
+            Some(pointer_session_id),
+            CLEANUP_TIMEOUT,
+        )
+        .await
+    {
+        eprintln!(
+            "rustwright: mouse release cleanup received no confirmation after committed drag: {error}"
+        );
     }
     result
+}
+
+const PHYSICAL_DRAG_STEPS: u32 = 10;
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_physical_drag_sequence_in_session(
+    client: &CdpClient,
+    interception_session_id: &str,
+    pointer_session_id: &str,
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+    modifiers: i64,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    run_drag_with_cleanup(
+        client,
+        interception_session_id,
+        pointer_session_id,
+        target_x,
+        target_y,
+        modifiers,
+        async { Ok(None) },
+        |_| async {
+            dispatch_mouse_move_sequence_in_session(
+                client,
+                pointer_session_id,
+                0.0,
+                0.0,
+                start_x,
+                start_y,
+                1,
+                0,
+                modifiers,
+                deadline,
+            )
+            .await?;
+            let mut press =
+                mouse_event_payload("mousePressed", start_x, start_y, "left", 1, 1, modifiers);
+            press["force"] = json!(0.5);
+            client
+                .send(
+                    "Input.dispatchMouseEvent",
+                    press,
+                    Some(pointer_session_id),
+                    deadline.remaining()?,
+                )
+                .await?;
+            dispatch_mouse_move_sequence_in_session(
+                client,
+                pointer_session_id,
+                start_x,
+                start_y,
+                target_x,
+                target_y,
+                PHYSICAL_DRAG_STEPS,
+                1,
+                modifiers,
+                deadline,
+            )
+            .await
+        },
+    )
+    .await
 }
 
 async fn dispatch_mouse_move_sequence_in_session(
@@ -11917,23 +12640,6 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                                             deadline.remaining()?,
                                         )
                                         .await?;
-                                } else {
-                                    client
-                                        .send(
-                                            "Input.dispatchMouseEvent",
-                                            mouse_event_payload(
-                                                "mouseReleased",
-                                                target.x,
-                                                target.y,
-                                                "left",
-                                                0,
-                                                1,
-                                                modifiers,
-                                            ),
-                                            Some(&resolved.session_id),
-                                            deadline.remaining()?,
-                                        )
-                                        .await?;
                                 }
                                 Ok(())
                             },
@@ -13622,6 +14328,7 @@ return true;
         };
         let (close_tx, _) = watch::channel(false);
         let stream = PyPageEventStream {
+            page: Arc::clone(&page),
             browser: Arc::clone(&browser),
             receiver: Arc::new(Mutex::new(Some(receiver))),
             event_log,
@@ -13632,7 +14339,6 @@ return true;
             pending_batch: Arc::new(Mutex::new(None)),
             close_tx,
             closed: Arc::new(AtomicBool::new(false)),
-            runtime_enabled: Arc::new(AtomicBool::new(false)),
         };
         Ok(stream)
     }
@@ -13664,20 +14370,8 @@ return true;
     fn console_event_waiter(&self) -> PyResult<PyConsoleEventWaiter> {
         let page = Arc::clone(&self.inner);
         let browser = Arc::clone(&page.browser);
-        let client = Arc::clone(&browser.client);
-        let session_id = page.session_id.clone();
         browser
-            .block_on(async move {
-                client
-                    .send(
-                        "Runtime.enable",
-                        json!({}),
-                        Some(&session_id),
-                        Duration::from_secs(5),
-                    )
-                    .await
-                    .map(|_| ())
-            })
+            .block_on(async move { enable_console_capture(&page, Duration::from_secs(5)).await })
             .map_err(py_err)?;
         Ok(PyConsoleEventWaiter {
             browser: Arc::clone(&self.inner.browser),
@@ -13782,15 +14476,7 @@ return true;
         let session_id = page.session_id.clone();
         browser
             .block_on(async move {
-                client
-                    .send(
-                        "Page.setInterceptFileChooserDialog",
-                        json!({ "enabled": true }),
-                        Some(&session_id),
-                        timeout,
-                    )
-                    .await?;
-                Ok(())
+                enable_file_chooser_intercept_for_session(&client, &session_id, timeout).await
             })
             .map_err(py_err)
     }
@@ -13929,18 +14615,14 @@ return true;
         let session_id = page.session_id.clone();
         browser
             .block_on(async move {
-                client
-                    .send(
-                        "DOM.setFileInputFiles",
-                        json!({
-                            "backendNodeId": backend_node_id,
-                            "files": files,
-                        }),
-                        Some(&session_id),
-                        timeout,
-                    )
-                    .await?;
-                Ok(())
+                set_file_input_files_for_session(
+                    &client,
+                    &session_id,
+                    backend_node_id,
+                    files,
+                    timeout,
+                )
+                .await
             })
             .map_err(py_err)
     }
@@ -14631,60 +15313,21 @@ impl PyPageEventStream {
     }
 
     fn enable_runtime(&self) -> PyResult<()> {
-        if self.runtime_enabled.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
+        let page = Arc::clone(&self.page);
         let browser = Arc::clone(&self.browser);
-        let client = Arc::clone(&browser.client);
-        let session_id = self.session_id.clone();
-        if let Err(error) = browser.block_on(async move {
-            client
-                .send(
-                    "Runtime.enable",
-                    json!({}),
-                    Some(&session_id),
-                    Duration::from_secs(5),
-                )
-                .await
-                .map(|_| ())
-        }) {
-            self.runtime_enabled.store(false, Ordering::SeqCst);
-            return Err(py_err(error));
-        }
-        Ok(())
+        browser
+            .block_on(async move { enable_console_capture(&page, Duration::from_secs(5)).await })
+            .map_err(py_err)
     }
 
     fn enable_runtime_async(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        if self.runtime_enabled.swap(true, Ordering::SeqCst) {
-            let asyncio = PyModule::import(py, "asyncio")?;
-            let event_loop = asyncio.call_method0("get_running_loop")?;
-            let future = event_loop.call_method0("create_future")?;
-            future.call_method1("set_result", (py.None(),))?;
-            return Ok(future.unbind());
-        }
+        let page = Arc::clone(&self.page);
         let browser = Arc::clone(&self.browser);
         let runtime = browser.runtime.handle().clone();
-        let client = Arc::clone(&browser.client);
-        let session_id = self.session_id.clone();
-        let runtime_enabled = Arc::clone(&self.runtime_enabled);
         python_future_on(
             py,
             runtime,
-            async move {
-                let result = client
-                    .send(
-                        "Runtime.enable",
-                        json!({}),
-                        Some(&session_id),
-                        Duration::from_secs(5),
-                    )
-                    .await
-                    .map(|_| ());
-                if result.is_err() {
-                    runtime_enabled.store(false, Ordering::SeqCst);
-                }
-                result
-            },
+            async move { enable_console_capture(&page, Duration::from_secs(5)).await },
             |py, ()| Ok(py.None()),
         )
     }
@@ -15495,6 +16138,7 @@ fn launch_chromium_with_options_cancellation(
         single_process_fallback,
         lifecycle: Arc::new(CloseLifecycle::new()),
         attached_pages: AttachedPageRegistry::default(),
+        next_native_network_index: AtomicU64::new(1),
     });
     if launch_was_cancelled(cancelled.as_ref()) {
         let _ = close_browser_blocking(Arc::clone(&browser));
@@ -15615,6 +16259,7 @@ fn connect_browser_over_cdp_cancelable(
         single_process_fallback: false,
         lifecycle: Arc::new(CloseLifecycle::new()),
         attached_pages: AttachedPageRegistry::default(),
+        next_native_network_index: AtomicU64::new(1),
     }))
 }
 
@@ -15700,6 +16345,146 @@ impl RustwrightDialog {
     }
 }
 
+/// A pending file chooser that can receive local host paths or be cancelled.
+#[derive(Clone)]
+pub struct RustwrightFileChooser {
+    browser: Weak<BrowserInner>,
+    session_id: String,
+    backend_node_id: u64,
+    multiple: bool,
+}
+
+impl std::fmt::Debug for RustwrightFileChooser {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RustwrightFileChooser")
+            .field("session_id", &self.session_id)
+            .field("backend_node_id", &self.backend_node_id)
+            .field("multiple", &self.multiple)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RustwrightFileChooser {
+    /// Supply local host paths to the intercepted file input.
+    pub fn set_files(&self, paths: &[PathBuf]) -> RwResult<()> {
+        let files = paths
+            .iter()
+            .map(|path| {
+                path.to_str()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| RwError::Message("file path is not valid UTF-8".to_string()))
+            })
+            .collect::<RwResult<Vec<_>>>()?;
+        let browser = self.browser.upgrade().ok_or(RwError::Closed)?;
+        let client = Arc::clone(&browser.client);
+        let session_id = self.session_id.clone();
+        let backend_node_id = self.backend_node_id;
+        browser.block_on_raw(async move {
+            set_file_input_files_for_session(
+                &client,
+                &session_id,
+                backend_node_id,
+                Value::Array(files.into_iter().map(Value::String).collect()),
+                Duration::from_secs(30),
+            )
+            .await
+        })
+    }
+
+    /// Cancel the chooser through Chromium's supported empty-file-list path.
+    pub fn cancel(&self) -> RwResult<()> {
+        self.set_files(&[])
+    }
+
+    /// Whether the intercepted input accepts more than one file.
+    pub fn is_multiple(&self) -> bool {
+        self.multiple
+    }
+}
+
+/// Maximum number of console records retained for one page.
+///
+/// The ring evicts the oldest record first and keeps per-navigation eviction
+/// counts so callers can report incomplete history without retaining an
+/// unbounded event log.
+pub const NATIVE_CONSOLE_RECORD_CAPACITY: usize = 1_024;
+
+/// Source location attached to a console record by Chromium.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RustwrightConsoleLocation {
+    pub url: String,
+    pub line_number: u64,
+    pub column_number: u64,
+}
+
+/// One console API call captured for a page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RustwrightConsoleRecord {
+    pub message_type: String,
+    pub text: String,
+    pub args: Vec<Value>,
+    pub location: Option<RustwrightConsoleLocation>,
+    pub navigation_epoch: u64,
+}
+
+/// A bounded console-record read result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RustwrightConsoleRecords {
+    pub records: Vec<RustwrightConsoleRecord>,
+    pub navigation_epoch: u64,
+    pub evicted: u64,
+}
+
+/// Maximum number of request lifecycle records retained for one page.
+///
+/// The ring evicts oldest-first and keeps per-navigation eviction counts.
+pub const NATIVE_NETWORK_RECORD_CAPACITY: usize = 1_024;
+
+/// Maximum response-body bytes returned by one native network detail read.
+///
+/// Chromium does not expose ranged response-body reads, so the transport may
+/// still deliver a larger payload before this cap is applied.
+pub const NATIVE_NETWORK_BODY_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+/// One request/response lifecycle captured for a page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RustwrightNetworkRecord {
+    pub index: u64,
+    pub method: String,
+    pub url: String,
+    pub resource_type: String,
+    pub response_status: Option<u16>,
+    pub failure: Option<String>,
+    pub request_headers: Vec<(String, String)>,
+    pub request_body: Option<String>,
+    pub response_headers: Vec<(String, String)>,
+    pub navigation_epoch: u64,
+    pub completed: bool,
+}
+
+/// A bounded network-record read result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RustwrightNetworkRecords {
+    pub records: Vec<RustwrightNetworkRecord>,
+    pub navigation_epoch: u64,
+    pub navigation_start_index: u64,
+    pub evicted: u64,
+}
+
+/// Lazy response-body result for a captured network request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RustwrightNetworkBody {
+    Text {
+        text: String,
+        total_bytes: usize,
+        truncated: bool,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
 /// A typed event emitted by a native page subscription.
 #[derive(Clone, Debug)]
 pub enum RustwrightPageEvent {
@@ -15707,6 +16492,10 @@ pub enum RustwrightPageEvent {
         kind: RustwrightDialogKind,
         message: String,
         dialog: RustwrightDialog,
+    },
+    FileChooser {
+        multiple: bool,
+        chooser: RustwrightFileChooser,
     },
     Download {
         guid: String,
@@ -16033,6 +16822,129 @@ impl RustwrightPage {
         RustwrightPageEventReceiver { queue, close_tx }
     }
 
+    /// Read captured console records.
+    ///
+    /// When `include_previous_navigations` is false, only the current
+    /// navigation epoch is returned. When `clear` is true, the returned scope
+    /// and its eviction count are removed after the snapshot is taken.
+    pub fn console_records(
+        &self,
+        include_previous_navigations: bool,
+        clear: bool,
+    ) -> RwResult<RustwrightConsoleRecords> {
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        browser.block_on(async move {
+            enable_console_capture(&page, Duration::from_secs(5)).await?;
+            let records = page
+                .console_records
+                .lock()
+                .unwrap()
+                .read(include_previous_navigations, clear);
+            Ok(records)
+        })
+    }
+
+    /// Read the page's bounded request/response lifecycle ring.
+    pub fn network_records(
+        &self,
+        include_previous_navigations: bool,
+        clear: bool,
+    ) -> RustwrightNetworkRecords {
+        self.inner
+            .native_network_records
+            .lock()
+            .unwrap()
+            .read(include_previous_navigations, clear)
+    }
+
+    /// Fetch and bound the response body for a retained request.
+    ///
+    /// Chromium does not expose ranged body reads, so the transport fetch is
+    /// lazy and the returned text is capped immediately after decoding.
+    pub fn network_response_body(
+        &self,
+        index: u64,
+        max_bytes: usize,
+    ) -> RwResult<RustwrightNetworkBody> {
+        let body_ref = self
+            .inner
+            .native_network_records
+            .lock()
+            .unwrap()
+            .body_ref(index);
+        let Some(body_ref) = body_ref else {
+            return Ok(RustwrightNetworkBody::Unavailable {
+                reason: "request is not retained".to_owned(),
+            });
+        };
+        if body_ref.response_status.is_none() {
+            return Ok(RustwrightNetworkBody::Unavailable {
+                reason: "response not received".to_owned(),
+            });
+        }
+        if let Some(reason) = body_ref.unavailable_reason {
+            return Ok(RustwrightNetworkBody::Unavailable { reason });
+        }
+        if !is_text_content_type(&body_ref.content_type) {
+            let content_type = if body_ref.content_type.is_empty() {
+                "unknown"
+            } else {
+                &body_ref.content_type
+            };
+            return Ok(RustwrightNetworkBody::Unavailable {
+                reason: format!("non-text content type: {content_type}"),
+            });
+        }
+        if !body_ref.completed {
+            return Ok(RustwrightNetworkBody::Unavailable {
+                reason: "response body is not complete".to_owned(),
+            });
+        }
+        let client = Arc::clone(&self.inner.browser.client);
+        let request_id = body_ref.request_id;
+        let session_id = body_ref.session_id;
+        let response = self.inner.browser.block_on_raw(async move {
+            client
+                .send(
+                    "Network.getResponseBody",
+                    json!({ "requestId": request_id }),
+                    Some(&session_id),
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(RustwrightNetworkBody::Unavailable {
+                    reason: error.to_string(),
+                });
+            }
+        };
+        let encoded = response
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let bytes = if response
+            .get("base64Encoded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            match base64::engine::general_purpose::STANDARD.decode(encoded) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Ok(RustwrightNetworkBody::Unavailable {
+                        reason: format!("invalid base64 response body: {error}"),
+                    });
+                }
+            }
+        } else {
+            encoded.as_bytes().to_vec()
+        };
+        Ok(bounded_network_text_body(&bytes, max_bytes))
+    }
+
     pub fn goto(
         &self,
         url: &str,
@@ -16321,6 +17233,37 @@ impl RustwrightPage {
             timeout,
             true,
             PhysicalPointerAction::Click { click_count: 2 },
+            cancel.cloned(),
+        ))
+    }
+
+    /// Strictly resolve two selectors and physically drag the first to the second.
+    pub fn drag_and_drop(
+        &self,
+        start_selector: &str,
+        end_selector: &str,
+        timeout_ms: Option<f64>,
+    ) -> RwResult<()> {
+        self.drag_and_drop_with_cancel(start_selector, end_selector, timeout_ms, None)
+    }
+
+    pub fn drag_and_drop_with_cancel(
+        &self,
+        start_selector: &str,
+        end_selector: &str,
+        timeout_ms: Option<f64>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<()> {
+        let start_locator_json = selector_to_locator_json(start_selector)?;
+        let end_locator_json = selector_to_locator_json(end_selector)?;
+        let page = Arc::clone(&self.inner);
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let browser = Arc::clone(&page.browser);
+        browser.block_on_raw(page_drag_and_drop_actionable_async(
+            page,
+            start_locator_json,
+            end_locator_json,
+            timeout,
             cancel.cloned(),
         ))
     }
@@ -16935,6 +17878,29 @@ fn native_page_event_from_cdp(
                     dialog: RustwrightDialog {
                         browser: Arc::downgrade(&page.browser),
                         session_id: page.session_id.clone(),
+                    },
+                },
+                false,
+            ))
+        }
+        "Page.fileChooserOpened" => {
+            let session_id = event_session_id?;
+            if !page.frame_state.lock().unwrap().owns_session(session_id) {
+                return None;
+            }
+            let backend_node_id = event
+                .pointer("/params/backendNodeId")
+                .and_then(Value::as_u64)?;
+            let multiple =
+                event.pointer("/params/mode").and_then(Value::as_str) == Some("selectMultiple");
+            Some((
+                RustwrightPageEvent::FileChooser {
+                    multiple,
+                    chooser: RustwrightFileChooser {
+                        browser: Arc::downgrade(&page.browser),
+                        session_id: session_id.to_string(),
+                        backend_node_id,
+                        multiple,
                     },
                 },
                 false,
@@ -17639,16 +18605,14 @@ async fn attach_existing_page_unregistered(
     session_cleanup.set_session(session_id.clone());
     let session_guard = AttachedSessionGuard::new(session_cleanup);
     let event_stream_start_cursor = browser.client.event_cursor();
-    try_join_all(
-        ["Page.enable", "DOM.enable", "Network.enable"]
-            .into_iter()
-            .map(|method| {
-                browser
-                    .client
-                    .send(method, json!({}), Some(&session_id), Duration::from_secs(5))
-            }),
-    )
+    try_join_all(DEFAULT_ATTACHED_SESSION_DOMAINS.into_iter().map(|method| {
+        browser
+            .client
+            .send(method, json!({}), Some(&session_id), Duration::from_secs(5))
+    }))
     .await?;
+    enable_file_chooser_intercept_for_session(&browser.client, &session_id, Duration::from_secs(5))
+        .await?;
     install_stealth_defaults(&browser, &session_id).await?;
     enable_page_iframe_auto_attach(&browser.client, &session_id, Duration::from_secs(5)).await?;
     let page_inner = Arc::new(PageInner {
@@ -17662,6 +18626,11 @@ async fn attach_existing_page_unregistered(
         network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(
             event_stream_start_cursor,
         ))),
+        console_records: Mutex::new(ConsoleRecordStore::default()),
+        console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+        native_network_records: Mutex::new(NativeNetworkRecordStore::new(
+            browser.next_native_network_index.load(Ordering::SeqCst),
+        )),
         event_stream_start_cursor,
         background_override_active: Arc::new(AtomicBool::new(false)),
         screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -17734,6 +18703,43 @@ async fn enable_page_iframe_auto_attach(
     Ok(())
 }
 
+async fn enable_file_chooser_intercept_for_session(
+    client: &CdpClient,
+    session_id: &str,
+    timeout: Duration,
+) -> RwResult<()> {
+    client
+        .send(
+            "Page.setInterceptFileChooserDialog",
+            json!({ "enabled": true }),
+            Some(session_id),
+            timeout,
+        )
+        .await
+        .map(|_| ())
+}
+
+async fn set_file_input_files_for_session(
+    client: &CdpClient,
+    session_id: &str,
+    backend_node_id: u64,
+    files: Value,
+    timeout: Duration,
+) -> RwResult<()> {
+    client
+        .send(
+            "DOM.setFileInputFiles",
+            json!({
+                "backendNodeId": backend_node_id,
+                "files": files,
+            }),
+            Some(session_id),
+            timeout,
+        )
+        .await
+        .map(|_| ())
+}
+
 async fn register_attached_iframe_session(
     page: Arc<PageInner>,
     frame_id: String,
@@ -17765,6 +18771,52 @@ async fn register_attached_iframe_session(
         .unwrap()
         .mark_iframe_session_armed(&child_session_id);
     spawn_attached_iframe_session_setup(page, frame_id, child_session_id);
+    Ok(())
+}
+
+const DEFAULT_ATTACHED_SESSION_DOMAINS: [&str; 3] = ["Page.enable", "DOM.enable", "Network.enable"];
+
+async fn enable_console_capture(page: &PageInner, timeout: Duration) -> RwResult<()> {
+    let mut capture = page.console_capture.lock().await;
+    capture.requested = true;
+    let sessions = {
+        let frame_state = page.frame_state.lock().unwrap();
+        std::iter::once(page.session_id.clone())
+            .chain(frame_state.iframe_sessions_ready.iter().cloned())
+            .collect::<HashSet<_>>()
+    };
+    for session_id in sessions {
+        enable_console_capture_for_session_locked(page, &session_id, timeout, &mut capture).await?;
+    }
+    Ok(())
+}
+
+async fn enable_console_capture_for_session_if_requested(
+    page: &PageInner,
+    session_id: &str,
+    timeout: Duration,
+) -> RwResult<()> {
+    let mut capture = page.console_capture.lock().await;
+    if !capture.requested {
+        return Ok(());
+    }
+    enable_console_capture_for_session_locked(page, session_id, timeout, &mut capture).await
+}
+
+async fn enable_console_capture_for_session_locked(
+    page: &PageInner,
+    session_id: &str,
+    timeout: Duration,
+    capture: &mut ConsoleCaptureState,
+) -> RwResult<()> {
+    if capture.enabled_sessions.contains(session_id) {
+        return Ok(());
+    }
+    page.browser
+        .client
+        .send("Runtime.enable", json!({}), Some(session_id), timeout)
+        .await?;
+    capture.enabled_sessions.insert(session_id.to_string());
     Ok(())
 }
 
@@ -17806,20 +18858,24 @@ async fn setup_attached_iframe_session(
     child_session_id: String,
 ) -> RwResult<()> {
     let client = Arc::clone(&page.browser.client);
-    try_join_all(
-        ["Page.enable", "DOM.enable", "Network.enable"]
-            .into_iter()
-            .map(|method| {
-                client.send(
-                    method,
-                    json!({}),
-                    Some(&child_session_id),
-                    Duration::from_secs(5),
-                )
-            }),
+    try_join_all(DEFAULT_ATTACHED_SESSION_DOMAINS.into_iter().map(|method| {
+        client.send(
+            method,
+            json!({}),
+            Some(&child_session_id),
+            Duration::from_secs(5),
+        )
+    }))
+    .await?;
+    enable_file_chooser_intercept_for_session(&client, &child_session_id, Duration::from_secs(5))
+        .await?;
+    install_stealth_defaults(&page.browser, &child_session_id).await?;
+    enable_console_capture_for_session_if_requested(
+        &page,
+        &child_session_id,
+        Duration::from_secs(5),
     )
     .await?;
-    install_stealth_defaults(&page.browser, &child_session_id).await?;
     refresh_page_frame_tree(&page, Duration::from_secs(5)).await
 }
 
@@ -17849,6 +18905,7 @@ fn spawn_page_oopif_event_listener(page: Weak<PageInner>) {
 
 async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
     let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+    record_page_observation_event(&page, &event);
     if method == "Target.targetCrashed"
         && event.pointer("/params/targetId").and_then(Value::as_str)
             == Some(page.target_id.as_str())
@@ -18021,6 +19078,562 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
             }
         }
         _ => {}
+    }
+}
+
+fn record_page_observation_event(page: &PageInner, event: &Value) {
+    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+    let event_session_id = event.get("sessionId").and_then(Value::as_str);
+    let is_main_session = event_session_id == Some(page.session_id.as_str());
+    let owned_session = event_session_id
+        .is_some_and(|session_id| page.frame_state.lock().unwrap().owns_session(session_id));
+    let next_index = page
+        .browser
+        .next_native_network_index
+        .load(Ordering::SeqCst);
+    let advances_navigation = {
+        let mut network = page.native_network_records.lock().unwrap();
+        match method {
+            "Network.requestWillBeSent" if is_main_session => {
+                let frame_id = event.pointer("/params/frameId").and_then(Value::as_str);
+                let main_frame_id = page.main_frame_id.lock().unwrap().clone();
+                let is_main_document = event.pointer("/params/type").and_then(Value::as_str)
+                    == Some("Document")
+                    && frame_id.is_some()
+                    && main_frame_id
+                        .as_deref()
+                        .map_or(true, |main| frame_id == Some(main));
+                is_main_document
+                    && network.begin_document_navigation(
+                        event.pointer("/params/loaderId").and_then(Value::as_str),
+                        next_index,
+                    )
+            }
+            "Page.frameNavigated" if is_main_session => {
+                let frame = event.pointer("/params/frame");
+                frame.is_some_and(|frame| frame.get("parentId").is_none())
+                    && network.begin_document_navigation(
+                        frame
+                            .and_then(|frame| frame.get("loaderId"))
+                            .and_then(Value::as_str),
+                        next_index,
+                    )
+            }
+            "Page.navigatedWithinDocument" if is_main_session => {
+                let frame_id = event.pointer("/params/frameId").and_then(Value::as_str);
+                let is_main =
+                    frame_id.is_some() && page.main_frame_id.lock().unwrap().as_deref() == frame_id;
+                if is_main {
+                    network.begin_same_document_navigation(next_index);
+                }
+                is_main
+            }
+            _ => false,
+        }
+    };
+    if advances_navigation {
+        page.console_records.lock().unwrap().advance_navigation();
+    }
+
+    if method == "Runtime.consoleAPICalled" && owned_session {
+        if let Some(record) = native_console_record_from_event(event) {
+            page.console_records.lock().unwrap().push(record);
+        }
+    }
+
+    if !owned_session {
+        return;
+    }
+    let Some(session_id) = event_session_id else {
+        return;
+    };
+    let Some(params) = event.get("params") else {
+        return;
+    };
+    let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
+        return;
+    };
+    let mut network = page.native_network_records.lock().unwrap();
+    match method {
+        "Network.requestWillBeSent" => {
+            if let Some(response) = params.get("redirectResponse") {
+                network.finish_redirect(session_id, request_id, response);
+            }
+            let Some(request) = params.get("request") else {
+                return;
+            };
+            let index = page
+                .browser
+                .next_native_network_index
+                .fetch_add(1, Ordering::SeqCst);
+            let entry = NativeNetworkEntry {
+                record: RustwrightNetworkRecord {
+                    index,
+                    method: request
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or("GET")
+                        .to_string(),
+                    url: request
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    resource_type: params
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("other")
+                        .to_ascii_lowercase(),
+                    response_status: None,
+                    failure: None,
+                    request_headers: metadata_headers(request.get("headers")),
+                    request_body: request
+                        .get("postData")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                    response_headers: Vec::new(),
+                    navigation_epoch: network.navigation_epoch,
+                    completed: false,
+                },
+                request_id: request_id.to_string(),
+                session_id: session_id.to_string(),
+                content_type: String::new(),
+                body_unavailable_reason: None,
+            };
+            network.push(entry);
+        }
+        "Network.requestWillBeSentExtraInfo" => {
+            if let Some(entry) = network.active_mut(session_id, request_id) {
+                entry.record.request_headers = metadata_headers(params.get("headers"));
+            }
+        }
+        "Network.responseReceived" => {
+            if let Some(response) = params.get("response") {
+                if let Some(entry) = network.active_mut(session_id, request_id) {
+                    apply_native_network_response(entry, response);
+                }
+            }
+        }
+        "Network.responseReceivedExtraInfo" => {
+            if let Some(entry) = network.active_mut(session_id, request_id) {
+                apply_native_network_response_extra_info(entry, params);
+            }
+        }
+        "Network.loadingFailed" => {
+            if let Some(entry) = network.active_mut(session_id, request_id) {
+                entry.record.failure = params
+                    .get("errorText")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                entry.record.completed = true;
+            }
+        }
+        "Network.loadingFinished" => {
+            if let Some(entry) = network.active_mut(session_id, request_id) {
+                entry.record.completed = true;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn native_console_record_from_event(event: &Value) -> Option<RustwrightConsoleRecord> {
+    let params = event.get("params")?;
+    let remote_args = params
+        .get("args")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let args = remote_args
+        .iter()
+        .map(console_arg_value)
+        .collect::<Vec<_>>();
+    let text = args
+        .iter()
+        .map(console_value_text)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let location =
+        params
+            .pointer("/stackTrace/callFrames/0")
+            .map(|frame| RustwrightConsoleLocation {
+                url: frame
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                line_number: frame.get("lineNumber").and_then(Value::as_u64).unwrap_or(0),
+                column_number: frame
+                    .get("columnNumber")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            });
+    Some(RustwrightConsoleRecord {
+        message_type: params
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("log")
+            .to_string(),
+        text,
+        args,
+        location,
+        navigation_epoch: 0,
+    })
+}
+
+#[cfg(test)]
+mod native_console_record_tests {
+    use super::*;
+
+    fn record(text: impl Into<String>) -> RustwrightConsoleRecord {
+        RustwrightConsoleRecord {
+            message_type: "log".to_owned(),
+            text: text.into(),
+            args: Vec::new(),
+            location: None,
+            navigation_epoch: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn console_ring_is_bounded_epoch_scoped_and_clearable() {
+        let mut store = ConsoleRecordStore::default();
+        for index in 0..=NATIVE_CONSOLE_RECORD_CAPACITY {
+            store.push(record(index.to_string()));
+        }
+        let first = store.read(false, false);
+        assert_eq!(first.records.len(), NATIVE_CONSOLE_RECORD_CAPACITY);
+        assert_eq!(first.records[0].text, "1");
+        assert_eq!(first.evicted, 1);
+        assert_eq!(first.navigation_epoch, 0);
+
+        store.advance_navigation();
+        store.push(record("current"));
+        let current = store.read(false, true);
+        assert_eq!(current.records.len(), 1);
+        assert_eq!(current.records[0].text, "current");
+        assert_eq!(current.records[0].navigation_epoch, 1);
+        assert_eq!(current.evicted, 0);
+        assert!(store.read(false, false).records.is_empty());
+
+        let all = store.read(true, true);
+        assert_eq!(all.records.len(), NATIVE_CONSOLE_RECORD_CAPACITY - 1);
+        assert_eq!(all.evicted, 2);
+        assert!(store.read(true, false).records.is_empty());
+    }
+
+    #[test]
+    fn console_event_parser_keeps_best_effort_args_and_location() {
+        let parsed = native_console_record_from_event(&json!({
+            "params": {
+                "type": "warning",
+                "args": [
+                    {"type": "string", "value": "hello"},
+                    {"type": "number", "value": 42}
+                ],
+                "stackTrace": {
+                    "callFrames": [{
+                        "url": "https://example.test/app.js",
+                        "lineNumber": 7,
+                        "columnNumber": 11
+                    }]
+                }
+            }
+        }))
+        .expect("console record");
+        assert_eq!(parsed.message_type, "warning");
+        assert_eq!(parsed.text, "hello 42");
+        assert_eq!(parsed.args, vec![json!("hello"), json!(42)]);
+        assert_eq!(
+            parsed.location,
+            Some(RustwrightConsoleLocation {
+                url: "https://example.test/app.js".to_owned(),
+                line_number: 7,
+                column_number: 11,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn default_attach_is_runtime_free_and_console_capture_is_single_flight() {
+        assert_eq!(
+            DEFAULT_ATTACHED_SESSION_DOMAINS.as_slice(),
+            &["Page.enable", "DOM.enable", "Network.enable"]
+        );
+
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(8);
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let (alive_tx, _) = watch::channel(true);
+        let browser = Arc::new(BrowserInner {
+            runtime: OwnedRuntime(None),
+            client: Arc::new(CdpClient {
+                write_tx,
+                pending: Arc::clone(&pending),
+                events: events.clone(),
+                event_log: Arc::clone(&event_log),
+                next_id: AtomicU64::new(1),
+                sent_runtime_enable_count: AtomicU64::new(0),
+                sent_target_close_count: AtomicU64::new(0),
+                sent_context_dispose_count: AtomicU64::new(0),
+                alive: Arc::new(AtomicBool::new(true)),
+                alive_tx,
+            }),
+            process: Mutex::new(None),
+            profile_dir: Mutex::new(None),
+            owned: false,
+            ws_endpoint: "ws://test.invalid".to_string(),
+            stealth_user_agent_override: Mutex::new(None),
+            single_process_fallback: false,
+            lifecycle: Arc::new(CloseLifecycle::new()),
+            attached_pages: AttachedPageRegistry::default(),
+            next_native_network_index: AtomicU64::new(1),
+        });
+        let page = Arc::new(PageInner {
+            browser,
+            target_id: "target".to_string(),
+            registry_generation: 1,
+            session_id: "root-session".to_string(),
+            context_id: None,
+            main_frame_id: Mutex::new(None),
+            frame_state: Mutex::new(PageFrameState::new("root-session".to_string())),
+            network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
+            console_records: Mutex::new(ConsoleRecordStore::default()),
+            console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+            native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
+            event_stream_start_cursor: 0,
+            background_override_active: Arc::new(AtomicBool::new(false)),
+            screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+            mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+            default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
+            lifecycle: Arc::new(CloseLifecycle::new()),
+            target_closed: AtomicBool::new(false),
+            crashed: AtomicBool::new(false),
+            close_target_on_drop: AtomicBool::new(false),
+        });
+
+        enable_console_capture_for_session_if_requested(
+            &page,
+            "not-yet-attached",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(write_rx.try_recv().is_err());
+
+        let respond = async {
+            let outgoing = tokio::time::timeout(Duration::from_secs(1), write_rx.recv())
+                .await
+                .expect("console capture must send Runtime.enable")
+                .expect("CDP writer must remain open");
+            let command = match outgoing {
+                CdpOutgoing::Text(payload) => serde_json::from_str::<Value>(&payload).unwrap(),
+                CdpOutgoing::Close => panic!("unexpected transport close"),
+            };
+            dispatch_cdp_payload(
+                json!({ "id": command["id"], "result": {} }),
+                Arc::clone(&pending),
+                events.clone(),
+                Arc::clone(&event_log),
+            );
+            command
+        };
+        let (first, second, command) = tokio::join!(
+            enable_console_capture(&page, Duration::from_secs(1)),
+            enable_console_capture(&page, Duration::from_secs(1)),
+            respond,
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(command["method"], "Runtime.enable");
+        assert_eq!(command["sessionId"], "root-session");
+        assert!(
+            write_rx.try_recv().is_err(),
+            "concurrent first-use must not send Runtime.enable twice"
+        );
+
+        let respond_late_iframe = async {
+            let outgoing = tokio::time::timeout(Duration::from_secs(1), write_rx.recv())
+                .await
+                .expect("late iframe capture must send Runtime.enable")
+                .expect("CDP writer must remain open");
+            let command = match outgoing {
+                CdpOutgoing::Text(payload) => serde_json::from_str::<Value>(&payload).unwrap(),
+                CdpOutgoing::Close => panic!("unexpected transport close"),
+            };
+            dispatch_cdp_payload(
+                json!({ "id": command["id"], "result": {} }),
+                Arc::clone(&pending),
+                events,
+                event_log,
+            );
+            command
+        };
+        let (late_iframe, command) = tokio::join!(
+            enable_console_capture_for_session_if_requested(
+                &page,
+                "late-iframe-session",
+                Duration::from_secs(1),
+            ),
+            respond_late_iframe,
+        );
+        late_iframe.unwrap();
+        assert_eq!(command["method"], "Runtime.enable");
+        assert_eq!(command["sessionId"], "late-iframe-session");
+        assert!(write_rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod native_network_record_tests {
+    use super::*;
+
+    fn entry(index: u64, request_id: impl Into<String>, epoch: u64) -> NativeNetworkEntry {
+        NativeNetworkEntry {
+            record: RustwrightNetworkRecord {
+                index,
+                method: "GET".to_owned(),
+                url: format!("https://example.test/{index}"),
+                resource_type: "fetch".to_owned(),
+                response_status: None,
+                failure: None,
+                request_headers: vec![("accept".to_owned(), "text/plain".to_owned())],
+                request_body: None,
+                response_headers: Vec::new(),
+                navigation_epoch: epoch,
+                completed: false,
+            },
+            request_id: request_id.into(),
+            session_id: "page-session".to_owned(),
+            content_type: String::new(),
+            body_unavailable_reason: None,
+        }
+    }
+
+    #[test]
+    fn network_ring_is_bounded_epoch_scoped_and_clearable() {
+        let mut store = NativeNetworkRecordStore::new(1);
+        for index in 1..=NATIVE_NETWORK_RECORD_CAPACITY as u64 + 1 {
+            store.push(entry(index, format!("request-{index}"), 0));
+        }
+
+        let first = store.read(false, false);
+        assert_eq!(first.records.len(), NATIVE_NETWORK_RECORD_CAPACITY);
+        assert_eq!(first.records[0].index, 2);
+        assert_eq!(first.evicted, 1);
+        assert_eq!(first.navigation_epoch, 0);
+        assert_eq!(first.navigation_start_index, 1);
+
+        assert!(store.begin_document_navigation(Some("loader-1"), 2_000));
+        assert!(!store.begin_document_navigation(Some("loader-1"), 2_001));
+        store.push(entry(2_000, "current", store.navigation_epoch));
+        let current = store.read(false, true);
+        assert_eq!(current.records.len(), 1);
+        assert_eq!(current.records[0].index, 2_000);
+        assert_eq!(current.records[0].navigation_epoch, 1);
+        assert_eq!(current.navigation_start_index, 2_000);
+        assert_eq!(current.evicted, 0);
+        assert!(store.read(false, false).records.is_empty());
+
+        let all = store.read(true, true);
+        assert_eq!(all.records.len(), NATIVE_NETWORK_RECORD_CAPACITY - 1);
+        assert_eq!(all.evicted, 2);
+        assert!(store.read(true, false).records.is_empty());
+
+        store.begin_same_document_navigation(3_000);
+        let same_document = store.read(false, false);
+        assert_eq!(same_document.navigation_epoch, 2);
+        assert_eq!(same_document.navigation_start_index, 3_000);
+    }
+
+    #[test]
+    fn network_lifecycle_updates_response_failure_headers_and_redirect_state() {
+        let mut store = NativeNetworkRecordStore::new(1);
+        store.push(entry(1, "redirect", 0));
+        store.finish_redirect(
+            "page-session",
+            "redirect",
+            &json!({
+                "status": 302,
+                "headers": {
+                    "Content-Type": "text/html; charset=utf-8",
+                    "Location": "https://example.test/final"
+                }
+            }),
+        );
+        let redirected = store.active_mut("page-session", "redirect").unwrap();
+        assert_eq!(redirected.record.response_status, Some(302));
+        assert_eq!(redirected.content_type, "text/html");
+        assert!(redirected.record.completed);
+        assert_eq!(
+            redirected.body_unavailable_reason.as_deref(),
+            Some("redirect response body is unavailable")
+        );
+
+        store.push(entry(2, "failed", 0));
+        let failed = store.active_mut("page-session", "failed").unwrap();
+        failed.record.request_headers = metadata_headers(Some(&json!({"X-Request": "captured"})));
+        apply_native_network_response(
+            failed,
+            &json!({
+                "status": 503,
+                "mimeType": "application/problem+json",
+                "headers": {"X-Response": "captured"}
+            }),
+        );
+        apply_native_network_response_extra_info(
+            failed,
+            &json!({
+                "statusCode": 503,
+                "headers": {"X-Extra": "captured"}
+            }),
+        );
+        failed.record.failure = Some("net::ERR_FAILED".to_owned());
+        failed.record.completed = true;
+        assert_eq!(failed.record.response_status, Some(503));
+        assert_eq!(failed.content_type, "application/problem+json");
+        assert_eq!(
+            failed.record.request_headers,
+            vec![("X-Request".to_owned(), "captured".to_owned())]
+        );
+        assert_eq!(
+            failed.record.response_headers,
+            vec![("X-Extra".to_owned(), "captured".to_owned())]
+        );
+        assert_eq!(failed.record.failure.as_deref(), Some("net::ERR_FAILED"));
+    }
+
+    #[test]
+    fn network_text_body_is_content_typed_and_byte_bounded() {
+        for content_type in [
+            "text/plain",
+            "application/json",
+            "application/problem+json",
+            "application/soap+xml",
+        ] {
+            assert!(is_text_content_type(content_type), "{content_type}");
+        }
+        for content_type in ["", "application/octet-stream", "image/png"] {
+            assert!(!is_text_content_type(content_type), "{content_type}");
+        }
+
+        assert_eq!(
+            bounded_network_text_body("éclair".as_bytes(), 2),
+            RustwrightNetworkBody::Text {
+                text: "é".to_owned(),
+                total_bytes: 7,
+                truncated: true,
+            }
+        );
+        assert_eq!(
+            bounded_network_text_body(b"body", usize::MAX),
+            RustwrightNetworkBody::Text {
+                text: "body".to_owned(),
+                total_bytes: 4,
+                truncated: false,
+            }
+        );
     }
 }
 
