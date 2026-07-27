@@ -8,12 +8,12 @@ alive across invocations, so a sequence of commands drives a single browser.
 It is Chromium-only (Rustwright automates Chromium over CDP).
 
 > The MCP server for Rustwright is the native `rustwright-mcp` server, maintained
-> in [`mcp-rs/`](../mcp-rs/) rather than as part of the core wheel. This document
+> in [`mcp/`](../mcp/) rather than as part of the core wheel. This document
 > covers the CLI.
 
 ## MCP stdio server
 
-Install the native server (see [`mcp-rs/README.md`](../mcp-rs/README.md)), then
+Install the native server (see [`mcp/README.md`](../mcp/README.md)), then
 start it with `rustwright mcp`. Any arguments after `mcp` pass through to the
 server unchanged.
 
