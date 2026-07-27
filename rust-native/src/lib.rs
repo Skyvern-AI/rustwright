@@ -6,6 +6,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -389,6 +390,93 @@ impl Dialog {
     }
 }
 
+/// A pending file chooser delivered by [`EventReceiver`].
+#[derive(Clone, Debug)]
+pub struct FileChooser {
+    inner: rustwright_core::RustwrightFileChooser,
+}
+
+impl FileChooser {
+    /// Supply workspace-confined local host paths to the file input.
+    pub fn set_files(&self, paths: &[PathBuf]) -> Result<()> {
+        self.inner.set_files(paths)
+    }
+
+    /// Cancel the chooser by supplying Chromium's supported empty file list.
+    pub fn cancel(&self) -> Result<()> {
+        self.inner.cancel()
+    }
+
+    /// Whether the intercepted input accepts more than one file.
+    pub fn is_multiple(&self) -> bool {
+        self.inner.is_multiple()
+    }
+}
+
+/// Source location attached to a console record by Chromium.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsoleLocation {
+    pub url: String,
+    pub line_number: u64,
+    pub column_number: u64,
+}
+
+/// One captured console API call.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConsoleRecord {
+    pub message_type: String,
+    pub text: String,
+    pub args: Vec<Value>,
+    pub location: Option<ConsoleLocation>,
+    pub navigation_epoch: u64,
+}
+
+/// A bounded console-record read result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConsoleRecords {
+    pub records: Vec<ConsoleRecord>,
+    pub navigation_epoch: u64,
+    pub evicted: u64,
+}
+
+/// One captured request/response lifecycle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkRecord {
+    pub index: u64,
+    pub method: String,
+    pub url: String,
+    pub resource_type: String,
+    pub response_status: Option<u16>,
+    pub failure: Option<String>,
+    pub request_headers: Vec<(String, String)>,
+    pub request_body: Option<String>,
+    pub response_headers: Vec<(String, String)>,
+    pub navigation_epoch: u64,
+    pub completed: bool,
+}
+
+/// A bounded network-record read result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkRecords {
+    pub records: Vec<NetworkRecord>,
+    pub navigation_epoch: u64,
+    pub navigation_start_index: u64,
+    pub evicted: u64,
+}
+
+/// Lazy bounded response-body result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NetworkBody {
+    Text {
+        text: String,
+        total_bytes: usize,
+        truncated: bool,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
 /// Typed page events emitted by [`Page::events`].
 #[derive(Clone, Debug)]
 pub enum PageEvent {
@@ -396,6 +484,10 @@ pub enum PageEvent {
         kind: DialogKind,
         message: String,
         dialog: Dialog,
+    },
+    FileChooser {
+        multiple: bool,
+        chooser: FileChooser,
     },
     Download {
         guid: String,
@@ -458,6 +550,96 @@ impl Page {
         EventReceiver {
             inner: self.inner.events(),
         }
+    }
+
+    /// Read the page's bounded console-record ring.
+    ///
+    /// Pass `include_previous_navigations` to include all retained epochs and
+    /// `clear` to remove the returned scope after reading it.
+    pub fn console_records(
+        &self,
+        include_previous_navigations: bool,
+        clear: bool,
+    ) -> Result<ConsoleRecords> {
+        let records = self
+            .inner
+            .console_records(include_previous_navigations, clear)?;
+        Ok(ConsoleRecords {
+            records: records
+                .records
+                .into_iter()
+                .map(|record| ConsoleRecord {
+                    message_type: record.message_type,
+                    text: record.text,
+                    args: record.args,
+                    location: record.location.map(|location| ConsoleLocation {
+                        url: location.url,
+                        line_number: location.line_number,
+                        column_number: location.column_number,
+                    }),
+                    navigation_epoch: record.navigation_epoch,
+                })
+                .collect(),
+            navigation_epoch: records.navigation_epoch,
+            evicted: records.evicted,
+        })
+    }
+
+    /// Read the page's oldest-first, 1,024-record request/response lifecycle ring.
+    ///
+    /// The result reports evictions for the selected navigation scope. Pass
+    /// `clear` to remove that scope after taking the snapshot.
+    pub fn network_records(
+        &self,
+        include_previous_navigations: bool,
+        clear: bool,
+    ) -> NetworkRecords {
+        let records = self
+            .inner
+            .network_records(include_previous_navigations, clear);
+        NetworkRecords {
+            records: records
+                .records
+                .into_iter()
+                .map(|record| NetworkRecord {
+                    index: record.index,
+                    method: record.method,
+                    url: record.url,
+                    resource_type: record.resource_type,
+                    response_status: record.response_status,
+                    failure: record.failure,
+                    request_headers: record.request_headers,
+                    request_body: record.request_body,
+                    response_headers: record.response_headers,
+                    navigation_epoch: record.navigation_epoch,
+                    completed: record.completed,
+                })
+                .collect(),
+            navigation_epoch: records.navigation_epoch,
+            navigation_start_index: records.navigation_start_index,
+            evicted: records.evicted,
+        }
+    }
+
+    /// Lazily fetch a retained text response body and cap returned bytes.
+    ///
+    /// The returned body is limited to the lesser of `max_bytes` and the
+    /// core's 20 MiB per-read ceiling.
+    pub fn network_response_body(&self, index: u64, max_bytes: usize) -> Result<NetworkBody> {
+        Ok(match self.inner.network_response_body(index, max_bytes)? {
+            rustwright_core::RustwrightNetworkBody::Text {
+                text,
+                total_bytes,
+                truncated,
+            } => NetworkBody::Text {
+                text,
+                total_bytes,
+                truncated,
+            },
+            rustwright_core::RustwrightNetworkBody::Unavailable { reason } => {
+                NetworkBody::Unavailable { reason }
+            }
+        })
     }
 
     /// Navigate to `url` and return the response metadata JSON value.
@@ -613,6 +795,29 @@ impl Page {
     ) -> Result<()> {
         self.inner
             .dblclick_with_cancel(selector, options.timeout, cancel)
+    }
+
+    /// Strictly resolve two selectors, auto-wait, and physically drag the first
+    /// element to the second through Chromium's native mouse input pipeline.
+    pub fn drag_and_drop(
+        &self,
+        start_selector: &str,
+        end_selector: &str,
+        options: ActionOptions,
+    ) -> Result<()> {
+        self.drag_and_drop_with_cancel(start_selector, end_selector, options, None)
+    }
+
+    /// Physically drag between two selectors with an optional cancellation signal.
+    pub fn drag_and_drop_with_cancel(
+        &self,
+        start_selector: &str,
+        end_selector: &str,
+        options: ActionOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
+        self.inner
+            .drag_and_drop_with_cancel(start_selector, end_selector, options.timeout, cancel)
     }
 
     /// Click an element inside the first frame matching `frame_selector`.
@@ -931,6 +1136,12 @@ fn map_page_event(event: rustwright_core::RustwrightPageEvent) -> PageEvent {
             message,
             dialog: Dialog { inner: dialog },
         },
+        rustwright_core::RustwrightPageEvent::FileChooser { multiple, chooser } => {
+            PageEvent::FileChooser {
+                multiple,
+                chooser: FileChooser { inner: chooser },
+            }
+        }
         rustwright_core::RustwrightPageEvent::Download {
             guid,
             url,
@@ -1028,6 +1239,13 @@ fn map_bigint_value(value: Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn physical_drag_facade_signatures_match_action_options_and_cancellation_contract() {
+        let _: fn(&Page, &str, &str, ActionOptions) -> Result<()> = Page::drag_and_drop;
+        let _: fn(&Page, &str, &str, ActionOptions, Option<&CancelToken>) -> Result<()> =
+            Page::drag_and_drop_with_cancel;
+    }
 
     #[test]
     fn decode_evaluate_wire_resolves_references_instead_of_dropping_them() {
