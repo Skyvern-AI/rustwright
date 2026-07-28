@@ -13,6 +13,7 @@ All notable user-facing changes to Rustwright are documented in this file.
 - Added native pending-file-chooser events and mirror-profile MCP file upload and cancellation with workspace-confined paths.
 - Added native physical element dragging and the mirror-profile `browser_drag` MCP tool.
 - Added alpha bindings for Go, Java, C#/.NET, Ruby, and PHP, plus a native Rust API, backed by the shared Rust engine.
+- Added shadow DOM support to frame enumeration: iframes attached inside a shadow root now appear in `page.frames` and `frame.child_frames`, so widgets that mount their cross-origin iframe that way (Cloudflare Turnstile, hCaptcha, and embedded payment fields among them) are reachable.
 
 ### Changed
 
@@ -26,6 +27,12 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ### Fixed
 
+- Fixed `page.evaluate()` treating an already-invoked IIFE as a function literal when its body contained an arrow function anywhere, which wrapped and re-called the value it had returned and failed with `__rw_fn is not a function`.
+- Fixed the best-effort frame-tree refresh spending the caller's whole timeout per session, which made `Request.frame` inside a route handler stall the navigation it belonged to until that timeout expired, and hang indefinitely when the timeout was disabled.
+- Fixed the stealth user-agent override pinning `Accept-Language` to `en-US,en`, which silently overrode `--accept-lang`/`--lang` and left a browser configured for one region reporting that region's timezone alongside an `en-US` locale.
+- Fixed dedicated workers being given their identity by rewriting the page's `Worker` constructor to load a generated blob that `importScripts` the real script, which moved every worker off its own URL and changed its `location` and origin; worker identity is now installed over the worker's own CDP session, as it already was for service workers, and the worker keeps its real script URL.
+- Fixed the stealth init script removing `navigator.webdriver` from browsers that already report `false`, replacing a value every real Chrome exposes with a missing property.
+- Fixed child-frame enumeration pairing the DOM query and the protocol's children by position, which gave a light-DOM frame the identity of a shadow-root frame that preceded it; the two are now correlated by frame identity.
 - Fixed locator waits so they re-arm after mid-wait navigation against the original timeout instead of surfacing execution-context errors.
 - Fixed remote-CDP actionability probes so they receive the full remaining action budget rather than a short per-probe cap.
 - Fixed Node.js evaluation decoding for special numeric values, BigInt, and regular expressions; Go/C-ABI and native Rust now use the core's canonical wire decoder.
