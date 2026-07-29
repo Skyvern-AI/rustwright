@@ -1018,7 +1018,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rustwright"
-version = "0.1.0-alpha.4"
+version = "0.2.0"
 dependencies = [
  "rustwright-core",
  "serde",
@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "rustwright-capi"
-version = "0.1.0-alpha.4"
+version = "0.2.0"
 dependencies = [
  "libc",
  "rustwright-core",
@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "rustwright-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "base64",
  "bytes",
@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "rustwright-node"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "napi",
  "napi-build",
