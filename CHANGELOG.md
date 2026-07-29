@@ -4,6 +4,8 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-29
+
 ### Added
 
 - Added a persistent `rustwright` CLI for browser sessions, accessibility snapshots, and element-reference actions.
@@ -78,6 +80,7 @@ All notable user-facing changes to Rustwright are documented in this file.
 - Added an experimental Node.js binding for launching Chromium and performing core page navigation, interaction, evaluation, screenshot, and lifecycle operations.
 
 [Unreleased]: https://github.com/Skyvern-AI/rustwright/commits/main
+[0.2.0]: https://github.com/Skyvern-AI/rustwright/releases/tag/v0.2.0
 [0.1.1]: https://github.com/Skyvern-AI/rustwright/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Skyvern-AI/rustwright/releases/tag/v0.1.0
 [0.1.0-alpha.4]: https://github.com/Skyvern-AI/rustwright/releases/tag/v0.1.0-alpha.4
