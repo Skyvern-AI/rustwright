@@ -29,6 +29,8 @@ All notable user-facing changes to Rustwright are documented in this file.
 - Fixed locator waits so they re-arm after mid-wait navigation against the original timeout instead of surfacing execution-context errors.
 - Fixed remote-CDP actionability probes so they receive the full remaining action budget rather than a short per-probe cap.
 - Fixed Node.js evaluation decoding for special numeric values, BigInt, and regular expressions; Go/C-ABI and native Rust now use the core's canonical wire decoder.
+- Fixed select-option locator helpers so they wait on the caller's timeout instead of falling back to the 30s default and then reporting an error naming the caller's budget.
+- Fixed non-finite timeouts, which failed after a single millisecond with a misleading `Timeout(1)` instead of falling back to the default budget.
 
 ## [0.1.1] - 2026-07-15
 

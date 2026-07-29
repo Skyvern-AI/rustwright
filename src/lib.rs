@@ -2630,6 +2630,158 @@ multiline-compatible = """4.5.6"""
     }
 
     #[test]
+    fn command_timeout_boundaries() {
+        let disabled = Duration::from_secs(24 * 60 * 60);
+        let default = Duration::from_millis(30_000);
+
+        // Malformed budgets fall back to the default rather than collapsing to the
+        // 1 ms that `NAN.max(1.0)` produces, which surfaced as a bogus `Timeout(1)`.
+        for malformed in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                BrowserInner::command_timeout(Some(malformed)),
+                default,
+                "{malformed} should fall back to the default budget"
+            );
+        }
+
+        // Explicit non-positive budgets keep their existing "disable" meaning, and a
+        // budget past the sentinel is already indistinguishable from disabled.
+        assert_eq!(BrowserInner::command_timeout(Some(0.0)), disabled);
+        assert_eq!(BrowserInner::command_timeout(Some(-1.0)), disabled);
+        assert_eq!(BrowserInner::command_timeout(Some(1e300)), disabled);
+
+        // Ordinary finite budgets are untouched, sub-millisecond ones still floor at 1 ms.
+        assert_eq!(
+            BrowserInner::command_timeout(Some(0.5)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            BrowserInner::command_timeout(Some(25.0)),
+            Duration::from_millis(25)
+        );
+    }
+
+    fn page_with_unanswered_cdp() -> (RustwrightPage, mpsc::UnboundedReceiver<CdpOutgoing>) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let (events, _) = broadcast::channel(4);
+        let (alive_tx, _) = watch::channel(true);
+        let browser = Arc::new(BrowserInner {
+            runtime: OwnedRuntime::new(runtime),
+            client: Arc::new(CdpClient {
+                write_tx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                events,
+                event_log: Arc::new(Mutex::new(CdpEventLog::new())),
+                next_id: AtomicU64::new(1),
+                sent_runtime_enable_count: AtomicU64::new(0),
+                sent_target_close_count: AtomicU64::new(0),
+                sent_context_dispose_count: AtomicU64::new(0),
+                alive: Arc::new(AtomicBool::new(true)),
+                alive_tx,
+            }),
+            process: Mutex::new(None),
+            profile_dir: Mutex::new(None),
+            owned: false,
+            ws_endpoint: "ws://test.invalid".to_string(),
+            stealth_user_agent_override: Mutex::new(None),
+            single_process_fallback: false,
+            lifecycle: Arc::new(CloseLifecycle::new()),
+            attached_pages: AttachedPageRegistry::default(),
+            next_native_network_index: AtomicU64::new(1),
+        });
+        let page = RustwrightPage {
+            inner: Arc::new(PageInner {
+                browser,
+                target_id: "test-target".to_string(),
+                registry_generation: 0,
+                session_id: "test-session".to_string(),
+                context_id: None,
+                main_frame_id: Mutex::new(None),
+                frame_state: Mutex::new(PageFrameState::new("test-session".to_string())),
+                network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
+                console_records: Mutex::new(ConsoleRecordStore::default()),
+                console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
+                event_stream_start_cursor: 0,
+                background_override_active: Arc::new(AtomicBool::new(false)),
+                screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+                mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+                default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
+                lifecycle: Arc::new(CloseLifecycle::new()),
+                target_closed: AtomicBool::new(false),
+                crashed: AtomicBool::new(false),
+                close_target_on_drop: AtomicBool::new(false),
+            }),
+        };
+        (page, write_rx)
+    }
+
+    fn assert_selection_uses_caller_timeout(
+        helper: &str,
+        operation: impl FnOnce(&RustwrightPage, &CancelToken) -> RwResult<Vec<String>>,
+    ) {
+        const MAX_EXPECTED_ELAPSED: Duration = Duration::from_millis(250);
+        const MUTATION_GUARD: Duration = Duration::from_millis(500);
+
+        let (page, _unanswered_commands) = page_with_unanswered_cdp();
+        let cancel = CancelToken::new();
+        let guard_cancel = cancel.clone();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let guard = std::thread::spawn(move || {
+            if completed_rx.recv_timeout(MUTATION_GUARD).is_err() {
+                let _ = guard_cancel.try_cancel();
+            }
+        });
+
+        let started = Instant::now();
+        let result = operation(&page, &cancel);
+        let elapsed = started.elapsed();
+        let _ = completed_tx.send(());
+        guard.join().unwrap();
+
+        assert!(
+            matches!(result, Err(RwError::Timeout(25))),
+            "{helper} should surface the 25 ms caller timeout, got {result:?}"
+        );
+        assert!(
+            elapsed < MAX_EXPECTED_ELAPSED,
+            "{helper} should honor the caller timeout well before the 30 s default; elapsed {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn select_options_honors_caller_timeout() {
+        assert_selection_uses_caller_timeout("select_options_with_cancel", |page, cancel| {
+            page.select_options_with_cancel(
+                "#never-answers",
+                &["value".to_string()],
+                Some(25.0),
+                Some(cancel),
+            )
+        });
+    }
+
+    #[test]
+    fn select_options_by_value_or_label_honors_caller_timeout() {
+        assert_selection_uses_caller_timeout(
+            "select_options_by_value_or_label_with_cancel",
+            |page, cancel| {
+                page.select_options_by_value_or_label_with_cancel(
+                    "#never-answers",
+                    &["label".to_string()],
+                    Some(25.0),
+                    Some(cancel),
+                )
+            },
+        );
+    }
+
+    #[test]
     fn native_input_timeout_honors_budget_larger_than_thirty_seconds() {
         assert_eq!(
             native_input_timeout(Some(45_000.0)),
@@ -6387,7 +6539,17 @@ impl BrowserInner {
 
     fn command_timeout(timeout_ms: Option<f64>) -> Duration {
         match timeout_ms {
-            Some(ms) if ms <= 0.0 => Duration::from_secs(24 * 60 * 60),
+            // A non-finite budget is malformed input, not a request to wait forever.
+            // Without this arm `f64::NAN.max(1.0)` yields 1.0, so a NaN timeout failed
+            // after a single millisecond instead of using the caller's real budget.
+            //
+            // This deliberately differs from `sanitize_action_timeout_ms`, which maps
+            // non-finite budgets to the 24h sentinel because its deadline machinery needs
+            // a finite value. Neither is a general policy for malformed input; see the
+            // note there.
+            Some(ms) if !ms.is_finite() => Duration::from_millis(30_000),
+            Some(ms) if ms <= 0.0 => DISABLED_ACTION_TIMEOUT,
+            Some(ms) if ms >= DISABLED_ACTION_TIMEOUT_MS => DISABLED_ACTION_TIMEOUT,
             Some(ms) => Duration::from_millis(ms.max(1.0) as u64),
             None => Duration::from_millis(30_000),
         }
@@ -11290,6 +11452,17 @@ fn decode_runtime_serialized_value(value: Value) -> Value {
 const DISABLED_ACTION_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const DISABLED_ACTION_TIMEOUT_MS: f64 = 24.0 * 60.0 * 60.0 * 1_000.0;
 
+/// Clamp a caller budget into a value the native-action deadline machinery can hold.
+///
+/// Non-finite and huge budgets collapse to the 24h sentinel for panic containment, not as a
+/// policy choice: this result feeds `Duration::from_secs_f64`, which panics on NaN and on
+/// values that overflow a `Duration`, and `action_deadline` then has to add it to an
+/// `Instant`. `native_action_timeouts_sanitize_non_finite_and_huge_values` pins that.
+///
+/// So a malformed budget means "wait 24h" here while `BrowserInner::command_timeout` reads
+/// it as "use the 30s default". The divergence is known and deliberately left alone: making
+/// the two agree is a public-boundary validation change — reject non-finite `timeout_ms`
+/// where it enters the API — rather than a rewrite of either sanitizer.
 fn sanitize_action_timeout_ms(timeout_ms: Option<f64>, nonpositive_is_disabled: bool) -> f64 {
     let timeout_ms = timeout_ms.unwrap_or(30_000.0);
     if !timeout_ms.is_finite() || timeout_ms > DISABLED_ACTION_TIMEOUT_MS {
@@ -17664,13 +17837,14 @@ return true;
 
     /// Select options by value and return the resulting values.
     pub fn select_options(&self, selector: &str, values: &[String]) -> RwResult<Vec<String>> {
-        self.select_options_with_cancel(selector, values, None)
+        self.select_options_with_cancel(selector, values, None, None)
     }
 
     pub fn select_options_with_cancel(
         &self,
         selector: &str,
         values: &[String],
+        timeout_ms: Option<f64>,
         cancel: Option<&CancelToken>,
     ) -> RwResult<Vec<String>> {
         let locator_json = selector_to_locator_json(selector)?;
@@ -17696,7 +17870,8 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
 return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value));
 "#
         );
-        let json = self.evaluate_locator_json_cancelable(locator_json, 0, body, None, cancel)?;
+        let json =
+            self.evaluate_locator_json_cancelable(locator_json, 0, body, timeout_ms, cancel)?;
         let selected_json: String = serde_json::from_str(&json)?;
         Ok(serde_json::from_str(&selected_json)?)
     }
@@ -17707,13 +17882,14 @@ return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value)
         selector: &str,
         values: &[String],
     ) -> RwResult<Vec<String>> {
-        self.select_options_by_value_or_label_with_cancel(selector, values, None)
+        self.select_options_by_value_or_label_with_cancel(selector, values, None, None)
     }
 
     pub fn select_options_by_value_or_label_with_cancel(
         &self,
         selector: &str,
         values: &[String],
+        timeout_ms: Option<f64>,
         cancel: Option<&CancelToken>,
     ) -> RwResult<Vec<String>> {
         let locator_json = selector_to_locator_json(selector)?;
@@ -17743,7 +17919,8 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
 return JSON.stringify(Array.from(el.selectedOptions).map(option => option.value));
 "#
         );
-        let json = self.evaluate_locator_json_cancelable(locator_json, 0, body, None, cancel)?;
+        let json =
+            self.evaluate_locator_json_cancelable(locator_json, 0, body, timeout_ms, cancel)?;
         let selected_json: String = serde_json::from_str(&json)?;
         Ok(serde_json::from_str(&selected_json)?)
     }

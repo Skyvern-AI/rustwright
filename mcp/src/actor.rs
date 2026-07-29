@@ -1616,11 +1616,13 @@ impl BrowserState {
         self.dispatch_ref_action(
             target,
             |state| {
+                let remaining = Self::remaining(request)?;
                 state
                     .ensure_page(request)?
-                    .select_options_by_value_or_label_with_cancel(
+                    .select_options_by_value_or_label_with_options_and_cancel(
                         &selector,
                         values,
+                        ActionOptions::timeout(Self::engine_timeout(remaining)),
                         Some(&request.cancellation.engine),
                     )
                     .map_err(|error| {
@@ -1697,9 +1699,10 @@ impl BrowserState {
                 FillFieldKind::Combobox => {
                     let values = [field.value.clone()];
                     self.ensure_page(request)?
-                        .select_options_by_value_or_label_with_cancel(
+                        .select_options_by_value_or_label_with_options_and_cancel(
                             &selector,
                             &values,
+                            options,
                             Some(&request.cancellation.engine),
                         )
                         .map(|_| ())
