@@ -328,6 +328,7 @@ impl CancellationReason {
 struct CommandCancellation {
     reason: AtomicU8,
     engine: CancelToken,
+    detail: Mutex<Option<String>>,
 }
 
 impl CommandCancellation {
@@ -335,24 +336,24 @@ impl CommandCancellation {
         Self {
             reason: AtomicU8::new(CancellationReason::Active as u8),
             engine: CancelToken::new(),
+            detail: Mutex::new(None),
         }
     }
 
     fn cancel(&self, reason: CancellationReason) -> bool {
-        if self.reason() != CancellationReason::Active
-            || self.engine.is_physical_action_committed()
-            || !self.engine.try_cancel()
-        {
-            return false;
-        }
-        self.reason
+        if self
+            .reason
             .compare_exchange(
                 CancellationReason::Active as u8,
                 reason as u8,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             )
-            .is_ok()
+            .is_err()
+        {
+            return false;
+        }
+        self.engine.try_cancel()
     }
 
     fn reason(&self) -> CancellationReason {
@@ -361,6 +362,14 @@ impl CommandCancellation {
 
     fn is_committed(&self) -> bool {
         self.engine.is_physical_action_committed()
+    }
+
+    fn set_detail(&self, detail: String) {
+        *self.detail.lock().unwrap() = Some(detail);
+    }
+
+    fn detail(&self) -> Option<String> {
+        self.detail.lock().unwrap().clone()
     }
 }
 
@@ -447,16 +456,26 @@ impl ActorShared {
         // A successful type owns its result without claiming request-level
         // physical commitment: the dispatched type path remains cancellable
         // between characters, but returns `Ok` only after delivering them all.
+        // A fully successful form fill has the same shape. A form of textboxes,
+        // comboboxes and sliders never commits a physical action, so
+        // `is_committed()` stays false for the whole request; without the
+        // exemption, a cancel or deadline landing while the closing snapshot is
+        // in flight would discard a form that was written completely and
+        // correctly, and report a bare `Cancelled`/`Timeout` with no detail --
+        // the interruption path that sets one is never reached on success.
         if request.cancellation.is_committed()
-            || (result.is_ok() && matches!(&request.op, BrowserOp::Type { .. }))
+            || (result.is_ok()
+                && matches!(&request.op, BrowserOp::Type { .. } | BrowserOp::FillForm(_)))
         {
             result
         } else {
-            request
-                .cancellation
-                .reason()
-                .error(request.timeout_ms)
-                .map_or(result, Err)
+            match request.cancellation.reason().error(request.timeout_ms) {
+                Some(error) => request
+                    .cancellation
+                    .detail()
+                    .map_or(Err(error), |detail| Err(BrowserError::Message(detail))),
+                None => result,
+            }
         }
     }
 
@@ -1640,7 +1659,25 @@ impl BrowserState {
     }
 
     fn fill_form(&mut self, fields: &[FillField], request: &ActorRequest) -> TextResult {
+        let mut completed_fields = Vec::with_capacity(fields.len());
         for field in fields {
+            // Defence in depth, and deliberately not distinguishable by a test.
+            // Once the request is interrupted the engine cancel token is already
+            // tripped, so the next field's `*_with_cancel` call short-circuits
+            // and writes nothing even without this check -- reverting it leaves
+            // every observable identical. It stays because that short-circuit is
+            // a property of the core crate rather than of this loop, and because
+            // without it an interrupted request still reaches `ensure_page`,
+            // which may do work on behalf of a request that is already over.
+            let reason = request.cancellation.reason();
+            if reason != CancellationReason::Active {
+                return Err(Self::fill_form_interruption(
+                    field,
+                    &completed_fields,
+                    reason,
+                    request,
+                ));
+            }
             if !self.current_refs.contains(&field.target) {
                 return Err(BrowserError::Message(format!(
                     "Field {:?} failed: unknown or stale ref {}; call browser_snapshot and use its latest refs",
@@ -1648,72 +1685,136 @@ impl BrowserState {
                 )));
             }
             let selector = format!(r#"[data-mcp-ref="{}"]"#, field.target);
-            let remaining = Self::remaining(request)?;
-            let options = ActionOptions::timeout(Self::engine_timeout(remaining));
-            let result = match field.kind {
-                FillFieldKind::Textbox | FillFieldKind::Slider => self
-                    .ensure_page(request)?
-                    .fill_with_cancel(
-                        &selector,
-                        &field.value,
-                        options,
-                        Some(&request.cancellation.engine),
-                    )
-                    .map(|_| ()),
-                FillFieldKind::Checkbox => match field.value.as_str() {
-                    "true" => self.ensure_page(request)?.check_with_cancel(
-                        &selector,
-                        options,
-                        Some(&request.cancellation.engine),
-                    ),
-                    "false" => self.ensure_page(request)?.uncheck_with_cancel(
-                        &selector,
-                        options,
-                        Some(&request.cancellation.engine),
-                    ),
-                    _ => {
-                        return Err(BrowserError::Message(format!(
-                            "Field {:?} failed: checkbox value must be 'true' or 'false'",
-                            field.name
-                        )));
-                    }
-                },
-                FillFieldKind::Radio => {
-                    if field.value != "true" {
-                        let detail = if field.value == "false" {
-                            "unchecking a radio is not supported"
-                        } else {
-                            "radio value must be 'true'"
-                        };
-                        return Err(BrowserError::Message(format!(
-                            "Field {:?} failed: {detail}",
-                            field.name
-                        )));
-                    }
-                    self.ensure_page(request)?.check_with_cancel(
-                        &selector,
-                        options,
-                        Some(&request.cancellation.engine),
-                    )
-                }
-                FillFieldKind::Combobox => {
-                    let values = [field.value.clone()];
-                    self.ensure_page(request)?
-                        .select_options_by_value_or_label_with_options_and_cancel(
+            let result = (|| -> Result<(), BrowserError> {
+                let remaining = Self::remaining(request)?;
+                let options = ActionOptions::timeout(Self::engine_timeout(remaining));
+                match field.kind {
+                    FillFieldKind::Textbox | FillFieldKind::Slider => self
+                        .ensure_page(request)?
+                        .fill_with_cancel(
                             &selector,
-                            &values,
+                            &field.value,
                             options,
                             Some(&request.cancellation.engine),
                         )
                         .map(|_| ())
+                        .map_err(|error| BrowserError::Message(error.to_string())),
+                    FillFieldKind::Checkbox => match field.value.as_str() {
+                        "true" => self
+                            .ensure_page(request)?
+                            .check_with_cancel(
+                                &selector,
+                                options,
+                                Some(&request.cancellation.engine),
+                            )
+                            .map_err(|error| BrowserError::Message(error.to_string())),
+                        "false" => self
+                            .ensure_page(request)?
+                            .uncheck_with_cancel(
+                                &selector,
+                                options,
+                                Some(&request.cancellation.engine),
+                            )
+                            .map_err(|error| BrowserError::Message(error.to_string())),
+                        _ => Err(BrowserError::Message(
+                            "checkbox value must be 'true' or 'false'".to_owned(),
+                        )),
+                    },
+                    FillFieldKind::Radio => {
+                        if field.value != "true" {
+                            let detail = if field.value == "false" {
+                                "unchecking a radio is not supported"
+                            } else {
+                                "radio value must be 'true'"
+                            };
+                            return Err(BrowserError::Message(detail.to_owned()));
+                        }
+                        self.ensure_page(request)?
+                            .check_with_cancel(
+                                &selector,
+                                options,
+                                Some(&request.cancellation.engine),
+                            )
+                            .map_err(|error| BrowserError::Message(error.to_string()))
+                    }
+                    FillFieldKind::Combobox => {
+                        let values = [field.value.clone()];
+                        self.ensure_page(request)?
+                            .select_options_by_value_or_label_with_options_and_cancel(
+                                &selector,
+                                &values,
+                                options,
+                                Some(&request.cancellation.engine),
+                            )
+                            .map(|_| ())
+                            .map_err(|error| BrowserError::Message(error.to_string()))
+                    }
                 }
-            };
-            result.map_err(|error| {
-                BrowserError::Message(format!("Field {:?} failed: {error}", field.name))
-            })?;
+            })();
+            if let Err(error) = result {
+                let reason = request.cancellation.reason();
+                if reason != CancellationReason::Active {
+                    return Err(Self::fill_form_interruption(
+                        field,
+                        &completed_fields,
+                        reason,
+                        request,
+                    ));
+                }
+                // The budget can expire without `reason()` saying so yet.
+                // `remaining()` reads this thread's clock, while
+                // `CancellationReason::Deadline` is published by the deadline
+                // task on the runtime thread, and nothing orders the two -- so
+                // a field can observe an expired budget while `reason()` still
+                // reads `Active` and the branch above declines to fire. That
+                // `Timeout` arrives here as itself: every engine error above is
+                // converted to `Message`, but `remaining()?` propagates its own
+                // variant untouched. Report it as the deadline it is, or the
+                // partial-fill detail is lost in exactly the case the deadline
+                // is what stopped the fill.
+                if matches!(error, BrowserError::Timeout(_)) {
+                    return Err(Self::fill_form_interruption(
+                        field,
+                        &completed_fields,
+                        CancellationReason::Deadline,
+                        request,
+                    ));
+                }
+                return Err(BrowserError::Message(format!(
+                    "Field {:?} failed: {error}",
+                    field.name
+                )));
+            }
+            completed_fields.push(field.name.as_str());
         }
         self.current_refs.clear();
-        self.snapshot(request)
+        self.committed_post_action_snapshot(request)
+    }
+
+    fn fill_form_interruption(
+        field: &FillField,
+        completed_fields: &[&str],
+        reason: CancellationReason,
+        request: &ActorRequest,
+    ) -> BrowserError {
+        let stopped_by = match reason {
+            CancellationReason::Cancelled => "cancellation",
+            CancellationReason::Deadline => "timeout",
+            CancellationReason::Active => unreachable!(),
+        };
+        let confirmed = if completed_fields.is_empty() {
+            "none".to_owned()
+        } else {
+            completed_fields.join(", ")
+        };
+        let detail = format!(
+            "Partial form fill stopped by {stopped_by} while processing field {:?}; \
+             fields confirmed complete before it: {confirmed}. The stopped field may also \
+             have been written; reconcile it before retrying.",
+            field.name
+        );
+        request.cancellation.set_detail(detail.clone());
+        BrowserError::Message(detail)
     }
 
     fn hover(&mut self, target: &str, request: &ActorRequest) -> TextResult {
@@ -4407,15 +4508,17 @@ mod tests {
         );
 
         // The other way to bypass the helper is to call the cancellable snapshot
-        // directly, which leaves this count short instead. Six committed
-        // physical actions: click, type-with-submit, hover, drag, and press_key
-        // in both its targeted and untargeted forms. A seventh committed tool
-        // should fail here until someone confirms it wants the same treatment.
+        // directly, which leaves this count short instead. Seven committed
+        // paths: click, type-with-submit, hover, drag, press_key in both its
+        // targeted and untargeted forms, and fill_form. Fill_form belongs here
+        // because reaching the end of its loop means every field returned `Ok`,
+        // so a late cancellation must not turn the observation of those writes
+        // into a failed fill.
         assert_eq!(
             production
                 .matches("committed_post_action_snapshot(request)")
                 .count(),
-            6,
+            7,
             "every committed physical action must observe through the helper"
         );
     }
@@ -4584,6 +4687,64 @@ mod tests {
             )
             .await
             .expect("snapshot should succeed after deadline");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deadline_engine_wakeup_before_reason_publication_surfaces_timeout() {
+        let _guard = browser_test_lock().lock().await;
+        let shared = Arc::new(ActorShared::new());
+        let cancellation = Arc::new(CommandCancellation::new());
+        let (reply, _response) = oneshot::channel();
+        shared
+            .submit(ActorRequest {
+                request_id: request_id(67_200),
+                op: BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                cancellation: Arc::clone(&cancellation),
+                deadline: Instant::now(),
+                timeout_ms: 73,
+                reply,
+            })
+            .expect("submit deterministic deadline request");
+        let request = shared.next().expect("take deterministic deadline request");
+
+        // Drive the verified race ordering directly. The worker stands in for
+        // an engine operation waiting on the token: it observes the persistent
+        // engine wake first, but cannot complete until the deadline path has
+        // attempted to publish its request-level reason. No scheduler timing or
+        // sleep determines the ordering in this regression.
+        let engine_awake = Arc::new(std::sync::Barrier::new(2));
+        let finish_engine_error = Arc::new(std::sync::Barrier::new(2));
+        let worker_awake = Arc::clone(&engine_awake);
+        let worker_finish = Arc::clone(&finish_engine_error);
+        let worker_cancellation = Arc::clone(&cancellation);
+        let worker_shared = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            while !worker_cancellation.engine.is_cancelled() {
+                thread::yield_now();
+            }
+            worker_awake.wait();
+            worker_finish.wait();
+            worker_shared.complete::<String>(&request, Err(BrowserError::Cancelled))
+        });
+
+        assert!(
+            cancellation.engine.try_cancel(),
+            "the engine wake must win the initial cancellation arbitration"
+        );
+        engine_awake.wait();
+        let _ = cancellation.cancel(CancellationReason::Deadline);
+        finish_engine_error.wait();
+
+        let result = worker.join().expect("join deterministic engine waiter");
+        assert_eq!(
+            result,
+            Err(BrowserError::Timeout(73)),
+            "a deadline-triggered engine wake must never surface as operator cancellation"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5223,6 +5384,9 @@ mod tests {
         let body = match path {
             "/actionability" => actionability_fixture(),
             "/cancel" => cancellation_fixture(),
+            "/fill-cancel" => fill_cancellation_fixture(),
+            "/fill-final-commit" => fill_final_commit_fixture(),
+            "/fill-nonphysical-cancel" => fill_nonphysical_cancellation_fixture(),
             "/input" => input_fixture(),
             "/atomic-click" => atomic_click_fixture(),
             "/physical" => physical_fixture(),
@@ -5366,6 +5530,132 @@ mod tests {
     });
   }
   fetch('/capture?events=atomic-ready');
+</script>"#
+            .to_owned()
+    }
+
+    fn fill_cancellation_fixture() -> String {
+        r#"<!doctype html>
+<label for="commit-checkbox">Commit checkbox</label>
+<input id="commit-checkbox" type="checkbox">
+<label for="later-01">Later field 01</label>
+<input id="later-01">
+<label for="later-02">Later field 02</label>
+<input id="later-02">
+<label for="later-03">Later field 03</label>
+<input id="later-03">
+<label for="later-04">Later field 04</label>
+<input id="later-04">
+<label for="later-05">Later field 05</label>
+<input id="later-05">
+<label for="later-06">Later field 06</label>
+<input id="later-06">
+<label for="later-07">Later field 07</label>
+<input id="later-07">
+<label for="later-08">Later field 08</label>
+<input id="later-08">
+<label for="later-09">Later field 09</label>
+<input id="later-09">
+<label for="later-10">Later field 10</label>
+<input id="later-10">
+<label for="later-11">Later field 11</label>
+<input id="later-11">
+<label for="later-12">Later field 12</label>
+<input id="later-12">
+<div id="written-fields" role="status">Written fields: none</div>
+<script>
+  const written = [];
+  const renderWritten = () => {
+    document.querySelector('#written-fields').textContent =
+      `Written fields: ${written.join(', ') || 'none'}`;
+  };
+  const checkbox = document.querySelector('#commit-checkbox');
+  checkbox.addEventListener('click', () => {
+    written.push('Commit checkbox');
+    renderWritten();
+    const signal = new XMLHttpRequest();
+    signal.open('GET', '/capture?events=fill-cancel-point', false);
+    signal.send();
+    const releaseWindow = performance.now() + 750;
+    while (performance.now() < releaseWindow) {}
+  });
+  for (let index = 1; index <= 12; index += 1) {
+    const name = `Later field ${String(index).padStart(2, '0')}`;
+    document.querySelector(`#later-${String(index).padStart(2, '0')}`)
+      .addEventListener('input', () => {
+        written.push(name);
+        renderWritten();
+      });
+  }
+  fetch('/capture?events=fill-cancel-ready');
+</script>"#
+            .to_owned()
+    }
+
+    fn fill_final_commit_fixture() -> String {
+        r#"<!doctype html>
+<label for="first-field">First field</label>
+<input id="first-field">
+<label for="final-checkbox">Final checkbox</label>
+<input id="final-checkbox" type="checkbox">
+<div id="written-fields" role="status">Written fields: none</div>
+<script>
+  const written = [];
+  const renderWritten = () => {
+    document.querySelector('#written-fields').textContent =
+      `Written fields: ${written.join(', ') || 'none'}`;
+  };
+  document.querySelector('#first-field').addEventListener('input', () => {
+    written.push('First field');
+    renderWritten();
+  });
+  document.querySelector('#final-checkbox').addEventListener('click', () => {
+    written.push('Final checkbox');
+    renderWritten();
+    const signal = new XMLHttpRequest();
+    signal.open('GET', '/capture?events=fill-final-commit-point', false);
+    signal.send();
+    const releaseWindow = performance.now() + 750;
+    while (performance.now() < releaseWindow) {}
+  });
+  fetch('/capture?events=fill-final-commit-ready');
+</script>"#
+            .to_owned()
+    }
+
+    fn fill_nonphysical_cancellation_fixture() -> String {
+        r#"<!doctype html>
+<label for="field-a">Field A</label>
+<input id="field-a">
+<label for="field-b">Field B</label>
+<input id="field-b">
+<label for="field-c">Field C</label>
+<input id="field-c">
+<div id="written-fields" role="status">Written fields: none</div>
+<script>
+  const written = [];
+  const renderWritten = () => {
+    document.querySelector('#written-fields').textContent =
+      `Written fields: ${written.join(', ') || 'none'}`;
+  };
+  document.querySelector('#field-a').addEventListener('input', () => {
+    written.push('Field A');
+    renderWritten();
+  });
+  document.querySelector('#field-b').addEventListener('input', () => {
+    written.push('Field B');
+    renderWritten();
+    const signal = new XMLHttpRequest();
+    signal.open('GET', '/capture?events=fill-nonphysical-cancel-point', false);
+    signal.send();
+    const releaseWindow = performance.now() + 750;
+    while (performance.now() < releaseWindow) {}
+  });
+  document.querySelector('#field-c').addEventListener('input', () => {
+    written.push('Field C');
+    renderWritten();
+  });
+  fetch('/capture?events=fill-nonphysical-cancel-ready');
 </script>"#
             .to_owned()
     }
@@ -5828,7 +6118,441 @@ mod tests {
             result.contains("Atomic click effect 1"),
             "the post-click snapshot must observe exactly one effect: {result}"
         );
-        assert!(!actor.cancel(&click_id));
+
+        let second_target = snapshot_ref(result, "button", "Atomic click effect 1");
+        let second_click_id = request_id(69_300);
+        let second_click_actor = Arc::clone(&actor);
+        let second_click_request_id = second_click_id.clone();
+        let second_click = tokio::spawn(async move {
+            second_click_actor
+                .execute_with_timeout(
+                    second_click_request_id,
+                    BrowserOp::Click {
+                        target: second_target,
+                        double_click: false,
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+        wait_until_in_flight(&actor, &second_click_id).await;
+        assert_eq!(server.capture(), "atomic-mousedown");
+        assert!(
+            !actor.cancel(&second_click_id),
+            "the second cancellation must also lose physical-action arbitration"
+        );
+        let second_result = second_click
+            .await
+            .expect("join second committed actor click")
+            .expect("a second committed actor click must not report cancellation");
+        let second_result = output_text(&second_result);
+        assert!(
+            second_result.contains("Atomic click effect 2"),
+            "the second click must land exactly once: {second_result}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fill_form_cancel_during_trailing_committed_checkbox_reports_success_with_every_field_written()
+     {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(69_000),
+                BrowserOp::Navigate(server.url("/fill-final-commit")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to trailing committed checkbox fixture");
+        assert_eq!(server.capture(), "fill-final-commit-ready");
+        let snapshot = output_text(&snapshot);
+        let fields = vec![
+            FillField {
+                target: snapshot_ref(snapshot, "textbox", "First field"),
+                name: "First field".to_owned(),
+                kind: FillFieldKind::Textbox,
+                value: "written-before-final".to_owned(),
+            },
+            FillField {
+                target: snapshot_ref(snapshot, "checkbox", "Final checkbox"),
+                name: "Final checkbox".to_owned(),
+                kind: FillFieldKind::Checkbox,
+                value: "true".to_owned(),
+            },
+        ];
+
+        let fill_id = request_id(69_001);
+        let fill_actor = Arc::clone(&actor);
+        let fill_request_id = fill_id.clone();
+        let fill = tokio::spawn(async move {
+            fill_actor
+                .execute_with_timeout(
+                    fill_request_id,
+                    BrowserOp::FillForm(fields),
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+        wait_until_in_flight(&actor, &fill_id).await;
+        assert_eq!(server.capture(), "fill-final-commit-point");
+        assert!(
+            !actor.cancel(&fill_id),
+            "cancellation during the final committed checkbox must lose arbitration"
+        );
+
+        let filled = fill
+            .await
+            .expect("join trailing committed checkbox fill")
+            .expect("a fully written form must report success");
+        let filled = output_text(&filled);
+        assert!(
+            filled.contains(r#"[value="written-before-final"]"#),
+            "{filled}"
+        );
+        assert!(
+            filled.contains(r#"- status "Written fields: First field, Final checkbox""#),
+            "{filled}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fill_form_cancel_during_nonphysical_field_preserves_conservative_partial_detail() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(69_100),
+                BrowserOp::Navigate(server.url("/fill-nonphysical-cancel")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to nonphysical fill cancellation fixture");
+        assert_eq!(server.capture(), "fill-nonphysical-cancel-ready");
+        let snapshot = output_text(&snapshot);
+        let fields = vec![
+            FillField {
+                target: snapshot_ref(snapshot, "textbox", "Field A"),
+                name: "Field A".to_owned(),
+                kind: FillFieldKind::Textbox,
+                value: "confirmed-a".to_owned(),
+            },
+            FillField {
+                target: snapshot_ref(snapshot, "textbox", "Field B"),
+                name: "Field B".to_owned(),
+                kind: FillFieldKind::Textbox,
+                value: "possibly-written-b".to_owned(),
+            },
+            FillField {
+                target: snapshot_ref(snapshot, "textbox", "Field C"),
+                name: "Field C".to_owned(),
+                kind: FillFieldKind::Textbox,
+                value: "must-not-write-c".to_owned(),
+            },
+        ];
+
+        let fill_id = request_id(69_101);
+        let fill_actor = Arc::clone(&actor);
+        let fill_request_id = fill_id.clone();
+        let fill = tokio::spawn(async move {
+            fill_actor
+                .execute_with_timeout(
+                    fill_request_id,
+                    BrowserOp::FillForm(fields),
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+        wait_until_in_flight(&actor, &fill_id).await;
+        assert_eq!(server.capture(), "fill-nonphysical-cancel-point");
+        assert!(
+            actor.cancel(&fill_id),
+            "a nonphysical fill must remain cancellable"
+        );
+
+        let partial = fill
+            .await
+            .expect("join nonphysical cancelled fill")
+            .expect_err("the cancelled fill must report a partial error");
+        let BrowserError::Message(partial) = partial else {
+            panic!("partial detail must survive completion, got {partial:?}");
+        };
+        assert!(
+            partial.contains("stopped by cancellation while processing field \"Field B\""),
+            "{partial}"
+        );
+        assert!(
+            partial.contains("fields confirmed complete before it: Field A"),
+            "{partial}"
+        );
+        assert!(
+            partial.contains("The stopped field may also have been written"),
+            "{partial}"
+        );
+
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(69_102),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("snapshot after nonphysical partial fill");
+        let snapshot = output_text(&snapshot);
+        assert!(snapshot.contains(r#"[value="confirmed-a"]"#), "{snapshot}");
+        assert!(
+            snapshot.contains(r#"[value="possibly-written-b"]"#),
+            "{snapshot}"
+        );
+        assert!(
+            !snapshot.contains(r#"[value="must-not-write-c"]"#),
+            "the field after the cancellation point must never be written: {snapshot}"
+        );
+        assert!(
+            snapshot.contains(r#"- status "Written fields: Field A, Field B""#),
+            "the page must record no write after Field B: {snapshot}"
+        );
+
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(69_103),
+                BrowserOp::Navigate(server.url("/fill-nonphysical-cancel")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("reset actor for first-field cancellation fixture");
+        assert_eq!(server.capture(), "fill-nonphysical-cancel-ready");
+        let snapshot = output_text(&snapshot);
+        let fields = vec![
+            FillField {
+                target: snapshot_ref(snapshot, "textbox", "Field B"),
+                name: "Field B".to_owned(),
+                kind: FillFieldKind::Textbox,
+                value: "possibly-written-first".to_owned(),
+            },
+            FillField {
+                target: snapshot_ref(snapshot, "textbox", "Field C"),
+                name: "Field C".to_owned(),
+                kind: FillFieldKind::Textbox,
+                value: "must-not-write-after-first".to_owned(),
+            },
+        ];
+
+        let fill_id = request_id(69_104);
+        let fill_actor = Arc::clone(&actor);
+        let fill_request_id = fill_id.clone();
+        let fill = tokio::spawn(async move {
+            fill_actor
+                .execute_with_timeout(
+                    fill_request_id,
+                    BrowserOp::FillForm(fields),
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+        wait_until_in_flight(&actor, &fill_id).await;
+        assert_eq!(server.capture(), "fill-nonphysical-cancel-point");
+        assert!(
+            actor.cancel(&fill_id),
+            "a first nonphysical field must remain cancellable"
+        );
+
+        let partial = fill
+            .await
+            .expect("join first-field cancelled fill")
+            .expect_err("the first-field cancellation must report a partial error");
+        let BrowserError::Message(partial) = partial else {
+            panic!("first-field partial detail must survive completion, got {partial:?}");
+        };
+        assert!(
+            partial.contains("stopped by cancellation while processing field \"Field B\""),
+            "{partial}"
+        );
+        assert!(
+            partial.contains("fields confirmed complete before it: none"),
+            "{partial}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fill_form_timeout_between_fields_preserves_partial_detail() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(69_200),
+                BrowserOp::Navigate(server.url("/fill-final-commit")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to between-field timeout fixture");
+        assert_eq!(server.capture(), "fill-final-commit-ready");
+        let snapshot = output_text(&snapshot);
+        let fields = vec![
+            FillField {
+                target: snapshot_ref(snapshot, "checkbox", "Final checkbox"),
+                name: "Final checkbox".to_owned(),
+                kind: FillFieldKind::Checkbox,
+                value: "true".to_owned(),
+            },
+            FillField {
+                target: snapshot_ref(snapshot, "textbox", "First field"),
+                name: "First field".to_owned(),
+                kind: FillFieldKind::Textbox,
+                value: "must-not-write".to_owned(),
+            },
+        ];
+
+        let partial = actor
+            .execute_with_timeout(
+                request_id(69_201),
+                BrowserOp::FillForm(fields),
+                Duration::from_millis(200),
+            )
+            .await
+            .expect_err("the between-field timeout must report a partial error");
+        let BrowserError::Message(partial) = partial else {
+            panic!("between-field timeout must preserve partial detail, got {partial:?}");
+        };
+        assert!(
+            partial.contains("stopped by timeout while processing field \"First field\""),
+            "{partial}"
+        );
+        assert!(
+            partial.contains("fields confirmed complete before it: Final checkbox"),
+            "{partial}"
+        );
+
+        assert_eq!(server.capture(), "fill-final-commit-point");
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(69_202),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("snapshot after between-field timeout");
+        let snapshot = output_text(&snapshot);
+        assert!(
+            !snapshot.contains(r#"[value="must-not-write"]"#),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot.contains(r#"- status "Written fields: Final checkbox""#),
+            "{snapshot}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fill_form_cancel_after_physical_commit_stops_later_fields_and_reports_partial_result()
+    {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(67_100),
+                BrowserOp::Navigate(server.url("/fill-cancel")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to fill cancellation fixture");
+        assert_eq!(server.capture(), "fill-cancel-ready");
+        let snapshot = output_text(&snapshot);
+
+        let mut fields = vec![FillField {
+            target: snapshot_ref(snapshot, "checkbox", "Commit checkbox"),
+            name: "Commit checkbox".to_owned(),
+            kind: FillFieldKind::Checkbox,
+            value: "true".to_owned(),
+        }];
+        for index in 1..=12 {
+            let name = format!("Later field {index:02}");
+            fields.push(FillField {
+                target: snapshot_ref(snapshot, "textbox", &name),
+                name,
+                kind: FillFieldKind::Textbox,
+                value: format!("cancelled-write-{index:02}"),
+            });
+        }
+
+        let fill_id = request_id(67_101);
+        let fill_actor = Arc::clone(&actor);
+        let fill_request_id = fill_id.clone();
+        let fill = tokio::spawn(async move {
+            fill_actor
+                .execute_with_timeout(
+                    fill_request_id,
+                    BrowserOp::FillForm(fields),
+                    Duration::from_secs(10),
+                )
+                .await
+        });
+        wait_until_in_flight(&actor, &fill_id).await;
+        assert_eq!(
+            server.capture(),
+            "fill-cancel-point",
+            "the cancellation point must occur inside the committed checkbox dispatch"
+        );
+        let cancellation_won_current_action = actor.cancel(&fill_id);
+        let fill_result = tokio::time::timeout(Duration::from_secs(5), fill)
+            .await
+            .expect("cancelled fill form should finish promptly")
+            .expect("fill form task should not panic");
+
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(67_102),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("snapshot after partially cancelled fill form");
+        let snapshot = output_text(&snapshot);
+        for index in 1..=12 {
+            let unexpected = format!(r#"[value="cancelled-write-{index:02}"]"#);
+            assert!(
+                !snapshot.contains(&unexpected),
+                "Later field {index:02} was written after cancellation \
+                 (current-action arbitration won={cancellation_won_current_action}):\n{snapshot}"
+            );
+        }
+        assert!(
+            snapshot.contains(r#"- status "Written fields: Commit checkbox""#),
+            "only the already-committed checkbox may be written:\n{snapshot}"
+        );
+
+        let partial = match fill_result {
+            Ok(BrowserOutput::Text(text)) | Err(BrowserError::Message(text)) => text,
+            other => panic!("fill form must report a named partial result, got {other:?}"),
+        };
+        assert!(
+            partial.to_ascii_lowercase().contains("partial") && partial.contains("Commit checkbox"),
+            "partial fill result must name the committed field: {partial}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6057,6 +6781,118 @@ mod tests {
         assert!(
             !type_path.contains("state.snapshot(request)"),
             "completed typing must not return to a cancellable snapshot"
+        );
+    }
+
+    #[test]
+    fn fill_form_expired_budget_reports_the_deadline_before_the_reason_is_published() {
+        // `remaining()` reads the clock on the worker thread; the `Deadline`
+        // reason is published by the deadline task on the runtime thread, and
+        // nothing orders the two. This request reproduces the window between
+        // them exactly: the budget is already spent, but nobody has published a
+        // reason, so `reason()` still says `Active`. The field error path must
+        // still recognise the expiry, or the partial-fill detail is dropped in
+        // precisely the case the deadline is what stopped the fill.
+        let mut state = BrowserState::default();
+        state.current_refs.insert("e1".to_owned());
+        state.current_refs.insert("e2".to_owned());
+        let fields = || {
+            vec![
+                FillField {
+                    target: "e1".to_owned(),
+                    name: "Field A".to_owned(),
+                    kind: FillFieldKind::Textbox,
+                    value: "never-written-a".to_owned(),
+                },
+                FillField {
+                    target: "e2".to_owned(),
+                    name: "Field B".to_owned(),
+                    kind: FillFieldKind::Textbox,
+                    value: "never-written-b".to_owned(),
+                },
+            ]
+        };
+        let (reply, _response) = oneshot::channel();
+        let request = ActorRequest {
+            request_id: request_id(69_106),
+            op: BrowserOp::FillForm(fields()),
+            cancellation: Arc::new(CommandCancellation::new()),
+            deadline: Instant::now(),
+            timeout_ms: 5_000,
+            reply,
+        };
+        assert_eq!(
+            request.cancellation.reason(),
+            CancellationReason::Active,
+            "the window under test is an expired budget with no reason published yet"
+        );
+
+        let error = state
+            .fill_form(&fields(), &request)
+            .expect_err("an expired budget must stop the fill");
+        let message = error.to_string();
+        assert!(
+            message.contains("stopped by timeout while processing field \"Field A\""),
+            "an expired budget must be reported as the timeout it is: {message}"
+        );
+        assert!(
+            message.contains("fields confirmed complete before it: none"),
+            "the partial-fill detail must survive the deadline race: {message}"
+        );
+        assert!(
+            !message.contains("Field \"Field A\" failed:"),
+            "a spent budget is not a field-specific failure: {message}"
+        );
+        assert_eq!(
+            request.cancellation.detail(),
+            Some(message),
+            "the detail must be published so `complete` can substitute it"
+        );
+    }
+
+    #[test]
+    fn complete_keeps_a_fully_written_nonphysical_form_that_a_late_cancel_raced() {
+        // A form of textboxes and comboboxes commits no physical action, so
+        // `is_committed()` stays false for the whole request. The closing
+        // snapshot is a real round trip, so a cancel can land after every field
+        // is written but before the result is handed back. The form is written;
+        // saying it was cancelled would send the caller to reconcile a form
+        // that needs no reconciling.
+        let shared = Arc::new(ActorShared::new());
+        let fill_id = request_id(69_107);
+        let (reply, _response) = oneshot::channel();
+        let fields = vec![FillField {
+            target: "e1".to_owned(),
+            name: "Field A".to_owned(),
+            kind: FillFieldKind::Textbox,
+            value: "written-a".to_owned(),
+        }];
+        shared
+            .submit(ActorRequest {
+                request_id: fill_id.clone(),
+                op: BrowserOp::FillForm(fields),
+                cancellation: Arc::new(CommandCancellation::new()),
+                deadline: Instant::now() + Duration::from_secs(5),
+                timeout_ms: 5_000,
+                reply,
+            })
+            .expect("submit nonphysical fill");
+        let request = shared.next().expect("take nonphysical fill");
+
+        let result: TextResult = Ok("- page snapshot".to_owned());
+        assert!(
+            shared.cancel(&fill_id, CancellationReason::Cancelled),
+            "a form of textboxes must not claim request-level commitment"
+        );
+        assert!(
+            !request.cancellation.is_committed(),
+            "filling textboxes must not set request-level physical commitment"
+        );
+
+        let completed = shared.complete(&request, result);
+        assert!(
+            completed.is_ok(),
+            "a fully written form must not report cancellation: {completed:?}"
         );
     }
 
