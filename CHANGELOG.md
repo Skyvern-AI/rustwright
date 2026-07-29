@@ -35,6 +35,7 @@ All notable user-facing changes to Rustwright are documented in this file.
 - Fixed MCP requests that exceed their deadline, which reported a bare cancellation, leaving callers unable to tell an operator cancel from a budget overrun. They now report a timeout naming the budget.
 - Fixed an interrupted `browser_fill_form` losing the detail of what it had written: the per-field report was replaced at completion by the bare cancellation or timeout error, so the caller was told the request stopped but not where. The detail now survives — including when the budget expires before the deadline is announced, which previously reported the expiry as a field-specific failure — is emitted even when no field completed, and the form's final snapshot is still returned after the deadline so the caller can see the state it must reconcile.
 - Fixed a fully written `browser_fill_form` being reported as cancelled. A form of text, combobox, and slider fields commits no physical action, so a cancellation or deadline arriving while the closing snapshot was in flight discarded the successful result and returned a bare cancellation — sending the caller to reconcile a form that had been written completely and correctly.
+- Fixed key presses and typed text reporting a failure when the browser had already executed the input and only its reply was lost or late, which made a retry press the key twice.
 
 ## [0.1.1] - 2026-07-15
 

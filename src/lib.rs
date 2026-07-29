@@ -2569,36 +2569,43 @@ multiline-compatible = """4.5.6"""
         let token = CancelToken::new();
         let dispatch_token = token.clone();
         let responder = browser.runtime.handle().spawn(async move {
-            let mut cancellation_won = None;
-            loop {
-                let command = match write_rx.recv().await.unwrap() {
-                    CdpOutgoing::Text(payload) => serde_json::from_str::<Value>(&payload).unwrap(),
-                    CdpOutgoing::Close => panic!("unexpected transport close"),
-                };
-                let method = command["method"].as_str().unwrap();
-                let result = match method {
-                    "Page.getFrameTree" => json!({}),
-                    "Runtime.evaluate" => {
-                        json!({ "result": { "type": "boolean", "value": true } })
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                let mut cancellation_won = None;
+                loop {
+                    let command = match write_rx.recv().await.unwrap() {
+                        CdpOutgoing::Text { payload, .. } => {
+                            serde_json::from_str::<Value>(&payload).unwrap()
+                        }
+                        CdpOutgoing::Close => panic!("unexpected transport close"),
+                    };
+                    let method = command["method"].as_str().unwrap();
+                    let result = match method {
+                        "Page.getFrameTree" => json!({}),
+                        "Runtime.evaluate" => {
+                            json!({ "result": { "type": "boolean", "value": true } })
+                        }
+                        "Input.dispatchKeyEvent" => json!({}),
+                        other => panic!("unexpected CDP command: {other}"),
+                    };
+                    let key_up =
+                        method == "Input.dispatchKeyEvent" && command["params"]["type"] == "keyUp";
+                    if method == "Input.dispatchKeyEvent" && command["params"]["type"] == "keyDown"
+                    {
+                        cancellation_won = Some(dispatch_token.try_cancel());
                     }
-                    "Input.dispatchKeyEvent" => json!({}),
-                    other => panic!("unexpected CDP command: {other}"),
-                };
-                let key_up =
-                    method == "Input.dispatchKeyEvent" && command["params"]["type"] == "keyUp";
-                if method == "Input.dispatchKeyEvent" && command["params"]["type"] == "keyDown" {
-                    cancellation_won = Some(dispatch_token.try_cancel());
+                    dispatch_cdp_payload(
+                        json!({ "id": command["id"], "result": result }),
+                        Arc::clone(&pending),
+                        events.clone(),
+                        Arc::clone(&event_log),
+                    );
+                    if key_up {
+                        return cancellation_won;
+                    }
                 }
-                dispatch_cdp_payload(
-                    json!({ "id": command["id"], "result": result }),
-                    Arc::clone(&pending),
-                    events.clone(),
-                    Arc::clone(&event_log),
-                );
-                if key_up {
-                    return cancellation_won;
-                }
-            }
+            })
+            .await
+            .expect("typing responder must finish within five seconds")
         });
 
         let result = page.type_text_with_timeout_and_cancel(
@@ -2621,6 +2628,575 @@ multiline-compatible = """4.5.6"""
         assert!(
             !token.is_physical_action_committed(),
             "typing must not claim request-level physical commitment"
+        );
+    }
+
+    #[test]
+    fn key_press_with_lost_key_down_reply_reports_success() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(4);
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let (alive_tx, _) = watch::channel(true);
+        let client = Arc::new(CdpClient {
+            write_tx,
+            pending: Arc::clone(&pending),
+            events: events.clone(),
+            event_log: Arc::clone(&event_log),
+            next_id: AtomicU64::new(1),
+            sent_runtime_enable_count: AtomicU64::new(0),
+            sent_target_close_count: AtomicU64::new(0),
+            sent_context_dispose_count: AtomicU64::new(0),
+            alive: Arc::new(AtomicBool::new(true)),
+            alive_tx,
+        });
+        let browser = Arc::new(BrowserInner {
+            runtime: OwnedRuntime::new(runtime),
+            client: Arc::clone(&client),
+            process: Mutex::new(None),
+            profile_dir: Mutex::new(None),
+            owned: false,
+            ws_endpoint: "ws://test.invalid".to_string(),
+            stealth_user_agent_override: Mutex::new(None),
+            single_process_fallback: false,
+            lifecycle: Arc::new(CloseLifecycle::new()),
+            attached_pages: AttachedPageRegistry::default(),
+            next_native_network_index: AtomicU64::new(1),
+        });
+        let page = RustwrightPage {
+            inner: Arc::new(PageInner {
+                browser: Arc::clone(&browser),
+                target_id: "test-target".to_string(),
+                registry_generation: 0,
+                session_id: "test-session".to_string(),
+                context_id: None,
+                main_frame_id: Mutex::new(None),
+                frame_state: Mutex::new(PageFrameState::new("test-session".to_string())),
+                network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
+                event_stream_start_cursor: 0,
+                background_override_active: Arc::new(AtomicBool::new(false)),
+                screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+                mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+                default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
+                lifecycle: Arc::new(CloseLifecycle::new()),
+                target_closed: AtomicBool::new(false),
+                crashed: AtomicBool::new(false),
+                close_target_on_drop: AtomicBool::new(false),
+                console_records: Mutex::new(ConsoleRecordStore::default()),
+                console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
+            }),
+        };
+        let responder = browser.runtime.handle().spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                loop {
+                    let command = match write_rx.recv().await.unwrap() {
+                        CdpOutgoing::Text { payload, tracker } => {
+                            if let Some(tracker) = tracker {
+                                assert!(tracker.begin_write());
+                                tracker.finish(true);
+                            }
+                            serde_json::from_str::<Value>(&payload).unwrap()
+                        }
+                        CdpOutgoing::Close => panic!("unexpected transport close"),
+                    };
+                    assert_eq!(command["method"], "Input.dispatchKeyEvent");
+                    let event_type = command["params"]["type"].as_str().unwrap();
+                    let is_base_key_down = matches!(event_type, "keyDown" | "rawKeyDown")
+                        && command["params"]["key"] == "a";
+                    if is_base_key_down {
+                        continue;
+                    }
+                    dispatch_cdp_payload(
+                        json!({ "id": command["id"], "result": {} }),
+                        Arc::clone(&pending),
+                        events.clone(),
+                        Arc::clone(&event_log),
+                    );
+                    if event_type == "keyUp" {
+                        return;
+                    }
+                }
+            })
+            .await
+            .expect("lost-reply responder must finish within five seconds")
+        });
+
+        let result = page.press_key_with_timeout_and_cancel(None, "a", Some(50.0), None);
+        browser.block_on_raw(responder).unwrap();
+
+        assert!(
+            result.is_ok(),
+            "a key-down written to the CDP transport must not be retried when its reply is lost: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_press_with_dropped_modifier_reply_reports_error_without_dispatching_base() {
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(4);
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let (alive_tx, _) = watch::channel(true);
+        let client = CdpClient {
+            write_tx,
+            pending: Arc::clone(&pending),
+            events: events.clone(),
+            event_log: Arc::clone(&event_log),
+            next_id: AtomicU64::new(1),
+            sent_runtime_enable_count: AtomicU64::new(0),
+            sent_target_close_count: AtomicU64::new(0),
+            sent_context_dispose_count: AtomicU64::new(0),
+            alive: Arc::new(AtomicBool::new(true)),
+            alive_tx,
+        };
+
+        let (result, commands) = tokio::join!(
+            dispatch_key_press(
+                &client,
+                "test-session",
+                "Control+a",
+                None,
+                OperationDeadline::new(Duration::from_millis(500)),
+                None,
+            ),
+            async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let modifier_down = match write_rx.recv().await.unwrap() {
+                        CdpOutgoing::Text { payload, .. } => {
+                            serde_json::from_str::<Value>(&payload).unwrap()
+                        }
+                        CdpOutgoing::Close => panic!("unexpected transport close"),
+                    };
+                    let modifier_down_id = modifier_down["id"].as_u64().unwrap();
+                    drop(
+                        pending
+                            .lock()
+                            .unwrap()
+                            .remove(&modifier_down_id)
+                            .expect("modifier reply sender"),
+                    );
+                    let modifier_up = match write_rx.recv().await.unwrap() {
+                        CdpOutgoing::Text { payload, .. } => {
+                            serde_json::from_str::<Value>(&payload).unwrap()
+                        }
+                        CdpOutgoing::Close => panic!("unexpected transport close"),
+                    };
+                    assert_eq!(
+                        modifier_up["params"]["type"], "keyUp",
+                        "a failed modifier must not allow the base key to be enqueued"
+                    );
+                    dispatch_cdp_payload(
+                        json!({ "id": modifier_up["id"], "result": {} }),
+                        Arc::clone(&pending),
+                        events.clone(),
+                        Arc::clone(&event_log),
+                    );
+                    vec![modifier_down, modifier_up]
+                })
+                .await
+                .expect("modifier responder must finish within five seconds")
+            },
+        );
+
+        assert!(
+            matches!(result, Err(RwError::Disconnected)),
+            "an unconfirmed modifier must fail the chord: {result:?}"
+        );
+        assert_eq!(commands[0]["params"]["type"], "rawKeyDown");
+        assert_eq!(commands[0]["params"]["key"], "Control");
+        assert_eq!(commands[1]["params"]["type"], "keyUp");
+        assert_eq!(commands[1]["params"]["key"], "Control");
+        assert!(
+            write_rx.try_recv().is_err(),
+            "the base key must not be sent after an unconfirmed modifier"
+        );
+    }
+
+    #[cfg(unix)]
+    fn read_pipe_messages(
+        mut peer: std::os::unix::net::UnixStream,
+        expected: usize,
+    ) -> Vec<Vec<u8>> {
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut messages = Vec::with_capacity(expected);
+        let mut current = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        while messages.len() < expected {
+            let bytes_read = peer.read(&mut chunk).unwrap();
+            assert!(bytes_read > 0, "pipe closed before all messages arrived");
+            for byte in &chunk[..bytes_read] {
+                if *byte == 0 {
+                    messages.push(std::mem::take(&mut current));
+                    if messages.len() == expected {
+                        break;
+                    }
+                } else {
+                    current.push(*byte);
+                }
+            }
+        }
+        messages
+    }
+
+    #[cfg(unix)]
+    fn fill_pipe_until_blocked(pipe: &mut std::os::unix::net::UnixStream) -> usize {
+        pipe.set_nonblocking(true).unwrap();
+        let filler = [b'x'; 8192];
+        let mut filled = 0;
+        loop {
+            match pipe.write(&filler) {
+                Ok(0) => panic!("pipe accepted a zero-byte write"),
+                Ok(bytes) => filled += bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("failed to fill pipe: {error}"),
+            }
+        }
+        pipe.set_nonblocking(false).unwrap();
+        filled
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn key_press_reports_failure_when_pipe_write_fails_after_enqueue() {
+        let (browser_input, transport_read) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (transport_write, browser_output) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(browser_output);
+        let transport_read_fd: std::os::fd::OwnedFd = transport_read.into();
+        let transport_write_fd: std::os::fd::OwnedFd = transport_write.into();
+        let client = CdpClient::connect_pipe(
+            fs::File::from(transport_read_fd),
+            fs::File::from(transport_write_fd),
+        )
+        .await
+        .unwrap();
+
+        let result = dispatch_key_press(
+            &client,
+            "test-session",
+            "a",
+            None,
+            OperationDeadline::new(Duration::from_millis(100)),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(RwError::Timeout(_) | RwError::Disconnected)),
+            "a command whose pipe write failed must remain a retryable failure: {result:?}"
+        );
+        assert!(
+            !client.is_connected(),
+            "the writer must observe the failed pipe I/O"
+        );
+        drop(browser_input);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipe_writer_lost_key_press_reply_is_written_unconfirmed() {
+        let (browser_input, transport_read) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (transport_write, browser_output) = std::os::unix::net::UnixStream::pair().unwrap();
+        let transport_read_fd: std::os::fd::OwnedFd = transport_read.into();
+        let transport_write_fd: std::os::fd::OwnedFd = transport_write.into();
+        let client = CdpClient::connect_pipe(
+            fs::File::from(transport_read_fd),
+            fs::File::from(transport_write_fd),
+        )
+        .await
+        .unwrap();
+
+        let send_outcome = client
+            .send_with_write_status(
+                "Input.dispatchKeyEvent",
+                json!({ "type": "keyDown", "key": "a" }),
+                Some("test-session"),
+                Duration::from_millis(25),
+            )
+            .await;
+        let messages = tokio::task::spawn_blocking(move || read_pipe_messages(browser_output, 1))
+            .await
+            .unwrap();
+        let command = serde_json::from_slice::<Value>(&messages[0]).unwrap();
+
+        assert_eq!(command["method"], "Input.dispatchKeyEvent");
+        assert!(matches!(&send_outcome.result, Err(RwError::Timeout(25))));
+        assert_eq!(send_outcome.write_status, TransportWriteStatus::Written);
+        let action = resolve_input_action_send(send_outcome, "key-down");
+        assert!(
+            action.result.is_ok(),
+            "a key press written by the pipe writer must not become retryable when its reply is lost: {:?}",
+            action.result
+        );
+        assert_eq!(action.commitment, InputActionCommitment::WrittenUnconfirmed);
+
+        client.close();
+        drop(browser_input);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_queued_command_is_abandoned_before_pipe_writer_reaches_it() {
+        let (browser_input, transport_read) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut transport_write, browser_output) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(fill_pipe_until_blocked(&mut transport_write) > 0);
+        let transport_read_fd: std::os::fd::OwnedFd = transport_read.into();
+        let transport_write_fd: std::os::fd::OwnedFd = transport_write.into();
+        let client = CdpClient::connect_pipe(
+            fs::File::from(transport_read_fd),
+            fs::File::from(transport_write_fd),
+        )
+        .await
+        .unwrap();
+
+        let blocker_state = Arc::new(CdpWriteState::new());
+        let (blocker_ack_tx, _blocker_ack_rx) = oneshot::channel();
+        assert!(client
+            .write_tx
+            .send(CdpOutgoing::Text {
+                payload: "blocker".to_string(),
+                tracker: Some(CdpWriteTracker {
+                    state: Arc::clone(&blocker_state),
+                    ack: blocker_ack_tx,
+                }),
+            })
+            .is_ok());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while blocker_state.load() != CDP_WRITE_WRITING {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the prefilled pipe must hold the first command inside write_all");
+
+        let send_outcome = client
+            .send_with_write_status(
+                "Input.dispatchKeyEvent",
+                json!({ "type": "keyDown", "key": "abandoned-marker" }),
+                Some("test-session"),
+                Duration::from_millis(20),
+            )
+            .await;
+        assert!(matches!(&send_outcome.result, Err(RwError::Timeout(20))));
+        assert_eq!(send_outcome.write_status, TransportWriteStatus::NotWritten);
+        assert!(client
+            .write_tx
+            .send(CdpOutgoing::Text {
+                payload: "sentinel".to_string(),
+                tracker: None,
+            })
+            .is_ok());
+
+        let messages = tokio::task::spawn_blocking(move || read_pipe_messages(browser_output, 2))
+            .await
+            .unwrap();
+        assert!(messages[0].ends_with(b"blocker"));
+        assert_eq!(messages[1], b"sentinel");
+        assert!(
+            messages
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+                .windows(b"abandoned-marker".len())
+                .all(|window| window != b"abandoned-marker"),
+            "an abandoned command must not reach the pipe after the writer resumes"
+        );
+
+        client.close();
+        drop(browser_input);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tracked_input_write_blocked_past_settle_is_indeterminate() {
+        let (browser_input, transport_read) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut transport_write, browser_output) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(fill_pipe_until_blocked(&mut transport_write) > 0);
+        let transport_read_fd: std::os::fd::OwnedFd = transport_read.into();
+        let transport_write_fd: std::os::fd::OwnedFd = transport_write.into();
+        let client = CdpClient::connect_pipe(
+            fs::File::from(transport_read_fd),
+            fs::File::from(transport_write_fd),
+        )
+        .await
+        .unwrap();
+
+        let state = Arc::new(CdpWriteState::new());
+        let observed_state = Arc::clone(&state);
+        let send_outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            let (send_outcome, ()) = tokio::join!(
+                client.send_with_write_status_for_state(
+                    "Input.dispatchKeyEvent",
+                    json!({ "type": "keyDown", "key": "in-flight-marker" }),
+                    Some("test-session"),
+                    Duration::from_millis(20),
+                    state,
+                ),
+                async {
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        while observed_state.load() != CDP_WRITE_WRITING {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("the tracked command must enter write_all");
+                },
+            );
+            send_outcome
+        })
+        .await
+        .expect("the in-flight tracked send must settle within five seconds");
+
+        assert!(matches!(&send_outcome.result, Err(RwError::Timeout(20))));
+        assert_eq!(
+            send_outcome.write_status,
+            TransportWriteStatus::Indeterminate
+        );
+        assert_eq!(observed_state.load(), CDP_WRITE_WRITING);
+        let action = resolve_input_action_send(send_outcome, "key-down");
+        assert!(matches!(action.result, Err(RwError::Timeout(20))));
+        assert_eq!(action.commitment, InputActionCommitment::WrittenUnconfirmed);
+
+        drop(browser_output);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.is_connected() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closing the blocked pipe must stop the writer");
+        client.close();
+        drop(browser_input);
+    }
+
+    #[tokio::test]
+    async fn confirmed_key_down_survives_delay_deadline() {
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(4);
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let (alive_tx, _) = watch::channel(true);
+        let client = CdpClient {
+            write_tx,
+            pending: Arc::clone(&pending),
+            events: events.clone(),
+            event_log: Arc::clone(&event_log),
+            next_id: AtomicU64::new(1),
+            sent_runtime_enable_count: AtomicU64::new(0),
+            sent_target_close_count: AtomicU64::new(0),
+            sent_context_dispose_count: AtomicU64::new(0),
+            alive: Arc::new(AtomicBool::new(true)),
+            alive_tx,
+        };
+
+        let (result, ()) = tokio::join!(
+            dispatch_key_press(
+                &client,
+                "test-session",
+                "a",
+                Some(Duration::from_millis(250)),
+                OperationDeadline::new(Duration::from_millis(100)),
+                None,
+            ),
+            async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let key_down = match write_rx.recv().await.unwrap() {
+                        CdpOutgoing::Text { payload, tracker } => {
+                            let tracker = tracker.expect("key-down write tracker");
+                            assert!(tracker.begin_write());
+                            tracker.finish(true);
+                            serde_json::from_str::<Value>(&payload).unwrap()
+                        }
+                        CdpOutgoing::Close => panic!("unexpected transport close"),
+                    };
+                    dispatch_cdp_payload(
+                        json!({ "id": key_down["id"], "result": {} }),
+                        Arc::clone(&pending),
+                        events.clone(),
+                        Arc::clone(&event_log),
+                    );
+
+                    let key_up = match write_rx.recv().await.unwrap() {
+                        CdpOutgoing::Text { payload, .. } => {
+                            serde_json::from_str::<Value>(&payload).unwrap()
+                        }
+                        CdpOutgoing::Close => panic!("unexpected transport close"),
+                    };
+                    dispatch_cdp_payload(
+                        json!({ "id": key_up["id"], "result": {} }),
+                        Arc::clone(&pending),
+                        events,
+                        event_log,
+                    );
+                })
+                .await
+                .expect("key-delay responder must finish within five seconds");
+            },
+        );
+
+        assert!(
+            result.is_ok(),
+            "a confirmed key-down must remain successful after its delay exhausts the deadline: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_text_with_lost_reply_reports_success_after_write() {
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(4);
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let (alive_tx, _) = watch::channel(true);
+        let client = CdpClient {
+            write_tx,
+            pending,
+            events,
+            event_log,
+            next_id: AtomicU64::new(1),
+            sent_runtime_enable_count: AtomicU64::new(0),
+            sent_target_close_count: AtomicU64::new(0),
+            sent_context_dispose_count: AtomicU64::new(0),
+            alive: Arc::new(AtomicBool::new(true)),
+            alive_tx,
+        };
+
+        let (result, command) = tokio::join!(
+            dispatch_typed_character(
+                &client,
+                "test-session",
+                'é',
+                None,
+                OperationDeadline::new(Duration::from_millis(25)),
+            ),
+            async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    match write_rx.recv().await.unwrap() {
+                        CdpOutgoing::Text { payload, tracker } => {
+                            let tracker = tracker.expect("insertText write tracker");
+                            assert!(tracker.begin_write());
+                            tracker.finish(true);
+                            serde_json::from_str::<Value>(&payload).unwrap()
+                        }
+                        CdpOutgoing::Close => panic!("unexpected transport close"),
+                    }
+                })
+                .await
+                .expect("insertText responder must finish within five seconds")
+            },
+        );
+
+        assert_eq!(command["method"], "Input.insertText");
+        assert_eq!(command["params"]["text"], "é");
+        assert!(
+            result.is_ok(),
+            "insertText written without a reply must not be reported as retryable: {result:?}"
         );
     }
 
@@ -2817,6 +3393,110 @@ multiline-compatible = """4.5.6"""
             ),
             Err(RwError::InvalidInput(message)) if message == "unsupported key"
         ));
+    }
+
+    #[test]
+    fn written_input_timeout_becomes_unconfirmed_commitment() {
+        let rejected = resolve_input_action_send(
+            CdpSendOutcome {
+                result: Err(RwError::Disconnected),
+                write_status: TransportWriteStatus::NotWritten,
+            },
+            "key-down",
+        );
+        assert!(matches!(rejected.result, Err(RwError::Disconnected)));
+        assert_eq!(rejected.commitment, InputActionCommitment::NotCommitted);
+        let written = resolve_input_action_send(
+            CdpSendOutcome {
+                result: Err(RwError::Timeout(25)),
+                write_status: TransportWriteStatus::Written,
+            },
+            "key-down",
+        );
+        assert!(
+            written.result.is_ok(),
+            "a timeout after a confirmed transport write is unconfirmed success, not a retryable failure: {:?}",
+            written.result
+        );
+        assert_eq!(
+            written.commitment,
+            InputActionCommitment::WrittenUnconfirmed
+        );
+    }
+
+    #[test]
+    fn written_input_disconnect_and_cdp_error_stay_failures() {
+        let cdp_error = resolve_input_action_send(
+            CdpSendOutcome {
+                result: Err(RwError::Cdp {
+                    method: "Input.dispatchKeyEvent".to_string(),
+                    message: "key event rejected".to_string(),
+                }),
+                write_status: TransportWriteStatus::Written,
+            },
+            "key-down",
+        );
+        assert!(matches!(
+            cdp_error.result,
+            Err(RwError::Cdp { method, message })
+                if method == "Input.dispatchKeyEvent" && message == "key event rejected"
+        ));
+        assert_eq!(cdp_error.commitment, InputActionCommitment::NotCommitted);
+        let disconnected = resolve_input_action_send(
+            CdpSendOutcome {
+                result: Err(RwError::Disconnected),
+                write_status: TransportWriteStatus::Written,
+            },
+            "key-down",
+        );
+        assert!(
+            matches!(disconnected.result, Err(RwError::Disconnected)),
+            "a disconnect after a transport write must remain a failure"
+        );
+        assert_eq!(disconnected.commitment, InputActionCommitment::NotCommitted);
+    }
+
+    #[tokio::test]
+    async fn indeterminate_input_write_is_written_unconfirmed() {
+        let state = Arc::new(CdpWriteState::new());
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let tracker = CdpWriteTracker {
+            state: Arc::clone(&state),
+            ack: ack_tx,
+        };
+        assert!(tracker.begin_write());
+        tracker.finish(false);
+        assert_eq!(
+            settle_write_status(&state, ack_rx).await,
+            TransportWriteStatus::Indeterminate
+        );
+
+        let resolution = resolve_input_action_send(
+            CdpSendOutcome {
+                result: Err(RwError::Timeout(250)),
+                write_status: TransportWriteStatus::Indeterminate,
+            },
+            "key-down",
+        );
+
+        assert!(matches!(resolution.result, Err(RwError::Timeout(250))));
+        assert_eq!(
+            resolution.commitment,
+            InputActionCommitment::WrittenUnconfirmed
+        );
+
+        let cdp_error = resolve_input_action_send(
+            CdpSendOutcome {
+                result: Err(RwError::Cdp {
+                    method: "Input.dispatchKeyEvent".to_string(),
+                    message: "key event rejected".to_string(),
+                }),
+                write_status: TransportWriteStatus::Indeterminate,
+            },
+            "key-down",
+        );
+        assert!(matches!(cdp_error.result, Err(RwError::Cdp { .. })));
+        assert_eq!(cdp_error.commitment, InputActionCommitment::NotCommitted);
     }
 
     fn chord_shape(key: &str) -> (Vec<String>, i64, String) {
@@ -4120,7 +4800,7 @@ multiline-compatible = """4.5.6"""
                 let mut commands = Vec::new();
                 for _ in 0..2 {
                     let command = match write_rx.recv().await.unwrap() {
-                        CdpOutgoing::Text(payload) => {
+                        CdpOutgoing::Text { payload, .. } => {
                             serde_json::from_str::<Value>(&payload).unwrap()
                         }
                         CdpOutgoing::Close => panic!("unexpected transport close"),
@@ -4184,7 +4864,7 @@ multiline-compatible = """4.5.6"""
                 let mut commands = Vec::new();
                 for _ in 0..14 {
                     let command = match write_rx.recv().await.unwrap() {
-                        CdpOutgoing::Text(payload) => {
+                        CdpOutgoing::Text { payload, .. } => {
                             serde_json::from_str::<Value>(&payload).unwrap()
                         }
                         CdpOutgoing::Close => panic!("unexpected transport close"),
@@ -4266,7 +4946,7 @@ multiline-compatible = """4.5.6"""
                 let mut commands = Vec::new();
                 for index in 0..5 {
                     let command = match write_rx.recv().await.unwrap() {
-                        CdpOutgoing::Text(payload) => {
+                        CdpOutgoing::Text { payload, .. } => {
                             serde_json::from_str::<Value>(&payload).unwrap()
                         }
                         CdpOutgoing::Close => panic!("unexpected transport close"),
@@ -4343,7 +5023,9 @@ multiline-compatible = """4.5.6"""
                     .await
             });
             let create = match write_rx.recv().await.unwrap() {
-                CdpOutgoing::Text(payload) => serde_json::from_str::<Value>(&payload).unwrap(),
+                CdpOutgoing::Text { payload, .. } => {
+                    serde_json::from_str::<Value>(&payload).unwrap()
+                }
                 CdpOutgoing::Close => panic!("unexpected transport close"),
             };
             assert_eq!(create["method"], "Target.createTarget");
@@ -4361,7 +5043,9 @@ multiline-compatible = """4.5.6"""
                 .expect("the orphan target should be closed")
                 .unwrap();
             let close = match close {
-                CdpOutgoing::Text(payload) => serde_json::from_str::<Value>(&payload).unwrap(),
+                CdpOutgoing::Text { payload, .. } => {
+                    serde_json::from_str::<Value>(&payload).unwrap()
+                }
                 CdpOutgoing::Close => panic!("unexpected transport close"),
             };
             assert_eq!(close["method"], "Target.closeTarget");
@@ -4379,7 +5063,9 @@ multiline-compatible = """4.5.6"""
                     .await
             });
             let create = match write_rx.recv().await.unwrap() {
-                CdpOutgoing::Text(payload) => serde_json::from_str::<Value>(&payload).unwrap(),
+                CdpOutgoing::Text { payload, .. } => {
+                    serde_json::from_str::<Value>(&payload).unwrap()
+                }
                 CdpOutgoing::Close => panic!("unexpected transport close"),
             };
             dispatch_cdp_payload(
@@ -5627,8 +6313,93 @@ impl Default for LaunchOptions {
 }
 
 enum CdpOutgoing {
-    Text(String),
+    Text {
+        payload: String,
+        tracker: Option<CdpWriteTracker>,
+    },
     Close,
+}
+
+const CDP_WRITE_QUEUED: u8 = 0;
+const CDP_WRITE_WRITING: u8 = 1;
+const CDP_WRITE_WRITTEN: u8 = 2;
+const CDP_WRITE_FAILED: u8 = 3;
+const CDP_WRITE_ABANDONED: u8 = 4;
+// Once writing starts, settlement is bounded by that one I/O call, not the queue backlog.
+const CDP_WRITE_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How far one queued CDP command has gotten toward the socket.
+///
+/// The sender and the writer race for this cell: the sender claims it when its
+/// deadline expires, the writer claims it just before touching the socket.
+/// Exactly one of them wins, which is what lets a timed-out command be reported
+/// as definitely-not-written instead of maybe-not-written.
+struct CdpWriteState(AtomicU8);
+
+impl CdpWriteState {
+    fn new() -> Self {
+        Self(AtomicU8::new(CDP_WRITE_QUEUED))
+    }
+
+    /// Claims the command for writing. `false` means the sender abandoned it
+    /// first and the writer must skip it.
+    fn begin_write(&self) -> bool {
+        self.0
+            .compare_exchange(
+                CDP_WRITE_QUEUED,
+                CDP_WRITE_WRITING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn finish(&self, written: bool) {
+        self.0.store(
+            if written {
+                CDP_WRITE_WRITTEN
+            } else {
+                CDP_WRITE_FAILED
+            },
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Cancels a command the writer has not started. `false` means it is too
+    /// late — the writer already owns it.
+    fn abandon(&self) -> bool {
+        self.0
+            .compare_exchange(
+                CDP_WRITE_QUEUED,
+                CDP_WRITE_ABANDONED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn load(&self) -> u8 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// The sender's half of the write handshake, carried with the payload.
+struct CdpWriteTracker {
+    state: Arc<CdpWriteState>,
+    ack: oneshot::Sender<()>,
+}
+
+impl CdpWriteTracker {
+    fn begin_write(&self) -> bool {
+        self.state.begin_write()
+    }
+
+    fn finish(self, written: bool) {
+        self.state.finish(written);
+        if written {
+            let _ = self.ack.send(());
+        }
+    }
 }
 
 struct CdpClient {
@@ -5642,6 +6413,23 @@ struct CdpClient {
     sent_context_dispose_count: AtomicU64,
     alive: Arc<AtomicBool>,
     alive_tx: watch::Sender<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransportWriteStatus {
+    /// `NotWritten` is produced only by abandonment or by a command that was
+    /// never enqueued.
+    NotWritten,
+    /// Every byte was handed to the socket.
+    Written,
+    /// The write was still in flight when we stopped waiting, or it failed
+    /// after the socket was already touched.
+    Indeterminate,
+}
+
+struct CdpSendOutcome {
+    result: RwResult<Value>,
+    write_status: TransportWriteStatus,
 }
 
 struct CdpEventLog {
@@ -5892,8 +6680,19 @@ impl CdpClient {
         tokio::spawn(async move {
             while let Some(message) = write_rx.recv().await {
                 match message {
-                    CdpOutgoing::Text(text) => {
-                        if write.send(Message::Text(text.into())).await.is_err() {
+                    CdpOutgoing::Text { payload, tracker } => {
+                        // The sender abandons a command whose deadline expired; skipping it here is
+                        // what makes "not written" a promise rather than a guess.
+                        if let Some(tracker) = &tracker {
+                            if !tracker.begin_write() {
+                                continue;
+                            }
+                        }
+                        let written = write.send(Message::Text(payload.into())).await.is_ok();
+                        if let Some(tracker) = tracker {
+                            tracker.finish(written);
+                        }
+                        if !written {
                             alive_writer.store(false, Ordering::SeqCst);
                             alive_tx_writer.send_replace(false);
                             break;
@@ -5968,10 +6767,20 @@ impl CdpClient {
         tokio::task::spawn_blocking(move || {
             while let Some(message) = write_rx.blocking_recv() {
                 match message {
-                    CdpOutgoing::Text(text) => {
-                        if pipe_write.write_all(text.as_bytes()).is_err()
-                            || pipe_write.write_all(&[0]).is_err()
-                        {
+                    CdpOutgoing::Text { payload, tracker } => {
+                        // The sender abandons a command whose deadline expired; skipping it here is
+                        // what makes "not written" a promise rather than a guess.
+                        if let Some(tracker) = &tracker {
+                            if !tracker.begin_write() {
+                                continue;
+                            }
+                        }
+                        let written = pipe_write.write_all(payload.as_bytes()).is_ok()
+                            && pipe_write.write_all(&[0]).is_ok();
+                        if let Some(tracker) = tracker {
+                            tracker.finish(written);
+                        }
+                        if !written {
                             alive_writer.store(false, Ordering::SeqCst);
                             alive_tx_writer.send_replace(false);
                             break;
@@ -6099,6 +6908,78 @@ impl CdpClient {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> RwResult<Value> {
+        self.send_with_optional_write_tracker(method, params, session_id, timeout, None)
+            .await
+    }
+
+    /// Sends a CDP command and reports whether the payload reached the socket.
+    ///
+    /// Input dispatch needs this because a lost reply means opposite things
+    /// depending on whether the browser ever saw the event.
+    async fn send_with_write_status(
+        &self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+    ) -> CdpSendOutcome {
+        let state = Arc::new(CdpWriteState::new());
+        self.send_with_write_status_for_state(method, params, session_id, timeout, state)
+            .await
+    }
+
+    /// Same as [`Self::send_with_write_status`], but the caller supplies the state
+    /// cell so a test can watch the handshake as it happens.
+    ///
+    /// `state` must be freshly created and used for exactly one command. Sharing a
+    /// cell across two sends would let the first write's `WRITTEN` make the second
+    /// writer skip its payload and still report it as written.
+    async fn send_with_write_status_for_state(
+        &self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+        state: Arc<CdpWriteState>,
+    ) -> CdpSendOutcome {
+        debug_assert_eq!(
+            state.load(),
+            CDP_WRITE_QUEUED,
+            "each command needs its own write state"
+        );
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let result = self
+            .send_with_optional_write_tracker(
+                method,
+                params,
+                session_id,
+                timeout,
+                Some(CdpWriteTracker {
+                    state: Arc::clone(&state),
+                    ack: ack_tx,
+                }),
+            )
+            .await;
+        // A reply of any kind proves the command was written, so the happy path
+        // never waits on the writer.
+        let write_status = match &result {
+            Ok(_) | Err(RwError::Cdp { .. }) => TransportWriteStatus::Written,
+            _ => settle_write_status(&state, ack_rx).await,
+        };
+        CdpSendOutcome {
+            result,
+            write_status,
+        }
+    }
+
+    async fn send_with_optional_write_tracker(
+        &self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+        tracker: Option<CdpWriteTracker>,
+    ) -> RwResult<Value> {
         if !self.is_connected() {
             return Err(RwError::Disconnected);
         }
@@ -6120,7 +7001,10 @@ impl CdpClient {
 
         if self
             .write_tx
-            .send(CdpOutgoing::Text(payload.to_string()))
+            .send(CdpOutgoing::Text {
+                payload: payload.to_string(),
+                tracker,
+            })
             .is_err()
         {
             self.mark_closed();
@@ -6166,7 +7050,14 @@ impl CdpClient {
             format!("{{\"id\":{id},\"method\":{method_json},\"params\":{params_json}}}")
         };
 
-        if self.write_tx.send(CdpOutgoing::Text(payload)).is_err() {
+        if self
+            .write_tx
+            .send(CdpOutgoing::Text {
+                payload,
+                tracker: None,
+            })
+            .is_err()
+        {
             self.mark_closed();
             return Err(RwError::Disconnected);
         }
@@ -6215,7 +7106,14 @@ impl CdpClient {
                 format!("{{\"id\":{id},\"method\":{method_json},\"params\":{params_json}}}")
             };
 
-            if self.write_tx.send(CdpOutgoing::Text(payload)).is_err() {
+            if self
+                .write_tx
+                .send(CdpOutgoing::Text {
+                    payload,
+                    tracker: None,
+                })
+                .is_err()
+            {
                 self.mark_closed();
                 return Err(RwError::Disconnected);
             }
@@ -6238,6 +7136,32 @@ impl CdpClient {
             }
         }
         Ok(results)
+    }
+}
+
+/// Waits just long enough to classify a command whose reply never arrived.
+async fn settle_write_status(
+    state: &CdpWriteState,
+    ack: oneshot::Receiver<()>,
+) -> TransportWriteStatus {
+    // Claiming a still-queued command cancels it, so the caller really is free
+    // to retry.
+    if state.abandon() {
+        return TransportWriteStatus::NotWritten;
+    }
+    match state.load() {
+        CDP_WRITE_WRITTEN => return TransportWriteStatus::Written,
+        CDP_WRITE_FAILED => return TransportWriteStatus::Indeterminate,
+        _ => {}
+    }
+    // The command is inside a single socket write, so this waits on one I/O call
+    // rather than on the writer's whole backlog. A failed write drops the ack,
+    // which wakes us just the same.
+    let _ = tokio::time::timeout(CDP_WRITE_SETTLE_TIMEOUT, ack).await;
+    match state.load() {
+        CDP_WRITE_WRITTEN => TransportWriteStatus::Written,
+        CDP_WRITE_FAILED => TransportWriteStatus::Indeterminate,
+        _ => TransportWriteStatus::Indeterminate,
     }
 }
 
@@ -18677,15 +19601,23 @@ async fn dispatch_typed_character(
 ) -> RwResult<()> {
     if !character.is_ascii() || character.is_ascii_control() {
         let dispatch_timeout = deadline.remaining()?;
-        client
-            .send(
-                "Input.insertText",
-                json!({ "text": character.to_string() }),
-                Some(session_id),
-                dispatch_timeout,
-            )
-            .await?;
-        return wait_input_delay(delay, deadline).await;
+        let action = resolve_input_action_send(
+            client
+                .send_with_write_status(
+                    "Input.insertText",
+                    json!({ "text": character.to_string() }),
+                    Some(session_id),
+                    dispatch_timeout,
+                )
+                .await,
+            "insertText",
+        );
+        action.result?;
+        if let Err(error) = wait_input_delay(delay, deadline).await {
+            debug_assert!(action.commitment.is_committed());
+            eprintln!("rustwright: input delay failed after committed insertText: {error}");
+        }
+        return Ok(());
     }
     dispatch_key_press(
         client,
@@ -18696,6 +19628,77 @@ async fn dispatch_typed_character(
         None,
     )
     .await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputActionCommitment {
+    NotCommitted,
+    Confirmed,
+    /// Written to the transport and unsafe to retry; browser execution is unconfirmed.
+    WrittenUnconfirmed,
+}
+
+impl InputActionCommitment {
+    fn is_committed(self) -> bool {
+        matches!(self, Self::Confirmed | Self::WrittenUnconfirmed)
+    }
+}
+
+struct InputActionResolution {
+    result: RwResult<()>,
+    commitment: InputActionCommitment,
+}
+
+fn resolve_input_action_send(
+    send_outcome: CdpSendOutcome,
+    action_name: &str,
+) -> InputActionResolution {
+    match send_outcome.result {
+        Ok(_) => InputActionResolution {
+            result: Ok(()),
+            commitment: InputActionCommitment::Confirmed,
+        },
+        // The event reached the socket and the connection is still up, so the
+        // browser almost certainly ran it and only the reply went missing.
+        // Reporting a retryable failure here is what makes a caller press twice.
+        Err(error @ RwError::Timeout(_))
+            if send_outcome.write_status == TransportWriteStatus::Written =>
+        {
+            eprintln!(
+                "rustwright: {action_name} was written to the transport, but browser execution is unconfirmed: {error}"
+            );
+            InputActionResolution {
+                result: Ok(()),
+                commitment: InputActionCommitment::WrittenUnconfirmed,
+            }
+        }
+        // The write was already in flight, so this may still reach the browser. The
+        // caller gets an error because it may equally never land, but the commitment
+        // records that a retry is not free.
+        //
+        // A reply of any kind already classifies as written, so a rejection carrying
+        // an in-flight status is unreachable today; the guard keeps this function
+        // honest on its own terms rather than on its caller's.
+        Err(error)
+            if send_outcome.write_status == TransportWriteStatus::Indeterminate
+                && !matches!(&error, RwError::Cdp { .. }) =>
+        {
+            eprintln!(
+                "rustwright: {action_name} may or may not have reached the browser; retrying it may repeat the input: {error}"
+            );
+            InputActionResolution {
+                result: Err(error),
+                commitment: InputActionCommitment::WrittenUnconfirmed,
+            }
+        }
+        // A confirmed browser rejection stays a failure. Buffered bytes can
+        // outlive the browser, and a dead session cannot accept a retry, so a
+        // disconnect stays a failure too.
+        Err(error) => InputActionResolution {
+            result: Err(error),
+            commitment: InputActionCommitment::NotCommitted,
+        },
+    }
 }
 
 struct KeyChord {
@@ -18773,6 +19776,7 @@ async fn dispatch_key_press(
         let mut modifiers = 0_i64;
         let mut attempted_modifiers = Vec::new();
         let mut base_attempted = false;
+        let mut base_commitment = InputActionCommitment::NotCommitted;
         let mut action_result = Ok(());
 
         for (index, (descriptor, mask)) in resolved_modifiers.iter().enumerate() {
@@ -18789,6 +19793,8 @@ async fn dispatch_key_press(
             };
             modifiers |= mask;
             attempted_modifiers.push((descriptor, *mask));
+            // A failed modifier stops before the base event and cleanup releases every
+            // attempted modifier, so retrying only repeats a page-level no-op pair.
             if let Err(error) = client
                 .send(
                     "Input.dispatchKeyEvent",
@@ -18813,33 +19819,43 @@ async fn dispatch_key_press(
             match dispatch_timeout {
                 Ok(dispatch_timeout) => {
                     base_attempted = true;
-                    if let Err(error) = client
-                        .send(
-                            "Input.dispatchKeyEvent",
-                            native_key_event_params(
-                                &base,
-                                if include_text {
-                                    "keyDown"
-                                } else {
-                                    "rawKeyDown"
-                                },
-                                modifiers,
-                                include_text,
-                            ),
-                            Some(session_id),
-                            dispatch_timeout,
-                        )
-                        .await
-                    {
-                        action_result = Err(error);
-                    }
+                    let action = resolve_input_action_send(
+                        client
+                            .send_with_write_status(
+                                "Input.dispatchKeyEvent",
+                                native_key_event_params(
+                                    &base,
+                                    if include_text {
+                                        "keyDown"
+                                    } else {
+                                        "rawKeyDown"
+                                    },
+                                    modifiers,
+                                    include_text,
+                                ),
+                                Some(session_id),
+                                dispatch_timeout,
+                            )
+                            .await,
+                        "key-down",
+                    );
+                    base_commitment = action.commitment;
+                    action_result = action.result;
                 }
                 Err(error) => action_result = Err(error),
             }
         }
 
         if action_result.is_ok() {
-            action_result = wait_input_delay(delay, deadline).await;
+            let delay_result = wait_input_delay(delay, deadline).await;
+            // A spent delay budget cannot make an already-committed chord safe to retry.
+            if base_commitment.is_committed() {
+                if let Err(error) = delay_result {
+                    eprintln!("rustwright: input delay failed after committed key press: {error}");
+                }
+            } else {
+                action_result = delay_result;
+            }
         }
 
         let mut cleanup_errors = Vec::new();
@@ -20086,7 +21102,9 @@ mod native_console_record_tests {
                 .expect("console capture must send Runtime.enable")
                 .expect("CDP writer must remain open");
             let command = match outgoing {
-                CdpOutgoing::Text(payload) => serde_json::from_str::<Value>(&payload).unwrap(),
+                CdpOutgoing::Text { payload, .. } => {
+                    serde_json::from_str::<Value>(&payload).unwrap()
+                }
                 CdpOutgoing::Close => panic!("unexpected transport close"),
             };
             dispatch_cdp_payload(
@@ -20117,7 +21135,9 @@ mod native_console_record_tests {
                 .expect("late iframe capture must send Runtime.enable")
                 .expect("CDP writer must remain open");
             let command = match outgoing {
-                CdpOutgoing::Text(payload) => serde_json::from_str::<Value>(&payload).unwrap(),
+                CdpOutgoing::Text { payload, .. } => {
+                    serde_json::from_str::<Value>(&payload).unwrap()
+                }
                 CdpOutgoing::Close => panic!("unexpected transport close"),
             };
             dispatch_cdp_payload(
