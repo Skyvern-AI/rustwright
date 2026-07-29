@@ -1,6 +1,6 @@
 {
   "name": "rustwright",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "description": "Node.js bindings for Rustwright's Rust CDP core",
   "license": "MIT",
