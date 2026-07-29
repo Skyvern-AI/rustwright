@@ -980,12 +980,28 @@ impl Page {
         values: &[S],
         cancel: Option<&CancelToken>,
     ) -> Result<Vec<String>> {
+        self.select_options_with_options_and_cancel(
+            selector,
+            values,
+            ActionOptions::default(),
+            cancel,
+        )
+    }
+
+    /// Select values with an operation timeout and optional cancellation signal.
+    pub fn select_options_with_options_and_cancel<S: AsRef<str>>(
+        &self,
+        selector: &str,
+        values: &[S],
+        options: ActionOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<String>> {
         let values = values
             .iter()
             .map(|value| value.as_ref().to_string())
             .collect::<Vec<_>>();
         self.inner
-            .select_options_with_cancel(selector, &values, cancel)
+            .select_options_with_cancel(selector, &values, options.timeout, cancel)
     }
 
     /// Select exact values or visible labels in DOM order and return the resulting values.
@@ -1007,12 +1023,32 @@ impl Page {
         values: &[S],
         cancel: Option<&CancelToken>,
     ) -> Result<Vec<String>> {
+        self.select_options_by_value_or_label_with_options_and_cancel(
+            selector,
+            values,
+            ActionOptions::default(),
+            cancel,
+        )
+    }
+
+    /// Select exact values or visible labels with an operation timeout and cancellation.
+    pub fn select_options_by_value_or_label_with_options_and_cancel<S: AsRef<str>>(
+        &self,
+        selector: &str,
+        values: &[S],
+        options: ActionOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<String>> {
         let values = values
             .iter()
             .map(|value| value.as_ref().to_string())
             .collect::<Vec<_>>();
-        self.inner
-            .select_options_by_value_or_label_with_cancel(selector, &values, cancel)
+        self.inner.select_options_by_value_or_label_with_cancel(
+            selector,
+            &values,
+            options.timeout,
+            cancel,
+        )
     }
 
     /// Move Chromium's native mouse to the element center.
