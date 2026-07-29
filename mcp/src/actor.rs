@@ -1,4 +1,5 @@
 use std::{
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
     env, fmt, fs,
     io::Write as _,
@@ -25,6 +26,288 @@ use tokio::sync::oneshot;
 use crate::tools::{ConsoleLevel, NetworkPart};
 
 const SNAPSHOT_JS: &str = include_str!("snapshot.js");
+const BEGIN_SENSITIVE_SNAPSHOT_TRACKING_JS: &str = r#"(input) => {
+  const trackingKey = Symbol.for('rustwright.mcp.sensitiveSnapshot');
+  const tracking = globalThis[trackingKey] || {};
+  if (!(tracking.sensitiveNodes instanceof WeakSet)) {
+    tracking.sensitiveNodes = new WeakSet();
+    tracking.sensitiveNodeRefs = new Set();
+  }
+  if (!(tracking.sensitiveNodeRefs instanceof Set)) tracking.sensitiveNodeRefs = new Set();
+  if (tracking.pending) tracking.pending.stop();
+  delete tracking.pending;
+  globalThis[trackingKey] = tracking;
+
+  const target = document.querySelector(input.selector);
+  const isPassword = target
+    && target.tagName === 'INPUT'
+    && String(target.getAttribute('type') || 'text').toLowerCase() === 'password';
+  if (!isPassword) return false;
+
+  const touched = new Set();
+  const valueBaseline = new Map();
+  const visibilityBaseline = new Map();
+  const isSnapshotVisible = (node) => {
+    for (let current = node; current; current = current.parentElement) {
+      const style = getComputedStyle(current);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      if (current.getAttribute('aria-hidden') === 'true') return false;
+      const rect = current.getBoundingClientRect();
+      if (rect.width <= 0 && rect.height <= 0 && current.tagName !== 'OPTION') return false;
+    }
+    return true;
+  };
+  for (const node of document.querySelectorAll('input, textarea')) {
+    valueBaseline.set(node, String(node.value || ''));
+  }
+  for (const node of document.querySelectorAll('*')) {
+    visibilityBaseline.set(node, isSnapshotVisible(node));
+  }
+  const mark = (node) => {
+    const element = node && node.nodeType === Node.ELEMENT_NODE
+      ? node
+      : node && node.parentElement;
+    if (!element) return;
+    touched.add(element);
+    const liveRegion = element.closest('[role="status"],[role="alert"],[aria-live]');
+    if (liveRegion) touched.add(liveRegion);
+  };
+  const markTree = (node) => {
+    mark(node);
+    if (node && node.querySelectorAll) {
+      for (const descendant of node.querySelectorAll('*')) mark(descendant);
+    }
+  };
+  const record = (mutations) => {
+    for (const mutation of mutations) {
+      mark(mutation.target);
+      if (mutation.type === 'childList') {
+        for (const node of mutation.addedNodes) markTree(node);
+      }
+    }
+  };
+  let observer;
+  let expiry;
+  const stop = () => {
+    observer.disconnect();
+    clearTimeout(expiry);
+  };
+  observer = new MutationObserver(record);
+  observer.observe(document, {
+    subtree: true,
+    childList: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: [
+      'aria-label', 'aria-labelledby', 'alt', 'title', 'placeholder', 'value', 'name', 'for',
+      'href', 'src', 'type', 'role', 'id', 'aria-hidden', 'hidden', 'class', 'style',
+    ],
+  });
+  const pending = {
+    observer,
+    record,
+    touched,
+    valueBaseline,
+    visibilityBaseline,
+    isSnapshotVisible,
+    target,
+    stop,
+  };
+  tracking.pending = pending;
+  // A failed or timed-out caller normally discards this observer explicitly.
+  // Bound its lifetime anyway so an evaluation failure cannot retain touched
+  // elements indefinitely if cleanup cannot reach this document. The caller
+  // supplies its remaining request deadline plus a bounded cleanup grace.
+  expiry = setTimeout(() => {
+    if (tracking.pending !== pending) return;
+    stop();
+    touched.clear();
+    valueBaseline.clear();
+    visibilityBaseline.clear();
+    delete tracking.pending;
+  }, Math.max(1_000, Number(input.expiryMs) || 1_000));
+  return true;
+}"#;
+const RESOLVE_SENSITIVE_SNAPSHOT_TRACKING_JS: &str = r#"(input) => {
+  const trackingKey = Symbol.for('rustwright.mcp.sensitiveSnapshot');
+  const tracking = globalThis[trackingKey];
+  const pending = tracking && tracking.pending;
+  if (!pending) return false;
+
+  pending.observer.disconnect();
+  pending.record(pending.observer.takeRecords());
+  pending.stop();
+  for (const node of document.querySelectorAll('*')) {
+    if (pending.visibilityBaseline.has(node)
+        && pending.visibilityBaseline.get(node) !== pending.isSnapshotVisible(node)) {
+      pending.touched.add(node);
+    }
+  }
+  const ROLE_BY_TAG = {
+    A: 'link', BUTTON: 'button', SELECT: 'combobox', TEXTAREA: 'textbox',
+    H1: 'heading', H2: 'heading', H3: 'heading', H4: 'heading', H5: 'heading',
+    H6: 'heading', IMG: 'img', NAV: 'navigation', MAIN: 'main', HEADER: 'banner',
+    FOOTER: 'contentinfo', FORM: 'form', TABLE: 'table', UL: 'list', OL: 'list',
+    LI: 'listitem', DIALOG: 'dialog', SUMMARY: 'button', LABEL: 'label',
+    OPTION: 'option', ARTICLE: 'article', SECTION: 'region', ASIDE: 'complementary',
+  };
+  const INPUT_ROLES = {
+    button: 'button', submit: 'button', reset: 'button', checkbox: 'checkbox',
+    radio: 'radio', range: 'slider', search: 'searchbox',
+  };
+  const roleOf = (node) => {
+    const explicit = node.getAttribute('role');
+    if (explicit) return explicit;
+    if (node.tagName === 'INPUT') {
+      const type = String(node.getAttribute('type') || 'text').toLowerCase();
+      return INPUT_ROLES[type] || 'textbox';
+    }
+    return ROLE_BY_TAG[node.tagName] || null;
+  };
+  const nameOf = (node) => {
+    const labelled = node.getAttribute('aria-labelledby');
+    if (labelled) {
+      const parts = labelled.split(/\s+/)
+        .map((id) => document.getElementById(id))
+        .filter(Boolean)
+        .map((labelledNode) => labelledNode.textContent.trim());
+      if (parts.length) return parts.join(' ');
+    }
+    const ariaLabel = node.getAttribute('aria-label');
+    if (ariaLabel) return ariaLabel;
+    if (node.labels && node.labels.length) return node.labels[0].textContent.trim();
+    const direct = node.getAttribute('alt') || node.getAttribute('title')
+      || node.getAttribute('placeholder');
+    if (direct) return direct;
+    if (node.tagName === 'INPUT' || node.tagName === 'SELECT' || node.tagName === 'TEXTAREA') {
+      return node.getAttribute('name') || '';
+    }
+    return String(node.textContent || '').trim().replace(/\s+/g, ' ');
+  };
+  const labelledbyConsumers = Array.from(document.querySelectorAll('[aria-labelledby]'));
+  const labelledbyIds = new Set(
+    labelledbyConsumers.flatMap(
+      (consumer) => String(consumer.getAttribute('aria-labelledby') || '')
+        .split(/\s+/)
+        .filter(Boolean),
+    ),
+  );
+  const targetBaseline = pending.valueBaseline.get(pending.target);
+  const targetValue = String(pending.target.value || '');
+  const writeStatus = targetValue.includes(input.value)
+    ? 'complete'
+    : targetBaseline !== undefined && targetValue !== targetBaseline
+      ? 'partial'
+      : 'unchanged';
+  const sensitiveValues = input.value.length > 0 ? [input.value] : [];
+  if (writeStatus === 'partial' && targetValue.length > 0) {
+    sensitiveValues.push(targetValue);
+  }
+  const containsSensitiveValue = (node) => {
+    const tag = node.tagName;
+    const role = roleOf(node);
+    const isPassword = node.tagName === 'INPUT'
+      && String(node.getAttribute('type') || 'text').toLowerCase() === 'password';
+    const values = [];
+    if (tag === 'IFRAME' || tag === 'FRAME') {
+      values.push(node.getAttribute('title') || node.getAttribute('name')
+        || node.getAttribute('src') || '');
+    } else if (role) {
+      values.push(role, nameOf(node));
+      if (tag === 'A') values.push(node.getAttribute('href'));
+      if ((tag === 'INPUT' || tag === 'TEXTAREA') && !isPassword) {
+        values.push(String(node.value || ''));
+      }
+    } else if (node.children.length === 0) {
+      values.push(String(node.textContent || '').trim().replace(/\s+/g, ' '));
+    }
+    if (node.id && labelledbyIds.has(node.id)) {
+      values.push(String(node.textContent || '').trim().replace(/\s+/g, ' '));
+    }
+    return values.some((value) => sensitiveValues.some(
+      (sensitiveValue) => String(value || '').includes(sensitiveValue),
+    ));
+  };
+  const taint = (node) => {
+    if (tracking.sensitiveNodes.has(node)) return;
+    tracking.sensitiveNodes.add(node);
+    tracking.sensitiveNodeRefs.add(new WeakRef(node));
+  };
+  try {
+    // This deliberately catches only exact requested or actually-landed echoes
+    // on renderer-visible candidates affected during the password write.
+    // Transformed or encoded echoes are not detectable without over-redacting
+    // legitimate content.
+    if (sensitiveValues.length > 0) {
+      const candidates = new Set(pending.touched);
+      for (const node of pending.touched) {
+        for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+          if (roleOf(ancestor)
+              || ancestor.tagName === 'IFRAME'
+              || ancestor.tagName === 'FRAME') {
+            candidates.add(ancestor);
+          }
+        }
+      }
+      const touchedNodes = Array.from(pending.touched);
+      for (const consumer of labelledbyConsumers) {
+        const referencesTouchedNode = String(consumer.getAttribute('aria-labelledby') || '')
+          .split(/\s+/)
+          .filter(Boolean)
+          .map((id) => document.getElementById(id))
+          .filter(Boolean)
+          .some((labelledNode) => touchedNodes.some(
+            (touchedNode) => labelledNode === touchedNode || labelledNode.contains(touchedNode),
+          ));
+        if (referencesTouchedNode) candidates.add(consumer);
+      }
+      for (const node of candidates) {
+        if (containsSensitiveValue(node)) taint(node);
+      }
+      const valueCandidates = new Set([
+        ...pending.valueBaseline.keys(),
+        ...document.querySelectorAll('input, textarea'),
+      ]);
+      for (const node of valueCandidates) {
+        // A password field's own value is never rendered, so tainting it buys
+        // nothing and costs its accessible name -- which is the caller's only
+        // handle on the field. A password field whose *name* echoes the secret
+        // is still caught above by containsSensitiveValue.
+        if (node.tagName === 'INPUT'
+            && String(node.getAttribute('type') || 'text').toLowerCase() === 'password') {
+          continue;
+        }
+        const baseline = pending.valueBaseline.get(node);
+        const liveValue = String(node.value || '');
+        if (liveValue !== baseline
+            && sensitiveValues.some((sensitiveValue) => liveValue.includes(sensitiveValue))) {
+          taint(node);
+        }
+      }
+    }
+    return { resolved: true, writeStatus };
+  } finally {
+    pending.touched.clear();
+    pending.valueBaseline.clear();
+    pending.visibilityBaseline.clear();
+    if (tracking.pending === pending) delete tracking.pending;
+  }
+  // Do not keep observing: without retaining input.value, later mutations
+  // cannot be re-classified. The resolved node set persists for this document.
+  // Known limitations: cross-document navigation destroys this document-scoped
+  // state, and main-world page JavaScript can tamper with the Symbol.for global.
+}"#;
+const DISCARD_SENSITIVE_SNAPSHOT_TRACKING_JS: &str = r#"() => {
+  const trackingKey = Symbol.for('rustwright.mcp.sensitiveSnapshot');
+  const tracking = globalThis[trackingKey];
+  const pending = tracking && tracking.pending;
+  if (!pending) return;
+  pending.stop();
+  pending.touched.clear();
+  pending.valueBaseline.clear();
+  pending.visibilityBaseline.clear();
+  if (tracking.pending === pending) delete tracking.pending;
+}"#;
 const FIND_REGEX_JS: &str = r#"(input) => {
   const expression = new RegExp(input.pattern, input.flags);
   return input.lines
@@ -91,6 +374,15 @@ const DEFAULT_CDP_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_TOOL_TIMEOUT_MS: u64 = 60_000;
 const MIN_TOOL_TIMEOUT_MS: u64 = 1_000;
 const MAX_TOOL_TIMEOUT_MS: u64 = 600_000;
+const SENSITIVE_TRACKING_CLEANUP_GRACE_MS: u64 = 5_000;
+/// What a masked secret renders as, for every site that masks one.
+///
+/// The snapshot renderer is JavaScript and cannot read this constant, so it is
+/// passed in as a snapshot option rather than spelled a second time there. The
+/// two sites mask different things -- a password field's value, and a secret
+/// echoed inside a pending dialog's text -- but a caller cannot tell them apart
+/// in the output, so they must not drift.
+const SECRET_MASK: &str = "••••••";
 const ENGINE_TIMEOUT_CUSHION: Duration = Duration::from_secs(1);
 const MAX_FILE_INPUTS: usize = 50;
 const MAX_FILE_INPUT_BYTES: u64 = 20 * 1024 * 1024;
@@ -300,6 +592,13 @@ pub(crate) type BrowserResult = Result<BrowserOutput, BrowserError>;
 type TextResult = Result<String, BrowserError>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SensitiveWriteProgress {
+    Unchanged,
+    Partial,
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 enum CancellationReason {
     Active = 0,
@@ -453,16 +752,10 @@ impl ActorShared {
         {
             queue.in_flight.take();
         }
-        // A successful type owns its result without claiming request-level
-        // physical commitment: the dispatched type path remains cancellable
-        // between characters, but returns `Ok` only after delivering them all.
-        // A fully successful form fill has the same shape. A form of textboxes,
-        // comboboxes and sliders never commits a physical action, so
-        // `is_committed()` stays false for the whole request; without the
-        // exemption, a cancel or deadline landing while the closing snapshot is
-        // in flight would discard a form that was written completely and
-        // correctly, and report a bare `Cancelled`/`Timeout` with no detail --
-        // the interruption path that sets one is never reached on success.
+        // Successful text-write tools own their truthful complete/partial
+        // result without claiming request-level physical commitment. Their
+        // dispatched paths remain cancellable, but return `Ok` after checking
+        // live write progress and resolving password taint.
         if request.cancellation.is_committed()
             || (result.is_ok()
                 && matches!(&request.op, BrowserOp::Type { .. } | BrowserOp::FillForm(_)))
@@ -633,6 +926,10 @@ impl BrowserActor {
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn sensitive_tracking_expiry_ms(remaining: Duration) -> u64 {
+    duration_millis(remaining).saturating_add(SENSITIVE_TRACKING_CLEANUP_GRACE_MS)
 }
 
 fn tool_timeout_from_env() -> Duration {
@@ -807,7 +1104,24 @@ impl BrowserState {
     }
 
     fn ensure_page(&mut self, request: &ActorRequest) -> Result<&Page, BrowserError> {
-        if !request.cancellation.is_committed()
+        self.ensure_page_for(request, false)
+    }
+
+    /// `committed_observation` marks a call that only observes state a committed
+    /// action already produced.
+    ///
+    /// The engine raises its own physical-action-committed flag for pointer and key
+    /// input, but a landed text write never raises it. Without this the request-level
+    /// cancellation gate rejects the post-action snapshot before its grace budget is
+    /// consulted, so a write that lands at the deadline can never return the masked
+    /// state `capture_committed_action_state` promises.
+    fn ensure_page_for(
+        &mut self,
+        request: &ActorRequest,
+        committed_observation: bool,
+    ) -> Result<&Page, BrowserError> {
+        if !committed_observation
+            && !request.cancellation.is_committed()
             && let Some(error) = request.cancellation.reason().error(request.timeout_ms)
         {
             return Err(error);
@@ -957,6 +1271,14 @@ impl BrowserState {
         }
     }
 
+    /// Render the pending modals as a caller-facing notice.
+    ///
+    /// This renders stored text verbatim, and deliberately takes no secret. A
+    /// dialog carrying one is masked in `pending_dialog` before any render
+    /// reaches it, so the guarantee holds for the lifetime of the dialog rather
+    /// than for one reply -- see [`Self::redact_pending_dialogs`]. Masking here
+    /// as well would be a second implementation of the same rule that no
+    /// reachable route exercises, free to drift from the first.
     fn modal_response(&mut self, result: &str, _request: &ActorRequest) -> String {
         self.poll_events();
         let active_target = self.page.as_ref().map(Page::target_id);
@@ -975,10 +1297,11 @@ impl BrowserState {
                 } else {
                     "Registered tab"
                 };
+                let message = &pending.message;
                 lines.push(format!(
                     "- {owner}: Dialog pending: type={}; message={:?}. Call browser_handle_dialog.",
                     Self::dialog_kind_name(&pending.kind),
-                    pending.message
+                    message
                 ));
             }
             if let Some(pending) = &runtime.pending_file_chooser {
@@ -1001,6 +1324,28 @@ impl BrowserState {
             result.to_owned()
         } else {
             format!("{result}\n\n### Modal\n{}", lines.join("\n"))
+        }
+    }
+
+    /// Mask a secret inside every stored pending-dialog message.
+    ///
+    /// Redacting only the writing tool's own reply protects one response. The
+    /// message itself stays in the page runtime until `browser_handle_dialog`
+    /// retires it, and every other tool is fronted by the generic modal gate,
+    /// which renders that stored text with no secret in hand -- so a plain
+    /// `browser_snapshot` issued while the dialog is still up would hand back
+    /// verbatim what the write had just masked. Masking at the point of storage
+    /// is what makes the guarantee hold for the lifetime of the dialog instead
+    /// of for a single reply, and it holds for readers added later without
+    /// their having to know a secret was involved.
+    fn redact_pending_dialogs(&mut self, sensitive_value: &str) {
+        if sensitive_value.is_empty() {
+            return;
+        }
+        for runtime in self.pages.values_mut() {
+            if let Some(pending) = runtime.pending_dialog.as_mut() {
+                pending.message = pending.message.replace(sensitive_value, SECRET_MASK);
+            }
         }
     }
 
@@ -1152,6 +1497,8 @@ impl BrowserState {
             None,
             false,
             Some(&request.cancellation.engine),
+            None,
+            None,
         )
     }
 
@@ -1175,6 +1522,8 @@ impl BrowserState {
             depth,
             boxes,
             Some(&request.cancellation.engine),
+            None,
+            None,
         )
     }
 
@@ -1183,21 +1532,92 @@ impl BrowserState {
         request: &ActorRequest,
         cancel: Option<&CancelToken>,
     ) -> TextResult {
-        self.snapshot_options(request, None, None, false, cancel)
+        let committed_budget = cancel
+            .is_none()
+            .then_some(Duration::from_millis(SENSITIVE_TRACKING_CLEANUP_GRACE_MS));
+        self.snapshot_options(request, None, None, false, cancel, committed_budget, None)
+    }
+
+    fn snapshot_with_sensitive_modal_redaction(
+        &mut self,
+        sensitive_value: &str,
+        request: &ActorRequest,
+    ) -> TextResult {
+        self.snapshot_options(
+            request,
+            None,
+            None,
+            false,
+            None,
+            Some(Duration::from_millis(SENSITIVE_TRACKING_CLEANUP_GRACE_MS)),
+            Some(sensitive_value),
+        )
     }
 
     // The post-action snapshot of a committed physical action is an OBSERVATION,
     // not part of the action. Passing `None` for the cancel token keeps a late
-    // cancel from killing it, but the snapshot still consults the request
-    // deadline, so an action that commits just before the deadline would report
-    // `Timeout` for a key press the page has already processed -- exactly the
-    // failure mode committed-action semantics exist to prevent, arriving through
-    // the deadline instead of through cancellation. Callers reach the
-    // post-snapshot only after the action returned `Ok`, so the degradation in
-    // `committed_snapshot_result` is always applied to an action that already
-    // succeeded.
-    fn committed_post_action_snapshot(&mut self, request: &ActorRequest) -> TextResult {
+    // cancel from killing it. It receives the same bounded grace used for
+    // sensitive cleanup so a write that lands at the request deadline can still
+    // return its masked state. Callers reach the post-snapshot only after an
+    // action completed or live progress was observed, so any degradation in
+    // `committed_snapshot_result` applies to state the page may already contain.
+    fn capture_committed_action_state(&mut self, request: &ActorRequest) -> TextResult {
         committed_snapshot_result(self.snapshot_with_cancel(request, None))
+    }
+
+    fn committed_post_action_snapshot(&mut self, request: &ActorRequest) -> TextResult {
+        self.capture_committed_action_state(request)
+    }
+
+    fn committed_sensitive_post_action_snapshot(
+        &mut self,
+        sensitive_value: &str,
+        request: &ActorRequest,
+    ) -> TextResult {
+        // Both steps below evaluate in the page, so a dialog opened by the write
+        // itself blocks either one. The resolve runs first and fails first, which
+        // is why the modal check has to cover both rather than sitting after a
+        // `?` on the resolve.
+        // The resolved progress only matters on the error paths that have to
+        // classify how much of the write landed; here the write already returned
+        // `Ok`, so the resolve is called for the taints it applies.
+        let snapshot = self
+            .resolve_sensitive_snapshot_tracking(sensitive_value, request)
+            .and_then(|_progress| {
+                self.snapshot_with_sensitive_modal_redaction(sensitive_value, request)
+            });
+        // A dialog opened by the write races the modal check at the top of
+        // `snapshot_options`: the renderer blocks before the CDP dialog event has
+        // been polled in, so the attempt evaluates into the block and can only
+        // fail. Re-check once it returns, the same way the click path does, so the
+        // caller gets the redacted modal notice instead of a bare capture failure,
+        // and the secret the dialog is displaying is masked while the value is
+        // still in hand.
+        //
+        // Taint resolution cannot have run in that case -- the renderer stays
+        // blocked until the dialog is handled, and the secret is not retained past
+        // this call -- so an echo left in the DOM is not masked in a snapshot taken
+        // after `browser_handle_dialog`. That is the same point-in-time limit
+        // documented for echoes appearing after the resolve, reached by a different
+        // route, and it is why the dialog message itself is redacted here rather
+        // than left to the snapshot renderer.
+        if self.has_pending_modal() {
+            // Mask the stored message, not just the reply below. This is the
+            // only moment the secret and the dialog are both in hand: the
+            // message outlives this call, and the generic modal gate that
+            // fronts every other tool renders it knowing nothing about
+            // secrets. Redacting here is what stops a plain `browser_snapshot`
+            // issued before `browser_handle_dialog` from handing back verbatim
+            // what this write just masked.
+            self.redact_pending_dialogs(sensitive_value);
+            if snapshot.is_err() {
+                return Ok(self.modal_response(
+                    "Snapshot deferred until the pending modal is handled.",
+                    request,
+                ));
+            }
+        }
+        committed_snapshot_result(snapshot)
     }
 
     fn snapshot_options(
@@ -1207,26 +1627,44 @@ impl BrowserState {
         depth: Option<u32>,
         boxes: bool,
         cancel: Option<&CancelToken>,
+        remaining_override: Option<Duration>,
+        sensitive_value: Option<&str>,
     ) -> TextResult {
         if self.has_pending_modal() {
+            // A dialog opened after taint resolution returned reaches this gate
+            // before the caller's own post-action modal check, so the secret is
+            // masked in storage here too rather than only in the reply. Both
+            // sites call the one masking rule; neither renders its own.
+            if let Some(value) = sensitive_value {
+                self.redact_pending_dialogs(value);
+            }
             return Ok(self.modal_response(
                 "Snapshot deferred until the pending modal is handled.",
                 request,
             ));
         }
         let start_ref = self.next_ref.max(1);
-        let remaining = Self::remaining(request)?;
-        let result = self.ensure_page(request)?.evaluate_with_cancel(
-            SNAPSHOT_JS,
-            Some(&json!({
-                "startRef": start_ref,
-                "target": target.map(|target| format!(r#"[data-mcp-ref="{target}"]"#)),
-                "maxDepth": depth,
-                "boxes": boxes,
-            })),
-            ActionOptions::timeout(Self::engine_timeout(remaining)),
-            cancel,
-        );
+        let remaining = match remaining_override {
+            Some(remaining) => remaining,
+            None => Self::remaining(request)?,
+        };
+        // A `remaining_override` is only ever supplied by the committed post-action
+        // path, which also passes no cancel token; both say the same thing, that this
+        // snapshot observes an action that already landed.
+        let result = self
+            .ensure_page_for(request, remaining_override.is_some())?
+            .evaluate_with_cancel(
+                SNAPSHOT_JS,
+                Some(&json!({
+                    "startRef": start_ref,
+                    "target": target.map(|target| format!(r#"[data-mcp-ref="{target}"]"#)),
+                    "maxDepth": depth,
+                    "boxes": boxes,
+                    "mask": SECRET_MASK,
+                })),
+                ActionOptions::timeout(Self::engine_timeout(remaining)),
+                cancel,
+            );
         let value = result.map_err(|error| {
             self.operation_error(
                 "snapshot evaluation failed",
@@ -1263,6 +1701,108 @@ impl BrowserState {
             .unwrap_or_else(|| (start_ref..next_ref).map(|n| format!("e{n}")).collect());
         self.next_ref = next_ref;
         Ok(outline)
+    }
+
+    fn begin_sensitive_snapshot_tracking(
+        &mut self,
+        selector: &str,
+        target: &str,
+        request: &ActorRequest,
+    ) -> Result<bool, BrowserError> {
+        let remaining = Self::remaining(request)?;
+        let result = self.ensure_page(request)?.evaluate_with_cancel(
+            BEGIN_SENSITIVE_SNAPSHOT_TRACKING_JS,
+            Some(&json!({
+                "selector": selector,
+                "expiryMs": sensitive_tracking_expiry_ms(remaining),
+            })),
+            ActionOptions::timeout(Self::engine_timeout(remaining)),
+            Some(&request.cancellation.engine),
+        );
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => {
+                let error = self.operation_error(
+                    &format!("sensitive snapshot tracking failed for {target}"),
+                    error,
+                    &request.cancellation,
+                    request.timeout_ms,
+                );
+                // The page function may have installed its observer before the
+                // evaluation timed out or was cancelled.
+                self.discard_sensitive_snapshot_tracking();
+                return Err(error);
+            }
+        };
+        match value.as_bool() {
+            Some(tracks_password) => Ok(tracks_password),
+            None => {
+                self.discard_sensitive_snapshot_tracking();
+                Err(BrowserError::Message(
+                    "sensitive snapshot tracking returned no password state".to_owned(),
+                ))
+            }
+        }
+    }
+
+    fn resolve_sensitive_snapshot_tracking(
+        &mut self,
+        sensitive_value: &str,
+        request: &ActorRequest,
+    ) -> Result<SensitiveWriteProgress, BrowserError> {
+        let page = self.page.as_ref().ok_or_else(|| {
+            BrowserError::Message(
+                "sensitive snapshot tracking resolution found no active page".to_owned(),
+            )
+        })?;
+        let result = page.evaluate_with_cancel(
+            RESOLVE_SENSITIVE_SNAPSHOT_TRACKING_JS,
+            Some(&json!({ "value": sensitive_value })),
+            // The password write has already committed. Resolution is cleanup
+            // for that committed write and must still run when a later submit
+            // or form step exhausted the request's original deadline.
+            ActionOptions::timeout(1_000.0),
+            None,
+        );
+        let value = result.map_err(|error| {
+            self.operation_error(
+                "sensitive snapshot tracking resolution failed",
+                error,
+                &request.cancellation,
+                request.timeout_ms,
+            )
+        })?;
+        if value.get("resolved").and_then(Value::as_bool) != Some(true) {
+            return Err(BrowserError::Message(
+                "sensitive snapshot tracking was no longer available".to_owned(),
+            ));
+        }
+        match value.get("writeStatus").and_then(Value::as_str) {
+            Some("complete") => Ok(SensitiveWriteProgress::Complete),
+            Some("partial") => Ok(SensitiveWriteProgress::Partial),
+            Some("unchanged") => Ok(SensitiveWriteProgress::Unchanged),
+            _ => Err(BrowserError::Message(
+                "sensitive snapshot tracking returned no write status".to_owned(),
+            )),
+        }
+    }
+
+    fn discard_sensitive_snapshot_tracking(&mut self) {
+        let Some(page) = self.page.as_ref() else {
+            return;
+        };
+        if let Err(error) = page.evaluate_with_cancel(
+            DISCARD_SENSITIVE_SNAPSHOT_TRACKING_JS,
+            None,
+            ActionOptions::timeout(1_000.0),
+            None,
+        ) {
+            // Cleanup is best-effort because the document may already be gone.
+            // If it is still alive but temporarily unreachable, the observer's
+            // page-side expiry bounds retained nodes to the request deadline
+            // plus a short cleanup grace.
+            eprintln!("browser actor: sensitive snapshot tracking cleanup failed: {error}");
+        }
     }
 
     fn find(
@@ -1550,78 +2090,142 @@ impl BrowserState {
         request: &ActorRequest,
     ) -> TextResult {
         let selector = format!(r#"[data-mcp-ref="{target}"]"#);
+        let tracks_sensitive_value = Cell::new(false);
+        let write_completed = Cell::new(false);
+        let write_partially_completed = Cell::new(false);
+        let sensitive_tracking_resolved = Cell::new(false);
+        let post_write_error = RefCell::new(None);
         self.dispatch_ref_action(
             target,
             |state| {
-                let remaining = Self::remaining(request)?;
-                let options = ActionOptions::timeout(Self::engine_timeout(remaining));
-                let page = state.ensure_page(request)?.clone();
-                let result = if clear && !slowly {
-                    page.fill_with_cancel(
-                        &selector,
-                        text,
-                        options,
-                        Some(&request.cancellation.engine),
-                    )
-                } else {
-                    if clear {
+                let tracks_password =
+                    state.begin_sensitive_snapshot_tracking(&selector, target, request)?;
+                tracks_sensitive_value.set(tracks_password);
+                let result = (|| {
+                    let remaining = Self::remaining(request)?;
+                    let options = ActionOptions::timeout(Self::engine_timeout(remaining));
+                    let page = state.ensure_page(request)?.clone();
+                    let result = if clear && !slowly {
                         page.fill_with_cancel(
                             &selector,
-                            "",
+                            text,
                             options,
                             Some(&request.cancellation.engine),
                         )
-                        .map_err(|error| {
-                            state.operation_error(
-                                &format!("clear failed for {target}"),
-                                error,
-                                &request.cancellation,
-                                request.timeout_ms,
+                    } else {
+                        if clear {
+                            page.fill_with_cancel(
+                                &selector,
+                                "",
+                                options,
+                                Some(&request.cancellation.engine),
                             )
-                        })?;
-                    }
-                    let typing_budget = Self::remaining(request)?;
-                    page.type_text_with_options_and_cancel(
-                        &selector,
-                        text,
-                        slowly.then_some(Duration::from_millis(50)),
-                        ActionOptions::timeout(Self::engine_timeout(typing_budget)),
-                        Some(&request.cancellation.engine),
-                    )
-                };
-                result.map_err(|error| {
-                    state.operation_error(
-                        &format!("type failed for {target}"),
-                        error,
-                        &request.cancellation,
-                        request.timeout_ms,
-                    )
-                })?;
-                if submit {
-                    let submit_budget = Self::remaining(request)?;
-                    state
-                        .ensure_page(request)?
-                        .press_key_with_options_and_cancel(
-                            Some(&selector),
-                            "Enter",
-                            ActionOptions::timeout(Self::engine_timeout(submit_budget)),
+                            .map_err(|error| {
+                                state.operation_error(
+                                    &format!("clear failed for {target}"),
+                                    error,
+                                    &request.cancellation,
+                                    request.timeout_ms,
+                                )
+                            })?;
+                        }
+                        let typing_budget = Self::remaining(request)?;
+                        page.type_text_with_options_and_cancel(
+                            &selector,
+                            text,
+                            slowly.then_some(Duration::from_millis(50)),
+                            ActionOptions::timeout(Self::engine_timeout(typing_budget)),
                             Some(&request.cancellation.engine),
                         )
-                        .map_err(|error| {
-                            state.operation_error(
-                                &format!("submit failed for {target}"),
-                                error,
-                                &request.cancellation,
-                                request.timeout_ms,
+                    };
+                    result.map_err(|error| {
+                        state.operation_error(
+                            &format!("type failed for {target}"),
+                            error,
+                            &request.cancellation,
+                            request.timeout_ms,
+                        )
+                    })?;
+                    write_completed.set(true);
+                    if submit {
+                        let submit_budget = Self::remaining(request)?;
+                        state
+                            .ensure_page(request)?
+                            .press_key_with_options_and_cancel(
+                                Some(&selector),
+                                "Enter",
+                                ActionOptions::timeout(Self::engine_timeout(submit_budget)),
+                                Some(&request.cancellation.engine),
                             )
-                        })?;
+                            .map_err(|error| {
+                                state.operation_error(
+                                    &format!("submit failed for {target}"),
+                                    error,
+                                    &request.cancellation,
+                                    request.timeout_ms,
+                                )
+                            })?;
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Err(error) if write_completed.get() => {
+                        post_write_error.replace(Some(error));
+                        Ok(())
+                    }
+                    Err(error) if tracks_password => {
+                        match state.resolve_sensitive_snapshot_tracking(text, request) {
+                            Ok(progress) => {
+                                sensitive_tracking_resolved.set(true);
+                                match progress {
+                                    SensitiveWriteProgress::Complete => {
+                                        write_completed.set(true);
+                                        post_write_error.replace(Some(error));
+                                        Ok(())
+                                    }
+                                    SensitiveWriteProgress::Partial => {
+                                        write_partially_completed.set(true);
+                                        post_write_error.replace(Some(error));
+                                        Ok(())
+                                    }
+                                    SensitiveWriteProgress::Unchanged => Err(error),
+                                }
+                            }
+                            Err(_) => {
+                                // The resolver may itself have timed out after
+                                // running in the document. Retry ephemerally in
+                                // the committed post-action path and leave its
+                                // deadline-derived expiry armed if unreachable.
+                                write_partially_completed.set(true);
+                                post_write_error.replace(Some(error));
+                                Ok(())
+                            }
+                        }
+                    }
+                    Err(error) => Err(error),
+                    Ok(()) => Ok(()),
                 }
-                Ok(())
             },
-            // Reaching the post-action snapshot proves that fill/type and the
-            // optional submit all returned `Ok`; cancellation after that point
-            // is too late to relabel the completed type as failed.
-            |state| state.committed_post_action_snapshot(request),
+            |state| {
+                let snapshot = if tracks_sensitive_value.get() && !sensitive_tracking_resolved.get()
+                {
+                    state.committed_sensitive_post_action_snapshot(text, request)
+                } else {
+                    state.committed_post_action_snapshot(request)
+                };
+                if let Some(error) = post_write_error.borrow_mut().take() {
+                    let completed = if write_completed.get() {
+                        "the text write completed"
+                    } else if write_partially_completed.get() {
+                        "the text write may have partially completed"
+                    } else {
+                        "the text write reached an unknown state"
+                    };
+                    partial_completion_result(completed, &error.to_string(), snapshot)
+                } else {
+                    snapshot
+                }
+            },
         )
     }
 
@@ -1679,116 +2283,303 @@ impl BrowserState {
                 ));
             }
             if !self.current_refs.contains(&field.target) {
-                return Err(BrowserError::Message(format!(
+                let error = BrowserError::Message(format!(
                     "Field {:?} failed: unknown or stale ref {}; call browser_snapshot and use its latest refs",
                     field.name, field.target
-                )));
+                ));
+                return self.fill_form_field_failure(
+                    field,
+                    &completed_fields,
+                    completed_fields.len(),
+                    fields.len(),
+                    error,
+                    request,
+                );
             }
             let selector = format!(r#"[data-mcp-ref="{}"]"#, field.target);
-            let result = (|| -> Result<(), BrowserError> {
-                let remaining = Self::remaining(request)?;
-                let options = ActionOptions::timeout(Self::engine_timeout(remaining));
-                match field.kind {
-                    FillFieldKind::Textbox | FillFieldKind::Slider => self
-                        .ensure_page(request)?
-                        .fill_with_cancel(
+            let remaining = match Self::remaining(request) {
+                Ok(remaining) => remaining,
+                Err(error) => {
+                    let error = Self::fill_form_pre_dispatch_error(field, error);
+                    return self.fill_form_field_failure(
+                        field,
+                        &completed_fields,
+                        completed_fields.len(),
+                        fields.len(),
+                        error,
+                        request,
+                    );
+                }
+            };
+            let options = ActionOptions::timeout(Self::engine_timeout(remaining));
+            let page = match self.ensure_page(request) {
+                Ok(page) => page.clone(),
+                Err(error) => {
+                    let error = Self::fill_form_pre_dispatch_error(field, error);
+                    return self.fill_form_field_failure(
+                        field,
+                        &completed_fields,
+                        completed_fields.len(),
+                        fields.len(),
+                        error,
+                        request,
+                    );
+                }
+            };
+            let tracks_sensitive_value =
+                if matches!(field.kind, FillFieldKind::Textbox | FillFieldKind::Slider) {
+                    match self.begin_sensitive_snapshot_tracking(&selector, &field.target, request)
+                    {
+                        Ok(tracks_sensitive_value) => tracks_sensitive_value,
+                        Err(error) => {
+                            let error = Self::fill_form_pre_dispatch_error(field, error);
+                            return self.fill_form_field_failure(
+                                field,
+                                &completed_fields,
+                                completed_fields.len(),
+                                fields.len(),
+                                error,
+                                request,
+                            );
+                        }
+                    }
+                } else {
+                    false
+                };
+            // Engine errors become `Message` here, so the only `Timeout` that can
+            // reach the arbitration below is a budget check propagating its own
+            // variant -- which is exactly the case that arbitration exists for.
+            let result: Result<(), BrowserError> = match field.kind {
+                FillFieldKind::Textbox | FillFieldKind::Slider => page
+                    .fill_with_cancel(
+                        &selector,
+                        &field.value,
+                        options,
+                        Some(&request.cancellation.engine),
+                    )
+                    .map(|_| ())
+                    .map_err(|error| BrowserError::Message(error.to_string())),
+                FillFieldKind::Checkbox => match field.value.as_str() {
+                    "true" => page
+                        .check_with_cancel(&selector, options, Some(&request.cancellation.engine))
+                        .map_err(|error| BrowserError::Message(error.to_string())),
+                    "false" => page
+                        .uncheck_with_cancel(&selector, options, Some(&request.cancellation.engine))
+                        .map_err(|error| BrowserError::Message(error.to_string())),
+                    _ => Err(BrowserError::Message(
+                        "checkbox value must be 'true' or 'false'".to_owned(),
+                    )),
+                },
+                FillFieldKind::Radio => {
+                    if field.value != "true" {
+                        let detail = if field.value == "false" {
+                            "unchecking a radio is not supported"
+                        } else {
+                            "radio value must be 'true'"
+                        };
+                        Err(BrowserError::Message(detail.to_owned()))
+                    } else {
+                        page.check_with_cancel(
                             &selector,
-                            &field.value,
                             options,
                             Some(&request.cancellation.engine),
                         )
-                        .map(|_| ())
-                        .map_err(|error| BrowserError::Message(error.to_string())),
-                    FillFieldKind::Checkbox => match field.value.as_str() {
-                        "true" => self
-                            .ensure_page(request)?
-                            .check_with_cancel(
-                                &selector,
-                                options,
-                                Some(&request.cancellation.engine),
-                            )
-                            .map_err(|error| BrowserError::Message(error.to_string())),
-                        "false" => self
-                            .ensure_page(request)?
-                            .uncheck_with_cancel(
-                                &selector,
-                                options,
-                                Some(&request.cancellation.engine),
-                            )
-                            .map_err(|error| BrowserError::Message(error.to_string())),
-                        _ => Err(BrowserError::Message(
-                            "checkbox value must be 'true' or 'false'".to_owned(),
-                        )),
-                    },
-                    FillFieldKind::Radio => {
-                        if field.value != "true" {
-                            let detail = if field.value == "false" {
-                                "unchecking a radio is not supported"
-                            } else {
-                                "radio value must be 'true'"
-                            };
-                            return Err(BrowserError::Message(detail.to_owned()));
-                        }
-                        self.ensure_page(request)?
-                            .check_with_cancel(
-                                &selector,
-                                options,
-                                Some(&request.cancellation.engine),
-                            )
-                            .map_err(|error| BrowserError::Message(error.to_string()))
-                    }
-                    FillFieldKind::Combobox => {
-                        let values = [field.value.clone()];
-                        self.ensure_page(request)?
-                            .select_options_by_value_or_label_with_options_and_cancel(
-                                &selector,
-                                &values,
-                                options,
-                                Some(&request.cancellation.engine),
-                            )
-                            .map(|_| ())
-                            .map_err(|error| BrowserError::Message(error.to_string()))
+                        .map_err(|error| BrowserError::Message(error.to_string()))
                     }
                 }
-            })();
+                FillFieldKind::Combobox => {
+                    let values = [field.value.clone()];
+                    page.select_options_by_value_or_label_with_options_and_cancel(
+                        &selector,
+                        &values,
+                        options,
+                        Some(&request.cancellation.engine),
+                    )
+                    .map(|_| ())
+                    .map_err(|error| BrowserError::Message(error.to_string()))
+                }
+            };
             if let Err(error) = result {
-                let reason = request.cancellation.reason();
-                if reason != CancellationReason::Active {
-                    return Err(Self::fill_form_interruption(
-                        field,
-                        &completed_fields,
-                        reason,
-                        request,
-                    ));
+                if tracks_sensitive_value {
+                    let write_error =
+                        BrowserError::Message(format!("Field {:?} failed: {error}", field.name));
+                    // Resolve before reporting, on every exit below. The taint
+                    // this field's tracker installed outlives the call, and the
+                    // interruption exits return without taking a snapshot, so
+                    // nothing else would clear it before the next one.
+                    //
+                    // Once resolution says a secret reached the page, that fact
+                    // outranks the interruption report: the masked snapshot is
+                    // the only artifact that carries it, an interruption carries
+                    // no snapshot at all, and `complete` preserves a successful
+                    // `FillForm` result under cancellation precisely so these
+                    // exits survive. Only `Unchanged` -- nothing written, nothing
+                    // to mask -- defers to the arbitration.
+                    match self.resolve_sensitive_snapshot_tracking(&field.value, request) {
+                        Ok(SensitiveWriteProgress::Complete) => {
+                            let completed_count = completed_fields.len() + 1;
+                            return self.fill_form_failure(
+                                completed_count,
+                                fields.len(),
+                                write_error,
+                                request,
+                            );
+                        }
+                        Ok(SensitiveWriteProgress::Partial) => {
+                            self.current_refs.clear();
+                            let snapshot = self.committed_post_action_snapshot(request);
+                            return partial_completion_result(
+                                &format!(
+                                    "{} of {} form fields completed; field {:?} \
+                                     was partially written",
+                                    completed_fields.len(),
+                                    fields.len(),
+                                    field.name
+                                ),
+                                &write_error.to_string(),
+                                snapshot,
+                            );
+                        }
+                        Ok(SensitiveWriteProgress::Unchanged) => {
+                            return self.fill_form_field_failure(
+                                field,
+                                &completed_fields,
+                                completed_fields.len(),
+                                fields.len(),
+                                write_error,
+                                request,
+                            );
+                        }
+                        Err(_) => {
+                            self.current_refs.clear();
+                            let snapshot = self
+                                .committed_sensitive_post_action_snapshot(&field.value, request);
+                            return partial_completion_result(
+                                &format!(
+                                    "{} of {} form fields completed; field {:?} \
+                                     may have been partially written",
+                                    completed_fields.len(),
+                                    fields.len(),
+                                    field.name
+                                ),
+                                &write_error.to_string(),
+                                snapshot,
+                            );
+                        }
+                    }
                 }
-                // The budget can expire without `reason()` saying so yet.
-                // `remaining()` reads this thread's clock, while
-                // `CancellationReason::Deadline` is published by the deadline
-                // task on the runtime thread, and nothing orders the two -- so
-                // a field can observe an expired budget while `reason()` still
-                // reads `Active` and the branch above declines to fire. That
-                // `Timeout` arrives here as itself: every engine error above is
-                // converted to `Message`, but `remaining()?` propagates its own
-                // variant untouched. Report it as the deadline it is, or the
-                // partial-fill detail is lost in exactly the case the deadline
-                // is what stopped the fill.
-                if matches!(error, BrowserError::Timeout(_)) {
-                    return Err(Self::fill_form_interruption(
-                        field,
-                        &completed_fields,
-                        CancellationReason::Deadline,
-                        request,
-                    ));
-                }
-                return Err(BrowserError::Message(format!(
-                    "Field {:?} failed: {error}",
-                    field.name
-                )));
+                return self.fill_form_field_failure(
+                    field,
+                    &completed_fields,
+                    completed_fields.len(),
+                    fields.len(),
+                    BrowserError::Message(format!("Field {:?} failed: {error}", field.name)),
+                    request,
+                );
             }
             completed_fields.push(field.name.as_str());
+            if tracks_sensitive_value
+                && self
+                    .resolve_sensitive_snapshot_tracking(&field.value, request)
+                    .is_err()
+            {
+                self.current_refs.clear();
+                let snapshot = self.committed_sensitive_post_action_snapshot(&field.value, request);
+                if completed_fields.len() == fields.len() {
+                    return snapshot;
+                }
+                return partial_completion_result(
+                    &format!(
+                        "{} of {} form fields were written",
+                        completed_fields.len(),
+                        fields.len()
+                    ),
+                    "sensitive redaction resolution failed",
+                    snapshot,
+                );
+            }
         }
         self.current_refs.clear();
         self.committed_post_action_snapshot(request)
+    }
+
+    /// Keep a pre-dispatch failure's variant when it is the request deadline
+    /// arriving as itself, so the arbitration can still recognise it; otherwise
+    /// name the stage, which is the only thing that distinguishes a setup
+    /// failure from a failed write in the message.
+    fn fill_form_pre_dispatch_error(field: &FillField, error: BrowserError) -> BrowserError {
+        if matches!(error, BrowserError::Timeout(_)) {
+            return error;
+        }
+        BrowserError::Message(format!(
+            "Field {:?} failed before dispatch: {error}",
+            field.name
+        ))
+    }
+
+    /// Decide how a failed field is reported, in one place, so the interruption
+    /// arbitration and the partial-write accounting cannot drift apart.
+    ///
+    /// An interruption outranks a partial report: once the request is cancelled
+    /// or its deadline has passed, `complete` converts this into a
+    /// `Cancelled`/`Timeout` anyway, and only the detail set here survives to
+    /// name the fields that landed.
+    fn fill_form_field_failure(
+        &mut self,
+        field: &FillField,
+        completed_before: &[&str],
+        completed_count: usize,
+        total_fields: usize,
+        error: BrowserError,
+        request: &ActorRequest,
+    ) -> TextResult {
+        let reason = request.cancellation.reason();
+        if reason != CancellationReason::Active {
+            return Err(Self::fill_form_interruption(
+                field,
+                completed_before,
+                reason,
+                request,
+            ));
+        }
+        // The budget can expire without `reason()` saying so yet. `remaining()`
+        // reads this thread's clock, while `CancellationReason::Deadline` is
+        // published by the deadline task on the runtime thread, and nothing
+        // orders the two -- so a field can observe an expired budget while
+        // `reason()` still reads `Active` and the branch above declines to fire.
+        // That `Timeout` arrives here as itself: every engine error is converted
+        // to `Message` before reaching this point, but a budget check propagates
+        // its own variant untouched. Report it as the deadline it is, or the
+        // partial-fill detail is lost in exactly the case the deadline is what
+        // stopped the fill.
+        if matches!(error, BrowserError::Timeout(_)) {
+            return Err(Self::fill_form_interruption(
+                field,
+                completed_before,
+                CancellationReason::Deadline,
+                request,
+            ));
+        }
+        self.fill_form_failure(completed_count, total_fields, error, request)
+    }
+
+    fn fill_form_failure(
+        &mut self,
+        completed_fields: usize,
+        total_fields: usize,
+        error: BrowserError,
+        request: &ActorRequest,
+    ) -> TextResult {
+        if completed_fields == 0 {
+            return Err(error);
+        }
+        self.current_refs.clear();
+        let snapshot = self.committed_post_action_snapshot(request);
+        partial_completion_result(
+            &format!("{completed_fields} of {total_fields} form fields were written"),
+            &error.to_string(),
+            snapshot,
+        )
     }
 
     fn fill_form_interruption(
@@ -2870,6 +3661,18 @@ fn committed_snapshot_result(snapshot: TextResult) -> TextResult {
              Call browser_snapshot for the current page state."
         )),
     }
+}
+
+fn partial_completion_result(
+    completed: &str,
+    later_failure: &str,
+    snapshot: TextResult,
+) -> TextResult {
+    let snapshot = snapshot?;
+    Ok(format!(
+        "Action partially completed: {completed}. Later step failed: {later_failure}\n\n\
+         ### Snapshot\n{snapshot}"
+    ))
 }
 
 fn render_drag_result(start_display: &str, end_display: &str, snapshot: &str) -> String {
@@ -4376,6 +5179,15 @@ mod tests {
             tool_timeout_from_value(Some("42000")),
             Duration::from_millis(42_000)
         );
+        assert_eq!(
+            sensitive_tracking_expiry_ms(Duration::from_millis(MAX_TOOL_TIMEOUT_MS)),
+            MAX_TOOL_TIMEOUT_MS + SENSITIVE_TRACKING_CLEANUP_GRACE_MS
+        );
+        assert!(
+            BEGIN_SENSITIVE_SNAPSHOT_TRACKING_JS
+                .contains("Math.max(1_000, Number(input.expiryMs) || 1_000)"),
+            "page-side sensitive tracking must use the caller's deadline-derived expiry"
+        );
     }
 
     #[test]
@@ -4508,17 +5320,17 @@ mod tests {
         );
 
         // The other way to bypass the helper is to call the cancellable snapshot
-        // directly, which leaves this count short instead. Seven committed
-        // paths: click, type-with-submit, hover, drag, press_key in both its
-        // targeted and untargeted forms, and fill_form. Fill_form belongs here
-        // because reaching the end of its loop means every field returned `Ok`,
-        // so a late cancellation must not turn the observation of those writes
-        // into a failed fill.
+        // directly, which leaves this count short instead. Nine committed
+        // physical-action paths: click, type-with-submit, hover, drag, press_key
+        // in both its targeted and untargeted forms, fill_form's complete and
+        // partial-completion exits, and the exit where a password field was only
+        // partially written. A tenth path should fail here until someone confirms
+        // it wants the same treatment.
         assert_eq!(
             production
                 .matches("committed_post_action_snapshot(request)")
                 .count(),
-            7,
+            9,
             "every committed physical action must observe through the helper"
         );
     }
@@ -5388,6 +6200,30 @@ mod tests {
             "/fill-final-commit" => fill_final_commit_fixture(),
             "/fill-nonphysical-cancel" => fill_nonphysical_cancellation_fixture(),
             "/input" => input_fixture(),
+            "/input-aria-echo" => input_aria_echo_fixture(),
+            "/input-aria-echo-common" => input_aria_echo_common_fixture(),
+            "/input-leaf-echo" => input_leaf_echo_fixture(),
+            "/input-fill-form-echo" => input_fill_form_echo_fixture(),
+            "/input-property-only-echo" => input_property_only_echo_fixture(),
+            "/input-post-dispatch-timeout-echo" => input_post_dispatch_timeout_echo_fixture(),
+            "/input-submit-failure-echo" => input_submit_failure_echo_fixture(),
+            "/input-partial-fill-echo" => input_partial_fill_echo_fixture(),
+            "/input-partial-type-value-echo" => input_partial_type_value_echo_fixture(),
+            "/input-partial-fill-value-echo" => input_partial_fill_value_echo_fixture(),
+            "/input-split-ancestor-echo" => input_split_ancestor_echo_fixture(),
+            "/input-split-labelledby-echo" => input_split_labelledby_echo_fixture(),
+            "/input-id-relationship-echo" => input_id_relationship_echo_fixture(),
+            "/input-labelled-container-echo" => input_labelled_container_echo_fixture(),
+            "/input-visibility-echo" => input_visibility_echo_fixture(),
+            "/input-aria-hidden-ancestor-echo" => input_aria_hidden_ancestor_echo_fixture(),
+            "/input-labelledby-echo" => input_labelledby_echo_fixture(),
+            "/input-label-echo" => input_label_echo_fixture(),
+            "/input-output-branch-echo" => input_output_branch_echo_fixture(),
+            "/input-role-echo" => input_role_echo_fixture(),
+            "/input-custom-role-echo" => input_custom_role_echo_fixture(),
+            "/input-dialog-echo" => input_dialog_echo_fixture(),
+            "/input-root-replacement-echo" => input_root_replacement_echo_fixture(),
+            "/input-reactive-safe" => input_reactive_safe_fixture(),
             "/atomic-click" => atomic_click_fixture(),
             "/physical" => physical_fixture(),
             "/oopif-top" => oopif_top_fixture(port),
@@ -5816,6 +6652,390 @@ mod tests {
       `Ambiguous selected values: ${selected}; changes: ${ambiguousMultiChanges}`;
   });
 </script>"#
+            .to_owned()
+    }
+
+    fn input_aria_echo_fixture() -> String {
+        r#"<!doctype html>
+<input
+  id="secret-echo-target"
+  type="password"
+  aria-label="Secret echo input"
+  oninput="
+    this.setAttribute('aria-label', this.value);
+    document.querySelector('#secret-echo-status').textContent = this.value;
+  "
+>
+<div id="secret-echo-status" role="status">No secret entered</div>"#
+            .to_owned()
+    }
+
+    fn input_aria_echo_common_fixture() -> String {
+        format!(
+            "{}\n<div id=\"unrelated-common-status\" role=\"status\">a</div>",
+            input_aria_echo_fixture()
+        )
+    }
+
+    fn input_leaf_echo_fixture() -> String {
+        r#"<!doctype html>
+<input
+  id="secret-leaf-target"
+  type="password"
+  aria-label="Secret leaf input"
+  oninput="
+    document.querySelector('#secret-leaf-echo').textContent = this.value;
+  "
+>
+<span id="secret-leaf-echo">No secret entered</span>"#
+            .to_owned()
+    }
+
+    fn input_fill_form_echo_fixture() -> String {
+        r#"<!doctype html>
+<input
+  id="first-fill-secret"
+  type="password"
+  aria-label="First fill secret"
+  oninput="
+    document.querySelector('#first-fill-echo').textContent = this.value;
+  "
+>
+<div id="first-fill-echo" role="status">First secret empty</div>
+<input
+  id="second-fill-secret"
+  type="password"
+  aria-label="Second fill secret"
+  oninput="
+    document.querySelector('#second-fill-echo').textContent = this.value;
+  "
+>
+<div id="second-fill-echo" role="status">Second secret empty</div>"#
+            .to_owned()
+    }
+
+    fn input_property_only_echo_fixture() -> String {
+        r#"<!doctype html>
+<input
+  id="property-only-secret"
+  type="password"
+  aria-label="Property-only secret"
+  oninput="document.querySelector('#property-only-mirror').value = this.value"
+>
+<input id="property-only-mirror" aria-label="Property-only mirror" value="public">"#
+            .to_owned()
+    }
+
+    fn input_post_dispatch_timeout_echo_fixture() -> String {
+        r#"<!doctype html>
+<label for="post-dispatch-timeout-secret">Post-dispatch timeout secret</label>
+<input
+  id="post-dispatch-timeout-secret"
+  type="password"
+  oninput="
+    document.querySelector('#post-dispatch-timeout-mirror').value = this.value;
+    const stallUntil = performance.now() + 500;
+    while (performance.now() < stallUntil) {}
+  "
+>
+<label for="post-dispatch-timeout-mirror">Post-dispatch timeout mirror</label>
+<input id="post-dispatch-timeout-mirror" value="public">"#
+            .to_owned()
+    }
+
+    fn input_submit_failure_echo_fixture() -> String {
+        r#"<!doctype html>
+<input
+  id="submit-failure-secret"
+  type="password"
+  aria-label="Submit failure secret"
+  oninput="
+    document.querySelector('#submit-failure-mirror').value = this.value;
+    this.removeAttribute('data-mcp-ref');
+  "
+>
+<input id="submit-failure-mirror" aria-label="Submit failure mirror" value="public">"#
+            .to_owned()
+    }
+
+    fn input_partial_fill_echo_fixture() -> String {
+        r#"<!doctype html>
+<input
+  id="partial-fill-secret"
+  type="password"
+  aria-label="Partial fill secret"
+  oninput="document.querySelector('#partial-fill-mirror').value = this.value"
+>
+<input id="partial-fill-mirror" aria-label="Partial fill mirror" value="public">
+<input id="partial-fill-checkbox" type="checkbox">
+<label for="partial-fill-checkbox">Partial fill checkbox</label>"#
+            .to_owned()
+    }
+
+    fn input_partial_type_value_echo_fixture() -> String {
+        r#"<!doctype html>
+<label for="partial-type-secret">Partial type secret</label>
+<input
+  id="partial-type-secret"
+  type="password"
+  maxlength="4"
+  oninput="document.querySelector('#partial-type-status').textContent = this.value"
+>
+<div id="partial-type-status" role="status">No partial value</div>"#
+            .to_owned()
+    }
+
+    fn input_partial_fill_value_echo_fixture() -> String {
+        r#"<!doctype html>
+<label for="partial-fill-value-secret">Partial fill value secret</label>
+<input
+  id="partial-fill-value-secret"
+  type="password"
+  oninput="
+    this.value = this.value.slice(0, 4);
+    document.querySelector('#partial-fill-value-status').textContent = this.value;
+  "
+>
+<div id="partial-fill-value-status" role="status">No partial value</div>"#
+            .to_owned()
+    }
+
+    fn input_split_ancestor_echo_fixture() -> String {
+        r#"<!doctype html>
+<label for="split-ancestor-secret">Split ancestor secret</label>
+<input
+  id="split-ancestor-secret"
+  type="password"
+  oninput="
+    const midpoint = Math.floor(this.value.length / 2);
+    document.querySelector('#split-first').textContent = this.value.slice(0, midpoint);
+    document.querySelector('#split-second').textContent = this.value.slice(midpoint);
+  "
+>
+<button><span id="split-first">Public</span><span id="split-second"> button</span></button>"#
+            .to_owned()
+    }
+
+    fn input_split_labelledby_echo_fixture() -> String {
+        r#"<!doctype html>
+<label for="split-labelledby-secret">Split labelledby secret</label>
+<input
+  id="split-labelledby-secret"
+  type="password"
+  oninput="
+    const [first, second] = this.value.split(' ');
+    document.querySelector('#split-labelledby-first').textContent = first;
+    document.querySelector('#split-labelledby-second').textContent = second;
+  "
+>
+<span id="split-labelledby-first">Public</span>
+<span id="split-labelledby-second">control</span>
+<button aria-labelledby="split-labelledby-first split-labelledby-second">
+  Fallback control
+</button>"#
+            .to_owned()
+    }
+
+    fn input_labelled_container_echo_fixture() -> String {
+        r#"<!doctype html>
+<section aria-label="Account details">
+  <label for="labelled-container-secret">Labelled container secret</label>
+  <input
+    id="labelled-container-secret"
+    type="password"
+    oninput="document.querySelector('#container-echo').textContent = this.value;"
+  >
+  <div id="container-echo"></div>
+</section>"#
+            .to_owned()
+    }
+
+    fn input_id_relationship_echo_fixture() -> String {
+        r#"<!doctype html>
+<label for="id-relationship-secret">ID relationship secret</label>
+<input
+  id="id-relationship-secret"
+  type="password"
+  oninput="document.querySelector('#relationship-decoy').id = 'relationship-echo'"
+>
+<span id="relationship-decoy" aria-hidden="true">id-relationship-password-canary-66871</span>
+<button aria-labelledby="relationship-echo">Public relationship button</button>"#
+            .to_owned()
+    }
+
+    fn input_visibility_echo_fixture() -> String {
+        r#"<!doctype html>
+<style>
+  .visibility-secret { display: none; }
+  body.show-visibility-secret .visibility-secret { display: block; }
+</style>
+<label for="visibility-secret-input">Visibility secret input</label>
+<input
+  id="visibility-secret-input"
+  type="password"
+  oninput="document.body.className = 'show-visibility-secret'"
+>
+<div class="visibility-secret" role="status">visibility-password-canary-66881</div>"#
+            .to_owned()
+    }
+
+    fn input_aria_hidden_ancestor_echo_fixture() -> String {
+        r#"<!doctype html>
+<label for="aria-hidden-ancestor-secret">ARIA-hidden ancestor secret</label>
+<input
+  id="aria-hidden-ancestor-secret"
+  type="password"
+  oninput="document.querySelector('#aria-hidden-secret-container').removeAttribute('aria-hidden')"
+>
+<div id="aria-hidden-secret-container" aria-hidden="true">
+  <span>aria-hidden-password-canary-68031</span>
+</div>"#
+            .to_owned()
+    }
+
+    fn input_labelledby_echo_fixture() -> String {
+        r#"<!doctype html>
+<input
+  id="secret-labelledby-target"
+  type="password"
+  aria-label="Secret labelledby input"
+  oninput="
+    document.querySelector('#dynamic-labelledby').textContent = this.value;
+  "
+>
+<span id="dynamic-labelledby">Public button name</span>
+<button aria-labelledby="dynamic-labelledby">Fallback button name</button>"#
+            .to_owned()
+    }
+
+    fn input_label_echo_fixture() -> String {
+        r#"<!doctype html>
+<input
+  id="secret-label-target"
+  type="password"
+  aria-label="Secret label input"
+  oninput="
+    document.querySelector('#dynamic-label').textContent = this.value;
+  "
+>
+<label id="dynamic-label" for="labelled-textbox">Public textbox name</label>
+<input id="labelled-textbox" value="safe echo value">"#
+            .to_owned()
+    }
+
+    fn input_output_branch_echo_fixture() -> String {
+        r#"<!doctype html>
+<input
+  id="secret-output-target"
+  type="password"
+  aria-label="Secret output input"
+  oninput="
+    document.querySelector('#echo-frame').setAttribute('title', this.value);
+    document.querySelector('#echo-link').setAttribute('href', '/echo/' + this.value);
+    const mirror = document.querySelector('#echo-value');
+    mirror.value = this.value;
+    mirror.setAttribute('title', 'Updated mirror');
+    this.setAttribute('type', 'text');
+  "
+>
+<iframe id="echo-frame" title="Public frame" style="width: 100px; height: 40px"></iframe>
+<a id="echo-link" href="/echo/public">Public link</a>
+<input id="echo-value" aria-label="Echo value" value="public">"#
+            .to_owned()
+    }
+
+    fn input_role_echo_fixture() -> String {
+        r#"<!doctype html>
+<input
+  id="role-secret-target"
+  type="password"
+  aria-label="Role secret input"
+  oninput="document.querySelector('#role-echo').setAttribute('role', this.value)"
+>
+<button id="role-echo" role="button">Public role target</button>"#
+            .to_owned()
+    }
+
+    fn input_custom_role_echo_fixture() -> String {
+        r#"<!doctype html>
+<label for="custom-role-secret">Custom role secret input</label>
+<input
+  id="custom-role-secret"
+  type="password"
+  oninput="document.querySelector('#custom-role-echo').setAttribute('role', this.value)"
+>
+<div id="custom-role-echo" role="button" tabindex="0">Public custom control</div>"#
+            .to_owned()
+    }
+
+    fn input_dialog_echo_fixture() -> String {
+        // The dialog has to be pending while the write is still finishing, which
+        // is the only moment the secret is in hand to redact with. Opening it
+        // from a timer makes that a race against the actor's next CDP round trip
+        // -- reliable when the test runs alone, roughly one failure in six under
+        // full-suite load. Hook the tracking teardown the resolve step itself
+        // calls instead, so the dialog is causally ordered ahead of the
+        // post-write snapshot rather than merely usually ahead of it. If the
+        // tracking object stops exposing `stop`, the hook silently does not
+        // install and the test fails loudly rather than passing vacuously.
+        r#"<!doctype html>
+<label for="dialog-secret">Dialog secret input</label>
+<input
+  id="dialog-secret"
+  type="password"
+  oninput="
+    const tracking = globalThis[Symbol.for('rustwright.mcp.sensitiveSnapshot')];
+    const pending = tracking && tracking.pending;
+    if (pending && typeof pending.stop === 'function' && !pending.dialogHookInstalled) {
+      pending.dialogHookInstalled = true;
+      const field = this;
+      const teardown = pending.stop;
+      pending.stop = function () {
+        teardown.call(this);
+        alert(field.value);
+      };
+    }
+  "
+>"#
+        .to_owned()
+    }
+
+    fn input_root_replacement_echo_fixture() -> String {
+        r#"<!doctype html>
+<input
+  id="root-replacement-secret"
+  type="password"
+  aria-label="Root replacement secret"
+  oninput="
+    const replacement = document.createElement('html');
+    const body = document.createElement('body');
+    const mirror = document.createElement('input');
+    mirror.setAttribute('aria-label', 'Root replacement mirror');
+    mirror.setAttribute('type', 'password');
+    mirror.value = this.value;
+    const echo = document.createElement('span');
+    echo.textContent = this.value;
+    body.appendChild(mirror);
+    body.appendChild(echo);
+    replacement.appendChild(body);
+    document.replaceChild(replacement, document.documentElement);
+  "
+>"#
+        .to_owned()
+    }
+
+    fn input_reactive_safe_fixture() -> String {
+        r#"<!doctype html>
+<input
+  id="reactive-safe-target"
+  type="password"
+  aria-label="Reactive secret input"
+  oninput="
+    document.querySelector('#reactive-safe-status').textContent =
+      this.value.length > 0 ? 'Password strength: measured' : 'Password strength: waiting';
+  "
+>
+<div id="reactive-safe-status" role="status">Password strength: waiting</div>"#
             .to_owned()
     }
 
@@ -6604,6 +7824,1331 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn input_tool_type_password_snapshot_masks_aria_and_status_echoes() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_000),
+                BrowserOp::Navigate(server.url("/input-aria-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to password echo fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Secret echo input");
+        let sentinel = "synthetic-password-echo-canary-66001";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_001),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into password echo fixture");
+        let typed = output_text(&typed);
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_tool_type_password_snapshot_masks_roleless_leaf_echo() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_300),
+                BrowserOp::Navigate(server.url("/input-leaf-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to password leaf echo fixture");
+        let snapshot = output_text(&snapshot);
+        assert!(snapshot.contains("- text: No secret entered"), "{snapshot}");
+        let target = snapshot_ref(snapshot, "textbox", "Secret leaf input");
+        let sentinel = "synthetic-password-leaf-canary-66301";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_301),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into password leaf echo fixture");
+        let typed = output_text(&typed);
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_aria_status_echo_snapshot_has_structure() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_310),
+                BrowserOp::Navigate(server.url("/input-aria-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to structural aria/status echo fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Secret echo input");
+        let sentinel = "structural-aria-status-canary-66311";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_311),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into structural aria/status echo fixture");
+        let typed = output_text(&typed);
+        assert!(typed.contains("[value=••••••]"), "{typed}");
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_roleless_leaf_echo_snapshot_has_structure() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_320),
+                BrowserOp::Navigate(server.url("/input-leaf-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to structural roleless-leaf fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Secret leaf input");
+        let sentinel = "structural-roleless-leaf-canary-66321";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_321),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into structural roleless-leaf fixture");
+        let typed = output_text(&typed);
+        assert!(typed.contains("[value=••••••]"), "{typed}");
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_taint_persists_across_later_snapshots() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_400),
+                BrowserOp::Navigate(server.url("/input-aria-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to persistent password echo fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Secret echo input");
+        let sentinel = "persistent-password-echo-canary-66401";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_401),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into persistent password echo fixture");
+        assert!(
+            !output_text(&typed).contains(sentinel),
+            "{}",
+            output_text(&typed)
+        );
+
+        let first_snapshot = actor
+            .execute_with_timeout(
+                request_id(66_402),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("take first later password snapshot");
+        assert!(
+            output_text(&first_snapshot).contains("[value=••••••]"),
+            "{}",
+            output_text(&first_snapshot)
+        );
+
+        let second_snapshot = actor
+            .execute_with_timeout(
+                request_id(66_403),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("take second later password snapshot");
+        let second_snapshot = output_text(&second_snapshot);
+        assert!(
+            second_snapshot.contains("[value=••••••]"),
+            "{second_snapshot}"
+        );
+        assert!(!second_snapshot.contains(sentinel), "{second_snapshot}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fill_form_password_snapshot_masks_reactive_echo() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_500),
+                BrowserOp::Navigate(server.url("/input-fill-form-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to fill-form password echo fixture");
+        let snapshot = output_text(&snapshot);
+        let first_target = snapshot_ref(snapshot, "textbox", "First fill secret");
+        let second_target = snapshot_ref(snapshot, "textbox", "Second fill secret");
+        let first_sentinel = "first-fill-form-password-canary-66501";
+        let second_sentinel = "second-fill-form-password-canary-66502";
+
+        let filled = actor
+            .execute_with_timeout(
+                request_id(66_501),
+                BrowserOp::FillForm(vec![
+                    FillField {
+                        target: first_target,
+                        name: "first password".to_owned(),
+                        kind: FillFieldKind::Textbox,
+                        value: first_sentinel.to_owned(),
+                    },
+                    FillField {
+                        target: second_target,
+                        name: "second password".to_owned(),
+                        kind: FillFieldKind::Textbox,
+                        value: second_sentinel.to_owned(),
+                    },
+                ]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("fill password through browser_fill_form");
+        let filled = output_text(&filled);
+        assert_eq!(filled.matches("[value=••••••]").count(), 2, "{filled}");
+        assert!(!filled.contains(first_sentinel), "{filled}");
+        assert!(!filled.contains(second_sentinel), "{filled}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_masks_aria_labelledby_echo() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_600),
+                BrowserOp::Navigate(server.url("/input-labelledby-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to aria-labelledby password echo fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Secret labelledby input");
+        let sentinel = "labelledby-password-echo-canary-66601";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_601),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into aria-labelledby password echo fixture");
+        let typed = output_text(&typed);
+        assert!(
+            typed
+                .lines()
+                .any(|line| line.trim().starts_with("- button [ref=")),
+            "{typed}"
+        );
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_masks_label_echo() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_700),
+                BrowserOp::Navigate(server.url("/input-label-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to label password echo fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Secret label input");
+        let sentinel = "label-password-echo-canary-66701";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_701),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into label password echo fixture");
+        let typed = output_text(&typed);
+        assert!(typed.contains("[value=\"safe echo value\"]"), "{typed}");
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_masks_frame_href_and_cleartext_values() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_800),
+                BrowserOp::Navigate(server.url("/input-output-branch-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to password output-branch fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Secret output input");
+        let sentinel = "output-branch-password-echo-canary-66801";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_801),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into password output-branch fixture");
+        let typed = output_text(&typed);
+        assert!(
+            typed.contains("- iframe \"\" (content not captured)"),
+            "{typed}"
+        );
+        assert_eq!(typed.matches("[value=••••••]").count(), 2, "{typed}");
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_masks_property_only_value_echo() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_810),
+                BrowserOp::Navigate(server.url("/input-property-only-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to property-only password echo fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Property-only secret");
+        let sentinel = "property-only-password-echo-canary-66811";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_811),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into property-only password echo fixture");
+        let typed = output_text(&typed);
+        assert_eq!(typed.matches("[value=••••••]").count(), 2, "{typed}");
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_dispatch_password_type_timeout_reports_masked_completion() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_812),
+                BrowserOp::Navigate(server.url("/input-post-dispatch-timeout-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to post-dispatch timeout fixture");
+        let target = snapshot_ref(
+            output_text(&snapshot),
+            "textbox",
+            "Post-dispatch timeout secret",
+        );
+        let sentinel = "post-dispatch-timeout-password-canary-66813";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_813),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_millis(200),
+            )
+            .await
+            .expect("landed password type must report complete or partial success");
+        let typed = output_text(&typed);
+        assert!(typed.contains("Action partially completed"), "{typed}");
+        assert_eq!(typed.matches("[value=••••••]").count(), 2, "{typed}");
+        assert!(!typed.contains(sentinel), "{typed}");
+
+        let later = actor
+            .execute_with_timeout(
+                request_id(66_814),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("snapshot after post-dispatch type timeout");
+        let later = output_text(&later);
+        assert_eq!(later.matches("[value=••••••]").count(), 2, "{later}");
+        assert!(!later.contains(sentinel), "{later}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_dispatch_password_fill_timeout_reports_masked_completion() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_815),
+                BrowserOp::Navigate(server.url("/input-post-dispatch-timeout-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to post-dispatch fill timeout fixture");
+        let target = snapshot_ref(
+            output_text(&snapshot),
+            "textbox",
+            "Post-dispatch timeout secret",
+        );
+        let sentinel = "post-dispatch-fill-timeout-password-canary-66816";
+
+        let filled = actor
+            .execute_with_timeout(
+                request_id(66_816),
+                BrowserOp::FillForm(vec![FillField {
+                    target,
+                    name: "post-dispatch password".to_owned(),
+                    kind: FillFieldKind::Textbox,
+                    value: sentinel.to_owned(),
+                }]),
+                Duration::from_millis(200),
+            )
+            .await
+            .expect("landed password fill must report complete or partial success");
+        let filled = output_text(&filled);
+        assert!(filled.contains("Action partially completed"), "{filled}");
+        assert_eq!(filled.matches("[value=••••••]").count(), 2, "{filled}");
+        assert!(!filled.contains(sentinel), "{filled}");
+
+        let later = actor
+            .execute_with_timeout(
+                request_id(66_817),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("snapshot after post-dispatch fill timeout");
+        let later = output_text(&later);
+        assert_eq!(later.matches("[value=••••••]").count(), 2, "{later}");
+        assert!(!later.contains(sentinel), "{later}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_submit_failure_resolves_taint_and_reports_partial_completion() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_820),
+                BrowserOp::Navigate(server.url("/input-submit-failure-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to submit-failure password echo fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Submit failure secret");
+        let sentinel = "submit-failure-password-echo-canary-66821";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_821),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: true,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        let later_snapshot = actor
+            .execute_with_timeout(
+                request_id(66_822),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("snapshot after the password write and failed submit");
+        let later_snapshot = output_text(&later_snapshot);
+        assert!(
+            later_snapshot.contains("[value=••••••]"),
+            "{later_snapshot}"
+        );
+        assert!(!later_snapshot.contains(sentinel), "{later_snapshot}");
+
+        assert!(
+            typed.is_ok(),
+            "password write must remain successful when the later submit fails: {typed:?}"
+        );
+        let typed = typed.expect("checked successful partial completion above");
+        let typed = output_text(&typed);
+        assert!(typed.contains("Action partially completed"), "{typed}");
+        assert!(typed.contains("[value=••••••]"), "{typed}");
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fill_form_later_field_failure_reports_masked_partial_completion() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_830),
+                BrowserOp::Navigate(server.url("/input-partial-fill-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to partial fill-form fixture");
+        let snapshot = output_text(&snapshot);
+        let password_target = snapshot_ref(snapshot, "textbox", "Partial fill secret");
+        let checkbox_target = snapshot_ref(snapshot, "checkbox", "Partial fill checkbox");
+        let sentinel = "partial-fill-password-echo-canary-66831";
+
+        let filled = actor
+            .execute_with_timeout(
+                request_id(66_831),
+                BrowserOp::FillForm(vec![
+                    FillField {
+                        target: password_target,
+                        name: "partial password".to_owned(),
+                        kind: FillFieldKind::Textbox,
+                        value: sentinel.to_owned(),
+                    },
+                    FillField {
+                        target: checkbox_target,
+                        name: "invalid checkbox".to_owned(),
+                        kind: FillFieldKind::Checkbox,
+                        value: "not-a-boolean".to_owned(),
+                    },
+                ]),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            filled.is_ok(),
+            "earlier form write must remain successful when a later field fails: {filled:?}"
+        );
+        let filled = filled.expect("checked successful partial completion above");
+        let filled = output_text(&filled);
+        assert!(filled.contains("Action partially completed"), "{filled}");
+        assert!(
+            filled.contains("1 of 2 form fields were written"),
+            "{filled}"
+        );
+        assert_eq!(filled.matches("[value=••••••]").count(), 2, "{filled}");
+        assert!(!filled.contains(sentinel), "{filled}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_masks_partial_type_value_that_landed() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(68_000),
+                BrowserOp::Navigate(server.url("/input-partial-type-value-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to partial type-value fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Partial type secret");
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(68_001),
+                BrowserOp::Type {
+                    target,
+                    text: "correct-horse".to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: false,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type a truncated password");
+        let typed = output_text(&typed);
+        assert!(typed.contains("[value=••••••]"), "{typed}");
+        assert!(!typed.contains("corr"), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_masks_partial_fill_form_value_that_landed() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(68_010),
+                BrowserOp::Navigate(server.url("/input-partial-fill-value-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to partial fill-form value fixture");
+        let target = snapshot_ref(
+            output_text(&snapshot),
+            "textbox",
+            "Partial fill value secret",
+        );
+
+        let filled = actor
+            .execute_with_timeout(
+                request_id(68_011),
+                BrowserOp::FillForm(vec![FillField {
+                    target,
+                    name: "partial password".to_owned(),
+                    kind: FillFieldKind::Textbox,
+                    value: "truncated-secret".to_owned(),
+                }]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("fill a truncated password");
+        let filled = output_text(&filled);
+        assert!(filled.contains("[value=••••••]"), "{filled}");
+        assert!(!filled.contains("trun"), "{filled}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_masks_secret_composed_across_labelledby_targets() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(68_020),
+                BrowserOp::Navigate(server.url("/input-split-labelledby-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to split labelledby fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Split labelledby secret");
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(68_021),
+                BrowserOp::Type {
+                    target,
+                    text: "secret phrase".to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into split labelledby fixture");
+        let typed = output_text(&typed);
+        assert!(
+            typed
+                .lines()
+                .any(|line| line.trim().starts_with("- button [ref=")),
+            "{typed}"
+        );
+        assert!(!typed.contains("secret phrase"), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_masks_secret_revealed_by_aria_hidden_ancestor() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(68_030),
+                BrowserOp::Navigate(server.url("/input-aria-hidden-ancestor-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to ARIA-hidden ancestor fixture");
+        let target = snapshot_ref(
+            output_text(&snapshot),
+            "textbox",
+            "ARIA-hidden ancestor secret",
+        );
+        let sentinel = "aria-hidden-password-canary-68031";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(68_031),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into ARIA-hidden ancestor fixture");
+        let typed = output_text(&typed);
+        assert!(typed.contains("[value=••••••]"), "{typed}");
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_write_masks_pending_dialog_message() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(68_040),
+                BrowserOp::Navigate(server.url("/input-dialog-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to dialog password echo fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Dialog secret input");
+        let sentinel = "dialog-password-canary-68041";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(68_041),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: true,
+                    clear: true,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("type into dialog password echo fixture");
+        let typed = output_text(&typed).to_owned();
+        actor
+            .execute_with_timeout(
+                request_id(68_042),
+                BrowserOp::HandleDialog {
+                    accept: true,
+                    prompt_text: None,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("dismiss password echo dialog");
+
+        assert!(typed.contains("Dialog pending"), "{typed}");
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_dialog_message_stays_masked_for_later_unrelated_tools() {
+        // Masking the write's own reply protects one response. The dialog text
+        // outlives that reply, and every other tool reaches it through the
+        // generic modal gate, which has no secret in hand -- so the guarantee
+        // only holds if the stored message was masked, not the rendering.
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(68_060),
+                BrowserOp::Navigate(server.url("/input-dialog-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to dialog password echo fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Dialog secret input");
+        let sentinel = "dialog-password-canary-68061";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(68_061),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: true,
+                    clear: true,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("type into dialog password echo fixture");
+        let typed = output_text(&typed).to_owned();
+
+        // The dialog is still up. A tool that knows nothing about the write now
+        // renders the same stored message.
+        let blocked = actor
+            .execute_with_timeout(
+                request_id(68_062),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("snapshot must defer behind the pending dialog rather than fail");
+        let blocked = output_text(&blocked).to_owned();
+
+        actor
+            .execute_with_timeout(
+                request_id(68_063),
+                BrowserOp::HandleDialog {
+                    accept: true,
+                    prompt_text: None,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("dismiss password echo dialog");
+
+        assert!(!typed.contains(sentinel), "the write's own reply: {typed}");
+        assert!(
+            blocked.contains("Dialog pending"),
+            "the later call must be fronted by the modal gate: {blocked}"
+        );
+        assert!(
+            !blocked.contains(sentinel),
+            "a later tool must not echo the secret the dialog is displaying: {blocked}"
+        );
+        assert!(
+            blocked.contains(SECRET_MASK),
+            "the later call must render the masked message: {blocked}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_keeps_tainted_custom_aria_control_addressable() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(68_050),
+                BrowserOp::Navigate(server.url("/input-custom-role-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to custom role password echo fixture");
+        let target = snapshot_ref(
+            output_text(&snapshot),
+            "textbox",
+            "Custom role secret input",
+        );
+        let sentinel = "custom-role-password-canary-68051";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(68_051),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into custom role password echo fixture");
+        let typed = output_text(&typed);
+        assert!(
+            typed
+                .lines()
+                .any(|line| line.trim().starts_with("- generic [ref=")),
+            "{typed}"
+        );
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_masks_secret_composed_by_descendant_mutations() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_860),
+                BrowserOp::Navigate(server.url("/input-split-ancestor-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to split-ancestor fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Split ancestor secret");
+        let sentinel = "split-ancestor-password-canary-66861";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_861),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into split-ancestor fixture");
+        let typed = output_text(&typed);
+        assert!(typed.contains("[value=••••••]"), "{typed}");
+        assert!(
+            typed
+                .lines()
+                .any(|line| line.trim().starts_with("- button [ref=")),
+            "{typed}"
+        );
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    /// A container's own name can only come from author-written markup, so it
+    /// cannot hold a secret typed after the page was written. Blanking every
+    /// ancestor of a tainted node erased those labels too and left the caller
+    /// with an unnamed region it could no longer address. The resolver never
+    /// taints such a container -- `containsSensitiveValue` reads its
+    /// `aria-label`, not its text -- so masking it is pure loss.
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_preserves_author_static_container_label() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_960),
+                BrowserOp::Navigate(server.url("/input-labelled-container-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to labelled container fixture");
+        let target = snapshot_ref(
+            output_text(&snapshot),
+            "textbox",
+            "Labelled container secret",
+        );
+        let sentinel = "labelled-container-password-canary-66961";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_961),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into labelled container fixture");
+        let typed = output_text(&typed);
+        assert!(typed.contains("[value=••••••]"), "{typed}");
+        assert!(!typed.contains(sentinel), "{typed}");
+        assert!(
+            typed.contains("- region \"Account details\""),
+            "an author-static container label survives a password write: {typed}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_masks_name_changed_only_by_id_relationship() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_870),
+                BrowserOp::Navigate(server.url("/input-id-relationship-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to ID relationship fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "ID relationship secret");
+        let sentinel = "id-relationship-password-canary-66871";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_871),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into ID relationship fixture");
+        let typed = output_text(&typed);
+        assert!(typed.contains("[value=••••••]"), "{typed}");
+        assert!(
+            typed
+                .lines()
+                .any(|line| line.trim().starts_with("- button [ref=")),
+            "{typed}"
+        );
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_masks_css_visibility_transition_echo() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_880),
+                BrowserOp::Navigate(server.url("/input-visibility-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to visibility transition fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Visibility secret input");
+        let sentinel = "visibility-password-canary-66881";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_881),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into visibility transition fixture");
+        let typed = output_text(&typed);
+        assert!(typed.contains("[value=••••••]"), "{typed}");
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_masks_exact_role_echo() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_840),
+                BrowserOp::Navigate(server.url("/input-role-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to role password echo fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Role secret input");
+        let sentinel = "role-password-echo-canary-66841";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_841),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into role password echo fixture");
+        let typed = output_text(&typed);
+        assert!(typed.contains("[value=••••••]"), "{typed}");
+        assert!(
+            typed
+                .lines()
+                .any(|line| line.trim().starts_with("- button [ref=")),
+            "{typed}"
+        );
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_snapshot_masks_same_document_root_replacement_echo() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_850),
+                BrowserOp::Navigate(server.url("/input-root-replacement-echo")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to root-replacement password echo fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Root replacement secret");
+        let sentinel = "root-replacement-password-echo-canary-66851";
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_851),
+                BrowserOp::Type {
+                    target,
+                    text: sentinel.to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into root-replacement password echo fixture");
+        let typed = output_text(&typed);
+        assert!(typed.contains("[value=••••••]"), "{typed}");
+        assert!(!typed.contains(sentinel), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_tool_type_password_snapshot_preserves_unrelated_short_secret_text() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_100),
+                BrowserOp::Navigate(server.url("/input-aria-echo-common")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to password echo fixture with common text");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Secret echo input");
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_101),
+                BrowserOp::Type {
+                    target,
+                    text: "a".to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type common password into echo fixture");
+        let typed = output_text(&typed);
+        assert!(typed.contains("[value=••••••]"), "{typed}");
+        assert_eq!(
+            typed
+                .lines()
+                .filter(|line| line.trim() == "- status \"a\"")
+                .count(),
+            1,
+            "{typed}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_tool_type_password_snapshot_preserves_reactive_safe_text() {
+        let _guard = browser_test_lock().lock().await;
+        let Some(actor) = actor().await else {
+            return;
+        };
+        let server = ActionFixtureServer::start();
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(66_200),
+                BrowserOp::Navigate(server.url("/input-reactive-safe")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("navigate actor to reactive safe fixture");
+        let target = snapshot_ref(output_text(&snapshot), "textbox", "Reactive secret input");
+
+        let typed = actor
+            .execute_with_timeout(
+                request_id(66_201),
+                BrowserOp::Type {
+                    target,
+                    text: "xy".to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("type into reactive safe fixture");
+        let typed = output_text(&typed);
+        assert!(typed.contains("Password strength: measured"), "{typed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn input_tool_default_clear_type_fills_without_empty_change() {
         let _guard = browser_test_lock().lock().await;
         let Some(actor) = actor().await else {
@@ -6774,13 +9319,143 @@ mod tests {
             .split_once("    fn select_option(")
             .expect("actor type path must end before select_option")
             .0;
+        // Password targets take a second post-action branch that resolves the
+        // sensitive-node taint first, so both branches must stay committed.
         assert!(
-            type_path.contains("|state| state.committed_post_action_snapshot(request)"),
-            "completed typing must use the completed-action snapshot path"
+            type_path.contains("state.committed_sensitive_post_action_snapshot(text, request)")
+                && type_path.contains("state.committed_post_action_snapshot(request)"),
+            "completed typing must use the completed-action snapshot path on both the \
+             sensitive and the ordinary branch"
         );
         assert!(
             !type_path.contains("state.snapshot(request)"),
             "completed typing must not return to a cancellable snapshot"
+        );
+        assert!(
+            type_path.contains("write_completed.set(true)")
+                && type_path.contains("Err(error) if write_completed.get()")
+                && type_path.contains("post_write_error.replace(Some(error))"),
+            "an error after the text write must resolve through the committed \
+             post-action path instead of discarding sensitive tracking"
+        );
+        let password_write_error_path = type_path
+            .split_once("Err(error) if tracks_password")
+            .expect("password helper-error path must exist")
+            .1
+            .split_once("Err(error) =>")
+            .expect("password helper-error path must end before ordinary errors")
+            .0;
+        assert!(
+            password_write_error_path
+                .contains("state.resolve_sensitive_snapshot_tracking(text, request)")
+                && password_write_error_path.contains("SensitiveWriteProgress::Complete")
+                && password_write_error_path.contains("write_completed.set(true)")
+                && password_write_error_path.contains("SensitiveWriteProgress::Partial")
+                && !password_write_error_path.contains("discard_sensitive_snapshot_tracking"),
+            "a password helper error must resolve live write progress before classifying \
+             completion, and must never discard a possibly landed write"
+        );
+        let sensitive_snapshot_path = production
+            .split_once("    fn committed_sensitive_post_action_snapshot(")
+            .expect("sensitive committed snapshot path must exist")
+            .1
+            .split_once("\n    fn ")
+            .expect("sensitive committed snapshot path must end before the next method")
+            .0;
+        assert!(
+            sensitive_snapshot_path
+                .contains("self.snapshot_with_sensitive_modal_redaction(sensitive_value, request)",)
+                && sensitive_snapshot_path.contains("committed_snapshot_result("),
+            "the sensitive snapshot path must commit the completed action while carrying \
+             ephemeral modal redaction"
+        );
+        assert!(
+            !sensitive_snapshot_path.contains("self.snapshot(request)"),
+            "the sensitive snapshot path must not fall back to a cancellable snapshot"
+        );
+        let sensitive_resolver_path = production
+            .split_once("    fn resolve_sensitive_snapshot_tracking(")
+            .expect("sensitive resolver path must exist")
+            .1
+            .split_once("\n    fn ")
+            .expect("sensitive resolver path must end before the next method")
+            .0;
+        assert!(
+            sensitive_resolver_path.contains("let page = self.page.as_ref()")
+                && sensitive_resolver_path.contains("ActionOptions::timeout(1_000.0)")
+                && !sensitive_resolver_path.contains("Self::remaining(request)")
+                && !sensitive_resolver_path.contains("self.ensure_page(request)"),
+            "committed sensitive resolution must survive a later step exhausting \
+             the request deadline"
+        );
+
+        let fill_form_path = production
+            .split_once("    fn fill_form(")
+            .expect("actor fill_form path must exist")
+            .1
+            .split_once("    fn hover(")
+            .expect("actor fill_form path must end before hover")
+            .0;
+        assert!(
+            fill_form_path.contains("self.committed_post_action_snapshot(request)")
+                && fill_form_path.contains("partial_completion_result("),
+            "fill_form must use committed snapshots for both complete and partial writes"
+        );
+        assert!(
+            !fill_form_path.contains("self.snapshot(request)"),
+            "fill_form must not use a cancellable snapshot after any writes"
+        );
+        let fill_helper_error_path = fill_form_path
+            .split_once("if let Err(error) = result")
+            .expect("fill_form helper-error path must exist")
+            .1
+            .split_once("\n            }\n            completed_fields.push(field.name.as_str());")
+            .expect("fill_form helper-error path must precede normal completion")
+            .0;
+        assert!(
+            fill_helper_error_path
+                .contains("self.resolve_sensitive_snapshot_tracking(&field.value, request)")
+                && fill_helper_error_path.contains("SensitiveWriteProgress::Complete")
+                && fill_helper_error_path.contains("SensitiveWriteProgress::Partial")
+                && !fill_helper_error_path.contains("discard_sensitive_snapshot_tracking"),
+            "fill_form must resolve every possibly started password write before \
+             reporting a field error"
+        );
+
+        let completion_path = production
+            .split_once("    fn complete<T>(")
+            .expect("actor completion path must exist")
+            .1
+            .split_once("\n    fn ")
+            .expect("actor completion path must end before the next method")
+            .0;
+        assert!(
+            completion_path.contains("BrowserOp::Type { .. } | BrowserOp::FillForm(_)",),
+            "request deadline handling must preserve truthful successful results from \
+             both text-write tools"
+        );
+
+        assert!(
+            BEGIN_SENSITIVE_SNAPSHOT_TRACKING_JS
+                .contains("tracking.sensitiveNodes instanceof WeakSet")
+                && RESOLVE_SENSITIVE_SNAPSHOT_TRACKING_JS.contains("new WeakRef(node)"),
+            "persistent sensitive-node tracking must not strongly retain tainted nodes"
+        );
+        assert!(
+            BEGIN_SENSITIVE_SNAPSHOT_TRACKING_JS.contains("'id', 'aria-hidden', 'hidden', 'class', 'style'")
+                && BEGIN_SENSITIVE_SNAPSHOT_TRACKING_JS.contains("visibilityBaseline")
+                && RESOLVE_SENSITIVE_SNAPSHOT_TRACKING_JS
+                    .contains("for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement)"),
+            "sensitive resolution must cover renderer relationships, visibility transitions, \
+             and aggregate-rendering ancestors"
+        );
+        assert!(
+            SNAPSHOT_JS.contains("if (!node.isConnected) continue;")
+                && SNAPSHOT_JS.contains(
+                    "for (let ancestor = node; ancestor; ancestor = ancestor.parentElement)",
+                )
+                && !SNAPSHOT_JS.contains("el.contains(node)"),
+            "each snapshot must precompute connected taints and ancestors once"
         );
     }
 

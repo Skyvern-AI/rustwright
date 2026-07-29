@@ -6,11 +6,36 @@
     target = null,
     maxDepth = null,
     boxes = false,
+    // Deliberately undefaulted: the mask glyph is owned by SECRET_MASK on the
+    // Rust side and passed in, so a second literal here cannot drift from it.
+    mask,
   } = options;
   const root = target === null ? document.body : document.querySelector(target);
   let refCounter = startRef;
   const lines = [];
   const refs = [];
+  const trackingKey = Symbol.for('rustwright.mcp.sensitiveSnapshot');
+  const tracking = globalThis[trackingKey];
+  const sensitiveNodes = new Set();
+  const aggregateSensitive = new Set();
+  if (tracking
+      && tracking.sensitiveNodes instanceof WeakSet
+      && tracking.sensitiveNodeRefs instanceof Set) {
+    for (const reference of tracking.sensitiveNodeRefs) {
+      const node = reference && typeof reference.deref === 'function'
+        ? reference.deref()
+        : null;
+      if (!node) {
+        tracking.sensitiveNodeRefs.delete(reference);
+        continue;
+      }
+      if (!node.isConnected) continue;
+      sensitiveNodes.add(node);
+      for (let ancestor = node; ancestor; ancestor = ancestor.parentElement) {
+        aggregateSensitive.add(ancestor);
+      }
+    }
+  }
 
   for (const el of document.querySelectorAll('[data-mcp-ref]')) {
     el.removeAttribute('data-mcp-ref');
@@ -40,34 +65,60 @@
     return rect.width > 0 || rect.height > 0 || el.tagName === 'OPTION';
   };
 
+  const containsSensitiveNode = (el) => sensitiveNodes.has(el);
+  // The resolver taints exactly the nodes whose rendered content holds the
+  // secret, ancestors included. An ancestor it did not taint is unsafe only
+  // where its name is *derived* from a tainted descendant's text, so the
+  // precomputed ancestor closure guards the aggregate paths alone. Blanking
+  // every ancestor outright also erased author-static labels, which cannot
+  // contain a secret typed after the page was written and are the caller's
+  // only handle on the field.
+  const hasSensitiveDescendant = (el) => aggregateSensitive.has(el);
+
   const roleOf = (el) => {
-    const explicit = el.getAttribute('role');
-    if (explicit) return explicit;
+    if (!containsSensitiveNode(el)) {
+      const explicit = el.getAttribute('role');
+      if (explicit) return explicit;
+    }
     if (el.tagName === 'INPUT') {
       const type = (el.getAttribute('type') || 'text').toLowerCase();
       return INPUT_ROLES[type] || 'textbox';
     }
-    return ROLE_BY_TAG[el.tagName] || null;
+    const nativeRole = ROLE_BY_TAG[el.tagName];
+    if (nativeRole) return nativeRole;
+    if (containsSensitiveNode(el)
+        && (el.hasAttribute('onclick') || el.tabIndex >= 0)) return 'generic';
+    return null;
   };
 
   const nameOf = (el) => {
+    if (containsSensitiveNode(el)) return '';
     const labelled = el.getAttribute('aria-labelledby');
     if (labelled) {
-      const parts = labelled.split(/\s+/)
+      const labelledNodes = labelled.split(/\s+/)
         .map((id) => document.getElementById(id))
-        .filter(Boolean)
-        .map((node) => node.textContent.trim());
+        .filter(Boolean);
+      if (labelledNodes.some(
+        (node) => containsSensitiveNode(node) || hasSensitiveDescendant(node),
+      )) return '';
+      const parts = labelledNodes.map((node) => node.textContent.trim());
       if (parts.length) return parts.join(' ');
     }
     const ariaLabel = el.getAttribute('aria-label');
     if (ariaLabel) return ariaLabel;
-    if (el.labels && el.labels.length) return el.labels[0].textContent.trim();
+    if (el.labels && el.labels.length) {
+      if (Array.from(el.labels).some(
+        (label) => containsSensitiveNode(label) || hasSensitiveDescendant(label),
+      )) return '';
+      return el.labels[0].textContent.trim();
+    }
     const direct = el.getAttribute('alt') || el.getAttribute('title')
       || el.getAttribute('placeholder');
     if (direct) return direct;
     if (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA') {
       return el.getAttribute('name') || '';
     }
+    if (hasSensitiveDescendant(el)) return '';
     return (el.textContent || '').trim().replace(/\s+/g, ' ');
   };
 
@@ -92,8 +143,10 @@
     if (SKIP_TAGS.has(tag) || el.namespaceURI === 'http://www.w3.org/2000/svg') return;
     if (!isVisible(el)) return;
     if (tag === 'IFRAME' || tag === 'FRAME') {
-      const label = el.getAttribute('title') || el.getAttribute('name')
-        || el.getAttribute('src') || '';
+      const label = containsSensitiveNode(el)
+        ? ''
+        : el.getAttribute('title') || el.getAttribute('name')
+          || el.getAttribute('src') || '';
       lines.push(`${'  '.repeat(treeDepth)}- iframe "${label.slice(0, MAX_NAME)}" (content not captured)`);
       return;
     }
@@ -106,14 +159,16 @@
       const parts = [`${'  '.repeat(treeDepth)}- ${role}`];
       if (name) parts.push(`"${name}"`);
       if (/^H[1-6]$/.test(el.tagName)) parts.push(`[level=${el.tagName[1]}]`);
-      if (el.tagName === 'A' && el.href) parts.push(`[href=${el.getAttribute('href')}]`);
+      if (el.tagName === 'A' && el.href && !containsSensitiveNode(el)) {
+        parts.push(`[href=${el.getAttribute('href')}]`);
+      }
       if (el.disabled) parts.push('[disabled]');
       if (el.checked) parts.push('[checked]');
       if ((el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && el.value) {
         const isPassword = el.tagName === 'INPUT'
           && (el.getAttribute('type') || 'text').toLowerCase() === 'password';
-        parts.push(isPassword
-          ? '[value=••••••]'
+        parts.push(isPassword || containsSensitiveNode(el)
+          ? `[value=${mask}]`
           : `[value="${String(el.value).slice(0, 60)}"]`);
       }
       if (isInteractive(el, role)) {
@@ -135,7 +190,9 @@
       }
     } else if (el.children.length === 0) {
       const text = (el.textContent || '').trim().replace(/\s+/g, ' ');
-      if (text) lines.push(`${'  '.repeat(treeDepth)}- text: ${text.slice(0, MAX_NAME)}`);
+      if (text && !containsSensitiveNode(el)) {
+        lines.push(`${'  '.repeat(treeDepth)}- text: ${text.slice(0, MAX_NAME)}`);
+      }
       return;
     }
     for (const child of el.children) walk(child, childDepth);
