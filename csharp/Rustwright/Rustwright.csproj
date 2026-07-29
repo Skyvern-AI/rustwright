@@ -6,7 +6,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
 
     <PackageId>Rustwright</PackageId>
-    <Version>0.1.1</Version>
+    <Version>0.2.0</Version>
     <Authors>Skyvern</Authors>
     <Description>A synchronous .NET binding for Rustwright's Rust-powered Chromium CDP engine.</Description>
     <PackageTags>browser;automation;cdp;chromium;playwright</PackageTags>

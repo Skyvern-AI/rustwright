@@ -11,7 +11,7 @@ plugins {
 }
 
 group = "io.github.skyvern-ai"
-version = "0.1.1"
+version = "0.2.0"
 
 tasks.withType<JavaCompile>().configureEach {
     options.encoding = "UTF-8"
@@ -51,7 +51,7 @@ mavenPublishing {
         javadocJar = JavadocJar.Javadoc(),
         sourcesJar = SourcesJar.Sources(),
     ))
-    coordinates("io.github.skyvern-ai", "rustwright", "0.1.1")
+    coordinates("io.github.skyvern-ai", "rustwright", "0.2.0")
     publishToMavenCentral(automaticRelease = true)
 
     // Maven-local builds intentionally stay unsigned. The guarded release job

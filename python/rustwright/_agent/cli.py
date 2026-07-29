@@ -67,7 +67,7 @@ def _version() -> str:
     try:
         return metadata.version("rustwright")
     except metadata.PackageNotFoundError:
-        return "0.1.1"
+        return "0.2.0"
 
 
 class ParserExit(Exception):
