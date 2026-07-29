@@ -4,11 +4,11 @@ This dependency-free Java 23 package uses the finalized `java.lang.foreign` API.
 
 ## Install (not yet published)
 
-The planned Maven Central coordinates are `io.github.skyvern-ai:rustwright:0.1.1`. The artifact is not yet published. Once it is available, add it with Gradle:
+The planned Maven Central coordinates are `io.github.skyvern-ai:rustwright:0.2.0`. The artifact is not yet published. Once it is available, add it with Gradle:
 
 ```kotlin
 dependencies {
-    implementation("io.github.skyvern-ai:rustwright:0.1.1")
+    implementation("io.github.skyvern-ai:rustwright:0.2.0")
 }
 ```
 
@@ -18,7 +18,7 @@ Or with Maven:
 <dependency>
   <groupId>io.github.skyvern-ai</groupId>
   <artifactId>rustwright</artifactId>
-  <version>0.1.1</version>
+  <version>0.2.0</version>
 </dependency>
 ```
 
