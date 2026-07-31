@@ -10180,6 +10180,2831 @@ def test_fill_sets_value_and_dispatches_events(page):
         page.locator("#checkbox-name").fill("forced checkbox", force=True)
 
 
+def _assert_fill_uses_browser_input_pipeline(page, fill):
+    page.set_content(
+        """
+        <input id="controlled" value="before">
+        <input id="clear" value="erase me">
+        <textarea id="textarea">before</textarea>
+        <div id="editable" contenteditable>before</div>
+        <input id="color" type="color" value="#000000">
+        <input id="date" type="date" value="2020-01-01">
+        <input id="range" type="range" min="0" max="100" value="10">
+        <script>
+        window.fillEvents = {};
+        const ids = ['controlled', 'clear', 'textarea', 'editable', 'color', 'date', 'range'];
+        for (const id of ids) {
+          const element = document.querySelector(`#${id}`);
+          window.fillEvents[id] = [];
+          for (const type of ['beforeinput', 'input', 'change']) {
+            element.addEventListener(type, event => window.fillEvents[id].push(event.type));
+          }
+          if ('value' in element) {
+            const prototype = element instanceof HTMLTextAreaElement
+              ? HTMLTextAreaElement.prototype
+              : HTMLInputElement.prototype;
+            const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
+            let trackedValue = String(descriptor.get.call(element));
+            Object.defineProperty(element, 'value', {
+              configurable: true,
+              get() {
+                return descriptor.get.call(this);
+              },
+              set(nextValue) {
+                trackedValue = String(nextValue);
+                descriptor.set.call(this, nextValue);
+              },
+            });
+            element._valueTracker = {
+              getValue() {
+                return trackedValue;
+              },
+              setValue(nextValue) {
+                trackedValue = String(nextValue);
+              },
+            };
+            element.addEventListener('input', () => {
+              const liveValue = String(descriptor.get.call(element));
+              if (liveValue !== element._valueTracker.getValue()) {
+                element._valueTracker.setValue(liveValue);
+                element.dataset.changeSeen = 'true';
+              }
+            });
+          } else {
+            element.addEventListener('input', () => {
+              element.dataset.changeSeen = 'true';
+            });
+          }
+        }
+        </script>
+        """
+    )
+
+    for selector, value in [
+        ("#controlled", "after"),
+        ("#clear", ""),
+        ("#textarea", "textarea after"),
+        ("#editable", "editable after"),
+        ("#color", "#ff0000"),
+        ("#date", "2026-07-29"),
+        ("#range", "75"),
+    ]:
+        fill(selector, value)
+
+    actual = page.evaluate(
+        """() => Object.fromEntries(
+          ['controlled', 'clear', 'textarea', 'editable', 'color', 'date', 'range'].map(id => {
+            const element = document.querySelector(`#${id}`);
+            return [id, {
+              value: 'value' in element ? element.value : element.textContent,
+              changeSeen: element.dataset.changeSeen === 'true',
+              events: window.fillEvents[id],
+            }];
+          })
+        )"""
+    )
+    expected = {
+        "controlled": {"value": "after", "changeSeen": True, "events": ["beforeinput", "input", "change"]},
+        "clear": {"value": "", "changeSeen": True, "events": ["beforeinput", "input", "change"]},
+        "textarea": {
+            "value": "textarea after",
+            "changeSeen": True,
+            "events": ["beforeinput", "input", "change"],
+        },
+        "editable": {"value": "editable after", "changeSeen": True, "events": ["beforeinput", "input"]},
+        "color": {"value": "#ff0000", "changeSeen": True, "events": ["input", "change"]},
+        "date": {"value": "2026-07-29", "changeSeen": True, "events": ["input", "change"]},
+        "range": {"value": "75", "changeSeen": True, "events": ["input", "change"]},
+    }
+    if actual != expected:
+        pytest.fail(f"fill behavior did not use the browser input pipeline:\n{json.dumps(actual, indent=2)}")
+
+
+def test_locator_fill_apply_reaches_react_value_tracker_through_browser_input(page):
+    def core_fill(selector, value):
+        result = page.locator(selector)._fill_apply(
+            value,
+            strict=True,
+            forced=False,
+            timeout=500,
+        )
+        assert result["ok"] is True
+
+    _assert_fill_uses_browser_input_pipeline(page, core_fill)
+
+
+def test_locator_simple_css_fast_fill_reaches_react_value_tracker_through_browser_input(page, monkeypatch):
+    from rustwright.sync_api import Locator
+
+    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
+
+    def reject_core_fallback(*args, **kwargs):
+        raise AssertionError("simple-CSS fill unexpectedly fell through to Locator._fill_apply")
+
+    monkeypatch.setattr(Locator, "_fill_apply", reject_core_fallback)
+
+    def simple_css_fill(selector, value):
+        page.locator(selector).fill(value, timeout=500)
+
+    _assert_fill_uses_browser_input_pipeline(page, simple_css_fill)
+
+
+def test_locator_fill_routes_deadline_retry_and_result_classification_through_core():
+    from rustwright.sync_api import Locator
+
+    source = inspect.getsource(Locator._fill)
+
+    assert "locator_fill_actionable" in source
+    assert "while True" not in source
+    assert "_fill_apply(" not in source
+    assert "_actionability_probe_timeout" not in source
+    assert "time.monotonic" not in source
+
+
+def test_locator_fill_timeout_zero_disables_timeout(page):
+    page.set_content("<input id='ready' value='old'>")
+
+    page.locator("#ready").fill("new", timeout=0)
+
+    assert page.locator("#ready").input_value() == "new"
+
+
+def test_locator_fill_core_poll_hook_runs_locator_handlers(page):
+    page.set_content(
+        """
+        <div id="overlay">Blocking notice</div>
+        <input id="target">
+        """
+    )
+    calls = []
+
+    def dismiss_overlay(locator):
+        calls.append(locator.text_content())
+        locator.evaluate("(element) => element.remove()")
+
+    page.add_locator_handler(page.locator("#overlay"), dismiss_overlay)
+    page.locator("#target").fill("handled")
+
+    assert calls == ["Blocking notice"]
+    assert page.locator("#target").input_value() == "handled"
+
+
+def test_forced_fill_matches_playwright_ineligible_matrix(page):
+    page.set_content(
+        """
+        <input id="css-hidden" style="display:none" value="old-css-hidden">
+        <input id="disabled" disabled value="old-disabled">
+        <input id="readonly" readonly value="old-readonly">
+        <input id="type-hidden" type="hidden" value="old-type-hidden">
+        <input id="checkbox" type="checkbox" value="old-checkbox">
+        <div id="editable" contenteditable>old-editable</div>
+        """
+    )
+
+    page.locator("#css-hidden").fill("new-css-hidden", force=True)
+    page.locator("#disabled").fill("new-disabled", force=True)
+    page.locator("#readonly").fill("new-readonly", force=True)
+
+    with pytest.raises(Error, match='Input of type "hidden"'):
+        page.locator("#type-hidden").fill("new-type-hidden", force=True)
+    with pytest.raises(Error, match='Input of type "checkbox"'):
+        page.locator("#checkbox").fill("new-checkbox", force=True)
+
+    page.locator("#editable").fill("new-editable", force=True)
+
+    assert page.locator("#css-hidden").input_value() == "old-css-hidden"
+    assert page.locator("#disabled").input_value() == "old-disabled"
+    assert page.locator("#readonly").input_value() == "old-readonly"
+    assert page.locator("#type-hidden").input_value() == "old-type-hidden"
+    assert page.locator("#checkbox").input_value() == "old-checkbox"
+    assert page.locator("#editable").text_content() == "new-editable"
+
+
+def test_sync_async_page_and_locator_fill_accept_browser_constrained_and_controlled_values(page, monkeypatch):
+    import rustwright.async_api as async_api
+
+    markup = """
+    <input id="maxlength" maxlength="4">
+    <input id="controlled">
+    <script>
+    document.querySelector('#controlled').addEventListener('input', event => {
+      event.target.value = event.target.value.toUpperCase();
+    });
+    </script>
+    """
+
+    page.set_content(markup)
+    page.locator("#maxlength").fill("abcdef")
+    page.locator("#controlled").fill("mixedCase")
+    assert page.locator("#maxlength").input_value() == "abcd"
+    assert page.locator("#controlled").input_value() == "MIXEDCASE"
+
+    original_run_sync_wait_sliced = async_api._run_sync_wait_sliced
+
+    async def reject_sync_fallback(*args, **kwargs):
+        raise AssertionError("AsyncPage.fill should use the native async path")
+
+    monkeypatch.setattr(async_api, "_run_sync_wait_sliced", reject_sync_fallback)
+
+    async def run():
+        from rustwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch()
+            async_page = await browser.new_page()
+            await async_page.set_content(markup)
+            await async_page.fill("#maxlength", "abcdef")
+            await async_page.fill("#controlled", "mixedCase")
+            assert await async_page.locator("#maxlength").input_value() == "abcd"
+            assert await async_page.locator("#controlled").input_value() == "MIXEDCASE"
+
+            monkeypatch.setattr(async_api, "_run_sync_wait_sliced", original_run_sync_wait_sliced)
+            await async_page.set_content(markup)
+            await async_page.locator("#maxlength").fill("abcdef")
+            await async_page.locator("#controlled").fill("mixedCase")
+            assert await async_page.locator("#maxlength").input_value() == "abcd"
+            assert await async_page.locator("#controlled").input_value() == "MIXEDCASE"
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_sync_and_async_fill_accept_page_committed_value_from_canceled_beforeinput(page):
+    markup = """
+    <input id="target" value="old">
+    <script>
+    document.querySelector('#target').addEventListener('beforeinput', event => {
+      if (!event.isTrusted) return;
+      event.preventDefault();
+      event.target.value = event.data;
+    });
+    </script>
+    """
+
+    page.set_content(markup)
+    page.locator("#target").fill("sync", timeout=1_000)
+    assert page.locator("#target").input_value() == "sync"
+
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch()
+            async_page = await browser.new_page()
+            await async_page.set_content(markup)
+            await async_page.fill("#target", "async", timeout=1_000)
+            assert await async_page.locator("#target").input_value() == "async"
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_locator_fill_rejects_pre_settle_value_as_canceled_unchanged_commit(
+    page, monkeypatch
+):
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        const target = document.querySelector('#target');
+        window.__fillAudit = {
+          focusUpdated: false,
+          trustedBeforeInput: 0,
+          untrustedInput: 0,
+        };
+        target.addEventListener('focus', () => {
+          setTimeout(() => {
+            target.value = 'focus-update';
+            window.__fillAudit.focusUpdated = true;
+          }, 0);
+        });
+        target.addEventListener('beforeinput', event => {
+          if (!event.isTrusted) return;
+          window.__fillAudit.trustedBeforeInput++;
+          const unchanged = target.value;
+          event.preventDefault();
+          target.value = unchanged;
+          target.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            composed: true,
+            data: unchanged,
+            inputType: event.inputType,
+          }));
+        });
+        target.addEventListener('input', event => {
+          if (!event.isTrusted) window.__fillAudit.untrustedInput++;
+        });
+        </script>
+        """
+    )
+
+    with pytest.raises(TimeoutError, match="confirmed as edited"):
+        page.locator("#target").fill("requested", timeout=250)
+
+    assert page.locator("#target").input_value() == "focus-update"
+    assert page.evaluate("window.__fillAudit") == {
+        "focusUpdated": True,
+        "trustedBeforeInput": 1,
+        "untrustedInput": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("fill_value", "expected_value"),
+    [("new", "$NEW"), ("", "$")],
+    ids=["insert", "clear"],
+)
+def test_locator_fill_accepts_canceled_beforeinput_custom_commit_once(
+    page, fill_value, expected_value
+):
+    page.set_content(
+        """
+        <input id="target" value="$old">
+        <script>
+        const target = document.querySelector('#target');
+        window.__audit = { handlerCount: 0 };
+        target.addEventListener('beforeinput', event => {
+          if (!event.isTrusted) return;
+          window.__audit.handlerCount++;
+          event.preventDefault();
+          target.value = event.data === null ? '$' : '$' + event.data.toUpperCase();
+          target.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            composed: true,
+            data: event.data,
+            inputType: event.inputType,
+          }));
+        });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill(fill_value, timeout=500)
+
+    assert page.locator("#target").input_value() == expected_value
+    assert page.evaluate("() => window.__audit.handlerCount") == 1
+
+
+@pytest.mark.parametrize(
+    "unsafe_fastpath",
+    [False, True],
+    ids=["standard-loop", "fastpath-loop"],
+)
+def test_locator_fill_strict_observe_ignores_temporary_duplicate(
+    page, monkeypatch, unsafe_fastpath
+):
+    if unsafe_fastpath:
+        monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
+    else:
+        monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        const target = document.querySelector('#target');
+        target.addEventListener('beforeinput', event => {
+          if (!event.isTrusted) return;
+          const requested = event.data;
+          event.preventDefault();
+          const duplicate = target.cloneNode();
+          duplicate.id = 'target';
+          duplicate.dataset.temporaryDuplicate = '';
+          document.body.appendChild(duplicate);
+          setTimeout(() => {
+            target.value = `page-${requested}`;
+            target.dispatchEvent(new InputEvent('input', {
+              bubbles: true,
+              composed: true,
+              data: requested,
+              inputType: event.inputType,
+            }));
+          }, 50);
+        });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("committed", timeout=500)
+
+    assert page.evaluate(
+        """() => document.querySelector(
+          '#target:not([data-temporary-duplicate])'
+        ).value"""
+    ) == "page-committed"
+    page.evaluate("() => document.querySelector('[data-temporary-duplicate]').remove()")
+
+
+def test_locator_fill_slow_async_commit_dispatches_once(page, monkeypatch):
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        const target = document.querySelector('#target');
+        window.__fillAudit = { trustedBeforeInput: 0 };
+        target.addEventListener('beforeinput', event => {
+          if (!event.isTrusted) return;
+          const requested = event.data;
+          window.__fillAudit.trustedBeforeInput++;
+          event.preventDefault();
+          setTimeout(() => {
+            target.value = `page-${requested}`;
+            target.dispatchEvent(new InputEvent('input', {
+              bubbles: true,
+              composed: true,
+              data: requested,
+              inputType: event.inputType,
+            }));
+          }, 700);
+        });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("committed", timeout=2_000)
+
+    assert page.locator("#target").input_value() == "page-committed"
+    assert page.evaluate("window.__fillAudit.trustedBeforeInput") == 1
+
+
+def test_locator_fill_install_sweep_renews_foreign_expired_guard_once(page):
+    from rustwright import _rustwright
+
+    page.set_content('<input id="target" value="old">')
+
+    own_key = "__rustwright_fill_guard_install_sweep_test"
+    renewable_key = "__rustwright_fill_guard_foreign_renewable_test"
+    spent_key = "__rustwright_fill_guard_foreign_spent_test"
+    fill_body = (
+        _rustwright._LOCATOR_FILL_TEMPLATE.replace("__STRICT__", "true")
+        .replace("__VALUE__", json.dumps("committed"))
+        .replace("__FILL_GUARD_KEY__", json.dumps(own_key))
+        .replace("__FORCED__", "false")
+    )
+    install_expression = (
+        """
+        (() => {
+          const matches = [document.querySelector('#target')];
+          const el = matches[0];
+          const strictFrameViolation = null;
+          const visible = candidate => !!candidate && candidate.isConnected;
+          const disabledState = candidate => !!candidate.disabled;
+        """
+        + fill_body
+        + """
+        })()
+        """
+    )
+    cdp = page.context.new_cdp_session(page)
+    frame_id = cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    context_id = cdp.send(
+        "Page.createIsolatedWorld",
+        {"frameId": frame_id, "worldName": "__utility_world__"},
+    )["executionContextId"]
+
+    def evaluate_in_fill_world(expression):
+        response = cdp.send(
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "contextId": context_id,
+                "awaitPromise": True,
+                "returnByValue": True,
+                "userGesture": True,
+            },
+        )
+        assert "exceptionDetails" not in response
+        return response["result"].get("value")
+
+    evaluate_in_fill_world(
+        f"""
+        (() => {{
+          const audit = globalThis.__fillGuardSweepAudit = {{}};
+          const installSyntheticGuard = (key, expiryRenewed) => {{
+            const guard = {{
+              passive: false,
+              expiryRenewed,
+              expiresAt: performance.now() - 1,
+              cleanup() {{
+                audit[key] = (audit[key] || 0) + 1;
+                if (globalThis[key] === guard) delete globalThis[key];
+              }},
+            }};
+            globalThis[key] = guard;
+          }};
+          installSyntheticGuard({json.dumps(renewable_key)}, false);
+          installSyntheticGuard({json.dumps(spent_key)}, true);
+          return null;
+        }})()
+        """
+    )
+
+    installed = evaluate_in_fill_world(install_expression)
+    assert installed["type"] == "insert-text"
+    swept = evaluate_in_fill_world(
+        f"""
+        (() => {{
+          const renewable = globalThis[{json.dumps(renewable_key)}];
+          return {{
+            renewable: renewable ? {{
+              passive: renewable.passive === true,
+              expiryRenewed: renewable.expiryRenewed === true,
+              expiresIn: renewable.expiresAt - performance.now(),
+            }} : null,
+            spentPresent: {json.dumps(spent_key)} in globalThis,
+            renewableCleanups:
+              globalThis.__fillGuardSweepAudit[{json.dumps(renewable_key)}] || 0,
+            spentCleanups:
+              globalThis.__fillGuardSweepAudit[{json.dumps(spent_key)}] || 0,
+          }};
+        }})()
+        """
+    )
+    expires_in = swept["renewable"].pop("expiresIn")
+    assert swept == {
+        "renewable": {"passive": True, "expiryRenewed": True},
+        "spentPresent": False,
+        "renewableCleanups": 0,
+        "spentCleanups": 1,
+    }
+    assert 0 < expires_in <= 5_000
+
+    evaluate_in_fill_world(
+        f"""
+        (() => {{
+          for (const key of [{json.dumps(renewable_key)}, {json.dumps(own_key)}]) {{
+            const guard = globalThis[key];
+            if (guard && typeof guard.cleanup === 'function') guard.cleanup();
+          }}
+          return null;
+        }})()
+        """
+    )
+
+
+def test_locator_fill_settle_reactivates_guard_and_discards_predispatch_confirmation(
+    page,
+):
+    from rustwright import _rustwright
+
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        const target = document.querySelector('#target');
+        window.__fillAudit = { trustedBeforeInput: 0 };
+        const handleBeforeInput = event => {
+          if (!event.isTrusted) return;
+          window.__fillAudit.trustedBeforeInput++;
+          event.preventDefault();
+          if (window.__fillAudit.trustedBeforeInput !== 1) return;
+          target.value = 'user';
+          target.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            composed: true,
+            data: event.data,
+            inputType: event.inputType,
+          }));
+        };
+        target.addEventListener('beforeinput', handleBeforeInput);
+        window.__removeFillTestListener = () => {
+          target.removeEventListener('beforeinput', handleBeforeInput);
+        };
+        </script>
+        """
+    )
+
+    guard_key = "__rustwright_fill_guard_predispatch_confirmation_test"
+    fill_body = (
+        _rustwright._LOCATOR_FILL_TEMPLATE.replace("__STRICT__", "true")
+        .replace("__VALUE__", json.dumps("committed"))
+        .replace("__FILL_GUARD_KEY__", json.dumps(guard_key))
+        .replace("__FORCED__", "false")
+    )
+    install_expression = (
+        """
+        (() => {
+          const matches = [document.querySelector('#target')];
+          const el = matches[0];
+          const strictFrameViolation = null;
+          const visible = candidate => !!candidate && candidate.isConnected;
+          const disabledState = candidate => !!candidate.disabled;
+        """
+        + fill_body
+        + """
+        })()
+        """
+    )
+    cdp = page.context.new_cdp_session(page)
+    frame_id = cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    context_id = cdp.send(
+        "Page.createIsolatedWorld",
+        {"frameId": frame_id, "worldName": "__utility_world__"},
+    )["executionContextId"]
+
+    def evaluate_in_fill_world(expression):
+        response = cdp.send(
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "contextId": context_id,
+                "awaitPromise": True,
+                "returnByValue": True,
+                "userGesture": True,
+            },
+        )
+        assert "exceptionDetails" not in response
+        return response["result"].get("value")
+
+    installed = evaluate_in_fill_world(install_expression)
+    assert installed["type"] == "insert-text"
+    evaluate_in_fill_world(
+        f"""
+        (() => {{
+          const guard = globalThis[{json.dumps(guard_key)}];
+          guard.expiresAt = performance.now() - 1;
+          return null;
+        }})()
+        """
+    )
+
+    # This trusted edit arrives before Rust's dispatch. Expiry passivates the active
+    # guard, but the event is still recorded with active semantics; the page then
+    # cancels it, commits the user's value, and announces that commit synthetically.
+    cdp.send("Input.insertText", {"text": "user"})
+    stale = evaluate_in_fill_world(
+        f"""
+        (() => {{
+          const guard = globalThis[{json.dumps(guard_key)}];
+          return {{
+            passive: guard.passive,
+            precursorReceived: guard.precursorReceived,
+            activePrecursor: !!guard.activePrecursor,
+            activeBeforeInput:
+              !!guard.activeBeforeInput && guard.activeBeforeInput.defaultPrevented,
+            untrustedInputReceived: guard.untrustedInputReceived,
+            mutationReceived: guard.mutationReceived,
+            actual: guard.locator.value,
+          }};
+        }})()
+        """
+    )
+    assert stale == {
+        "passive": True,
+        "precursorReceived": True,
+        "activePrecursor": True,
+        "activeBeforeInput": True,
+        "untrustedInputReceived": True,
+        "mutationReceived": False,
+        "actual": "user",
+    }
+
+    # Simulate the real settle/ready contract immediately before Rust dispatches.
+    # This is deterministic: the stale trusted edit above already passivated the
+    # installed guard, so no polling race is needed to land inside the settle.
+    settled = evaluate_in_fill_world(
+        f"""
+        (() => {{
+          const guard = globalThis[{json.dumps(guard_key)}];
+          guard.passive = false;
+          guard.expiresAt = performance.now() + 5000;
+          guard.expiryRenewed = false;
+          guard.resetConfirmationEvidence();
+          return {{
+            passive: guard.passive,
+            expiryRenewed: guard.expiryRenewed,
+            expiresIn: guard.expiresAt - performance.now(),
+            precursorReceived: guard.precursorReceived,
+            activePrecursor: guard.activePrecursor,
+            activeBeforeInput: guard.activeBeforeInput,
+            untrustedInputReceived: guard.untrustedInputReceived,
+            mutationReceived: guard.mutationReceived,
+          }};
+        }})()
+        """
+    )
+    expires_in = settled.pop("expiresIn")
+    assert settled == {
+        "passive": False,
+        "expiryRenewed": False,
+        "precursorReceived": False,
+        "activePrecursor": None,
+        "activeBeforeInput": None,
+        "untrustedInputReceived": False,
+        "mutationReceived": False,
+    }
+    assert 0 < expires_in <= 5_000
+
+    # The page cancels Rust's different edit without committing. The user's stale
+    # value remains, but none of its pre-dispatch evidence may confirm this attempt.
+    # Reactivation nevertheless lets the guard record this dispatch's own precursor.
+    cdp.send("Input.insertText", {"text": "committed"})
+    observed = evaluate_in_fill_world(
+        f"""
+        (() => {{
+          const guard = globalThis[{json.dumps(guard_key)}];
+          const actual = String(guard.locator.value ?? '');
+          const committedValue = 'committed';
+          const pageCommittedCanceledEdit =
+            !!guard.activeBeforeInput &&
+            guard.activeBeforeInput.defaultPrevented &&
+            guard.untrustedInputReceived &&
+            actual !== guard.initialValue;
+          const dispatchConfirmed =
+            guard.mutationReceived ||
+            (
+              guard.precursorReceived &&
+              !guard.diverted &&
+              (
+                actual === committedValue ||
+                pageCommittedCanceledEdit
+              )
+            );
+          return {{
+            dispatchConfirmed,
+            passive: guard.passive,
+            expiryRenewed: guard.expiryRenewed,
+            precursorReceived: guard.precursorReceived,
+            activeBeforeInput: !!guard.activeBeforeInput,
+            untrustedInputReceived: guard.untrustedInputReceived,
+            mutationReceived: guard.mutationReceived,
+            actual,
+          }};
+        }})()
+        """
+    )
+
+    assert observed == {
+        "dispatchConfirmed": False,
+        "passive": False,
+        "expiryRenewed": False,
+        "precursorReceived": True,
+        "activeBeforeInput": True,
+        "untrustedInputReceived": False,
+        "mutationReceived": False,
+        "actual": "user",
+    }
+    assert page.evaluate("window.__fillAudit.trustedBeforeInput") == 2
+
+    # Model the reported listener-less path from a retained passive guard. The Rust
+    # unit contract binds these settle operations to the generated expression;
+    # this page-level half proves that the reactivated recording gates retain both of
+    # the dispatch's trusted events and the requested value.
+    page.evaluate("window.__removeFillTestListener()")
+    listenerless_settle = evaluate_in_fill_world(
+        f"""
+        (() => {{
+          const guard = globalThis[{json.dumps(guard_key)}];
+          guard.passive = true;
+          guard.expiresAt = performance.now() - 1;
+          guard.expiryRenewed = true;
+          const wasRetainedPassive =
+            guard.passive &&
+            guard.expiryRenewed &&
+            guard.expiresAt < performance.now();
+          guard.locator.select();
+          guard.passive = false;
+          guard.expiresAt = performance.now() + 5000;
+          guard.expiryRenewed = false;
+          guard.resetConfirmationEvidence();
+          return {{
+            wasRetainedPassive,
+            passive: guard.passive,
+            expiryRenewed: guard.expiryRenewed,
+          }};
+        }})()
+        """
+    )
+    assert listenerless_settle == {
+        "wasRetainedPassive": True,
+        "passive": False,
+        "expiryRenewed": False,
+    }
+
+    cdp.send("Input.insertText", {"text": "committed"})
+    listenerless_dispatch = evaluate_in_fill_world(
+        f"""
+        (() => {{
+          const guard = globalThis[{json.dumps(guard_key)}];
+          return {{
+            passive: guard.passive,
+            expiryRenewed: guard.expiryRenewed,
+            precursorReceived: guard.precursorReceived,
+            activeBeforeInput: !!guard.activeBeforeInput,
+            mutationReceived: guard.mutationReceived,
+            actual: guard.locator.value,
+          }};
+        }})()
+        """
+    )
+    assert listenerless_dispatch == {
+        "passive": False,
+        "expiryRenewed": False,
+        "precursorReceived": True,
+        "activeBeforeInput": True,
+        "mutationReceived": True,
+        "actual": "committed",
+    }
+
+    evaluate_in_fill_world(
+        f"""
+        (() => {{
+          const guard = globalThis[{json.dumps(guard_key)}];
+          if (guard) guard.cleanup();
+          return null;
+        }})()
+        """
+    )
+
+
+@pytest.mark.parametrize(
+    ("starts_passive", "expected_confirmed", "expected_reentry"),
+    [
+        pytest.param(False, True, "observe-dispatch", id="active-guard"),
+        pytest.param(True, False, "insert-text", id="retained-passive-guard"),
+    ],
+)
+def test_locator_fill_guard_renews_once_after_lease_while_renderer_is_blocked(
+    page, starts_passive, expected_confirmed, expected_reentry
+):
+    from rustwright import _rustwright
+
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        const target = document.querySelector('#target');
+        window.__fillAudit = { trustedBeforeInput: 0 };
+        target.addEventListener('beforeinput', event => {
+          if (!event.isTrusted) return;
+          window.__fillAudit.trustedBeforeInput++;
+          event.preventDefault();
+          const requested = event.data;
+          const until = performance.now() + 300;
+          while (performance.now() < until) {}
+          target.value = `page-${requested}`;
+          target.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            composed: true,
+            data: requested,
+            inputType: event.inputType,
+          }));
+        });
+        </script>
+        """
+    )
+
+    guard_key = (
+        "__rustwright_fill_guard_passive_expiry_test"
+        if starts_passive
+        else "__rustwright_fill_guard_active_expiry_test"
+    )
+    fill_body = (
+        _rustwright._LOCATOR_FILL_TEMPLATE.replace("__STRICT__", "true")
+        .replace("__VALUE__", json.dumps("committed"))
+        .replace("__FILL_GUARD_KEY__", json.dumps(guard_key))
+        .replace("__FORCED__", "false")
+    )
+    install_expression = (
+        """
+        (() => {
+          const matches = [document.querySelector('#target')];
+          const el = matches[0];
+          const strictFrameViolation = null;
+          const visible = candidate => !!candidate && candidate.isConnected;
+          const disabledState = candidate => !!candidate.disabled;
+        """
+        + fill_body
+        + """
+        })()
+        """
+    )
+    cdp = page.context.new_cdp_session(page)
+    frame_id = cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    context_id = cdp.send(
+        "Page.createIsolatedWorld",
+        {"frameId": frame_id, "worldName": "__utility_world__"},
+    )["executionContextId"]
+
+    def evaluate_in_fill_world(expression):
+        response = cdp.send(
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "contextId": context_id,
+                "awaitPromise": True,
+                "returnByValue": True,
+                "userGesture": True,
+            },
+        )
+        assert "exceptionDetails" not in response
+        return response["result"].get("value")
+
+    installed = evaluate_in_fill_world(install_expression)
+    assert installed["type"] == "insert-text"
+    evaluate_in_fill_world(
+        f"""
+        (() => {{
+          const guard = globalThis[{json.dumps(guard_key)}];
+          Object.assign(guard, {{
+            passive: {json.dumps(starts_passive)},
+            expiresAt: performance.now() + 5000,
+          }});
+          guard.target.addEventListener('beforeinput', () => {{
+            guard.expiresAt = performance.now() - 1;
+          }}, {{ capture: true, once: true }});
+          return null;
+        }})()
+        """
+    )
+
+    cdp.send("Input.insertText", {"text": "committed"})
+
+    observed = evaluate_in_fill_world(
+        f"""
+        (() => {{
+          const guard = globalThis[{json.dumps(guard_key)}];
+          if (!guard) return {{ confirmed: false }};
+          const actual = String(guard.locator.value ?? '');
+          return {{
+            expiryRenewed: guard.expiryRenewed === true,
+            confirmed:
+              guard.passive === true &&
+              guard.precursorReceived &&
+              guard.untrustedInputReceived &&
+              !!guard.activeBeforeInput &&
+              guard.activeBeforeInput.defaultPrevented &&
+              guard.locator === document.querySelector('#target') &&
+              actual !== guard.initialValue,
+            precursorReceived: guard.precursorReceived,
+            untrustedInputReceived: guard.untrustedInputReceived,
+            activeBeforeInput: !!guard.activeBeforeInput,
+            mutationReceived: guard.mutationReceived,
+            actual,
+          }};
+        }})()
+        """
+    )
+
+    reentered = evaluate_in_fill_world(install_expression)
+    assert reentered["type"] == expected_reentry
+    if expected_reentry == "observe-dispatch":
+        assert (
+            evaluate_in_fill_world(
+                f"globalThis[{json.dumps(guard_key)}].expiryRenewed"
+            )
+            is False
+        )
+    evaluate_in_fill_world(
+        f"(() => {{ const g = globalThis[{json.dumps(guard_key)}]; if (g) g.cleanup(); return null; }})()"
+    )
+
+    assert observed == {
+        "expiryRenewed": True,
+        "confirmed": expected_confirmed,
+        "precursorReceived": not starts_passive,
+        "untrustedInputReceived": not starts_passive,
+        "activeBeforeInput": not starts_passive,
+        "mutationReceived": False,
+        "actual": "page-committed",
+    }
+    assert page.evaluate("window.__fillAudit.trustedBeforeInput") == 1
+
+    page.evaluate(
+        """() => {
+        document.querySelector('#target').value = 'old';
+        window.__fillAudit.trustedBeforeInput = 0;
+        }"""
+    )
+    page.locator("#target").fill("committed", timeout=1_000)
+    assert page.locator("#target").input_value() == "page-committed"
+    assert page.evaluate("window.__fillAudit.trustedBeforeInput") == 1
+
+
+def test_locator_fill_records_own_input_when_capture_formatter_expires_guard(
+    page, monkeypatch
+):
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        window.__fillAudit = { trustedBeforeInput: 0 };
+        window.addEventListener('beforeinput', event => {
+          if (event.isTrusted && event.target.id === 'target') {
+            window.__fillAudit.trustedBeforeInput++;
+          }
+        }, true);
+        </script>
+        """
+    )
+
+    cdp = page.context.new_cdp_session(page)
+    frame_id = cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    context_id = cdp.send(
+        "Page.createIsolatedWorld",
+        {"frameId": frame_id, "worldName": "__utility_world__"},
+    )["executionContextId"]
+    response = cdp.send(
+        "Runtime.evaluate",
+        {
+            "expression": """
+            (() => {
+              window.addEventListener('input', event => {
+                if (!event.isTrusted || event.target.id !== 'target') return;
+                const guard = Object.getOwnPropertyNames(globalThis)
+                  .filter(key => key.startsWith('__rustwright_fill_guard_'))
+                  .map(key => globalThis[key])
+                  .find(candidate => candidate && candidate.target === event.target);
+                if (!guard) return;
+                event.target.value = `formatted-${event.target.value}`;
+                // Synthetically model a window-capture formatter that blocked past
+                // the lease before the guard's document-capture listener can run.
+                guard.expiresAt = performance.now() - 1;
+              }, { capture: true, once: true });
+              return null;
+            })()
+            """,
+            "contextId": context_id,
+            "awaitPromise": True,
+            "returnByValue": True,
+            "userGesture": True,
+        },
+    )
+    assert "exceptionDetails" not in response
+
+    page.locator("#target").fill("committed", timeout=1_000)
+
+    assert page.locator("#target").input_value() == "formatted-committed"
+    assert page.evaluate("window.__fillAudit.trustedBeforeInput") == 1
+
+
+def test_locator_fill_records_beforeinput_that_passivates_active_guard(
+    page, monkeypatch
+):
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        window.__fillAudit = { trustedBeforeInput: 0 };
+        window.addEventListener('beforeinput', event => {
+          if (event.isTrusted && event.target.id === 'target') {
+            window.__fillAudit.trustedBeforeInput++;
+          }
+        }, true);
+        </script>
+        """
+    )
+
+    cdp = page.context.new_cdp_session(page)
+    frame_id = cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    context_id = cdp.send(
+        "Page.createIsolatedWorld",
+        {"frameId": frame_id, "worldName": "__utility_world__"},
+    )["executionContextId"]
+    response = cdp.send(
+        "Runtime.evaluate",
+        {
+            "expression": """
+            (() => {
+              window.addEventListener('beforeinput', event => {
+                if (!event.isTrusted || event.target.id !== 'target') return;
+                const guard = Object.getOwnPropertyNames(globalThis)
+                  .filter(key => key.startsWith('__rustwright_fill_guard_'))
+                  .map(key => globalThis[key])
+                  .find(candidate => candidate && candidate.target === event.target);
+                if (!guard) return;
+                guard.expiresAt = performance.now() + 10;
+                const until = performance.now() + 25;
+                while (performance.now() < until) {}
+              }, { capture: true, once: true });
+              return null;
+            })()
+            """,
+            "contextId": context_id,
+            "awaitPromise": True,
+            "returnByValue": True,
+            "userGesture": True,
+        },
+    )
+    assert "exceptionDetails" not in response
+
+    page.locator("#target").fill("committed", timeout=1_000)
+
+    assert page.locator("#target").input_value() == "committed"
+    assert page.evaluate("window.__fillAudit.trustedBeforeInput") == 1
+
+
+def test_locator_fill_records_window_capture_formatter_after_stop_propagation(
+    page, monkeypatch
+):
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        window.__fillAudit = { trustedBeforeInput: 0, trustedInput: 0 };
+        window.addEventListener('beforeinput', event => {
+          if (event.isTrusted && event.target.id === 'target') {
+            window.__fillAudit.trustedBeforeInput++;
+          }
+        }, true);
+        window.addEventListener('input', event => {
+          if (!event.isTrusted || event.target.id !== 'target') return;
+          window.__fillAudit.trustedInput++;
+          event.target.value = `formatted-${event.target.value}`;
+          event.stopPropagation();
+        }, true);
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("committed", timeout=1_000)
+
+    assert page.locator("#target").input_value() == "formatted-committed"
+    assert page.evaluate("window.__fillAudit") == {
+        "trustedBeforeInput": 1,
+        "trustedInput": 1,
+    }
+
+
+def test_locator_fill_pins_dispatching_frame_when_frame_locator_retargets(
+    page, monkeypatch
+):
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+    page.set_content(
+        """
+        <iframe id="frame-a" data-fill-target></iframe>
+        <iframe id="frame-b"></iframe>
+        <script>
+        const frameA = document.querySelector('#frame-a');
+        const frameB = document.querySelector('#frame-b');
+        frameA.contentDocument.body.innerHTML = '<input id="target" value="old-a">';
+        frameB.contentDocument.body.innerHTML = '<input id="target" value="">';
+        const targetA = frameA.contentDocument.querySelector('#target');
+        const targetB = frameB.contentDocument.querySelector('#target');
+        window.__fillFrameAudit = { aTrustedBeforeInput: 0, bTrustedBeforeInput: 0 };
+        targetA.addEventListener('beforeinput', event => {
+          if (!event.isTrusted) return;
+          const requested = event.data;
+          window.__fillFrameAudit.aTrustedBeforeInput++;
+          event.preventDefault();
+          setTimeout(() => {
+            frameA.removeAttribute('data-fill-target');
+            frameB.setAttribute('data-fill-target', '');
+          }, 50);
+          setTimeout(() => {
+            targetA.value = `page-${requested}`;
+            targetA.dispatchEvent(new frameA.contentWindow.InputEvent('input', {
+              bubbles: true,
+              composed: true,
+              data: requested,
+              inputType: event.inputType,
+            }));
+          }, 200);
+        });
+        targetB.addEventListener('beforeinput', event => {
+          if (event.isTrusted) window.__fillFrameAudit.bTrustedBeforeInput++;
+        });
+        </script>
+        """
+    )
+
+    page.frame_locator("iframe[data-fill-target]").locator("#target").fill(
+        "committed", timeout=1_500
+    )
+
+    assert (
+        page.frame_locator("#frame-a").locator("#target").input_value()
+        == "page-committed"
+    )
+    assert page.frame_locator("#frame-b").locator("#target").input_value() == ""
+    assert page.evaluate("window.__fillFrameAudit") == {
+        "aTrustedBeforeInput": 1,
+        "bTrustedBeforeInput": 0,
+    }
+
+
+def test_locator_value_like_fill_retry_keeps_retargeted_frame_pin(page, monkeypatch):
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+    page.set_content(
+        """
+        <iframe id="frame-a" data-fill-target></iframe>
+        <iframe id="frame-b"></iframe>
+        <script>
+        const frameA = document.querySelector('#frame-a');
+        const frameB = document.querySelector('#frame-b');
+        frameA.contentDocument.body.innerHTML =
+          '<input id="target" type="date" value="2025-01-01">';
+        frameB.contentDocument.body.innerHTML =
+          '<input id="target" type="date" value="2024-01-01">';
+        const targetA = frameA.contentDocument.querySelector('#target');
+        const targetB = frameB.contentDocument.querySelector('#target');
+        window.__fillFrameAudit = { aInput: 0, aChange: 0, bInput: 0, bChange: 0 };
+        targetA.addEventListener('input', () => {
+          window.__fillFrameAudit.aInput++;
+          frameA.removeAttribute('data-fill-target');
+          frameB.setAttribute('data-fill-target', '');
+          const until = performance.now() + 1100;
+          while (performance.now() < until) {}
+        });
+        targetA.addEventListener('change', () => window.__fillFrameAudit.aChange++);
+        targetB.addEventListener('input', () => window.__fillFrameAudit.bInput++);
+        targetB.addEventListener('change', () => window.__fillFrameAudit.bChange++);
+        </script>
+        """
+    )
+
+    # The synchronous handler re-points the frame selector before blocking beyond the
+    # one-second probe cap. The retry must consume frame A's applied marker instead of
+    # resolving frame B and applying the value-like setter there a second time.
+    page.frame_locator("iframe[data-fill-target]").locator("#target").fill(
+        "2026-07-31", timeout=0
+    )
+
+    assert page.frame_locator("#frame-a").locator("#target").input_value() == "2026-07-31"
+    assert page.frame_locator("#frame-b").locator("#target").input_value() == "2024-01-01"
+    assert page.evaluate("window.__fillFrameAudit") == {
+        "aInput": 1,
+        "aChange": 1,
+        "bInput": 0,
+        "bChange": 0,
+    }
+
+
+def test_locator_fill_timeout_distinguishes_missing_dispatch_confirmation_from_editability(page):
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        document.querySelector('#target').addEventListener('beforeinput', event => {
+          if (event.isTrusted) event.preventDefault();
+        });
+        </script>
+        """
+    )
+
+    with pytest.raises(Error) as error:
+        page.locator("#target").fill("new", timeout=250)
+
+    message = str(error.value)
+    assert "timed out waiting for locator to be confirmed as edited" in message
+    assert "'editable_for_fill': True" in message
+    assert "waiting for locator to be editable" not in message
+    assert page.locator("#target").input_value() == "old"
+
+
+@pytest.mark.parametrize("page_commits", [False, True], ids=["no-commit", "moved-commit"])
+def test_locator_fast_fill_pending_dispatch_observes_single_dispatch(
+    page, monkeypatch, page_commits
+):
+    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
+    page.set_content(
+        """
+        <input id="a" value="old">
+        <input id="b">
+        <script>
+        const target = document.querySelector('#a');
+        window.__fillAudit = { trustedBeforeInput: 0, pageCommits: false };
+        target.addEventListener('beforeinput', event => {
+          if (!event.isTrusted) return;
+          const requested = event.data;
+          window.__fillAudit.trustedBeforeInput++;
+          event.preventDefault();
+          if (!window.__fillAudit.pageCommits) return;
+          setTimeout(() => {
+            target.value = `moved-${requested}`;
+            target.dispatchEvent(new InputEvent('input', {
+              bubbles: true,
+              composed: true,
+              data: requested,
+              inputType: event.inputType,
+            }));
+          }, 50);
+        });
+        </script>
+        """
+    )
+    page.evaluate(
+        "(pageCommits) => { window.__fillAudit.pageCommits = pageCommits; }",
+        page_commits,
+    )
+
+    if page_commits:
+        page.locator("#a").fill("blocked", timeout=500)
+        assert page.locator("#a").input_value() == "moved-blocked"
+    else:
+        with pytest.raises(TimeoutError):
+            page.locator("#a").fill("blocked", timeout=250)
+
+    assert page.evaluate("window.__fillAudit.trustedBeforeInput") == 1
+    assert page.evaluate(
+        """() => Object.getOwnPropertyNames(globalThis).filter(
+          key => key.startsWith('__rustwright_fill_guard_')
+        )"""
+    ) == []
+    page.locator("#b").fill("works", timeout=1_000)
+    assert page.locator("#b").input_value() == "works"
+
+
+def test_locator_fill_timeout_does_not_interfere_with_sequential_fill(
+    page, monkeypatch
+):
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+    page.set_content(
+        """
+        <input id="a" value="old">
+        <input id="b">
+        <script>
+        document.querySelector('#a').addEventListener('beforeinput', event => {
+          if (event.isTrusted) event.preventDefault();
+        });
+        </script>
+        """
+    )
+
+    with pytest.raises(TimeoutError):
+        page.locator("#a").fill("blocked", timeout=150)
+
+    page.locator("#b").fill("works", timeout=1_000)
+    assert page.locator("#b").input_value() == "works"
+
+
+def test_locator_fill_ignores_pre_dispatch_synthetic_input_noise(page, monkeypatch):
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        const target = document.querySelector('#target');
+        window.__fillNoise = { count: 0, trustedBeforeInput: 0 };
+        let noiseSequence = 0;
+        const noiseTimer = setInterval(() => {
+          target.value = `noise-${++noiseSequence}`;
+          target.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            composed: true,
+            data: null,
+            inputType: 'insertText',
+          }));
+          window.__fillNoise.count++;
+        }, 0);
+        target.addEventListener('beforeinput', event => {
+          if (!event.isTrusted) return;
+          clearInterval(noiseTimer);
+          window.__fillNoise.trustedBeforeInput++;
+          event.preventDefault();
+        });
+        </script>
+        """
+    )
+
+    with pytest.raises(TimeoutError):
+        page.locator("#target").fill("wanted", timeout=250)
+
+    assert page.evaluate("window.__fillNoise.count") > 0
+    assert page.evaluate("window.__fillNoise.trustedBeforeInput") == 1
+    assert page.locator("#target").input_value().startswith("noise-")
+
+
+@pytest.mark.parametrize(
+    ("operation", "replacement"),
+    [
+        pytest.param("fill", "new", id="non-empty-fill"),
+        pytest.param("clear", "", id="clear"),
+    ],
+)
+def test_locator_fill_rejects_focus_diversion_without_mutating_other_input(
+    page, operation, replacement
+):
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <input id="other" value="other">
+        <script>
+        document.querySelector('#target').addEventListener('focus', () => {
+          document.querySelector('#other').focus();
+        });
+        </script>
+        """
+    )
+
+    locator = page.locator("#target")
+    with pytest.raises(Error, match="timed out"):
+        if operation == "fill":
+            locator.fill(replacement, timeout=250)
+        else:
+            locator.clear(timeout=250)
+
+    assert locator.input_value() == "old"
+    assert page.locator("#other").input_value() == "other"
+
+
+@pytest.mark.parametrize(
+    ("operation", "replacement"),
+    [
+        pytest.param("fill", "new", id="non-empty-fill"),
+        pytest.param("clear", "", id="clear"),
+    ],
+)
+def test_locator_fill_recovers_from_delayed_focus_diversion_without_mutating_other_input(
+    page, operation, replacement
+):
+    # The steal is queued on a timer, so it lands before the insert but the guard
+    # can pull focus back in time. Playwright succeeds on this exact page, so
+    # failing here would be a false negative: the value does reach the target and
+    # nothing else is written. Diversion is judged on outcome, not on the steal
+    # having happened -- a steal that actually writes elsewhere is still rejected
+    # (see the immediate- and mutation-phase diversion tests above).
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <input id="other" value="other">
+        <script>
+        document.querySelector('#target').addEventListener('focus', () => {
+          setTimeout(() => document.querySelector('#other').focus(), 0);
+        });
+        </script>
+        """
+    )
+
+    locator = page.locator("#target")
+    if operation == "fill":
+        locator.fill(replacement, timeout=5000)
+    else:
+        locator.clear(timeout=5000)
+
+    assert locator.input_value() == replacement
+    assert page.locator("#other").input_value() == "other"
+
+
+@pytest.mark.parametrize(
+    ("operation", "replacement", "diversion_event"),
+    [
+        pytest.param("fill", "new", "beforeinput", id="non-empty-fill"),
+        pytest.param("clear", "", "keydown", id="clear"),
+    ],
+)
+def test_locator_fill_recovers_from_mutation_phase_focus_diversion_without_mutating_other_input(
+    page, operation, replacement, diversion_event
+):
+    # The steal happens once per attempt, inside the precursor handler, so the guard
+    # restores focus before the edit runs and the value lands on the target. Playwright
+    # writes into #other on this exact page ("newother"); rejecting here would be a
+    # false negative on an outcome that is strictly better than Playwright's.
+    page.set_content(
+        f"""
+        <input id="target" value="old">
+        <input id="other" value="other">
+        <script>
+        document.querySelector('#target').addEventListener('{diversion_event}', () => {{
+          document.querySelector('#other').focus();
+        }});
+        </script>
+        """
+    )
+
+    locator = page.locator("#target")
+    if operation == "fill":
+        locator.fill(replacement, timeout=5000)
+    else:
+        locator.clear(timeout=5000)
+
+    assert locator.input_value() == replacement
+    assert page.locator("#other").input_value() == "other"
+
+
+@pytest.mark.parametrize(
+    ("operation", "replacement", "diversion_event"),
+    [
+        pytest.param("fill", "new", "beforeinput", id="non-empty-fill"),
+        pytest.param("clear", "", "keydown", id="clear"),
+    ],
+)
+def test_locator_fill_recovers_from_window_bubble_diversion_without_mutating_other_input(
+    page, operation, replacement, diversion_event
+):
+    # The bubble-phase guard restores focus and re-runs the edit on the target. Playwright
+    # instead writes into #other ("newother" / "ther"), so rejecting here would be a
+    # false negative.
+    page.set_content(
+        f"""
+        <input id="target" value="old">
+        <input id="other" value="other">
+        <script>
+        window.addEventListener('{diversion_event}', event => {{
+          if (event.target.id === 'target') document.querySelector('#other').focus();
+        }});
+        </script>
+        """
+    )
+
+    locator = page.locator("#target")
+    if operation == "fill":
+        locator.fill(replacement, timeout=5000)
+    else:
+        locator.clear(timeout=5000)
+
+    assert locator.input_value() == replacement
+    assert page.locator("#other").input_value() == "other"
+
+
+def test_locator_fill_accepts_beforeinput_focus_round_trip_without_mutating_sibling(
+    page,
+):
+    # False negative (A): a beforeinput focus round trip completes before the edit.
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <input id="other" value="other">
+        <script>
+        document.querySelector('#target').addEventListener('beforeinput', event => {
+          document.querySelector('#other').focus();
+          event.target.focus();
+        });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new", timeout=5000)
+
+    assert page.locator("#target").input_value() == "new"
+    assert page.locator("#other").input_value() == "other"
+
+
+def test_locator_clear_accepts_window_capture_keydown_stop_immediate(page):
+    # False negative (C): keydown capture can hide the precursor without
+    # canceling clear.
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        window.addEventListener('keydown', event => {
+          event.stopImmediatePropagation();
+        }, true);
+        </script>
+        """
+    )
+
+    page.locator("#target").clear(timeout=5000)
+
+    assert page.locator("#target").input_value() == ""
+
+
+def test_locator_fill_accepts_window_capture_beforeinput_stop_immediate(page):
+    # False negative (B): beforeinput capture can hide the precursor without
+    # stealing focus.
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        window.addEventListener('beforeinput', event => {
+          event.stopImmediatePropagation();
+        }, true);
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new", timeout=5000)
+
+    assert page.locator("#target").input_value() == "new"
+
+
+def test_locator_fill_retries_window_capture_stop_immediate_without_mutating_sibling(page):
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <input id="other" value="other">
+        <script>
+        window.addEventListener('beforeinput', event => {
+          if (event.target.id !== 'target') return;
+          document.querySelector('#other').focus();
+          event.stopImmediatePropagation();
+        }, { capture: true, once: true });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new", timeout=500)
+
+    assert page.locator("#target").input_value() == "new"
+    assert page.locator("#other").input_value() == "other"
+
+
+def test_locator_fill_accepts_persistent_window_capture_stop_immediate_without_mutating_sibling(
+    page,
+):
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <input id="other" value="other">
+        <script>
+        window.addEventListener('beforeinput', event => {
+          if (event.target.id !== 'target') return;
+          document.querySelector('#other').focus();
+          event.stopImmediatePropagation();
+        }, true);
+        </script>
+        """
+    )
+
+    # A page capture listener can blind the precursor guard while the browser still
+    # edits the correct element; the trusted input event at the target proves the
+    # fill landed.
+    page.locator("#target").fill("new", timeout=5000)
+
+    assert page.locator("#target").input_value() == "new"
+    assert page.locator("#other").input_value() == "other"
+
+
+def test_locator_clear_rejects_canceled_delete_on_nonempty_target(page):
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        document.querySelector('#target').addEventListener('keydown', event => {
+          if (event.key === 'Delete') event.preventDefault();
+        });
+        </script>
+        """
+    )
+
+    with pytest.raises(Error, match="timed out"):
+        page.locator("#target").clear(timeout=250)
+
+    assert page.locator("#target").input_value() == "old"
+
+
+def test_locator_fill_accepts_target_mutation_before_input_handler_moves_focus(page):
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <input id="other" value="other">
+        <script>
+        document.querySelector('#target').addEventListener('input', () => {
+          document.querySelector('#other').focus();
+        });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new", timeout=500)
+
+    assert page.locator("#target").input_value() == "new"
+    assert page.locator("#other").input_value() == "other"
+    assert page.evaluate("document.activeElement.id") == "other"
+
+
+@pytest.mark.parametrize("caret_delay_ms", [0, 1, 5, 10, 12])
+def test_locator_fill_replaces_value_when_focus_handler_collapses_the_caret(
+    page, caret_delay_ms
+):
+    # A focus handler that collapses the caret to the end used to land inside the
+    # settle between the select-all and the insert, so the text was appended rather
+    # than replacing the value ("oldnew"). Real Playwright appends only when the
+    # handler runs with no delay at all; every delay here is well inside its window.
+    page.set_content(
+        f"""
+        <input id="target" value="old">
+        <script>
+        const target = document.querySelector('#target');
+        target.addEventListener('focus', () => setTimeout(
+          () => target.setSelectionRange(target.value.length, target.value.length),
+          {caret_delay_ms},
+        ));
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new")
+
+    assert page.locator("#target").input_value() == "new"
+
+
+@pytest.mark.parametrize("caret_delay_ms", [0, 5, 12])
+def test_locator_fill_clears_value_when_focus_handler_collapses_the_caret(
+    page, caret_delay_ms
+):
+    # Same race on the clear path, where the emptied fill presses Delete instead of
+    # inserting: a collapsed caret at the end makes Delete a no-op and the old value
+    # survives.
+    page.set_content(
+        f"""
+        <input id="target" value="old">
+        <script>
+        const target = document.querySelector('#target');
+        target.addEventListener('focus', () => setTimeout(
+          () => target.setSelectionRange(target.value.length, target.value.length),
+          {caret_delay_ms},
+        ));
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("")
+
+    assert page.locator("#target").input_value() == ""
+
+
+@pytest.mark.parametrize(
+    "collapse_script",
+    [
+        # Collapses at window capture, then repairs the selection in its own listener on
+        # the target. Cancelling the edit at capture used to lose to this page outright:
+        # the cancel is irrevocable, so the repair came too late and every retry repeated
+        # the sequence until the deadline. Playwright fills it correctly.
+        """
+        window.addEventListener('beforeinput', event => {
+          if (event.target !== target || !event.isTrusted) return;
+          target.setSelectionRange(target.value.length, target.value.length);
+        }, {capture: true});
+        target.addEventListener('beforeinput', event => {
+          if (event.isTrusted) target.select();
+        });
+        """,
+        # Collapses at window capture and never repairs.
+        """
+        window.addEventListener('beforeinput', event => {
+          if (event.target !== target || !event.isTrusted) return;
+          target.setSelectionRange(target.value.length, target.value.length);
+        }, {capture: true});
+        """,
+        # Collapses in its own listener on the target, after the capture guard has run.
+        """
+        target.addEventListener('beforeinput', event => {
+          if (event.isTrusted) {
+            target.setSelectionRange(target.value.length, target.value.length);
+          }
+        });
+        """,
+    ],
+    ids=["repairs-at-target", "collapses-at-capture", "collapses-at-target"],
+)
+def test_locator_fill_replaces_value_when_handler_collapses_caret_during_dispatch(
+    page, collapse_script
+):
+    # A caret collapsed during the precursor's own dispatch, rather than by a timer
+    # before it. Chromium resolves the range an insert applies to after the precursor
+    # finishes dispatching, so the guard restores the whole-value selection instead of
+    # cancelling — cancelling never converges here, because the handler that collapses
+    # the caret re-fires on every retry.
+    page.set_content(
+        f"""
+        <input id="target" value="old">
+        <script>
+        const target = document.querySelector('#target');
+        {collapse_script}
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new")
+
+    assert page.locator("#target").input_value() == "new"
+
+
+def test_locator_fill_preserves_whole_value_selection_direction_during_settle(page):
+    # Re-selecting the whole value flips a page-owned backward selection forward. That
+    # direction change is observable, so a selectionchange handler can rewrite the value
+    # and range before the trusted insertion lands.
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        const target = document.querySelector('#target');
+        let armed = false;
+        window.__audit = { normalized: 0 };
+        target.addEventListener('focus', () => setTimeout(() => {
+          if (target.value !== 'old') return;
+          target.setSelectionRange(0, target.value.length, 'backward');
+          armed = true;
+        }, 0), { once: true });
+        document.addEventListener('selectionchange', () => {
+          if (
+            !armed ||
+            target.value !== 'old' ||
+            target.selectionStart !== 0 ||
+            target.selectionEnd !== target.value.length ||
+            target.selectionDirection === 'backward'
+          ) return;
+          armed = false;
+          target.value = target.value.toUpperCase();
+          target.setSelectionRange(target.value.length, target.value.length);
+          window.__audit.normalized++;
+        });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new", timeout=500)
+
+    assert page.locator("#target").input_value() == "new"
+    assert page.evaluate("() => window.__audit.normalized") == 0
+
+
+@pytest.mark.parametrize(
+    ("fill_value", "expected_value"),
+    [("new", "new"), ("", "")],
+    ids=["replace", "clear"],
+)
+def test_locator_fill_preserves_whole_value_selection_range_during_settle(
+    page, fill_value, expected_value
+):
+    # A redundant select also makes a backward whole-value selection observable. If the
+    # page narrows the resulting forward range, both insertion and deletion operate on
+    # that narrower range instead of replacing the entire value.
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        const target = document.querySelector('#target');
+        let armed = false;
+        window.__audit = { narrowed: 0 };
+        target.addEventListener('focus', () => setTimeout(() => {
+          if (target.value !== 'old') return;
+          target.setSelectionRange(0, target.value.length, 'backward');
+          armed = true;
+        }, 0), { once: true });
+        document.addEventListener('selectionchange', () => {
+          if (
+            !armed ||
+            target.value !== 'old' ||
+            target.selectionStart !== 0 ||
+            target.selectionEnd !== target.value.length ||
+            target.selectionDirection === 'backward'
+          ) return;
+          armed = false;
+          target.setSelectionRange(1, 2);
+          window.__audit.narrowed++;
+        });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill(fill_value, timeout=500)
+
+    assert page.locator("#target").input_value() == expected_value
+    assert page.evaluate("() => window.__audit.narrowed") == 0
+
+
+def test_locator_fill_preserves_mask_when_handler_rewrites_value_during_dispatch(page):
+    # Rewriting the value establishes a new edit context for the insertion range. The
+    # guard must leave that page-owned range alone or the native insert bypasses the mask
+    # and reports success with the wrong unwrapped value.
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        const target = document.querySelector('#target');
+        window.__audit = { maskValid: null, inputs: 0 };
+        target.addEventListener('beforeinput', event => {
+          if (!event.isTrusted || event.inputType !== 'insertText') return;
+          target.value = '[]';
+          target.setSelectionRange(1, 1);
+        });
+        target.addEventListener('input', event => {
+          window.__audit.inputs++;
+          window.__audit.maskValid = /^\\[[^\\[\\]]*\\]$/.test(target.value);
+        });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new", timeout=500)
+
+    assert page.locator("#target").input_value() == "[new]"
+    assert page.evaluate("() => window.__audit") == {"maskValid": True, "inputs": 1}
+
+
+def test_locator_fill_accepts_mask_caret_established_during_capture(page):
+    # A capture handler that rewrites the value and places its insertion caret owns both
+    # pieces of state. Re-selecting the whole rewritten value makes the mask reject every
+    # retry, whereas deferring lets the trusted insert complete once.
+    page.set_content(
+        """
+        <input id="target" value="[old]">
+        <script>
+        const target = document.querySelector('#target');
+        window.__audit = { accepted: null, cancels: 0 };
+        window.addEventListener('beforeinput', event => {
+          if (event.target !== target || !event.isTrusted || event.inputType !== 'insertText') return;
+          target.value = '[]';
+          target.setSelectionRange(1, 1);
+        }, { capture: true });
+        target.addEventListener('beforeinput', event => {
+          if (!event.isTrusted || event.inputType !== 'insertText') return;
+          const ok = target.selectionStart === 1 && target.selectionEnd === 1;
+          window.__audit.accepted = ok;
+          if (!ok) { window.__audit.cancels++; event.preventDefault(); }
+        });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new", timeout=500)
+
+    assert page.locator("#target").input_value() == "[new]"
+    assert page.evaluate("() => window.__audit") == {"accepted": True, "cancels": 0}
+
+
+def test_locator_fill_clear_preserves_mask_prefix_selection_range_during_delete(page):
+    # The clear mask keeps its prefix by choosing a non-empty deletion range. That range
+    # is deliberate page intent even though the value is unchanged, so replacing it with
+    # a whole-value selection destroys the prefix and makes the mask cancel every retry.
+    page.set_content(
+        """
+        <input id="target" value="$old">
+        <script>
+        const target = document.querySelector('#target');
+        window.__audit = { accepted: null, cancels: 0 };
+        target.addEventListener('beforeinput', event => {
+          if (!event.isTrusted || event.inputType !== 'deleteContentForward') return;
+          target.setSelectionRange(1, target.value.length);
+        });
+        window.addEventListener('beforeinput', event => {
+          if (event.target !== target || !event.isTrusted || event.inputType !== 'deleteContentForward') return;
+          const ok = target.selectionStart === 1 && target.selectionEnd === target.value.length;
+          window.__audit.accepted = ok;
+          if (!ok) { window.__audit.cancels++; event.preventDefault(); }
+        });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("", timeout=500)
+
+    assert page.locator("#target").input_value() == "$"
+    assert page.evaluate("() => window.__audit") == {"accepted": True, "cancels": 0}
+
+
+def test_locator_fill_clears_value_when_handler_collapses_caret_during_delete(page):
+    # Clearing presses Delete, so the deletion is driven by a `beforeinput` that follows
+    # the keydown the guard watches. A caret collapsed in that window turns the delete
+    # into a no-op at the end of the value and the old value survives.
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        const target = document.querySelector('#target');
+        target.addEventListener('beforeinput', event => {
+          if (event.isTrusted) {
+            target.setSelectionRange(target.value.length, target.value.length);
+          }
+        });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("")
+
+    assert page.locator("#target").input_value() == ""
+
+
+def test_locator_fill_accepts_edit_when_page_remounts_the_control(page):
+    # A delegated input handler that replaces the control with an equivalent node — the
+    # React remount pattern. The trusted edit landed on the intended element, so the
+    # locator re-resolving to the replacement is not a diversion. Rejecting it used to
+    # retry until the deadline, dispatching the edit dozens of times; Playwright edits
+    # once and returns.
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        window.inputCount = 0;
+        document.addEventListener('input', event => {
+          if (event.target.id !== 'target' || !event.isTrusted) return;
+          window.inputCount++;
+          const next = event.target.cloneNode();
+          next.value = event.target.value;
+          event.target.replaceWith(next);
+        }, true);
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new", timeout=3000)
+
+    assert page.locator("#target").input_value() == "new"
+    assert page.evaluate("window.inputCount") == 1
+
+
+def test_locator_fill_accepts_page_clamped_number(page):
+    page.set_content(
+        """
+        <input id="target" type="number" min="0" max="10" value="5">
+        <script>
+        const target = document.querySelector('#target');
+        target.addEventListener('input', () => {
+          target.value = String(Math.min(target.max, Math.max(target.min, target.value)));
+        });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("99", timeout=500)
+
+    assert page.locator("#target").input_value() == "10"
+
+
+def test_locator_fill_accepts_browser_normalized_number(page):
+    # Chromium accepts "+1" and stores "1". Playwright reports success; treating any
+    # textual difference as a rejection raised after the edit had already landed.
+    page.set_content('<input id="target" type="number" value="7">')
+
+    page.locator("#target").fill("+1")
+
+    assert page.locator("#target").input_value() == "1"
+
+
+def test_locator_fill_still_rejects_number_input_text(page):
+    page.set_content('<input id="target" type="number" value="7">')
+
+    with pytest.raises(Error, match=r"Cannot type text into input\[type=number\]"):
+        page.locator("#target").fill("not-a-number", timeout=500)
+
+    assert page.locator("#target").input_value() == "7"
+
+
+def test_locator_fill_preserves_page_authored_sibling_readonly_change(page):
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <input id="sibling" value="sibling">
+        <script>
+        document.querySelector('#target').addEventListener('beforeinput', () => {
+          document.querySelector('#sibling').readOnly = true;
+        });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new")
+
+    assert page.locator("#target").input_value() == "new"
+    assert page.evaluate("document.querySelector('#sibling').readOnly") is True
+
+
+def test_locator_fill_does_not_mutate_sibling_editability_attributes(page):
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <input id="input-sibling" value="input">
+        <div id="editable-sibling" contenteditable>editable</div>
+        <script>
+        window.siblingEditabilityMutations = [];
+        const observer = new MutationObserver(records => {
+          for (const record of records) {
+            window.siblingEditabilityMutations.push({
+              id: record.target.id,
+              attribute: record.attributeName,
+            });
+          }
+        });
+        observer.observe(document.querySelector('#input-sibling'), {
+          attributes: true,
+          attributeFilter: ['readonly'],
+        });
+        observer.observe(document.querySelector('#editable-sibling'), {
+          attributes: true,
+          attributeFilter: ['contenteditable'],
+        });
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new")
+
+    assert page.locator("#target").input_value() == "new"
+    assert page.evaluate("window.siblingEditabilityMutations") == []
+
+
+def test_locator_fill_uses_effective_contenteditable_host_for_nested_locator(page):
+    page.set_content(
+        """
+        <div id="editor" contenteditable><span id="nested">old</span></div>
+        <input id="sibling" value="sibling">
+        """
+    )
+
+    page.locator("#nested").fill("new")
+
+    assert page.locator("#editor").text_content() == "new"
+    assert page.locator("#sibling").input_value() == "sibling"
+
+
+def test_locator_fill_guard_is_invisible_to_page_script(page):
+    # The locator script runs in a CDP isolated world, so its globalThis is not the
+    # page's window. This handler observed zero guard keys while the fill was in flight.
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        window.seenGuardKeys = null;
+        window.addEventListener('beforeinput', event => {
+          if (!event.isTrusted) return;
+          window.seenGuardKeys = Object.getOwnPropertyNames(globalThis).filter(
+            key => key.startsWith('__rustwright_fill_guard_')
+          );
+        }, true);
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new", timeout=5000)
+
+    assert page.locator("#target").input_value() == "new"
+    assert page.evaluate("() => window.seenGuardKeys") == []
+
+
+def test_locator_fill_guard_cannot_be_forged_by_page_script(page):
+    # A forged guard claiming precursorReceived/mutationReceived cannot report success:
+    # page writes land in the page world, while the engine reads the isolated world.
+    # A control that only cancels the edit is rejected identically, so this timeout
+    # catches the canceled edit rather than detecting the forgery.
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <script>
+        window.addEventListener('beforeinput', event => {
+          if (!event.isTrusted) return;
+          event.preventDefault();
+          const forged = {
+            locator: document.querySelector('#target'),
+            target: document.querySelector('#target'),
+            diverted: false,
+            precursorReceived: true,
+            mutationReceived: true,
+            initialValue: 'old',
+            maxLength: null,
+            cleanup() {},
+          };
+          for (const key of Object.getOwnPropertyNames(globalThis)) {
+            if (key.startsWith('__rustwright_fill_guard_')) globalThis[key] = forged;
+          }
+          for (let index = 0; index < 200; index += 1) {
+            const key = '__rustwright_fill_guard_' + index;
+            if (key in globalThis) globalThis[key] = forged;
+          }
+        }, true);
+        </script>
+        """
+    )
+
+    with pytest.raises(Error, match="timed out"):
+        page.locator("#target").fill("new", timeout=1000)
+
+    assert page.locator("#target").input_value() == "old"
+
+
+def test_concurrent_locator_fills_keep_dispatch_bound_to_each_target():
+    async def run():
+        from rustwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            launched = await playwright.chromium.launch()
+            first_connection = None
+            second_connection = None
+            try:
+                launched_page = await launched.new_page()
+                target_url = data_url("<input id='a'><input id='b'>")
+                await launched_page.goto(target_url)
+
+                first_connection = await playwright.chromium.connect_over_cdp(
+                    launched._ws_endpoint
+                )
+                second_connection = await playwright.chromium.connect_over_cdp(
+                    launched._ws_endpoint
+                )
+                first_page = next(
+                    page
+                    for page in first_connection.contexts[0].pages
+                    if page.url == target_url
+                )
+                second_page = next(
+                    page
+                    for page in second_connection.contexts[0].pages
+                    if page.url == target_url
+                )
+
+                await asyncio.gather(
+                    first_page.locator("#a").fill("first"),
+                    second_page.locator("#b").fill("second"),
+                )
+
+                assert await first_page.locator("#a").input_value() == "first"
+                assert await second_page.locator("#b").input_value() == "second"
+            finally:
+                if first_connection is not None:
+                    await first_connection.close()
+                if second_connection is not None:
+                    await second_connection.close()
+                await launched.close()
+
+    asyncio.run(run())
+
+
+def test_locator_fill_retry_does_not_leave_guard_blocking_other_input(page):
+    # The first focus is diverted so fill must retry; every guard from that retry
+    # sequence must be gone before trusted typing reaches a different input.
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <input id="other">
+        <script>
+        window.targetFocusCount = 0;
+        window.otherEvents = [];
+        document.querySelector('#target').addEventListener('focus', () => {
+          window.targetFocusCount += 1;
+          if (window.targetFocusCount === 1) document.querySelector('#other').focus();
+        });
+        window.addEventListener('keydown', event => {
+          if (event.target.id === 'other') window.otherEvents.push(event.type);
+        }, true);
+        window.addEventListener('beforeinput', event => {
+          if (event.target.id === 'other') window.otherEvents.push(event.type);
+        }, true);
+        window.addEventListener('input', event => {
+          if (event.target.id === 'other') window.otherEvents.push(event.type);
+        }, true);
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new", timeout=2_000)
+    assert page.evaluate("window.targetFocusCount") >= 2
+
+    page.locator("#other").click(timeout=1_000)
+    page.keyboard.type("XY")
+
+    assert page.locator("#other").input_value() == "XY"
+    assert "input" in page.evaluate("window.otherEvents")
+
+
+def test_completed_locator_fill_does_not_block_typing_in_other_input(page):
+    # A completed fill must not leave its dispatch guard intercepting later edits
+    # directed at another element.
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <input id="other">
+        <script>
+        window.otherEvents = [];
+        window.addEventListener('input', event => {
+          if (event.target.id === 'other') window.otherEvents.push(event.type);
+        }, true);
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("new", timeout=1_000)
+    page.locator("#other").click(timeout=1_000)
+    page.keyboard.type("works")
+
+    assert page.locator("#other").input_value() == "works"
+    assert "input" in page.evaluate("window.otherEvents")
+
+
+def test_locator_fill_cleans_guard_after_post_install_timeout(page):
+    page.set_content(
+        """
+        <input id="target">
+        <input id="other">
+        <script>
+        document.querySelector('#target').addEventListener('beforeinput', () => {
+          const until = performance.now() + 40;
+          while (performance.now() < until) {}
+        });
+        </script>
+        """
+    )
+
+    with pytest.raises(Error, match="timed out"):
+        page.locator("#target").fill("blocked", timeout=10)
+
+    page.locator("#other").type("works", timeout=1_000)
+    assert page.locator("#other").input_value() == "works"
+
+
+def test_locator_fill_passive_guard_does_not_intervene_in_later_trusted_typing():
+    # A rejected dispatch passivates its retained guard before retrying. Preserve that
+    # fixture across the future-drop cleanup so this test can exercise passivity itself.
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch()
+            page = await browser.new_page()
+            await page.set_content(
+                """
+                <input id="target" value="abc">
+                <input id="cleanup">
+                <script>
+                const target = document.querySelector('#target');
+                let canceledTrustedEdit = false;
+                target.addEventListener('beforeinput', event => {
+                  if (!event.isTrusted || canceledTrustedEdit) return;
+                  canceledTrustedEdit = true;
+                  event.preventDefault();
+                });
+                </script>
+                """
+            )
+
+            cdp = await page.context.new_cdp_session(page)
+            frame_id = (await cdp.send("Page.getFrameTree"))["frameTree"]["frame"]["id"]
+            context_id = (
+                await cdp.send(
+                    "Page.createIsolatedWorld",
+                    {"frameId": frame_id, "worldName": "__utility_world__"},
+                )
+            )["executionContextId"]
+
+            async def evaluate_with_cdp(expression, *, isolated=False):
+                params = {
+                    "expression": expression,
+                    "awaitPromise": True,
+                    "returnByValue": True,
+                    "userGesture": True,
+                }
+                if isolated:
+                    params["contextId"] = context_id
+                response = await cdp.send("Runtime.evaluate", params)
+                assert "exceptionDetails" not in response
+                return response["result"].get("value")
+
+            fill = asyncio.create_task(page.fill("#target", "new", timeout=30_000))
+            for _ in range(500):
+                state = await evaluate_with_cdp(
+                    """
+                    (() => {
+                      const keys = Object.getOwnPropertyNames(globalThis).filter(
+                        key => key.startsWith('__rustwright_fill_guard_')
+                      );
+                      const guard = keys.length === 1 ? globalThis[keys[0]] : null;
+                      return !!guard && guard.passive === true;
+                    })()
+                    """,
+                    isolated=True,
+                )
+                if state:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("fill never reached the retained-passive guard state")
+
+            # Keep this synthetic retained-passive fixture observable even though
+            # dropping the real fill future now races a detached cleanup task.
+            held = await evaluate_with_cdp(
+                """
+                (() => {
+                  const keys = Object.getOwnPropertyNames(globalThis).filter(
+                    key => key.startsWith('__rustwright_fill_guard_')
+                  );
+                  const guard = keys.length === 1 ? globalThis[keys[0]] : null;
+                  if (!guard || guard.passive !== true) return false;
+                  globalThis.__passiveFillGuardSnapshot = {
+                    guard,
+                    activePrecursor: guard.activePrecursor,
+                    activeBeforeInput: guard.activeBeforeInput,
+                    cleanup: guard.cleanup,
+                    cleanupRequested: false,
+                  };
+                  guard.cleanup = () => {
+                    globalThis.__passiveFillGuardSnapshot.cleanupRequested = true;
+                  };
+                  return true;
+                })()
+                """,
+                isolated=True,
+            )
+            assert held is True
+            fill.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await fill
+
+            retained = await evaluate_with_cdp(
+                """
+                (() => {
+                  const keys = Object.getOwnPropertyNames(globalThis).filter(
+                    key => key.startsWith('__rustwright_fill_guard_')
+                  );
+                  const guard = keys.length === 1 ? globalThis[keys[0]] : null;
+                  return {
+                    count: keys.length,
+                    passive: guard ? guard.passive === true : false,
+                    precursorReceived: guard ? guard.precursorReceived : false,
+                    mutationReceived: guard ? guard.mutationReceived : false,
+                  };
+                })()
+                """,
+                isolated=True,
+            )
+            assert retained == {
+                "count": 1,
+                "passive": True,
+                "precursorReceived": True,
+                "mutationReceived": False,
+            }
+
+            selection = await evaluate_with_cdp(
+                """
+                (() => {
+                  const target = document.querySelector('#target');
+                  target.focus();
+                  target.setSelectionRange(1, 1);
+                  return { start: target.selectionStart, end: target.selectionEnd };
+                })()
+                """
+            )
+            assert selection == {"start": 1, "end": 1}
+
+            await cdp.send("Input.insertText", {"text": "X"})
+
+            assert await page.locator("#target").input_value() == "aXbc"
+            passive_state = await evaluate_with_cdp(
+                """
+                (() => {
+                  const snapshot = globalThis.__passiveFillGuardSnapshot;
+                  const guard = snapshot && snapshot.guard;
+                  return {
+                    samePrecursor:
+                      !!guard && guard.activePrecursor === snapshot.activePrecursor,
+                    sameBeforeInput:
+                      !!guard && guard.activeBeforeInput === snapshot.activeBeforeInput,
+                    mutationReceived: guard ? guard.mutationReceived : null,
+                  };
+                })()
+                """,
+                isolated=True,
+            )
+            assert passive_state == {
+                "samePrecursor": True,
+                "sameBeforeInput": True,
+                "mutationReceived": False,
+            }
+
+            await evaluate_with_cdp(
+                """
+                (() => {
+                  const snapshot = globalThis.__passiveFillGuardSnapshot;
+                  if (snapshot && snapshot.guard) {
+                    snapshot.guard.cleanup = snapshot.cleanup;
+                  }
+                  for (const key of Object.getOwnPropertyNames(globalThis)) {
+                    if (!key.startsWith('__rustwright_fill_guard_')) continue;
+                    const guard = globalThis[key];
+                    guard.expiryRenewed = true;
+                    guard.expiresAt = performance.now() - 1;
+                  }
+                  return null;
+                })()
+                """,
+                isolated=True,
+            )
+            await page.locator("#cleanup").fill("done", timeout=1_000)
+            remaining_guards = await evaluate_with_cdp(
+                """Object.getOwnPropertyNames(globalThis).filter(
+                  key => key.startsWith('__rustwright_fill_guard_')
+                )""",
+                isolated=True,
+            )
+            assert remaining_guards == []
+            await browser.close()
+
+    asyncio.run(run())
+
+
+
+def test_page_fill_timeout_guard_does_not_block_other_trusted_edit(page):
+    page.set_content(
+        """
+        <input id="target" value="old">
+        <input id="other">
+        <script>
+        window.otherInputEvents = [];
+        window.addEventListener('beforeinput', event => {
+          if (event.target.id !== 'target' || !event.isTrusted) return;
+          document.querySelector('#other').focus();
+          event.preventDefault();
+          const until = performance.now() + 40;
+          while (performance.now() < until) {}
+        }, true);
+        document.querySelector('#other').addEventListener('input', event => {
+          window.otherInputEvents.push({
+            value: event.target.value,
+            trusted: event.isTrusted,
+          });
+        });
+        </script>
+        """
+    )
+
+    with pytest.raises(Error, match="timed out"):
+        page.fill("#target", "blocked", timeout=10)
+
+    page.locator("#other").click(timeout=1_000)
+    page.keyboard.type("works")
+
+    assert page.locator("#other").input_value() == "works"
+    events = page.evaluate("window.otherInputEvents")
+    assert events
+    assert events[-1] == {"value": "works", "trusted": True}
+    assert all(event["trusted"] is True for event in events)
+
+
+def test_async_page_fill_cancellation_cleans_guard_before_other_trusted_edit():
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch()
+            page = await browser.new_page()
+            await page.set_content(
+                """
+                <input id="target" value="old">
+                <input id="other">
+                <script>
+                window.otherInputEvents = [];
+                window.addEventListener('beforeinput', event => {
+                  if (event.target.id !== 'target' || !event.isTrusted) return;
+                  location.hash = 'fill-started';
+                  document.querySelector('#other').focus();
+                  event.preventDefault();
+                  const until = performance.now() + 750;
+                  while (performance.now() < until) {}
+                }, true);
+                document.querySelector('#other').addEventListener('input', event => {
+                  window.otherInputEvents.push({
+                    value: event.target.value,
+                    trusted: event.isTrusted,
+                  });
+                });
+                </script>
+                """
+            )
+
+            cdp = await page.context.new_cdp_session(page)
+            frame_id = (await cdp.send("Page.getFrameTree"))["frameTree"]["frame"]["id"]
+            context_id = (
+                await cdp.send(
+                    "Page.createIsolatedWorld",
+                    {"frameId": frame_id, "worldName": "__utility_world__"},
+                )
+            )["executionContextId"]
+
+            fill = asyncio.create_task(page.fill("#target", "blocked", timeout=30_000))
+            for _ in range(200):
+                if page.url.endswith("#fill-started"):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("fill never reached its trusted beforeinput cancellation point")
+            fill.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await fill
+
+            loop = asyncio.get_running_loop()
+            cleanup_deadline = loop.time() + 1.0
+            while True:
+                response = await cdp.send(
+                    "Runtime.evaluate",
+                    {
+                        "contextId": context_id,
+                        "expression": """
+                        (() => {
+                          const guards = Object.getOwnPropertyNames(globalThis)
+                            .filter(key => key.startsWith('__rustwright_fill_guard_'))
+                            .map(key => globalThis[key])
+                            .filter(Boolean);
+                          return guards.length === 0 || guards.every(
+                            guard => guard.passive === true
+                          );
+                        })()
+                        """,
+                        "awaitPromise": True,
+                        "returnByValue": True,
+                        "userGesture": True,
+                    },
+                )
+                assert "exceptionDetails" not in response
+                if response["result"].get("value") is True:
+                    break
+                if loop.time() >= cleanup_deadline:
+                    pytest.fail("dropped fill guard remained active for over one second")
+                await asyncio.sleep(0.025)
+
+            await page.locator("#other").click()
+            await page.keyboard.type("works")
+            assert await page.locator("#other").input_value() == "works"
+            events = await page.evaluate("window.otherInputEvents")
+            assert events
+            assert events[-1] == {"value": "works", "trusted": True}
+            assert all(event["trusted"] is True for event in events)
+            await browser.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("markup", "operation", "replacement"),
+    [
+        pytest.param("<input id='target' value=''>", "clear", "", id="empty-clear"),
+        pytest.param(
+            "<input id='target' maxlength='0'>",
+            "fill",
+            "ignored",
+            id="maxlength-zero",
+        ),
+    ],
+)
+def test_locator_fill_accepts_target_stable_trusted_noop(
+    page, markup, operation, replacement
+):
+    page.set_content(markup)
+    locator = page.locator("#target")
+
+    if operation == "clear":
+        locator.clear()
+    else:
+        locator.fill(replacement)
+
+    assert locator.input_value() == ""
+
+
+@pytest.mark.parametrize(
+    ("operation", "replacement"),
+    [
+        pytest.param("fill", "new", id="non-empty-fill"),
+        pytest.param("clear", "", id="clear"),
+    ],
+)
+def test_locator_fill_uses_shadow_aware_focused_target(page, operation, replacement):
+    page.set_content(
+        """
+        <div id="host"></div>
+        <script>
+        document.querySelector('#host').attachShadow({ mode: 'open' }).innerHTML =
+          '<input id="shadow-input" value="old">';
+        </script>
+        """
+    )
+    locator = page.locator("#shadow-input")
+
+    if operation == "fill":
+        locator.fill(replacement)
+    else:
+        locator.clear()
+
+    assert locator.input_value() == replacement
+
+
+def test_locator_fill_preserves_trusted_change_on_later_blur(page):
+    page.set_content(
+        """
+        <input id="field" value="old">
+        <button id="blur">Blur</button>
+        <script>
+        window.fillEvents = [];
+        for (const type of ['beforeinput', 'input', 'change']) {
+          document.querySelector('#field').addEventListener(type, event => {
+            window.fillEvents.push({ type: event.type, trusted: event.isTrusted });
+          });
+        }
+        </script>
+        """
+    )
+
+    page.locator("#field").fill("new")
+    assert page.evaluate("window.fillEvents") == [
+        {"type": "beforeinput", "trusted": True},
+        {"type": "input", "trusted": True},
+    ]
+
+    page.locator("#blur").click()
+    assert page.evaluate("window.fillEvents") == [
+        {"type": "beforeinput", "trusted": True},
+        {"type": "input", "trusted": True},
+        {"type": "change", "trusted": True},
+    ]
+
+
+def test_sync_locator_and_async_page_fill_emit_matching_text_events(page):
+    markup = """
+    <input id="field" value="old">
+    <script>
+    window.fillEvents = [];
+    for (const type of ['beforeinput', 'input', 'change']) {
+      document.querySelector('#field').addEventListener(type, event => {
+        window.fillEvents.push({ type: event.type, trusted: event.isTrusted });
+      });
+    }
+    </script>
+    """
+    page.set_content(markup)
+    page.locator("#field").fill("sync")
+    sync_events = page.evaluate("window.fillEvents")
+
+    async def collect_async_page_events():
+        from rustwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch()
+            async_page = await browser.new_page()
+            await async_page.set_content(markup)
+            await async_page.fill("#field", "async", timeout=0)
+            events = await async_page.evaluate("window.fillEvents")
+            await browser.close()
+            return events
+
+    async_events = asyncio.run(collect_async_page_events())
+    expected = [
+        {"type": "beforeinput", "trusted": True},
+        {"type": "input", "trusted": True},
+    ]
+    assert sync_events == expected
+    assert async_events == expected
+
+
+def test_fill_normalizes_color_and_number_and_validates_empty_native_values(page):
+    page.set_content(
+        """
+        <input id="color" type="color" value="#000000">
+        <input id="number" type="number" value="12">
+        <input id="range" type="range" min="0" max="100" value="25">
+        """
+    )
+
+    page.locator("#color").fill("#FF0000")
+    page.locator("#number").fill(" 345 ")
+
+    assert page.locator("#color").input_value() == "#ff0000"
+    assert page.locator("#number").input_value() == "345"
+
+    with pytest.raises(Error, match="Malformed value"):
+        page.locator("#color").fill("")
+    with pytest.raises(Error, match="Malformed value"):
+        page.locator("#range").fill("")
+
+    assert page.locator("#color").input_value() == "#000000"
+    assert page.locator("#range").input_value() == "50"
+
+
+def test_native_value_fill_input_event_crosses_shadow_boundary(page):
+    page.set_content(
+        """
+        <div id="host"></div>
+        <script>
+        const host = document.querySelector('#host');
+        host.attachShadow({ mode: 'open' }).innerHTML =
+          '<input id="shadow-color" type="color" value="#000000">';
+        window.outerInputEvents = [];
+        document.addEventListener('input', event => {
+          window.outerInputEvents.push({
+            composed: event.composed,
+            target: event.target.id,
+          });
+        });
+        </script>
+        """
+    )
+
+    page.locator("#shadow-color").fill("#00FF00")
+
+    assert page.locator("#shadow-color").input_value() == "#00ff00"
+    assert page.evaluate("window.outerInputEvents") == [{"composed": True, "target": "host"}]
+
+
+def test_native_value_fill_evaluator_retry_dispatches_events_once(page, monkeypatch):
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+    page.set_content(
+        """
+        <input id="target" type="date" value="2025-01-01">
+        <script>
+        const target = document.querySelector('#target');
+        window.__fillAudit = { input: 0, change: 0 };
+        target.addEventListener('input', () => {
+          window.__fillAudit.input++;
+          if (window.__fillAudit.input !== 1) return;
+          const until = performance.now() + 1100;
+          while (performance.now() < until) {}
+        });
+        target.addEventListener('change', () => {
+          window.__fillAudit.change++;
+        });
+        </script>
+        """
+    )
+
+    # Disabled action timeouts still cap each evaluator probe at one second. The first
+    # synthetic input therefore outlives its probe and the core has to re-enter it.
+    page.locator("#target").fill("2026-07-31", timeout=0)
+
+    assert page.locator("#target").input_value() == "2026-07-31"
+    assert page.evaluate("window.__fillAudit") == {"input": 1, "change": 1}
+
+
 def test_type_inserts_at_focus_caret_like_playwright(page):
     page.set_content("<input id='message' value='hello'>")
 
@@ -10598,31 +13423,34 @@ def test_wait_for_single_retries_transient_actionability_probe_timeout(page, mon
     assert probe["calls"] >= 2  # retried after the transient probe timeout
 
 
-def test_fill_apply_loop_retries_transient_probe_timeout(page, monkeypatch):
-    # The fill-apply loop performs the actual fill via the structured native entry point. A first probe whose CDP round
-    # trips outlast the per-probe budget raises TimeoutError; the loop must retry until the
-    # outer deadline instead of re-raising that transient timeout as a fatal error.
-    from rustwright.sync_api import Locator
-
+def test_core_fill_loop_retries_transient_probe_timeout(page):
+    # A first core-owned Runtime.evaluate probe that outlasts the disabled-timeout
+    # per-probe cap must be retried by the core without a Python polling loop.
     page.set_content("<input id='name'>")
+    # The probe evaluates in the frame utility world, so patching a main-world
+    # prototype would never be seen by it. Stall the renderer main thread instead:
+    # every world shares that thread, so the probe genuinely outlasts its cap.
+    page.evaluate(
+        """() => {
+          window.__stallRan = false;
+          setTimeout(() => {
+            const deadline = performance.now() + 1100;
+            while (performance.now() < deadline) {}
+            window.__stallRan = true;
+          }, 0);
+        }"""
+    )
 
-    real_fill_apply = Locator._fill_apply
-    probe = {"calls": 0, "timed_out": 0}
-
-    def flaky_fill_apply(self, value, *, strict, forced, timeout):
-        probe["calls"] += 1
-        if probe["timed_out"] == 0:
-            probe["timed_out"] += 1
-            raise TimeoutError(f"timed out after {int(timeout)} ms")
-        return real_fill_apply(self, value, strict=strict, forced=forced, timeout=timeout)
-
-    monkeypatch.setattr(Locator, "_fill_apply", flaky_fill_apply)
-
-    page.fill("#name", "Ada", timeout=30_000)
+    started = time.monotonic()
+    page.fill("#name", "Ada", timeout=0)
+    elapsed = time.monotonic() - started
 
     assert page.locator("#name").input_value() == "Ada"
-    assert probe["timed_out"] == 1
-    assert probe["calls"] >= 2  # retried after the transient probe timeout
+    # The stall outlasts the per-probe cap, so the first probe timed out; the fill
+    # only succeeds because the core retried it rather than aborting.
+    assert page.evaluate("window.__stallRan") is True
+    assert elapsed >= 1.0  # waited through the stall instead of failing fast
+    assert elapsed < 20
 
 
 def test_select_apply_loop_retries_transient_probe_timeout(page, monkeypatch):
@@ -10653,18 +13481,20 @@ def test_select_apply_loop_retries_transient_probe_timeout(page, monkeypatch):
     assert probe["calls"] >= 2  # retried after the transient probe timeout
 
 
-def test_fill_apply_loop_surfaces_outer_deadline_on_persistent_probe_timeout(page, monkeypatch):
-    # When every fill-apply probe keeps timing out, the loop must still end at the outer
-    # deadline with its own editable-timeout message (not the raw per-probe timeout) and
-    # without busy-looping past the deadline.
-    from rustwright.sync_api import Locator
-
+def test_core_fill_loop_surfaces_outer_deadline_on_persistent_probe_timeout(page):
+    # A renderer probe that outlasts the finite outer deadline must surface the
+    # core's editable timeout rather than a raw CDP command timeout.
     page.set_content("<input id='name'>")
-
-    def always_timeout_fill_apply(self, value, *, strict, forced, timeout):
-        raise TimeoutError(f"timed out after {int(timeout)} ms")
-
-    monkeypatch.setattr(Locator, "_fill_apply", always_timeout_fill_apply)
+    # Cross-world stall (see the retry test): block the shared renderer main thread
+    # for well past the 300 ms outer deadline so no probe can ever complete.
+    page.evaluate(
+        """() => {
+          setTimeout(() => {
+            const deadline = performance.now() + 1500;
+            while (performance.now() < deadline) {}
+          }, 0);
+        }"""
+    )
 
     started = time.monotonic()
     with pytest.raises(TimeoutError, match="editable"):
@@ -10674,25 +13504,29 @@ def test_fill_apply_loop_surfaces_outer_deadline_on_persistent_probe_timeout(pag
     assert elapsed < 5  # honored the ~300ms outer deadline; no runaway busy-loop
 
 
-def test_fill_apply_loop_propagates_owner_crash_on_probe_timeout(page, monkeypatch):
-    # A probe timeout must not mask owner unavailability: if the page crashes while a fill
-    # probe is timing out, the loop surfaces the crash immediately instead of polling until
-    # the outer deadline.
-    from rustwright.sync_api import Locator
+def test_core_fill_loop_propagates_barrier_driven_owner_fault(page):
+    page.set_content("<div id='barrier'>close owner</div><input id='target'>")
+    fault_observed = threading.Event()
+    hook_returned = threading.Event()
 
-    page.set_content("<input id='name'>")
+    def close_owner(_locator):
+        page.close()
+        fault_observed.set()
+        hook_returned.set()
 
-    def crashing_fill_apply(self, value, *, strict, forced, timeout):
-        self._page._crashed = True
-        raise TimeoutError(f"timed out after {int(timeout)} ms")
+    page.add_locator_handler(
+        page.locator("#barrier"),
+        close_owner,
+        no_wait_after=True,
+    )
+    started = time.monotonic()
+    with pytest.raises(Error, match="Target page, context or browser has been closed"):
+        page.fill("#target", "Ada", timeout=30_000)
+    elapsed = time.monotonic() - started
 
-    monkeypatch.setattr(Locator, "_fill_apply", crashing_fill_apply)
-
-    try:
-        with pytest.raises(Error, match="Page crashed"):
-            page.fill("#name", "Ada", timeout=30_000)
-    finally:
-        page._crashed = False
+    assert fault_observed.is_set()
+    assert hook_returned.is_set()
+    assert elapsed < 1
 
 
 def test_wait_for_single_propagates_owner_crash_when_probe_times_out_at_deadline(page, monkeypatch):
@@ -14259,6 +17093,30 @@ def test_forced_site_isolation_oopif_uses_iframe_target_session(playwright, oopi
         browser.close()
 
 
+def test_forced_site_isolation_oopif_fill_uses_iframe_target_frame(
+    playwright, oopif_test_server
+):
+    # The fill path needs an isolated world for its dispatch guard, so it resolves a
+    # frame id even when the locator did not carry one. That id has to belong to the
+    # session the locator resolved to: an out-of-process iframe runs in its own target,
+    # and handing it the top-level page's frame id makes Page.createIsolatedWorld fail
+    # with "No frame for given id found". No other forced-isolation test fills, which
+    # is why only CI (where site isolation is on by default) ever caught this.
+    browser = playwright.chromium.launch(headless=True, args=["--site-per-process"])
+    try:
+        page = browser.new_page()
+        page.goto(f"{oopif_test_server['top']}/oopif-top")
+        targets = page.context.new_cdp_session(page).send("Target.getTargets")["targetInfos"]
+        assert any(target.get("type") == "iframe" for target in targets)
+
+        frame_locator = page.frame_locator("#child")
+        frame_locator.locator("#name").fill("Ada Lovelace")
+
+        assert frame_locator.locator("#name").input_value() == "Ada Lovelace"
+    finally:
+        browser.close()
+
+
 def test_forced_isolation_oopif_same_origin_descendant_uses_target_root_coordinates(
     playwright, oopif_test_server
 ):
@@ -14373,6 +17231,26 @@ def test_frame_locator_strict_semantics_match_playwright(page):
         owner.get_attribute("id")
     assert page.frame_locator("iframe").first.owner.get_attribute("id") == "a"
     assert page.frame_locator("iframe").nth(1).owner.get_attribute("id") == "b"
+
+
+def test_frame_locator_fill_strict_violation_does_not_mutate_matching_frames(page):
+    first_child = "<input id='target' value='first'>"
+    second_child = "<input id='target' value='second'>"
+    page.set_content(
+        f"""
+        <iframe id="a" srcdoc="{escape(first_child, quote=True)}"></iframe>
+        <iframe id="b" srcdoc="{escape(second_child, quote=True)}"></iframe>
+        """
+    )
+
+    with pytest.raises(
+        Error,
+        match='strict mode violation: locator\\("iframe"\\) resolved to 2 elements',
+    ):
+        page.frame_locator("iframe").locator("#target").fill("mutated", timeout=500)
+
+    assert page.frame_locator("#a").locator("#target").input_value() == "first"
+    assert page.frame_locator("#b").locator("#target").input_value() == "second"
 
 
 def test_same_frame_composite_locators_are_allowed(page):
@@ -32749,7 +35627,7 @@ def test_async_page_click_default_dispatches_native_trusted_sequence(monkeypatch
     asyncio.run(run())
 
 
-def test_async_page_fill_default_commits_natively_with_input_and_change(monkeypatch):
+def test_async_page_fill_default_commits_natively_without_synthetic_change(monkeypatch):
     import rustwright.async_api as async_api
 
     monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
@@ -32768,11 +35646,17 @@ def test_async_page_fill_default_commits_natively_with_input_and_change(monkeypa
             await page.set_content(
                 """
                 <input id="name" value="old">
+                <button id="blur">Blur</button>
                 <script>
                 window.events = [];
                 for (const type of ['input', 'change']) {
                   document.querySelector('#name').addEventListener(type, event => {
-                    window.events.push({ type, value: event.target.value, bubbles: event.bubbles });
+                    window.events.push({
+                      type,
+                      value: event.target.value,
+                      bubbles: event.bubbles,
+                      trusted: event.isTrusted,
+                    });
                   });
                 }
                 </script>
@@ -32783,8 +35667,12 @@ def test_async_page_fill_default_commits_natively_with_input_and_change(monkeypa
 
             assert await page.evaluate("document.querySelector('#name').value") == "Ada"
             assert await page.evaluate("window.events") == [
-                {"type": "input", "value": "Ada", "bubbles": True},
-                {"type": "change", "value": "Ada", "bubbles": True},
+                {"type": "input", "value": "Ada", "bubbles": True, "trusted": True},
+            ]
+            await page.evaluate("document.querySelector('#blur').focus()")
+            assert await page.evaluate("window.events") == [
+                {"type": "input", "value": "Ada", "bubbles": True, "trusted": True},
+                {"type": "change", "value": "Ada", "bubbles": True, "trusted": True},
             ]
             await browser.close()
 
@@ -32882,6 +35770,9 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
 
             return run()
 
+        def locator_fill_actionable(self, *args):
+            self.calls.append(("locator_fill_actionable", args))
+
         def click_async(self, *args):
             async def run():
                 self.calls.append(("click", args))
@@ -32904,6 +35795,7 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
                 (),
                 {"_mask": 8, "_modifiers_mask": lambda self: self._mask},
             )()
+            self._locator_handlers = []
             self._core = FakeCore(self)
 
         def click(self, *args, **kwargs):
@@ -32911,6 +35803,9 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
 
         def fill(self, *args, **kwargs):
             raise AssertionError("the dispatch stub should intercept sync fill")
+
+        def _slow_mo(self):
+            return None
 
     class FakeLocator:
         _spec = {"kind": "css", "selector": "#target"}
@@ -32964,20 +35859,102 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
         monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
         await page.click("#target", force=False)
         await page.fill("#target", "value", force=False)
-        assert [call[0] for call in sync_calls] == ["click", "fill"]
+        assert [call[0] for call in sync_calls] == ["click"]
+        assert sync_page._core.calls[-1][0] == "locator_fill_actionable"
+        assert isinstance(
+            sync_page._core.calls[-1][1][-1],
+            async_api._rustwright._RustCancelToken,
+        )
 
         sync_calls.clear()
         sync_page._active_page_cdp_event_contexts = 1
         await page.click("#target")
         await page.fill("#target", "value")
-        assert [call[0] for call in sync_calls] == ["click", "fill"]
+        assert [call[0] for call in sync_calls] == ["click"]
         assert [call[0] for call in sync_page._core.calls] == [
             "click_actionable_wait",
             "dispatch_mouse_click",
             "fill_actionable",
             "click",
             "fill",
+            "locator_fill_actionable",
+            "locator_fill_actionable",
         ]
+
+        monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
+        sync_calls.clear()
+        await page.fill("#target", "value")
+        assert [call[0] for call in sync_calls] == ["fill"]
+        assert sync_page._core.calls[-1][0] == "locator_fill_actionable"
+
+    asyncio.run(run())
+
+
+def test_async_page_fill_sync_fallback_cancellation_signals_rust_token(monkeypatch):
+    import rustwright.async_api as async_api
+
+    entered = threading.Event()
+    released = threading.Event()
+
+    class FakeCancelToken:
+        instances = []
+
+        def __init__(self):
+            self.cancelled = threading.Event()
+            self.instances.append(self)
+
+        def cancel(self):
+            self.cancelled.set()
+
+    class FakeCore:
+        def locator_fill_actionable(self, *args):
+            entered.set()
+            if args[-1].cancelled.wait(2):
+                released.set()
+
+    class FakeSyncPage:
+        _active_page_cdp_event_contexts = 0
+        _default_timeout = 30_000.0
+        _locator_handlers = []
+
+        def __init__(self):
+            self._core = FakeCore()
+
+        def _slow_mo(self):
+            raise AssertionError("cancelled fill must not run slow_mo")
+
+    class FakeLocator:
+        _spec = {"kind": "css", "selector": "#target"}
+        _index = 0
+        _strict = False
+
+    page = object.__new__(async_api.AsyncPage)
+    page._sync = FakeSyncPage()
+    fake_rustwright = type("FakeRustwright", (), {"_RustCancelToken": FakeCancelToken})
+    monkeypatch.setattr(async_api, "_rustwright", fake_rustwright)
+    monkeypatch.setattr(async_api, "_native_page_hot_path_supported", lambda _page: False)
+    monkeypatch.setattr(async_api, "_native_selector_locator", lambda *args, **kwargs: FakeLocator())
+    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+
+    async def run() -> None:
+        fill = asyncio.create_task(page.fill("#target", "value"))
+        for _ in range(100):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+
+        fill.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await fill
+
+        for _ in range(100):
+            if released.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert released.is_set()
+        assert len(FakeCancelToken.instances) == 1
+        assert FakeCancelToken.instances[0].cancelled.is_set()
 
     asyncio.run(run())
 
