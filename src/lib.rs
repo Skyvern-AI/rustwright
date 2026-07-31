@@ -4669,6 +4669,67 @@ multiline-compatible = """4.5.6"""
     }
 
     #[test]
+    fn shadow_query_helper_uses_lexer_ast_and_iterative_traversal() {
+        assert!(SHADOW_PIERCING_QUERY_HELPER.contains("const isCssWhitespace = char =>"));
+        assert!(SHADOW_PIERCING_QUERY_HELPER.contains("const cssTrim = text =>"));
+        for code_point in [
+            r#"'\u0009'"#,
+            r#"'\u000a'"#,
+            r#"'\u000c'"#,
+            r#"'\u000d'"#,
+            r#"'\u0020'"#,
+        ] {
+            assert!(SHADOW_PIERCING_QUERY_HELPER.contains(code_point));
+        }
+        assert!(!SHADOW_PIERCING_QUERY_HELPER.contains(r#"/\s/"#));
+        assert!(!SHADOW_PIERCING_QUERY_HELPER.contains(".trim()"));
+        assert!(SHADOW_PIERCING_QUERY_HELPER.contains("const lex = text =>"));
+        assert!(SHADOW_PIERCING_QUERY_HELPER.contains("const parseSelectorList ="));
+        assert!(SHADOW_PIERCING_QUERY_HELPER.contains("const matchesComplex ="));
+        assert!(SHADOW_PIERCING_QUERY_HELPER.contains("const matchesRelative ="));
+        assert!(SHADOW_PIERCING_QUERY_HELPER.contains("while (stack.length)"));
+        assert!(!SHADOW_PIERCING_QUERY_HELPER.contains("const visit ="));
+        assert!(!SHADOW_PIERCING_QUERY_HELPER.contains("Unsupported shadow-piercing"));
+    }
+
+    #[test]
+    fn locator_template_substitution_does_not_rewrite_selector_contents() {
+        let token = "__QUERY_ALL_DEEP_HELPER__";
+        let locator_json = json!({
+            "kind": "css",
+            "selector": format!(r#"[data-token="{token}"]"#),
+        })
+        .to_string();
+        let expected_spec = format!("const spec = {locator_json};");
+
+        let fast = locator_script(&locator_json, 0, "return matches.length;");
+        assert!(fast.contains(&expected_spec));
+        assert_eq!(fast.matches("const queryAllDeep =").count(), 1);
+
+        let full_json = json!({
+            "kind": "filtered",
+            "base": serde_json::from_str::<Value>(&locator_json).unwrap(),
+            "has_text": "target",
+        })
+        .to_string();
+        let full = locator_script(&full_json, 0, "return matches.length;");
+        assert!(full.contains(&format!("const spec = {full_json};")));
+        assert_eq!(full.matches("const queryAllDeep =").count(), 1);
+    }
+
+    #[test]
+    fn element_handle_locator_scripts_use_the_supplied_context_root() {
+        let script = locator_script_for_root(
+            r#"{"kind":"css","selector":".target"}"#,
+            0,
+            "return matches;",
+            "this",
+        );
+        assert!(script.contains("const locatorRoot = this;"));
+        assert!(script.contains("allIn(current, locatorRoot)"));
+    }
+
+    #[test]
     fn native_locator_fast_path_detection_preserves_cheap_sentinel_cases() {
         let args = r#"{"strict":true,"explicit_index":false,"has_handlers":false}"#;
         assert!(locator_fast_path_body(
@@ -11946,6 +12007,89 @@ async fn evaluate_locator_for_page(
     evaluate_locator_resolution(&page, &resolution, expression, deadline, Duration::ZERO).await
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_locator_for_element_handle(
+    page: Arc<PageInner>,
+    object_id: String,
+    session_id: Option<String>,
+    locator_json: String,
+    index: usize,
+    body: String,
+    timeout: Duration,
+    return_by_value: bool,
+    require_attached: bool,
+    transport_slack: Duration,
+) -> RwResult<String> {
+    let deadline = OperationDeadline::new(timeout);
+    let session_id = session_id.unwrap_or_else(|| page.session_id.clone());
+    let expression = locator_script_for_root(&locator_json, index, &body, "this");
+    let expression = expression.trim();
+    let attached_guard = if require_attached {
+        "if (!this.isConnected) throw new Error('Element is not attached to the DOM');"
+    } else {
+        ""
+    };
+    let function_declaration = format!(
+        r#"function() {{
+  if (!this || this.nodeType !== Node.ELEMENT_NODE || typeof this.tagName !== 'string') {{
+    throw new Error('JSHandle is not an Element');
+  }}
+  {attached_guard}
+  return ({expression});
+}}"#
+    );
+    let transport_timeout = deadline.remaining()?.saturating_add(transport_slack);
+    let result = page
+        .browser
+        .client
+        .send(
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": function_declaration,
+                "awaitPromise": true,
+                "returnByValue": return_by_value,
+                "userGesture": true,
+            }),
+            Some(&session_id),
+            transport_timeout,
+        )
+        .await?;
+    if return_by_value {
+        runtime_result_to_json(&result)
+    } else {
+        runtime_result_to_remote_object_with_session(&result, &session_id)
+    }
+}
+
+async fn query_selector_for_element_handle(
+    page: Arc<PageInner>,
+    object_id: String,
+    session_id: Option<String>,
+    locator_json: String,
+    all_matches: bool,
+    timeout: Duration,
+) -> RwResult<String> {
+    let body = if all_matches {
+        "return matches;"
+    } else {
+        "return matches[0] || null;"
+    };
+    evaluate_locator_for_element_handle(
+        page,
+        object_id,
+        session_id,
+        locator_json,
+        0,
+        body.to_string(),
+        timeout,
+        false,
+        false,
+        Duration::ZERO,
+    )
+    .await
+}
+
 fn fill_guard_cleanup_expression(own_key: &str) -> RwResult<String> {
     let own_key_json = serde_json::to_string(own_key)?;
     Ok(format!(
@@ -13301,6 +13445,11 @@ const targetState = {state_json};
 const strict = {strict_json};
 const timeoutMs = {timeout_millis};
 const snapshot = () => {{
+  if (
+    locatorRoot &&
+    locatorRoot.nodeType === Node.ELEMENT_NODE &&
+    !locatorRoot.isConnected
+  ) return {{ rootDetached: true }};
   const currentMatches = all(spec);
   if (strict && currentMatches.length > 1) return {{ strict: true, count: currentMatches.length }};
   const current = currentMatches[index] || null;
@@ -13316,6 +13465,7 @@ const snapshot = () => {{
   return {{ attached, matched }};
 }};
 const first = snapshot();
+if (first.rootDetached) throw new Error('Element is not attached to the DOM');
 if (first.strict) return `__rustwright_strict_violation__:${{first.count}}`;
 if (first.matched) return first.attached;
 return new Promise(resolve => {{
@@ -13333,7 +13483,8 @@ return new Promise(resolve => {{
   }};
   const check = () => {{
     const next = snapshot();
-    if (next.strict) finish(`__rustwright_strict_violation__:${{next.count}}`);
+    if (next.rootDetached) finish('__rustwright_locator_root_detached__');
+    else if (next.strict) finish(`__rustwright_strict_violation__:${{next.count}}`);
     else if (next.matched) finish(next.attached);
   }};
   observer = new MutationObserver(check);
@@ -13699,7 +13850,16 @@ async fn page_wait_for_selector_async(
         }
     })
     .await?;
+    wait_for_selector_result(&json, timeout)
+}
+
+fn wait_for_selector_result(json: &str, timeout: Duration) -> RwResult<bool> {
     let value = serde_json::from_str::<Value>(&json).unwrap_or(Value::Null);
+    if value.as_str() == Some("__rustwright_locator_root_detached__") {
+        return Err(RwError::Message(
+            "Element is not attached to the DOM".to_string(),
+        ));
+    }
     if value.as_str() == Some("__rustwright_timeout__") {
         return Err(locator_wait_timeout(timeout));
     }
@@ -13713,6 +13873,34 @@ async fn page_wait_for_selector_async(
         )));
     }
     Ok(value.as_bool().unwrap_or(false))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn element_handle_wait_for_selector_async(
+    page: Arc<PageInner>,
+    object_id: String,
+    session_id: Option<String>,
+    locator_json: String,
+    index: usize,
+    state: String,
+    timeout: Duration,
+    strict: bool,
+) -> RwResult<bool> {
+    let body = wait_for_selector_body(&state, strict, timeout);
+    let json = evaluate_locator_for_element_handle(
+        page,
+        object_id,
+        session_id,
+        locator_json,
+        index,
+        body,
+        timeout,
+        true,
+        true,
+        Duration::from_secs(1),
+    )
+    .await?;
+    wait_for_selector_result(&json, timeout)
 }
 
 fn locator_action_body(action: &str, strict: bool, timeout: Duration) -> String {
@@ -16518,6 +16706,70 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         );
         let _ = self.js_handle_dispose(object_id, timeout_ms, None);
         result.map_err(py_err)
+    }
+
+    #[pyo3(signature = (object_id, locator_json, all_matches=false, timeout_ms=None, session_id=None))]
+    fn element_handle_query_selector(
+        &self,
+        py: Python<'_>,
+        object_id: &str,
+        locator_json: &str,
+        all_matches: bool,
+        timeout_ms: Option<f64>,
+        session_id: Option<&str>,
+    ) -> PyResult<String> {
+        let page = Arc::clone(&self.inner);
+        let object_id = object_id.to_string();
+        let session_id = session_id.map(ToString::to_string);
+        let locator_json = locator_json.to_string();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        py.detach(move || {
+            let browser = Arc::clone(&page.browser);
+            browser.block_on(query_selector_for_element_handle(
+                page,
+                object_id,
+                session_id,
+                locator_json,
+                all_matches,
+                timeout,
+            ))
+        })
+        .map_err(py_err)
+    }
+
+    #[pyo3(signature = (object_id, locator_json, index, state=None, timeout_ms=None, strict=None, session_id=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn element_handle_wait_for_selector(
+        &self,
+        py: Python<'_>,
+        object_id: &str,
+        locator_json: &str,
+        index: usize,
+        state: Option<&str>,
+        timeout_ms: Option<f64>,
+        strict: Option<bool>,
+        session_id: Option<&str>,
+    ) -> PyResult<bool> {
+        let page = Arc::clone(&self.inner);
+        let object_id = object_id.to_string();
+        let session_id = session_id.map(ToString::to_string);
+        let locator_json = locator_json.to_string();
+        let state = state.unwrap_or("visible").to_string();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        py.detach(move || {
+            let browser = Arc::clone(&page.browser);
+            browser.block_on(element_handle_wait_for_selector_async(
+                page,
+                object_id,
+                session_id,
+                locator_json,
+                index,
+                state,
+                timeout,
+                strict.unwrap_or(false),
+            ))
+        })
+        .map_err(py_err)
     }
 
     #[pyo3(signature = (object_id, timeout_ms=None, session_id=None))]
@@ -28084,7 +28336,558 @@ fn simple_css_locator_spec(value: &Value) -> bool {
     }
 }
 
-fn fast_css_locator_script(locator_json: &str, index: usize, body: &str) -> String {
+// Keep one shadow-aware CSS lexer, AST, and matcher shared by every locator script.
+// DOM discovery is iterative; recursive matching is bounded by selector AST depth.
+const SHADOW_PIERCING_QUERY_HELPER: &str = r#"
+  const queryAllDeep = (root, selector) => {
+    root = root || document;
+    const source = String(selector);
+
+    // Let the owner document's native selector parser validate before the
+    // shadow-piercing lexer runs, so native SyntaxError details take priority.
+    // XML documents do not create HTMLTemplateElement instances, so validate
+    // those selectors on a detached element owned by the original document.
+    const ownerDocument = root.nodeType === Node.DOCUMENT_NODE
+      ? root
+      : (root.ownerDocument || document);
+    const validationRoot = ownerDocument.contentType === 'text/html'
+      ? ownerDocument.implementation.createHTMLDocument('')
+      : ownerDocument.createElement('rustwright-selector-probe');
+    validationRoot.querySelectorAll(source);
+
+    const isCssWhitespace = char =>
+      char === '\u0009' ||
+      char === '\u000a' ||
+      char === '\u000c' ||
+      char === '\u000d' ||
+      char === '\u0020';
+    const cssTrim = text => {
+      let start = 0;
+      let end = text.length;
+      while (start < end && isCssWhitespace(text[start])) start++;
+      while (end > start && isCssWhitespace(text[end - 1])) end--;
+      return text.slice(start, end);
+    };
+
+    const readEscape = (text, start) => {
+      let end = start + 1;
+      if (end >= text.length) return { raw: '\\', end };
+      if (/[0-9a-fA-F]/.test(text[end])) {
+        let digits = 0;
+        while (end < text.length && digits < 6 && /[0-9a-fA-F]/.test(text[end])) {
+          end++;
+          digits++;
+        }
+        if (end < text.length && isCssWhitespace(text[end])) {
+          if (text[end] === '\r' && text[end + 1] === '\n') end += 2;
+          else end++;
+        }
+      } else {
+        end++;
+      }
+      return { raw: text.slice(start, end), end };
+    };
+
+    const decodeIdentifier = value => {
+      let decoded = '';
+      let index = 0;
+      while (index < value.length) {
+        if (value[index] !== '\\') {
+          decoded += value[index++];
+          continue;
+        }
+        const escaped = readEscape(value, index);
+        const body = escaped.raw.slice(1);
+        const hex = /^[0-9a-fA-F]{1,6}/.exec(body);
+        if (hex) {
+          let codePoint = Number.parseInt(hex[0], 16);
+          if (
+            !codePoint ||
+            codePoint > 0x10ffff ||
+            (codePoint >= 0xd800 && codePoint <= 0xdfff)
+          ) {
+            codePoint = 0xfffd;
+          }
+          decoded += String.fromCodePoint(codePoint);
+        } else if (body) {
+          decoded += body[0];
+        } else {
+          decoded += '\ufffd';
+        }
+        index = escaped.end;
+      }
+      return decoded;
+    };
+
+    const readFunction = (text, open) => {
+      let value = '';
+      let depth = 1;
+      let quote = '';
+      let bracketDepth = 0;
+      let index = open + 1;
+      while (index < text.length) {
+        const char = text[index];
+        if (char === '\\') {
+          const escaped = readEscape(text, index);
+          value += escaped.raw;
+          index = escaped.end;
+          continue;
+        }
+        if (quote) {
+          value += char;
+          if (char === quote) quote = '';
+          index++;
+          continue;
+        }
+        if (char === '"' || char === "'") {
+          quote = char;
+          value += char;
+          index++;
+          continue;
+        }
+        if (char === '/' && text[index + 1] === '*') {
+          const close = text.indexOf('*/', index + 2);
+          if (close < 0) {
+            index = text.length;
+            continue;
+          }
+          index = close + 2;
+          continue;
+        }
+        if (char === '[') {
+          bracketDepth++;
+          value += char;
+          index++;
+          continue;
+        }
+        if (char === ']') {
+          bracketDepth--;
+          value += char;
+          index++;
+          continue;
+        }
+        if (!bracketDepth && char === '(') {
+          depth++;
+          value += char;
+          index++;
+          continue;
+        }
+        if (!bracketDepth && char === ')') {
+          depth--;
+          if (!depth) return { value, end: index + 1 };
+          value += char;
+          index++;
+          continue;
+        }
+        value += char;
+        index++;
+      }
+      throw new Error('Invalid CSS selector: unterminated functional pseudo-class');
+    };
+
+    const lex = text => {
+      const tokens = [];
+      let raw = '';
+      let quote = '';
+      let bracketDepth = 0;
+      const pushRaw = () => {
+        if (!raw) return;
+        tokens.push({ type: 'native', value: raw });
+        raw = '';
+      };
+      const pushSpace = () => {
+        pushRaw();
+        if (!tokens.length || tokens[tokens.length - 1].type !== 'space')
+          tokens.push({ type: 'space' });
+      };
+
+      let index = 0;
+      while (index < text.length) {
+        const char = text[index];
+        if (char === '\\') {
+          const escaped = readEscape(text, index);
+          raw += escaped.raw;
+          index = escaped.end;
+          continue;
+        }
+        if (quote) {
+          raw += char;
+          if (char === quote) quote = '';
+          index++;
+          continue;
+        }
+        if (char === '"' || char === "'") {
+          quote = char;
+          raw += char;
+          index++;
+          continue;
+        }
+        if (char === '/' && text[index + 1] === '*') {
+          const close = text.indexOf('*/', index + 2);
+          if (close < 0) {
+            index = text.length;
+            continue;
+          }
+          index = close + 2;
+          continue;
+        }
+        if (char === '[') {
+          bracketDepth++;
+          raw += char;
+          index++;
+          continue;
+        }
+        if (char === ']') {
+          if (!bracketDepth) throw new Error('Invalid CSS selector: unexpected ]');
+          bracketDepth--;
+          raw += char;
+          index++;
+          continue;
+        }
+        if (bracketDepth) {
+          raw += char;
+          index++;
+          continue;
+        }
+        if (char === ':') {
+          let nameEnd = index + 1;
+          let rawName = '';
+          while (nameEnd < text.length) {
+            if (/[-_a-zA-Z0-9]/.test(text[nameEnd])) {
+              rawName += text[nameEnd++];
+              continue;
+            }
+            if (text[nameEnd] === '\\') {
+              const escaped = readEscape(text, nameEnd);
+              rawName += escaped.raw;
+              nameEnd = escaped.end;
+              continue;
+            }
+            break;
+          }
+          const name = decodeIdentifier(rawName).toLowerCase();
+          if (name === 'scope' && text[nameEnd] !== '(') {
+            pushRaw();
+            tokens.push({ type: 'scope' });
+            index = nameEnd;
+            continue;
+          }
+          if (name && text[nameEnd] === '(') {
+            const parsed = readFunction(text, nameEnd);
+            if (['has', 'is', 'not', 'where'].includes(name)) {
+              pushRaw();
+              tokens.push({ type: 'function', name, source: parsed.value });
+            } else {
+              raw += text.slice(index, nameEnd + 1) + parsed.value + ')';
+            }
+            index = parsed.end;
+            continue;
+          }
+        }
+        if (isCssWhitespace(char)) {
+          pushSpace();
+          index++;
+          while (index < text.length && isCssWhitespace(text[index])) index++;
+          continue;
+        }
+        if (char === ',' || char === '>' || char === '+' || char === '~') {
+          pushRaw();
+          tokens.push({
+            type: char === ',' ? 'comma' : 'combinator',
+            value: char,
+          });
+          index++;
+          continue;
+        }
+        if (char === '(' || char === ')')
+          throw new Error(`Invalid CSS selector: unexpected ${char}`);
+        raw += char;
+        index++;
+      }
+      if (quote || bracketDepth)
+        throw new Error('Invalid CSS selector: unterminated string or attribute selector');
+      pushRaw();
+      return tokens;
+    };
+
+    const parseSelectorList = (text, relative) => {
+      const tokens = lex(text);
+      const groups = [];
+      let parts = [];
+      let compounds = [];
+      let combinators = [];
+      let leading = null;
+      let pendingSpace = false;
+
+      const pushCompound = () => {
+        if (!parts.length) return false;
+        const normalized = [];
+        for (const part of parts) {
+          if (
+            part.type === 'native' &&
+            normalized.length &&
+            normalized[normalized.length - 1].type === 'native'
+          ) {
+            normalized[normalized.length - 1].value += part.value;
+          } else {
+            normalized.push(part);
+          }
+        }
+        compounds.push({ parts: normalized });
+        parts = [];
+        return true;
+      };
+      const pushGroup = () => {
+        pushCompound();
+        if (!compounds.length || combinators.length + 1 !== compounds.length)
+          throw new Error('Invalid CSS selector: incomplete complex selector');
+        groups.push({ compounds, combinators, leading: relative ? (leading || ' ') : null });
+        compounds = [];
+        combinators = [];
+        leading = null;
+        pendingSpace = false;
+      };
+
+      for (const token of tokens) {
+        if (token.type === 'space') {
+          if (parts.length) pendingSpace = true;
+          continue;
+        }
+        if (token.type === 'comma') {
+          pushGroup();
+          continue;
+        }
+        if (token.type === 'combinator') {
+          if (parts.length) {
+            pushCompound();
+            combinators.push(token.value);
+          } else if (relative && !compounds.length && leading == null) {
+            leading = token.value;
+          } else {
+            throw new Error('Invalid CSS selector: misplaced combinator');
+          }
+          pendingSpace = false;
+          continue;
+        }
+        if (pendingSpace && parts.length) {
+          pushCompound();
+          combinators.push(' ');
+        }
+        pendingSpace = false;
+        if (token.type === 'function') {
+          let selectors;
+          if (token.name === 'is' || token.name === 'where') {
+            const armSource = token => {
+              if (token.type === 'native') return token.value;
+              if (token.type === 'space') return ' ';
+              if (token.type === 'combinator') return token.value;
+              if (token.type === 'scope') return ':scope';
+              if (token.type === 'function')
+                return `:${token.name}(${token.source})`;
+              return '';
+            };
+            const arms = [];
+            let arm = '';
+            for (const innerToken of lex(token.source)) {
+              if (innerToken.type === 'comma') {
+                arms.push(cssTrim(arm));
+                arm = '';
+              } else {
+                arm += armSource(innerToken);
+              }
+            }
+            arms.push(cssTrim(arm));
+            const probeDocument = root.nodeType === Node.DOCUMENT_NODE
+              ? root
+              : (root.ownerDocument || document);
+            const probe = root.nodeType === Node.ELEMENT_NODE
+              ? root
+              : (probeDocument.documentElement || probeDocument.createElement('div'));
+            selectors = arms.flatMap(arm => {
+              if (!arm) return [];
+              try {
+                Element.prototype.matches.call(probe, arm);
+              } catch (_) {
+                return [];
+              }
+              return parseSelectorList(arm, false);
+            });
+            // Rustwright's native qSA path already gets the browser's forgiving
+            // :is()/:where() behavior. Playwright rejects unsupported arms in its
+            // own parser, but shadow presence must not change Rustwright's result.
+          } else {
+            selectors = parseSelectorList(token.source, token.name === 'has');
+          }
+          parts.push({
+            type: 'function',
+            name: token.name,
+            selectors,
+          });
+        } else {
+          parts.push({ ...token });
+        }
+      }
+      pushGroup();
+      return groups;
+    };
+
+    const ast = parseSelectorList(source, false);
+    const complexUsesScope = complex => complex.compounds.some(compound =>
+      compound.parts.some(part =>
+        part.type === 'scope' ||
+        (part.type === 'function' && part.selectors.some(complexUsesScope))
+      )
+    );
+    const selectorUsesScope = ast.some(complexUsesScope);
+    const elements = [];
+    const seen = new Set();
+    const initial = [];
+    const appendChildren = (node, output) => {
+      if (!node) return;
+      if (node.nodeType === Node.DOCUMENT_NODE) {
+        if (node.documentElement) output.push(node.documentElement);
+        return;
+      }
+      if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+        output.push(...Array.from(node.children || []));
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      if (node.shadowRoot) output.push(...Array.from(node.shadowRoot.children || []));
+      output.push(...Array.from(node.children || []));
+    };
+    appendChildren(root, initial);
+    const stack = initial.reverse();
+    let hasOpenShadowRoot = root.nodeType === Node.ELEMENT_NODE && !!root.shadowRoot;
+    while (stack.length) {
+      const element = stack.pop();
+      if (!element || seen.has(element)) continue;
+      seen.add(element);
+      elements.push(element);
+      if (element.shadowRoot) hasOpenShadowRoot = true;
+      const children = [];
+      appendChildren(element, children);
+      for (let index = children.length - 1; index >= 0; index--) stack.push(children[index]);
+    }
+    if (!hasOpenShadowRoot && !selectorUsesScope)
+      return Array.from(root.querySelectorAll(source));
+
+    const rootElement = root.nodeType === Node.ELEMENT_NODE
+      ? root
+      : root.nodeType === Node.DOCUMENT_NODE
+        ? root.documentElement
+        : null;
+    // Preserve the old recursive queryAllDeep order: a root's native qSA order
+    // comes first, followed by each open shadow root in host document order.
+    const orderedElements = [];
+    const orderedSeen = new Set();
+    const roots = [root];
+    while (roots.length) {
+      const currentRoot = roots.pop();
+      const descendants = Array.from(currentRoot.querySelectorAll('*'));
+      for (const element of descendants) {
+        if (orderedSeen.has(element)) continue;
+        orderedSeen.add(element);
+        orderedElements.push(element);
+      }
+      const shadowRoots = [];
+      if (currentRoot.nodeType === Node.ELEMENT_NODE && currentRoot.shadowRoot)
+        shadowRoots.push(currentRoot.shadowRoot);
+      for (const element of descendants) {
+        if (element.shadowRoot) shadowRoots.push(element.shadowRoot);
+      }
+      for (let index = shadowRoots.length - 1; index >= 0; index--)
+        roots.push(shadowRoots[index]);
+    }
+    const candidates = rootElement && selectorUsesScope && !seen.has(rootElement)
+      ? [rootElement, ...orderedElements]
+      : orderedElements;
+    const universeSet = new Set(elements);
+    if (rootElement) universeSet.add(rootElement);
+    const nativeCaches = new Map();
+    const nativeMatches = (element, native) => {
+      if (!native || native === '*') return true;
+      let cache = nativeCaches.get(native);
+      if (!cache) {
+        cache = new WeakMap();
+        nativeCaches.set(native, cache);
+      }
+      if (!cache.has(element)) cache.set(element, element.matches(native));
+      return cache.get(element);
+    };
+    const deepParent = element => {
+      if (element.parentElement && universeSet.has(element.parentElement))
+        return element.parentElement;
+      const treeRoot = element.getRootNode && element.getRootNode();
+      const host = treeRoot && treeRoot.host;
+      return host && universeSet.has(host) ? host : null;
+    };
+    const deepPreviousSibling = element => element.previousElementSibling;
+
+    const matchesComplex = (element, complex, scope) => {
+      const matchAt = (candidate, index) => {
+        if (!candidate || !matchesCompound(candidate, complex.compounds[index], scope)) return false;
+        if (index === 0) return true;
+        const combinator = complex.combinators[index - 1];
+        if (combinator === '>') return matchAt(deepParent(candidate), index - 1);
+        if (combinator === '+') return matchAt(deepPreviousSibling(candidate), index - 1);
+        if (combinator === '~') {
+          for (
+            let sibling = deepPreviousSibling(candidate);
+            sibling;
+            sibling = deepPreviousSibling(sibling)
+          ) {
+            if (matchAt(sibling, index - 1)) return true;
+          }
+          return false;
+        }
+        for (let parent = deepParent(candidate); parent; parent = deepParent(parent)) {
+          if (matchAt(parent, index - 1)) return true;
+        }
+        return false;
+      };
+      return matchAt(element, complex.compounds.length - 1);
+    };
+    const matchesRelative = (scope, relativeSelector) => {
+      const scoped = {
+        compounds: [{ parts: [{ type: 'scope' }] }, ...relativeSelector.compounds],
+        combinators: [relativeSelector.leading || ' ', ...relativeSelector.combinators],
+      };
+      return elements.some(element => matchesComplex(element, scoped, scope));
+    };
+    const matchesCompound = (element, compound, scope) => {
+      let native = '';
+      for (const part of compound.parts) {
+        if (part.type === 'native') {
+          native += part.value;
+          continue;
+        }
+        if (part.type === 'scope') {
+          if (element !== scope) return false;
+          continue;
+        }
+        const matched = part.selectors.some(inner =>
+          part.name === 'has'
+            ? matchesRelative(element, inner)
+            : matchesComplex(element, inner, scope)
+        );
+        if (part.name === 'not' ? matched : !matched) return false;
+      }
+      return nativeMatches(element, native || '*');
+    };
+
+    return candidates.filter(element =>
+      ast.some(complex => matchesComplex(element, complex, rootElement))
+    );
+  };
+"#;
+
+fn fast_css_locator_script(
+    locator_json: &str,
+    index: usize,
+    body: &str,
+    locator_root: &str,
+) -> String {
     let needs_visible = body.contains("visible(") || body.contains("visibleForRole(");
     let needs_visible_for_role = body.contains("visibleForRole(");
     let needs_disabled = body.contains("disabledState(");
@@ -28519,31 +29322,14 @@ fn fast_css_locator_script(locator_json: &str, index: usize, body: &str) -> Stri
 (() => {
   const spec = __SPEC__;
   const index = __INDEX__;
-  const queryAllDeep = (root, selector) => {
-    root = root || document;
-    const result = [];
-    const seen = new Set();
-    const add = el => {
-      if (el && el.nodeType === 1 && !seen.has(el)) {
-        seen.add(el);
-        result.push(el);
-      }
-    };
-    const visit = scope => {
-      for (const el of Array.from(scope.querySelectorAll(selector))) add(el);
-      for (const el of Array.from(scope.querySelectorAll('*'))) {
-        if (el.shadowRoot) visit(el.shadowRoot);
-      }
-    };
-    visit(root);
-    return result;
-  };
+  const locatorRoot = __LOCATOR_ROOT__;
+  __QUERY_ALL_DEEP_HELPER__
   __VISIBLE_HELPER__
   __COMMON_ACCESSIBILITY_HELPER__
   __ROLE_HELPER__
   __DISABLED_HELPER__
   __VISIBLE_FOR_ROLE_HELPER__
-  const all = current => allIn(current, document);
+  const all = current => allIn(current, locatorRoot);
   const allIn = (current, root) => {
     root = root || document;
     if (!current || current.kind === 'css') {
@@ -28565,17 +29351,20 @@ fn fast_css_locator_script(locator_json: &str, index: usize, body: &str) -> Stri
 })()
 "#;
     template
-        .replace("__SPEC__", locator_json)
-        .replace("__INDEX__", &index.to_string())
-        .replace("__VISIBLE_HELPER__", visible_helper)
-        .replace(
+        .replacen("__QUERY_ALL_DEEP_HELPER__", SHADOW_PIERCING_QUERY_HELPER, 1)
+        .replacen("__VISIBLE_HELPER__", visible_helper, 1)
+        .replacen(
             "__COMMON_ACCESSIBILITY_HELPER__",
             common_accessibility_helper,
+            1,
         )
-        .replace("__ROLE_HELPER__", role_helper)
-        .replace("__DISABLED_HELPER__", disabled_helper)
-        .replace("__VISIBLE_FOR_ROLE_HELPER__", visible_for_role_helper)
-        .replace("__BODY__", body)
+        .replacen("__ROLE_HELPER__", role_helper, 1)
+        .replacen("__DISABLED_HELPER__", disabled_helper, 1)
+        .replacen("__VISIBLE_FOR_ROLE_HELPER__", visible_for_role_helper, 1)
+        .replacen("__LOCATOR_ROOT__", locator_root, 1)
+        .replacen("__INDEX__", &index.to_string(), 1)
+        .replacen("__BODY__", body, 1)
+        .replacen("__SPEC__", locator_json, 1)
 }
 
 fn body_can_use_fast_common_accessibility(body: &str) -> bool {
@@ -28589,20 +29378,26 @@ fn body_requires_full_locator_runtime(body: &str) -> bool {
         && !body_can_use_fast_common_accessibility(body)
 }
 
-fn locator_script(locator_json: &str, index: usize, body: &str) -> String {
+fn locator_script_for_root(
+    locator_json: &str,
+    index: usize,
+    body: &str,
+    locator_root: &str,
+) -> String {
     if !body_requires_full_locator_runtime(body)
         && serde_json::from_str::<Value>(locator_json)
             .ok()
             .filter(simple_css_locator_spec)
             .is_some()
     {
-        return fast_css_locator_script(locator_json, index, body);
+        return fast_css_locator_script(locator_json, index, body, locator_root);
     }
 
     let template = r#"
 (() => {
   const spec = __SPEC__;
   const index = __INDEX__;
+  const locatorRoot = __LOCATOR_ROOT__;
 
   const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
   const includesText = (value, needle, exact) => {
@@ -28660,25 +29455,7 @@ fn locator_script(locator_json: &str, index: usize, body: &str) -> String {
     }
     return true;
   };
-  const queryAllDeep = (root, selector) => {
-    root = root || document;
-    const result = [];
-    const seen = new Set();
-    const add = el => {
-      if (el && el.nodeType === 1 && !seen.has(el)) {
-        seen.add(el);
-        result.push(el);
-      }
-    };
-    const visit = scope => {
-      for (const el of Array.from(scope.querySelectorAll(selector))) add(el);
-      for (const el of Array.from(scope.querySelectorAll('*'))) {
-        if (el.shadowRoot) visit(el.shadowRoot);
-      }
-    };
-    visit(root);
-    return result;
-  };
+  __QUERY_ALL_DEEP_HELPER__
   const elementChildren = el => [
     ...Array.from((el && el.children) || []),
     ...Array.from((el && el.shadowRoot && el.shadowRoot.children) || []),
@@ -29277,7 +30054,7 @@ fn locator_script(locator_json: &str, index: usize, body: &str) -> String {
     }
     return currentElements;
   };
-  const all = current => allIn(current, document);
+  const all = current => allIn(current, locatorRoot);
   const allIn = (current, root) => {
     root = root || document;
     if (!current || current.kind === 'css') {
@@ -29505,16 +30282,22 @@ fn locator_script(locator_json: &str, index: usize, body: &str) -> String {
     }
     return null;
   };
-  const strictFrameViolation = findStrictFrameViolation(spec, document);
+  const strictFrameViolation = findStrictFrameViolation(spec, locatorRoot);
   const matches = all(spec);
   const el = matches[index] || null;
   __BODY__
 })()
 "#;
     template
-        .replace("__SPEC__", locator_json)
-        .replace("__INDEX__", &index.to_string())
-        .replace("__BODY__", body)
+        .replacen("__QUERY_ALL_DEEP_HELPER__", SHADOW_PIERCING_QUERY_HELPER, 1)
+        .replacen("__LOCATOR_ROOT__", locator_root, 1)
+        .replacen("__INDEX__", &index.to_string(), 1)
+        .replacen("__BODY__", body, 1)
+        .replacen("__SPEC__", locator_json, 1)
+}
+
+fn locator_script(locator_json: &str, index: usize, body: &str) -> String {
+    locator_script_for_root(locator_json, index, body, "document")
 }
 
 #[cfg(feature = "python")]
