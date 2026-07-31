@@ -1424,6 +1424,7 @@ class TargetClosedError(Error):
 _TARGET_CLOSED_MESSAGE = "Target page, context or browser has been closed"
 _PAGE_CRASHED_MESSAGE = "Page crashed"
 _DISCONNECTED_MESSAGE = "target or browser is closed"
+_ACTION_TIMEOUT_WIRE_MARKER = "__rustwright_action_timeout__:"
 _TIMEOUT_WIRE_MARKER = "__rustwright_timeout__:"
 _TARGET_CLOSED_WIRE_MARKER = "__rustwright_target_closed__:"
 _PAGE_CRASHED_WIRE_MARKER = "__rustwright_page_crashed__:"
@@ -1448,7 +1449,10 @@ def _copy_wire_error_metadata(source: Error, target: Error) -> Error:
 
 
 def _decode_wire_error(message: str) -> Optional[Error]:
-    if message.startswith(_TIMEOUT_WIRE_MARKER):
+    if message.startswith(_ACTION_TIMEOUT_WIRE_MARKER):
+        marker = _ACTION_TIMEOUT_WIRE_MARKER
+        kind = "action_timeout"
+    elif message.startswith(_TIMEOUT_WIRE_MARKER):
         marker = _TIMEOUT_WIRE_MARKER
         kind = "timeout"
     elif message.startswith(_TARGET_CLOSED_WIRE_MARKER):
@@ -1470,7 +1474,32 @@ def _decode_wire_error(message: str) -> Optional[Error]:
     if not isinstance(payload, dict):
         return None
 
-    if kind == "timeout":
+    if kind == "action_timeout":
+        if set(payload) != {"state", "action", "last_info_json", "last_info_key"}:
+            return None
+        if (
+            type(payload["state"]) is not str
+            or type(payload["action"]) is not str
+            or type(payload["last_info_json"]) is not str
+            or (payload["last_info_key"] is not None and type(payload["last_info_key"]) is not str)
+        ):
+            return None
+        try:
+            info = _decode_json_result(json.loads(payload["last_info_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        info_key = payload["last_info_key"]
+        if info_key is not None:
+            if not isinstance(info, dict) or info_key not in info:
+                return None
+            info = info[info_key]
+        count = int(info.get("count") or 0) if isinstance(info, dict) else 0
+        detail = "no element matched" if count == 0 else f"last state was {info}"
+        error = TimeoutError(
+            f"timed out waiting for locator to be {payload['state']} "
+            f"while trying to {payload['action']}; {detail}"
+        )
+    elif kind == "timeout":
         if set(payload) != {"ms"} or type(payload["ms"]) is not int or payload["ms"] < 0:
             return None
         error: Error = TimeoutError(f"timed out after {payload['ms']} ms")
@@ -18884,6 +18913,10 @@ class Page:
         finally:
             self._running_locator_handler = False
 
+    def _run_locator_handlers_for_remaining(self, remaining_ms: float) -> None:
+        deadline = time.monotonic() + max(float(remaining_ms), 1.0) / 1000
+        self._run_locator_handlers(deadline)
+
     def pick_locator(self) -> "Locator":
         if self._closed:
             raise TargetClosedError(f"Page.pick_locator: {_TARGET_CLOSED_MESSAGE}")
@@ -22154,8 +22187,9 @@ return {
             position=position,
         )
 
-    def _try_fast_simple_css_fill(
+    def _try_fast_fill(
         self,
+        operation: str,
         value: str,
         *,
         action: str,
@@ -22164,87 +22198,11 @@ return {
     ) -> bool:
         if not _unsafe_dom_fastpath_enabled():
             return False
-        selector = self._simple_css_fast_path_selector()
-        if selector is None:
-            return False
-        if self._explicit_index:
-            return False
-        payload = {
-            "selector": selector,
-            "index": int(self._index),
-            "strict": bool(self._strict),
-            "value": str(value),
-            "forced": bool(force),
-        }
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-const allElements = document.querySelectorAll('*');
-for (let i = 0; i < allElements.length; i++) {
-  if (allElements[i].shadowRoot) return { ok: false, type: 'fallback' };
-}
-const visible = el => {
-  if (!el || !el.isConnected) return false;
-  const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-  const style = view.getComputedStyle(el);
-  if (style.visibility === 'hidden' || style.display === 'none') return false;
-  const rect = el.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
-};
-const hasAriaDisabledAncestor = el => {
-  let current = el;
-  while (current && current.nodeType === 1) {
-    if (String(current.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return true;
-    current = current.parentElement;
-  }
-  return false;
-};
-const matches = Array.from(document.querySelectorAll(String(payload.selector || '')));
-if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-const el = matches[Number(payload.index || 0)] || null;
-if (!el) return { ok: false, type: 'fallback' };
-if (hasAriaDisabledAncestor(el)) return { ok: false, type: 'fallback' };
-const value = String(payload.value ?? '');
-const forced = !!payload.forced;
-const tagName = String(el.tagName || '').toUpperCase();
-const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
-const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
-const disabled = typeof el.matches === 'function' && el.matches(':disabled');
-const readonly = !!el.readOnly;
-const info = {
-  non_fillable_input: tagName === 'INPUT' && nonFillableInputTypes.has(inputType),
-  input_type: inputType,
-  is_select: tagName === 'SELECT',
-};
-if (info.non_fillable_input) return { ok: false, type: 'input-type', inputType, info };
-if (tagName === 'SELECT') return { ok: false, type: forced ? 'force-non-fillable' : 'select', info };
-const fillable = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
-if (!fillable) return { ok: false, type: forced ? 'force-non-fillable' : 'non-fillable', info };
-if (forced && (!visible(el) || disabled || readonly)) return { ok: true };
-if (!forced && (!visible(el) || disabled || readonly)) return { ok: false, type: 'fallback' };
-if ('value' in el) {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.value = value;
-  if (value !== '' && el.value !== value) {
-    return {
-      ok: false,
-      type: inputType === 'number' ? 'number-text' : 'malformed',
-      value: el.value,
-      info,
-    };
-  }
-} else {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.textContent = value;
-}
-el.dispatchEvent(new Event('input', { bubbles: true }));
-el.dispatchEvent(new Event('change', { bubbles: true }));
-return { ok: true };
-}""",
-            payload,
+        result = self._native_locator_fast_path(
+            operation,
             timeout=timeout,
             method=f"Locator.{action}",
+            args={"value": str(value), "forced": bool(force)},
         )
         if not isinstance(result, dict):
             return False
@@ -22252,7 +22210,7 @@ return { ok: true };
         if result.get("ok"):
             self._page._slow_mo()
             return True
-        if result_type == "fallback":
+        if result_type in {"fallback", "not-applicable", "pending"}:
             return False
         if result_type == "strict":
             count = int(result.get("count") or 0)
@@ -22261,12 +22219,30 @@ return { ok: true };
             raise Error(f"Locator.{action}: Error: Cannot type text into input[type=number]")
         if result_type == "malformed":
             raise Error(f"Locator.{action}: Error: Malformed value")
+        if result_type == "not-editable":
+            raise Error(f"Locator.{action}: Error: Element is not editable")
         info = result.get("info") if isinstance(result.get("info"), dict) else {}
         if result_type == "input-type":
             info = {**info, "non_fillable_input": True, "input_type": result.get("inputType") or info.get("input_type")}
         if result_type == "select":
             info = {**info, "is_select": True}
         raise self._fill_type_error(action, info, force=result_type == "force-non-fillable")
+
+    def _try_fast_simple_css_fill(
+        self,
+        value: str,
+        *,
+        action: str,
+        timeout: Optional[float],
+        force: Optional[bool],
+    ) -> bool:
+        return self._try_fast_fill(
+            "css_fill",
+            value,
+            action=action,
+            timeout=timeout,
+            force=force,
+        )
 
     def _try_fast_simple_css_dom_click(self, *, timeout: Optional[float]) -> bool:
         if not _unsafe_dom_fastpath_enabled():
@@ -22809,80 +22785,13 @@ if (!el) return {{ ok: false, type: 'fallback' }};
         timeout: Optional[float],
         force: Optional[bool],
     ) -> bool:
-        if not _unsafe_dom_fastpath_enabled():
-            return False
-        payload = self._label_fast_path_payload()
-        if payload is None:
-            return False
-        payload = {**payload, "value": str(value), "forced": bool(force)}
-        result = self._evaluate_simple_css_fast_path(
-            self._fast_label_control_script(
-                """
-const value = String(payload.value ?? '');
-const forced = !!payload.forced;
-const tagName = String(el.tagName || '').toUpperCase();
-const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
-const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
-const disabled = disabledState(el);
-const readonly = !!el.readOnly;
-const info = {
-  non_fillable_input: tagName === 'INPUT' && nonFillableInputTypes.has(inputType),
-  input_type: inputType,
-  is_select: tagName === 'SELECT',
-};
-if (info.non_fillable_input) return { ok: false, type: 'input-type', inputType, info };
-if (tagName === 'SELECT') return { ok: false, type: forced ? 'force-non-fillable' : 'select', info };
-const fillable = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
-if (!fillable) return { ok: false, type: forced ? 'force-non-fillable' : 'non-fillable', info };
-if (forced && (!visible(el) || disabled || readonly)) return { ok: true };
-if (!forced && (!visible(el) || disabled || readonly)) return { ok: false, type: 'fallback' };
-if ('value' in el) {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.value = value;
-  if (value !== '' && el.value !== value) {
-    return {
-      ok: false,
-      type: inputType === 'number' ? 'number-text' : 'malformed',
-      value: el.value,
-      info,
-    };
-  }
-} else {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.textContent = value;
-}
-el.dispatchEvent(new Event('input', { bubbles: true }));
-el.dispatchEvent(new Event('change', { bubbles: true }));
-return { ok: true };
-"""
-            ),
-            payload,
+        return self._try_fast_fill(
+            "label_fill",
+            value,
+            action=action,
             timeout=timeout,
-            method=f"Locator.{action}",
+            force=force,
         )
-        if not isinstance(result, dict):
-            return False
-        result_type = result.get("type")
-        if result.get("ok"):
-            self._page._slow_mo()
-            return True
-        if result_type == "fallback":
-            return False
-        if result_type == "strict":
-            count = int(result.get("count") or 0)
-            raise Error(f"strict mode violation: locator resolved to {count} elements while trying to {action}")
-        if result_type == "number-text":
-            raise Error(f"Locator.{action}: Error: Cannot type text into input[type=number]")
-        if result_type == "malformed":
-            raise Error(f"Locator.{action}: Error: Malformed value")
-        info = result.get("info") if isinstance(result.get("info"), dict) else {}
-        if result_type == "input-type":
-            info = {**info, "non_fillable_input": True, "input_type": result.get("inputType") or info.get("input_type")}
-        if result_type == "select":
-            info = {**info, "is_select": True}
-        raise self._fill_type_error(action, info, force=result_type == "force-non-fillable")
 
     def _try_fast_simple_label_check(self, *, timeout: Optional[float]) -> bool:
         if not _unsafe_dom_fastpath_enabled():
@@ -23012,80 +22921,13 @@ return { ok: true, selected: Array.from(el.selectedOptions).map(option => option
         timeout: Optional[float],
         force: Optional[bool],
     ) -> bool:
-        if not _unsafe_dom_fastpath_enabled():
-            return False
-        payload = self._placeholder_fast_path_payload()
-        if payload is None:
-            return False
-        payload = {**payload, "value": str(value), "forced": bool(force)}
-        result = self._evaluate_simple_css_fast_path(
-            self._fast_placeholder_control_script(
-                """
-const value = String(payload.value ?? '');
-const forced = !!payload.forced;
-const tagName = String(el.tagName || '').toUpperCase();
-const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
-const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
-const disabled = disabledState(el);
-const readonly = !!el.readOnly;
-const info = {
-  non_fillable_input: tagName === 'INPUT' && nonFillableInputTypes.has(inputType),
-  input_type: inputType,
-  is_select: tagName === 'SELECT',
-};
-if (info.non_fillable_input) return { ok: false, type: 'input-type', inputType, info };
-if (tagName === 'SELECT') return { ok: false, type: forced ? 'force-non-fillable' : 'select', info };
-const fillable = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
-if (!fillable) return { ok: false, type: forced ? 'force-non-fillable' : 'non-fillable', info };
-if (forced && (!visible(el) || disabled || readonly)) return { ok: true };
-if (!forced && (!visible(el) || disabled || readonly)) return { ok: false, type: 'fallback' };
-if ('value' in el) {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.value = value;
-  if (value !== '' && el.value !== value) {
-    return {
-      ok: false,
-      type: inputType === 'number' ? 'number-text' : 'malformed',
-      value: el.value,
-      info,
-    };
-  }
-} else {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.textContent = value;
-}
-el.dispatchEvent(new Event('input', { bubbles: true }));
-el.dispatchEvent(new Event('change', { bubbles: true }));
-return { ok: true };
-"""
-            ),
-            payload,
+        return self._try_fast_fill(
+            "placeholder_fill",
+            value,
+            action=action,
             timeout=timeout,
-            method=f"Locator.{action}",
+            force=force,
         )
-        if not isinstance(result, dict):
-            return False
-        result_type = result.get("type")
-        if result.get("ok"):
-            self._page._slow_mo()
-            return True
-        if result_type == "fallback":
-            return False
-        if result_type == "strict":
-            count = int(result.get("count") or 0)
-            raise Error(f"strict mode violation: locator resolved to {count} elements while trying to {action}")
-        if result_type == "number-text":
-            raise Error(f"Locator.{action}: Error: Cannot type text into input[type=number]")
-        if result_type == "malformed":
-            raise Error(f"Locator.{action}: Error: Malformed value")
-        info = result.get("info") if isinstance(result.get("info"), dict) else {}
-        if result_type == "input-type":
-            info = {**info, "non_fillable_input": True, "input_type": result.get("inputType") or info.get("input_type")}
-        if result_type == "select":
-            info = {**info, "is_select": True}
-        raise self._fill_type_error(action, info, force=result_type == "force-non-fillable")
 
     def _fill(self, value: str, *, action: str, timeout: Optional[float] = None, force: Optional[bool] = None) -> None:
         self._raise_if_frame_locator_in_composite(f"Locator.{action}")
@@ -23096,74 +22938,23 @@ return { ok: true };
             return
         if self._try_fast_simple_placeholder_fill(value, action=action, timeout=timeout_ms, force=force):
             return
-        deadline = time.monotonic() + max(timeout_ms, 0.0) / 1000
-        last_info: dict[str, Any] = {}
-        while True:
-            remaining_ms = max((deadline - time.monotonic()) * 1000, 1.0)
-            command_timeout = _actionability_probe_timeout(remaining_ms)
-            self._page._run_locator_handlers(deadline)
-            try:
-                result = self._fill_apply(
-                    str(value),
-                    strict=bool(self._strict and not self._explicit_index),
-                    forced=bool(force),
-                    timeout=command_timeout,
-                )
-            except TimeoutError:
-                # A single fill-apply probe timing out is transient over a slow remote-CDP
-                # transport: one probe's CDP round trips can outlast the per-probe budget.
-                # Surface owner unavailability immediately, otherwise keep polling until the
-                # outer deadline instead of aborting the whole action (matches Playwright and
-                # the sibling wait/select loops). TimeoutError subclasses Error, so this must
-                # precede the generic Error handler below.
-                _raise_if_owner_unavailable(self._page, method=_locator_method_for_action(action))
-                if time.monotonic() >= deadline:
-                    break
-                _sleep_until_next_poll(deadline)
-                continue
-            except Error as exc:
-                if "No element matches locator" not in str(exc):
-                    raise
-                result = {"ok": False, "type": "pending", "info": {"count": 0, "attached": False}}
-            if self._strict and not self._explicit_index and isinstance(result, dict):
-                info = result.get("info") if isinstance(result.get("info"), dict) else {}
-                self._raise_frame_strict_violation(info.get("frame_strict_violation"))
-                count = int(info.get("count") or 0)
-                if count > 1:
-                    raise Error(
-                        f"strict mode violation: locator resolved to {count} elements while trying to {action}"
-                    )
-            if isinstance(result, dict) and result.get("ok"):
-                self._page._slow_mo()
-                return
-            if isinstance(result, dict) and result.get("type") == "pending":
-                info = result.get("info")
-                if isinstance(info, dict):
-                    last_info = info
-                if time.monotonic() >= deadline:
-                    break
-                _sleep_until_next_poll(deadline)
-                continue
-            info = {
-                "non_fillable_input": isinstance(result, dict) and result.get("type") == "input-type",
-                "input_type": result.get("inputType") if isinstance(result, dict) else "",
-                "is_select": isinstance(result, dict) and result.get("type") == "select",
-            }
-            if isinstance(result, dict) and result.get("type") == "number-text":
-                raise Error(f"Locator.{action}: Error: Cannot type text into input[type=number]")
-            if isinstance(result, dict) and result.get("type") == "malformed":
-                raise Error(f"Locator.{action}: Error: Malformed value")
-            raise self._fill_type_error(
-                action,
-                info,
-                force=isinstance(result, dict) and result.get("type") == "force-non-fillable",
-            )
-
-        count = int(last_info.get("count") or 0)
-        detail = "no element matched" if count == 0 else f"last state was {last_info}"
-        raise TimeoutError(
-            f"timed out waiting for locator to be editable while trying to {action}; {detail}"
+        on_poll = (
+            self._page._run_locator_handlers_for_remaining
+            if getattr(self._page, "_locator_handlers", None)
+            else None
         )
+        _call(
+            self._page._core.locator_fill_actionable,
+            _json(self._spec),
+            self._index,
+            str(value),
+            bool(self._strict and not self._explicit_index),
+            bool(force),
+            action,
+            timeout_ms,
+            on_poll,
+        )
+        self._page._slow_mo()
 
     def fill(
         self,
