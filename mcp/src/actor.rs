@@ -6199,7 +6199,8 @@ mod tests {
             "/fill-cancel" => fill_cancellation_fixture(),
             "/fill-final-commit" => fill_final_commit_fixture(),
             "/fill-nonphysical-cancel" => fill_nonphysical_cancellation_fixture(),
-            "/input" => input_fixture(),
+            "/input" => input_fixture(false),
+            "/input-slow-cancel" => input_fixture(true),
             "/input-aria-echo" => input_aria_echo_fixture(),
             "/input-aria-echo-common" => input_aria_echo_common_fixture(),
             "/input-leaf-echo" => input_leaf_echo_fixture(),
@@ -6536,7 +6537,7 @@ mod tests {
             .to_owned()
     }
 
-    fn input_fixture() -> String {
+    fn input_fixture(capture_on_input: bool) -> String {
         r#"<!doctype html>
 <label for="type-target">Type target</label>
 <input id="type-target" value="old value">
@@ -6544,7 +6545,7 @@ mod tests {
 <input id="secret-target" type="password">
 <div id="secret-length-readout" role="status">Secret length: 0</div>
 <div id="type-readout" role="status">Typed value: old value</div>
-<div id="type-change-readout" role="status">Type change value: none</div>
+<div id="type-change-readout" role="status">Type change value: none; trusted: none</div>
 <div id="key-readout" role="status">Key pressed: none</div>
 <div id="submit-readout" role="status">Submit effects: 0</div>
 <button id="hover-target">Hover target</button>
@@ -6580,6 +6581,7 @@ mod tests {
   const typeChangeReadout = document.querySelector('#type-change-readout');
   const keyReadout = document.querySelector('#key-readout');
   const submitReadout = document.querySelector('#submit-readout');
+  const captureOnInput = __CAPTURE_ON_INPUT__;
   const updateSecretLength = () => {
     document.querySelector('#secret-length-readout').textContent =
       `Secret length: ${secretTarget.value.length}`;
@@ -6588,10 +6590,17 @@ mod tests {
   secretTarget.addEventListener('change', updateSecretLength);
   typeTarget.addEventListener('input', () => {
     typeReadout.textContent = `Typed value: ${typeTarget.value}`;
+    if (captureOnInput && typeTarget.value !== '') {
+      const signal = new XMLHttpRequest();
+      signal.open('GET', '/capture?events=input-keydown', false);
+      signal.send();
+      const releaseWindow = performance.now() + 500;
+      while (performance.now() < releaseWindow) {}
+    }
   });
-  typeTarget.addEventListener('change', () => {
+  typeTarget.addEventListener('change', event => {
     typeChangeReadout.textContent =
-      `Type change value: ${typeTarget.value || '(empty)'}`;
+      `Type change value: ${typeTarget.value || '(empty)'}; trusted: ${event.isTrusted}`;
   });
   let keyEffects = 0;
   let submitEffects = 0;
@@ -6602,11 +6611,13 @@ mod tests {
       submitReadout.textContent = `Submit effects: ${submitEffects}`;
     }
     keyReadout.textContent = `Key pressed: ${event.key}; trusted: ${event.isTrusted}`;
-    const signal = new XMLHttpRequest();
-    signal.open('GET', '/capture?events=input-keydown', false);
-    signal.send();
-    const releaseWindow = performance.now() + 500;
-    while (performance.now() < releaseWindow) {}
+    if (!captureOnInput) {
+      const signal = new XMLHttpRequest();
+      signal.open('GET', '/capture?events=input-keydown', false);
+      signal.send();
+      const releaseWindow = performance.now() + 500;
+      while (performance.now() < releaseWindow) {}
+    }
   });
   typeTarget.addEventListener('keyup', event => {
     keyReadout.textContent =
@@ -6652,7 +6663,10 @@ mod tests {
       `Ambiguous selected values: ${selected}; changes: ${ambiguousMultiChanges}`;
   });
 </script>"#
-            .to_owned()
+            .replace(
+                "__CAPTURE_ON_INPUT__",
+                if capture_on_input { "true" } else { "false" },
+            )
     }
 
     fn input_aria_echo_fixture() -> String {
@@ -7541,6 +7555,44 @@ mod tests {
         assert!(
             snapshot.contains(r#"- status "Written fields: Field A, Field B""#),
             "the page must record no write after Field B: {snapshot}"
+        );
+
+        let field_c = snapshot_ref(snapshot, "textbox", "Field C");
+        actor
+            .execute_with_timeout(
+                request_id(69_110),
+                BrowserOp::Type {
+                    target: field_c,
+                    text: "trusted-after-cancel".to_owned(),
+                    submit: false,
+                    slowly: false,
+                    clear: false,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("trusted type into a different field after cancellation");
+        let snapshot = actor
+            .execute_with_timeout(
+                request_id(69_111),
+                BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("snapshot after trusted post-cancellation type");
+        let snapshot = output_text(&snapshot);
+        assert!(
+            snapshot.contains(r#"[value="trusted-after-cancel"]"#),
+            "trusted typing must land after a cancelled fill: {snapshot}"
+        );
+        assert!(
+            snapshot.contains(r#"- status "Written fields: Field A, Field B, Field C"#),
+            "the page must observe the trusted post-cancellation input, \
+             which the fixture records once per typed character: {snapshot}"
         );
 
         let snapshot = actor
@@ -9149,7 +9201,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn input_tool_default_clear_type_fills_without_empty_change() {
+    async fn input_tool_default_clear_type_leaves_change_pending_until_trusted_blur() {
         let _guard = browser_test_lock().lock().await;
         let Some(actor) = actor().await else {
             return;
@@ -9182,8 +9234,29 @@ mod tests {
         let typed = output_text(&typed);
         assert!(typed.contains(r#"[value="typed value"]"#), "{typed}");
         assert!(typed.contains("Typed value: typed value"), "{typed}");
-        assert!(typed.contains("Type change value: typed value"), "{typed}");
+        assert!(
+            typed.contains("Type change value: none; trusted: none"),
+            "{typed}"
+        );
         assert!(!typed.contains("Type change value: (empty)"), "{typed}");
+        let blur_target = snapshot_ref(&typed, "button", "Hover target");
+
+        let blurred = actor
+            .execute_with_timeout(
+                request_id(61_102),
+                BrowserOp::Click {
+                    target: blur_target,
+                    double_click: false,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("blur typed field through a trusted click");
+        let blurred = output_text(&blurred);
+        assert!(
+            blurred.contains("Type change value: typed value; trusted: true"),
+            "{blurred}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -9196,7 +9269,7 @@ mod tests {
         let snapshot = actor
             .execute_with_timeout(
                 request_id(61_200),
-                BrowserOp::Navigate(server.url("/input")),
+                BrowserOp::Navigate(server.url("/input-slow-cancel")),
                 Duration::from_secs(10),
             )
             .await
@@ -9222,7 +9295,11 @@ mod tests {
                 .await
         });
         wait_until_in_flight(&actor, &type_id).await;
-        assert_eq!(server.capture(), "input-keydown");
+        assert_eq!(
+            server.capture(),
+            "input-keydown",
+            "the first typed character must land before cancellation"
+        );
         assert!(
             actor.cancel(&type_id),
             "typing characters must not claim request-level commitment"
@@ -9247,6 +9324,10 @@ mod tests {
         let snapshot = output_text(&snapshot);
         assert!(snapshot.contains(r#"[value="s"]"#), "{snapshot}");
         assert!(snapshot.contains("Typed value: s"), "{snapshot}");
+        assert!(
+            snapshot.contains("Type change value: none; trusted: none"),
+            "{snapshot}"
+        );
         assert!(snapshot.contains("Submit effects: 0"), "{snapshot}");
     }
 
