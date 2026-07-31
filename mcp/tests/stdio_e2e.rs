@@ -1123,40 +1123,108 @@ fn assert_password_is_masked(snapshot: &str) {
     assert!(!snapshot.contains("do-not-render"));
 }
 
-fn process_rows() -> Vec<(u32, u32, String)> {
+#[derive(Clone)]
+struct ProcessInfo {
+    pid: u32,
+    started: String,
+    command: String,
+}
+
+fn malformed_process_row(line: &str) -> ! {
+    panic!("unexpected ps row format: {line:?}");
+}
+
+fn process_rows() -> Vec<(ProcessInfo, u32)> {
     let output = Command::new("ps")
-        .args(["-axo", "pid=,ppid=,comm="])
+        .args(["-axo", "pid=,ppid=,lstart=,comm="])
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
         .output()
         .expect("run ps");
+    // A failed ps yields no rows, and no rows reads as "every captured process exited" --
+    // the same silent false negative this whole check exists to rule out.
+    assert!(
+        output.status.success(),
+        "ps failed with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim(),
+    );
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter_map(|line| {
+        .map(|line| {
             let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse().ok()?;
-            let ppid = fields.next()?.parse().ok()?;
+            let pid = fields
+                .next()
+                .and_then(|field| field.parse().ok())
+                .unwrap_or_else(|| malformed_process_row(line));
+            let ppid = fields
+                .next()
+                .and_then(|field| field.parse().ok())
+                .unwrap_or_else(|| malformed_process_row(line));
+            let started = (0..5)
+                .map(|_| fields.next().unwrap_or_else(|| malformed_process_row(line)))
+                .collect::<Vec<_>>();
+            let year = started[4];
+            if year.len() != 4 || !year.bytes().all(|byte| byte.is_ascii_digit()) {
+                malformed_process_row(line);
+            }
+            let started = started.join(" ");
+            // comm may legitimately be empty: procps-ng prints the kernel command name with no
+            // non-empty fallback, and PR_SET_NAME lets a process set it to "". Since ps scans
+            // every process on the runner, panicking here would fail the test because of an
+            // unrelated process. The four-digit year above is the structural check; the command
+            // is only used to make a real leak diagnosable from the failure message.
             let command = fields.collect::<Vec<_>>().join(" ");
-            Some((pid, ppid, command))
+            (
+                ProcessInfo {
+                    pid,
+                    started,
+                    command,
+                },
+                ppid,
+            )
         })
         .collect()
 }
 
-fn descendants(root: u32) -> Vec<(u32, String)> {
+fn descendants(root: u32) -> Vec<ProcessInfo> {
     let rows = process_rows();
-    let mut by_parent: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
-    for (pid, ppid, command) in rows {
-        by_parent.entry(ppid).or_default().push((pid, command));
+    let mut by_parent: HashMap<u32, Vec<ProcessInfo>> = HashMap::new();
+    for (process, ppid) in rows {
+        by_parent.entry(ppid).or_default().push(process);
     }
     let mut queue = VecDeque::from([root]);
     let mut found = Vec::new();
     while let Some(parent) = queue.pop_front() {
         if let Some(children) = by_parent.get(&parent) {
-            for (pid, command) in children {
-                found.push((*pid, command.clone()));
-                queue.push_back(*pid);
+            for process in children {
+                found.push(process.clone());
+                queue.push_back(process.pid);
             }
         }
     }
     found
+}
+
+fn wait_for_processes_to_exit(processes: &[ProcessInfo], timeout: Duration) -> Vec<ProcessInfo> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // A PID can be reused after the captured process exits, so include its
+        // start time when deciding whether the same process is still alive.
+        let live_processes: HashMap<u32, String> = process_rows()
+            .into_iter()
+            .map(|(process, _)| (process.pid, process.started))
+            .collect();
+        let survivors: Vec<ProcessInfo> = processes
+            .iter()
+            .filter(|process| live_processes.get(&process.pid) == Some(&process.started))
+            .cloned()
+            .collect();
+        if survivors.is_empty() || Instant::now() >= deadline {
+            return survivors;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn wait_for_exit(child: &mut Child, timeout: Duration) {
@@ -1385,16 +1453,33 @@ fn real_stdio_snapshot_click_monotonic_refs_and_clean_shutdown() {
         !browser_processes.is_empty(),
         "expected browser subprocesses before shutdown"
     );
-    let browser_pids: Vec<u32> = browser_processes.iter().map(|(pid, _)| *pid).collect();
+    let browser_pids: Vec<u32> = browser_processes
+        .iter()
+        .map(|process| process.pid)
+        .collect();
     let (transcript, diagnostics) = server.finish();
 
-    let live_pids: HashSet<u32> = process_rows().into_iter().map(|(pid, _, _)| pid).collect();
-    let orphans: Vec<u32> = browser_pids
+    // The server can exit before Chromium finishes tearing down its helpers.
+    // A bounded wait distinguishes that handoff from a process that was leaked.
+    let browser_exit_timeout = Duration::from_secs(5);
+    let browser_exit_started = Instant::now();
+    let orphan_processes = wait_for_processes_to_exit(&browser_processes, browser_exit_timeout);
+    let browser_exit_wait = browser_exit_started.elapsed();
+    let orphan_pids: Vec<u32> = orphan_processes.iter().map(|process| process.pid).collect();
+    let orphan_details: Vec<String> = orphan_processes
         .iter()
-        .copied()
-        .filter(|pid| live_pids.contains(pid))
+        .map(|process| {
+            format!(
+                "pid {} (started {}, command {})",
+                process.pid, process.started, process.command
+            )
+        })
         .collect();
-    assert!(orphans.is_empty(), "orphan browser processes: {orphans:?}");
+    assert!(
+        orphan_processes.is_empty(),
+        "orphan browser processes after waiting {browser_exit_wait:?} \
+         (timeout {browser_exit_timeout:?}): {orphan_details:?}"
+    );
     assert!(diagnostics.contains("browser actor: stopped"));
 
     println!("--- stdio e2e transcript ---");
@@ -1403,7 +1488,7 @@ fn real_stdio_snapshot_click_monotonic_refs_and_clean_shutdown() {
     }
     println!("--- shutdown evidence ---");
     println!("captured browser descendants: {browser_pids:?}");
-    println!("orphan browser descendants after exit: {orphans:?}");
+    println!("orphan browser descendants after waiting {browser_exit_wait:?}: {orphan_pids:?}");
 }
 
 #[test]
