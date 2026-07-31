@@ -23258,6 +23258,722 @@ def test_css_selectors_pierce_open_shadow_dom(page):
     assert page.evaluate("document.body.dataset.shadowClick") == "yes"
 
 
+def test_css_shadow_piercing_keeps_ancestor_context(page):
+    selector = '[role="treeitem"][data-path="a.py"]'
+
+    page.set_content(
+        """
+        <div class="host">
+          <div role="treeitem" data-path="a.py">a.py</div>
+        </div>
+        """
+    )
+    assert {
+        "unanchored": page.locator(selector).count(),
+        "descendant": page.locator(f".host {selector}").count(),
+        "chained": page.locator(".host").locator(selector).count(),
+    } == {"unanchored": 1, "descendant": 1, "chained": 1}
+
+    page.set_content(
+        """
+        <div class="host"><my-tree></my-tree></div>
+        <script>
+        const shadow = document.querySelector('my-tree').attachShadow({ mode: 'open' });
+        shadow.innerHTML = '<div role="treeitem" data-path="a.py">a.py</div>';
+        </script>
+        """
+    )
+    assert {
+        "unanchored": page.locator(selector).count(),
+        "descendant": page.locator(f".host {selector}").count(),
+        "chained": page.locator(".host").locator(selector).count(),
+    } == {"unanchored": 1, "descendant": 1, "chained": 1}
+
+
+@pytest.mark.parametrize("ancestor_form", ["descendant", "chained"])
+def test_css_shadow_piercing_ancestor_context_can_click(page, ancestor_form):
+    selector = '[role="treeitem"][data-path="a.py"]'
+    page.set_content(
+        """
+        <div class="host"><my-tree></my-tree></div>
+        <script>
+        const shadow = document.querySelector('my-tree').attachShadow({ mode: 'open' });
+        shadow.innerHTML = `
+          <div
+            role="treeitem"
+            data-path="a.py"
+            style="width: 80px; height: 24px"
+            onclick="document.body.dataset.clickedPath = this.dataset.path"
+          >a.py</div>
+        `;
+        </script>
+        """
+    )
+
+    assert page.locator(selector).count() == 1
+    locator = (
+        page.locator(f".host {selector}")
+        if ancestor_form == "descendant"
+        else page.locator(".host").locator(selector)
+    )
+    locator.click(timeout=500)
+    assert page.evaluate("document.body.dataset.clickedPath") == "a.py"
+
+
+def test_css_shadow_piercing_reaches_nested_open_roots_but_not_closed_roots(page):
+    selector = '[role="treeitem"][data-path="a.py"]'
+
+    page.set_content(
+        """
+        <div class="host"><my-tree></my-tree></div>
+        <script>
+        const closed = document.querySelector('my-tree').attachShadow({ mode: 'closed' });
+        closed.innerHTML = '<div role="treeitem" data-path="a.py">a.py</div>';
+        window.__closedRootHasTarget = !!closed.querySelector('[data-path="a.py"]');
+        </script>
+        """
+    )
+    assert page.evaluate("window.__closedRootHasTarget") is True
+    assert {
+        "unanchored": page.locator(selector).count(),
+        "descendant": page.locator(f".host {selector}").count(),
+        "chained": page.locator(".host").locator(selector).count(),
+    } == {"unanchored": 0, "descendant": 0, "chained": 0}
+
+    page.set_content(
+        """
+        <div class="host"><my-tree></my-tree></div>
+        <script>
+        const outer = document.querySelector('my-tree').attachShadow({ mode: 'open' });
+        outer.innerHTML = '<nested-tree></nested-tree>';
+        const inner = outer.querySelector('nested-tree').attachShadow({ mode: 'open' });
+        inner.innerHTML = '<div role="treeitem" data-path="a.py">a.py</div>';
+        </script>
+        """
+    )
+    assert {
+        "unanchored": page.locator(selector).count(),
+        "descendant": page.locator(f".host {selector}").count(),
+        "chained": page.locator(".host").locator(selector).count(),
+    } == {"unanchored": 1, "descendant": 1, "chained": 1}
+
+
+def test_css_shadow_piercing_preserves_direct_child_combinators(page):
+    selector = '[role="treeitem"][data-path="a.py"]'
+
+    def direct_child_counts():
+        return {
+            "shadow_host_to_target": page.locator(f"my-tree > {selector}").count(),
+            "outer_container_to_target": page.locator(f".host > {selector}").count(),
+            "full_direct_chain": page.locator(f".host > my-tree > {selector}").count(),
+        }
+
+    page.set_content(
+        """
+        <div class="host">
+          <my-tree><div role="treeitem" data-path="a.py">a.py</div></my-tree>
+        </div>
+        """
+    )
+    assert direct_child_counts() == {
+        "shadow_host_to_target": 1,
+        "outer_container_to_target": 0,
+        "full_direct_chain": 1,
+    }
+
+    page.set_content(
+        """
+        <div class="host"><my-tree></my-tree></div>
+        <script>
+        const shadow = document.querySelector('my-tree').attachShadow({ mode: 'open' });
+        shadow.innerHTML = '<div role="treeitem" data-path="a.py">a.py</div>';
+        </script>
+        """
+    )
+    assert direct_child_counts() == {
+        "shadow_host_to_target": 1,
+        "outer_container_to_target": 0,
+        "full_direct_chain": 1,
+    }
+
+
+def test_element_handle_selector_apis_pierce_open_shadow_roots(page):
+    page.set_content(
+        """
+        <div class="host"><my-tree></my-tree></div>
+        <script>
+        const shadow = document.querySelector('my-tree').attachShadow({ mode: 'open' });
+        shadow.innerHTML = `
+          <div class="target">first</div>
+          <div class="target">second</div>
+        `;
+        </script>
+        """
+    )
+    host = page.query_selector(".host")
+    assert host is not None
+
+    first = host.query_selector(".target")
+    assert first is not None
+    assert first.inner_text() == "first"
+    assert [item.inner_text() for item in host.query_selector_all(".target")] == [
+        "first",
+        "second",
+    ]
+    assert host.eval_on_selector(".target", "element => element.textContent") == "first"
+    assert host.eval_on_selector_all(
+        ".target",
+        "elements => elements.map(element => element.textContent)",
+    ) == ["first", "second"]
+
+
+@pytest.mark.parametrize("state", ["hidden", "detached"])
+def test_element_handle_wait_for_selector_does_not_false_succeed_through_shadow_dom(page, state):
+    page.set_content(
+        """
+        <div class="host"><my-tree></my-tree></div>
+        <script>
+        const shadow = document.querySelector('my-tree').attachShadow({ mode: 'open' });
+        shadow.innerHTML = '<div class="target">visible target</div>';
+        </script>
+        """
+    )
+    assert page.locator(".target").is_visible() is True
+    host = page.query_selector(".host")
+    assert host is not None
+
+    with pytest.raises(TimeoutError, match=r"ElementHandle\.wait_for_selector: Timeout 100ms exceeded"):
+        host.wait_for_selector(".target", state=state, timeout=100)
+
+    page.evaluate("document.querySelector('my-tree').shadowRoot.querySelector('.target').remove()")
+    assert host.wait_for_selector(".target", state=state, timeout=100) is None
+
+
+def test_shadow_host_itself_is_a_locator_and_element_handle_context(page):
+    page.set_content(
+        """
+        <my-tree></my-tree>
+        <script>
+        const shadow = document.querySelector('my-tree').attachShadow({ mode: 'open' });
+        shadow.innerHTML = `
+          <button data-testid="shadow-action" aria-label="Launch">Go</button>
+        `;
+        </script>
+        """
+    )
+    host_locator = page.locator("my-tree")
+    assert {
+        "standalone_test_id": page.get_by_test_id("shadow-action").count(),
+        "host_scoped_test_id": host_locator.get_by_test_id("shadow-action").count(),
+        "standalone_role": page.get_by_role("button", name="Launch").count(),
+        "host_scoped_role": host_locator.get_by_role("button", name="Launch").count(),
+    } == {
+        "standalone_test_id": 1,
+        "host_scoped_test_id": 1,
+        "standalone_role": 1,
+        "host_scoped_role": 1,
+    }
+
+    host_handle = page.query_selector("my-tree")
+    assert host_handle is not None
+    target = host_handle.query_selector('[data-testid="shadow-action"]')
+    assert target is not None
+    assert target.inner_text() == "Go"
+
+
+def test_shadow_piercing_selector_placeholder_text_is_not_rewritten(page):
+    token = "__QUERY_ALL_DEEP_HELPER__"
+    selector = f'[data-token="{token}"]'
+    page.set_content(
+        f"""
+        <div data-token="{token}">light target</div>
+        <my-tree></my-tree>
+        <script>
+        const shadow = document.querySelector('my-tree').attachShadow({{ mode: 'open' }});
+        shadow.innerHTML = '<div data-token="{token}">shadow target</div>';
+        </script>
+        """
+    )
+
+    assert page.locator(selector).count() == 2
+    assert page.locator(selector).filter(has_text="shadow target").count() == 1
+
+
+def test_shadow_piercing_scope_from_element_context_crosses_open_root(page):
+    selector = ":scope > my-tree > .target"
+    page.set_content(
+        """
+        <div class="context"><my-tree></my-tree></div>
+        <script>
+        const shadow = document.querySelector('my-tree').attachShadow({ mode: 'open' });
+        shadow.innerHTML = '<div class="target">shadow target</div>';
+        </script>
+        """
+    )
+    context = page.query_selector(".context")
+    assert context is not None
+    assert [item.inner_text() for item in context.query_selector_all(selector)] == [
+        "shadow target"
+    ]
+
+
+def test_shadow_piercing_scope_matches_document_and_element_context_roots(page):
+    page.set_content(
+        """
+        <div id="outer"><span class="light">light</span><x-host></x-host></div>
+        <script>
+        document.querySelector('x-host').attachShadow({mode: 'open'}).innerHTML =
+          '<span class="shadow">shadow</span>';
+        </script>
+        """
+    )
+
+    assert page.locator(":scope").evaluate_all(
+        "(elements) => elements.map(element => element.tagName.toLowerCase())"
+    ) == ["html"]
+    assert page.locator(":scope > body").evaluate_all(
+        "(elements) => elements.map(element => element.tagName.toLowerCase())"
+    ) == ["body"]
+    assert page.locator(":is(:scope, x-host)").evaluate_all(
+        "(elements) => elements.map(element => element.id || element.tagName.toLowerCase())"
+    ) == ["html", "x-host"]
+    assert page.locator(":not(:scope)").evaluate_all(
+        "(elements) => elements.map(element => "
+        "element.id || element.tagName.toLowerCase())"
+    ) == ["head", "body", "outer", "span", "x-host", "script", "span"]
+
+    outer = page.query_selector("#outer")
+    assert outer is not None
+    assert [
+        element.get_attribute("id") for element in outer.query_selector_all(":scope")
+    ] == ["outer"]
+    assert [
+        element.get_attribute("id") or element.get_attribute("class")
+        for element in outer.query_selector_all(":is(:scope, .light)")
+    ] == ["outer", "light"]
+
+
+def test_shadow_piercing_preserves_per_root_candidate_order(page):
+    page.set_content(
+        """
+        <x-host></x-host>
+        <div id="light" class="target">light</div>
+        <script>
+        document.querySelector('x-host').attachShadow({mode: 'open'}).innerHTML =
+          '<div id="shadow" class="target">shadow</div>';
+        </script>
+        """
+    )
+
+    targets = page.locator(".target")
+    assert targets.count() == 2
+    assert targets.nth(0).get_attribute("id") == "light"
+    assert targets.nth(1).get_attribute("id") == "shadow"
+
+
+def test_shadow_piercing_preserves_recursive_per_root_candidate_order(page):
+    page.set_content(
+        """
+        <x-first></x-first>
+        <div id="document-light" class="target">document light</div>
+        <x-second></x-second>
+        <script>
+        const firstRoot = document.querySelector('x-first').attachShadow({mode: 'open'});
+        firstRoot.innerHTML = `
+          <span id="outer-before" class="target">outer before</span>
+          <x-nested></x-nested>
+          <span id="outer-after" class="target">outer after</span>
+        `;
+        firstRoot.querySelector('x-nested').attachShadow({mode: 'open'}).innerHTML =
+          '<span id="nested" class="target">nested</span>';
+        document.querySelector('x-second').attachShadow({mode: 'open'}).innerHTML =
+          '<span id="second" class="target">second</span>';
+        </script>
+        """
+    )
+
+    assert page.locator(".target").evaluate_all(
+        "elements => elements.map(element => element.id)"
+    ) == ["document-light", "outer-before", "outer-after", "nested", "second"]
+
+
+@pytest.mark.parametrize("unrelated_shadow", [False, True])
+def test_top_level_selector_lists_validate_every_arm_eagerly(
+    page, unrelated_shadow
+):
+    page.set_content('<div id="ok" class="ok">ok</div><x-unrelated></x-unrelated>')
+    if unrelated_shadow:
+        page.evaluate(
+            "document.querySelector('x-unrelated').attachShadow({mode: 'open'})"
+        )
+
+    with pytest.raises(Error):
+        page.locator("*, :definitely-unsupported").count()
+
+
+def test_natively_invalid_selector_uses_native_syntax_error_on_both_paths(page):
+    error_messages = []
+    for unrelated_shadow in (False, True):
+        page.set_content("<div></div><x-unrelated></x-unrelated>")
+        if unrelated_shadow:
+            page.evaluate(
+                "document.querySelector('x-unrelated').attachShadow({mode: 'open'})"
+            )
+
+        with pytest.raises(Error) as exc_info:
+            page.locator("]").count()
+        message = str(exc_info.value).splitlines()[0]
+        assert "SyntaxError" in message
+        assert "Invalid CSS selector" not in message
+        error_messages.append(message)
+
+    assert error_messages[0] == error_messages[1]
+
+
+def test_shadow_validation_probe_uses_svg_xml_owner_document(page):
+    page.goto(
+        "data:image/svg+xml,"
+        "%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%3E"
+        "%3Ccircle%20id=%22target%22/%3E%3C/svg%3E"
+    )
+
+    assert page.evaluate("document.contentType") == "image/svg+xml"
+    assert page.locator(":scope > circle").evaluate_all(
+        "elements => elements.map(element => element.id)"
+    ) == ["target"]
+
+    svg = page.query_selector("svg")
+    assert svg is not None
+    assert [
+        element.get_attribute("id")
+        for element in svg.query_selector_all(":scope > circle")
+    ] == [
+        "target"
+    ]
+
+
+@pytest.mark.parametrize("unrelated_shadow", [False, True])
+def test_top_level_selector_lists_accept_multiple_valid_arms(page, unrelated_shadow):
+    page.set_content(
+        '<div id="ok" class="ok">ok</div><span id="also-ok" class="also-ok">also</span>'
+        "<x-unrelated></x-unrelated>"
+    )
+    if unrelated_shadow:
+        page.evaluate(
+            "document.querySelector('x-unrelated').attachShadow({mode: 'open'})"
+        )
+
+    assert page.locator(".ok, .also-ok").evaluate_all(
+        "elements => elements.map(element => element.id)"
+    ) == ["ok", "also-ok"]
+
+
+@pytest.mark.parametrize("pseudo", ["is", "where"])
+@pytest.mark.parametrize("unrelated_shadow", [False, True])
+def test_forgiving_selector_lists_ignore_invalid_arms_on_both_paths(
+    page, pseudo, unrelated_shadow
+):
+    page.set_content('<div id="ok" class="ok">ok</div><x-unrelated></x-unrelated>')
+    if unrelated_shadow:
+        page.evaluate(
+            "document.querySelector('x-unrelated').attachShadow({mode: 'open'})"
+        )
+
+    selector = f":{pseudo}(.ok, :definitely-unsupported)"
+    assert page.locator(selector).evaluate_all(
+        "elements => elements.map(element => element.id)"
+    ) == ["ok"]
+
+
+@pytest.mark.parametrize("unrelated_shadow", [False, True])
+@pytest.mark.parametrize(
+    "selector",
+    [
+        ":not(*, :definitely-unsupported)",
+        ":not(.miss, :definitely-unsupported)",
+    ],
+)
+def test_not_selector_lists_validate_every_arm_eagerly(
+    page, unrelated_shadow, selector
+):
+    page.set_content('<div id="ok" class="ok">ok</div><x-unrelated></x-unrelated>')
+    if unrelated_shadow:
+        page.evaluate(
+            "document.querySelector('x-unrelated').attachShadow({mode: 'open'})"
+        )
+
+    with pytest.raises(Error):
+        page.locator(selector).count()
+
+
+@pytest.mark.parametrize("unrelated_shadow", [False, True])
+def test_not_selector_lists_accept_multiple_valid_arms(page, unrelated_shadow):
+    page.set_content(
+        '<div id="a" class="a"></div><div id="b" class="b"></div>'
+        '<div id="ok" class="ok"></div><x-unrelated></x-unrelated>'
+    )
+    if unrelated_shadow:
+        page.evaluate(
+            "document.querySelector('x-unrelated').attachShadow({mode: 'open'})"
+        )
+
+    assert page.locator("div:not(.a, .b)").evaluate_all(
+        "elements => elements.map(element => element.id)"
+    ) == ["ok"]
+
+
+@pytest.mark.parametrize("unrelated_shadow", [False, True])
+def test_has_selector_lists_validate_invalid_later_arm_eagerly(
+    page, unrelated_shadow
+):
+    page.set_content(
+        '<div id="match"><span class="child">child</span></div>'
+        "<x-unrelated></x-unrelated>"
+    )
+    if unrelated_shadow:
+        page.evaluate(
+            "document.querySelector('x-unrelated').attachShadow({mode: 'open'})"
+        )
+
+    with pytest.raises(Error):
+        page.locator("div:has(> .child, :definitely-unsupported)").count()
+
+
+@pytest.mark.parametrize(
+    ("selector", "expected"),
+    [
+        (".host /* comment */ > my-tree > .target", ["shadow target"]),
+        (".host :is(my-tree > .target, .missing)", ["shadow target"]),
+        (".host :where(my-tree > .target, .missing)", ["shadow target"]),
+        (".host :not(.missing, .other) > .target", ["shadow target"]),
+    ],
+)
+def test_shadow_piercing_comments_and_selector_list_pseudos(page, selector, expected):
+    page.set_content(
+        """
+        <div class="host"><my-tree></my-tree></div>
+        <script>
+        const shadow = document.querySelector('my-tree').attachShadow({ mode: 'open' });
+        shadow.innerHTML = '<div class="target">shadow target</div>';
+        </script>
+        """
+    )
+
+    assert page.locator(selector).all_inner_texts() == expected
+
+
+def test_shadow_piercing_tolerates_eof_comment_and_decodes_pseudo_name_escape(page):
+    page.set_content(
+        """
+        <div id="light" class="c">light</div>
+        <x-host></x-host>
+        <script>
+        document.querySelector('x-host').attachShadow({mode: 'open'}).innerHTML =
+          '<div id="shadow" class="c">shadow</div>';
+        </script>
+        """
+    )
+
+    assert page.locator("div/*").evaluate_all(
+        "(elements) => elements.map(element => element.id)"
+    ) == ["light", "shadow"]
+    assert page.locator(r"div:\69 s(.c)").evaluate_all(
+        "(elements) => elements.map(element => element.id)"
+    ) == ["light", "shadow"]
+
+
+def test_shadow_piercing_combinators_strings_escapes_and_relative_lists(page):
+    page.set_content(
+        """
+        <div class="host"><x-host></x-host></div>
+        <script>
+        document.querySelector('x-host').attachShadow({mode: 'open'}).innerHTML = `
+          <i class="anchor"></i>
+          <b class="adjacent escaped+name" data-value="a > b, c">adjacent</b>
+          <u class="general child">general</u>
+        `;
+        </script>
+        """
+    )
+
+    assert page.locator(".host .anchor + .adjacent").all_inner_texts() == ["adjacent"]
+    assert page.locator(".host .anchor ~ .general").all_inner_texts() == ["general"]
+    assert page.locator('x-host > [data-value="a > b, c"]').all_inner_texts() == [
+        "adjacent"
+    ]
+    assert page.locator(r"x-host > .escaped\+name").all_inner_texts() == ["adjacent"]
+    assert page.locator("x-host:has(> .missing, > .child)").count() == 1
+
+
+@pytest.mark.parametrize("unrelated_shadow", [False, True])
+def test_shadow_piercing_uses_css_whitespace_only(page, unrelated_shadow):
+    nbsp = "\u00a0"
+    page.set_content(
+        f'<div class="parent"><div id="target" class="a{nbsp} b">'
+        '<span id="child" class="child"></span></div></div>'
+        '<x-unrelated></x-unrelated>'
+    )
+    if unrelated_shadow:
+        page.evaluate(
+            "document.querySelector('x-unrelated').attachShadow({mode: 'open'})"
+        )
+
+    for selector in (f".a{nbsp}", rf".\61{nbsp}", f":is(.a{nbsp}, .missing)"):
+        assert page.locator(selector).evaluate_all(
+            "elements => elements.map(element => element.id)"
+        ) == ["target"]
+    for css_whitespace in ("\u0009", "\u000a", "\u000c", "\u000d", "\u0020"):
+        assert page.locator(f".parent{css_whitespace}.child").evaluate_all(
+            "elements => elements.map(element => element.id)"
+        ) == ["child"]
+
+
+@pytest.mark.parametrize("unrelated_shadow", [False, True])
+def test_shadow_piercing_relative_has_is_independent_of_unrelated_roots(page, unrelated_shadow):
+    page.set_content(
+        """
+        <div id="match"><span class="child">child</span></div>
+        <div id="miss"></div>
+        <aside id="unrelated"></aside>
+        """
+    )
+    if unrelated_shadow:
+        page.evaluate(
+            "() => document.querySelector('#unrelated').attachShadow({mode: 'open'}).innerHTML = '<i>other</i>'"
+        )
+
+    assert page.locator("div:has(> .child)").evaluate_all("(els) => els.map(el => el.id)") == [
+        "match"
+    ]
+
+
+def test_shadow_piercing_has_matches_descendant_in_open_root(page):
+    page.set_content(
+        """
+        <div id="match"></div><div id="miss"></div>
+        <script>
+        document.querySelector('#match').attachShadow({mode: 'open'}).innerHTML =
+          '<span class="child">child</span>';
+        </script>
+        """
+    )
+
+    assert page.locator("div:has(.child)").evaluate_all("(els) => els.map(el => el.id)") == [
+        "match"
+    ]
+
+
+@pytest.mark.parametrize("root_arrangement", ["zero", "related", "unrelated"])
+def test_shadow_piercing_css_comments_are_lexical_trivia(page, root_arrangement):
+    page.set_content(
+        """
+        <div id="light"><span class="child" data-label="a/*literal*/b">light</span></div>
+        <section id="unrelated"></section>
+        """
+    )
+    if root_arrangement == "related":
+        page.set_content("<div id='shadow'></div>")
+        page.evaluate(
+            "() => document.querySelector('#shadow').attachShadow({mode: 'open'}).innerHTML = "
+            "'<span class=\"child\" data-label=\"a/*literal*/b\">shadow</span>'"
+        )
+        selector = "div/* comment */ > .child"
+        expected = ["shadow"]
+    else:
+        if root_arrangement == "unrelated":
+            page.evaluate(
+                "() => document.querySelector('#unrelated').attachShadow({mode: 'open'}).innerHTML = '<i>other</i>'"
+            )
+        selector = 'div/* comment */ > .child[data-label="a/*literal*/b"]'
+        expected = ["light"]
+
+    assert page.locator(selector).all_inner_texts() == expected
+
+
+@pytest.mark.parametrize("state", ["hidden", "detached"])
+def test_element_handle_wait_revalidates_context_attachment_each_snapshot(page, state):
+    page.set_content(
+        """
+        <div id="context"><span class="target">visible</span></div>
+        <script>
+        window.removeContextSoon = () => setTimeout(
+          () => document.querySelector('#context').remove(),
+          25
+        );
+        </script>
+        """
+    )
+    context = page.query_selector("#context")
+    assert context is not None
+    page.evaluate("window.removeContextSoon()")
+
+    with pytest.raises(
+        Error,
+        match=r"ElementHandle\.wait_for_selector: .*Element is not attached to the DOM",
+    ):
+        context.wait_for_selector(".target", state=state, timeout=500)
+
+
+def test_shadow_piercing_hex_escape_consumes_optional_terminator(page):
+    page.set_content(
+        """
+        <div id="ab"><x-host></x-host></div>
+        <script>
+        document.querySelector('x-host').attachShadow({mode: 'open'}).innerHTML =
+          '<span class="target">found</span>';
+        </script>
+        """
+    )
+
+    assert page.locator(r"#\61 b > x-host > .target").all_inner_texts() == ["found"]
+
+
+def test_shadow_piercing_uses_iterative_traversal_for_5000_open_roots(page):
+    page.set_content("<main id='root'></main>")
+    page.evaluate(
+        """() => {
+        let parent = document.querySelector('#root');
+        for (let index = 0; index < 5000; index++) {
+          const host = document.createElement('x-host');
+          parent.appendChild(host);
+          parent = host.attachShadow({mode: 'open'});
+        }
+        const target = document.createElement('span');
+        target.className = 'deep';
+        target.textContent = 'found';
+        parent.appendChild(target);
+        }"""
+    )
+
+    assert page.locator(".deep").all_inner_texts() == ["found"]
+
+
+def test_shadow_piercing_preserves_slot_reassignment_and_iframe_boundaries(page):
+    page.set_content(
+        """
+        <x-host>
+          <span id="slotted" slot="first" class="target">slotted</span>
+          <span id="sibling">sibling</span>
+        </x-host>
+        <iframe srcdoc="<span class='target'>frame</span>"></iframe>
+        <script>
+        document.querySelector('x-host').attachShadow({mode: 'open'}).innerHTML =
+          '<slot name="first"></slot><slot name="second"></slot>';
+        </script>
+        """
+    )
+
+    assert page.frame_locator("iframe").locator(".target").all_inner_texts() == ["frame"]
+    assert page.locator(".target").all_inner_texts() == ["slotted"]
+    assert page.locator("x-host > #slotted").count() == 1
+    assert page.locator("slot[name=first] > #slotted").count() == 0
+    page.evaluate("document.querySelector('#slotted').slot = 'second'")
+    assert page.locator(".target").all_inner_texts() == ["slotted"]
+    assert page.locator("x-host > #slotted").count() == 1
+    assert page.locator("slot[name=second] > #slotted").count() == 0
+    assert page.locator("#slotted + #sibling").count() == 1
+
+
 def test_get_by_locators_pierce_open_shadow_dom(page):
     page.set_content(
         """

@@ -22425,24 +22425,9 @@ const includesText = (value, needle, exact) => {
   const right = normalize(needle);
   return exact ? left === right : left.toLowerCase().includes(right.toLowerCase());
 };
-const queryAllDeep = (root, selector) => {
-  const result = [];
-  const seen = new Set();
-  const add = el => {
-    if (el && el.nodeType === 1 && !seen.has(el)) {
-      seen.add(el);
-      result.push(el);
-    }
-  };
-  const visit = scope => {
-    for (const el of Array.from(scope.querySelectorAll(selector))) add(el);
-    for (const el of Array.from(scope.querySelectorAll('*'))) {
-      if (el.shadowRoot) visit(el.shadowRoot);
-    }
-  };
-  visit(root || document);
-  return result;
-};
+if (Array.from(document.querySelectorAll('*')).some(el => el.shadowRoot)) {
+  return { ok: false, type: 'fallback' };
+}
 const referencedText = el => {
   const ids = String(el.getAttribute('aria-labelledby') || '').trim().split(/\\s+/).filter(Boolean);
   if (!ids.length) return '';
@@ -22521,7 +22506,7 @@ const deepElementFromPoint = (doc, x, y) => {
   }
   return hit;
 };
-const candidates = queryAllDeep(document, 'button,input,[role]');
+const candidates = Array.from(document.querySelectorAll('button,input,[role]'));
 const matches = candidates.filter(el => {
   if (buttonRoleOf(el) !== 'button') return false;
   if (!visible(el)) return false;
@@ -24502,141 +24487,6 @@ class ElementHandle(_EventEmitter):
             options = {**options, "strict_method": f"ElementHandle.{method}"}
         return locator if _selector_strict(locator._page, options) else locator._without_strict()
 
-    @staticmethod
-    def _remote_selector_spec(selector: str) -> Optional[dict[str, Any]]:
-        parsed = _selector_spec(str(selector))
-        if parsed.get("kind") == "css":
-            if any(
-                parsed.get(key) is not None
-                for key in ("visible", "has_text", "text_pseudo", "layout")
-            ):
-                return None
-            return {"kind": "css", "selector": str(parsed.get("selector") or "*")}
-        if parsed.get("kind") == "xpath":
-            return {"kind": "xpath", "selector": str(parsed.get("selector") or "")}
-        if parsed.get("kind") == "text_selector":
-            return {
-                "kind": "text",
-                "text": parsed.get("text"),
-                "exact": bool(parsed.get("exact")),
-            }
-        return None
-
-    @staticmethod
-    def _remote_query_js(return_expression: str) -> str:
-        return f"""
-(root, payload) => {{
-  const normalize = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
-  const includesText = (value, needle, exact) => {{
-    const raw = String(value ?? '');
-    if (needle && typeof needle === 'object' && needle.kind === 'regex') {{
-      try {{
-        return new RegExp(String(needle.pattern || ''), String(needle.flags || '')).test(raw);
-      }} catch (_) {{
-        return false;
-      }}
-    }}
-    const left = normalize(raw);
-    const right = normalize(needle);
-    return exact ? left === right : left.toLowerCase().includes(right.toLowerCase());
-  }};
-  const xpathAll = (selector, scope) => {{
-    const doc = scope.nodeType === 9 ? scope : (scope.ownerDocument || document);
-    const context = scope.nodeType === 9 ? doc : scope;
-    let expression = String(selector || '');
-    if (scope.nodeType !== 9 && expression.startsWith('//')) expression = `.${{expression}}`;
-    const snapshot = doc.evaluate(expression, context, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-    const result = [];
-    for (let index = 0; index < snapshot.snapshotLength; index++) {{
-      const node = snapshot.snapshotItem(index);
-      if (node && node.nodeType === Node.ELEMENT_NODE) result.push(node);
-    }}
-    return result;
-  }};
-  const controlText = el => {{
-    const tag = el && el.tagName;
-    if (tag === 'TEXTAREA') return el.value || el.textContent || '';
-    if (tag === 'INPUT' && ['button', 'submit'].includes(String(el.type || '').toLowerCase())) {{
-      return el.value || '';
-    }}
-    return '';
-  }};
-  const selectorText = el => {{
-    const control = controlText(el);
-    if (control) return control;
-    return (el && (el.textContent || el.innerText)) || '';
-  }};
-  const directSelectorText = el => {{
-    const control = controlText(el);
-    if (control) return control;
-    return Array.from((el && el.childNodes) || [])
-      .filter(node => node.nodeType === Node.TEXT_NODE)
-      .map(node => node.textContent || '')
-      .join(' ');
-  }};
-  const elementChildren = el => [
-    ...Array.from((el && el.children) || []),
-    ...Array.from((el && el.shadowRoot && el.shadowRoot.children) || []),
-  ];
-  const textCandidate = el => ![
-    'HTML', 'HEAD', 'BODY', 'SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE',
-    'TITLE', 'META', 'LINK', 'BASE'
-  ].includes((el && el.tagName) || '');
-  const textAll = (spec, scope) => {{
-    const elements = Array.from(scope.querySelectorAll('*')).filter(textCandidate);
-    return elements.filter(el => {{
-      const text = spec.exact ? directSelectorText(el) : selectorText(el);
-      if (!includesText(text, spec.text, !!spec.exact)) return false;
-      return !elementChildren(el).some(
-        child => includesText(spec.exact ? directSelectorText(child) : selectorText(child), spec.text, !!spec.exact)
-      );
-    }});
-  }};
-  const queryAll = (spec, scope) => {{
-    if (!scope || scope.nodeType !== Node.ELEMENT_NODE) return [];
-    if (spec.kind === 'css') return Array.from(scope.querySelectorAll(String(spec.selector || '*')));
-    if (spec.kind === 'xpath') return xpathAll(spec.selector, scope);
-    if (spec.kind === 'text') return textAll(spec, scope);
-    return [];
-  }};
-  const matches = queryAll(payload.spec || {{}}, root);
-  {return_expression}
-}}
-"""
-
-    def _remote_query_count(self, method: str, selector: str) -> Optional[int]:
-        self._ensure_not_disposed(method)
-        if self._handle is None:
-            return None
-        if self._handle._disposed:
-            raise TargetClosedError(f"ElementHandle.{method}: {_TARGET_CLOSED_MESSAGE}")
-        spec = self._remote_selector_spec(selector)
-        if spec is None:
-            return None
-        result = self._handle.evaluate(self._remote_query_js("return matches.length;"), {"spec": spec})
-        return int(result or 0)
-
-    def _remote_child_locator(self, selector: str, index: int) -> Locator:
-        root = self._live_locator("query_selector", require_attached=False)
-        if root is None:
-            return self.owner_frame().locator(str(selector)).nth(index)
-        return root.locator(str(selector)).nth(index)
-
-    def _remote_child_handle(self, selector: str, index: int) -> "ElementHandle":
-        assert self._handle is not None
-        spec = self._remote_selector_spec(selector)
-        if spec is None:
-            raise Error("remote selector handles require a supported selector engine")
-        handle = self._handle.evaluate_handle(
-            self._remote_query_js("return matches[payload.index] || null;"),
-            {"spec": spec, "index": int(index)},
-        )
-        return ElementHandle(self._remote_child_locator(selector, index), handle=handle)
-
-    def _is_detached_remote_root(self, method: str) -> bool:
-        snapshot = self._remote_element_snapshot(method)
-        return bool(snapshot is not None and not snapshot.get("attached"))
-
     def _relative_locator(self, method: str, selector: str) -> Locator:
         if self._handle is None:
             return self._locator.locator(selector)
@@ -24644,93 +24494,60 @@ class ElementHandle(_EventEmitter):
         assert root is not None
         return root.locator(selector)
 
-    def _try_fast_relative_css_wait_for_state(self, selector: str, state: str, *, timeout: Optional[float]) -> Any:
-        if state not in {"hidden", "detached"}:
-            return _MISSING
-        if self._handle is None or getattr(self._locator._page, "_locator_handlers", None):
-            return _MISSING
-        spec = _selector_spec(selector)
-        if spec.get("kind") != "css":
-            return _MISSING
-        css = spec.get("selector")
-        if not isinstance(css, str):
-            return _MISSING
-        payload = {"selector": css, "state": state}
-        result = self._handle.evaluate(
-            """(root, payload) => {
-try {
-  if (!root || root.nodeType !== Node.ELEMENT_NODE) return { ok: false, type: 'not_element' };
-  if (!root.isConnected) return { ok: false, type: 'detached_root' };
-  const visible = el => {
-    if (!el || !el.isConnected) return false;
-    if ((el.tagName || '') === 'OPTION') return el.parentElement ? visible(el.parentElement) : false;
-    const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-    const style = view.getComputedStyle(el);
-    if (style.visibility === 'hidden' || style.display === 'none') return false;
-    const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  };
-  const el = root.querySelector(String(payload.selector || ''));
-  const state = String(payload.state || 'visible');
-  if (state === 'hidden') return { ok: true, satisfied: !el || !visible(el) };
-  if (state === 'detached') return { ok: true, satisfied: !el };
-  return { ok: false, type: 'fallback' };
-} catch (_) {
-  return { ok: false, type: 'fallback' };
-}
-}""",
-            payload,
-        )
-        if isinstance(result, dict) and result.get("ok"):
-            return True if result.get("satisfied") else _MISSING
-        if isinstance(result, dict) and result.get("type") == "not_element":
-            raise Error("ElementHandle.wait_for_selector: JSHandle is not an Element")
-        if isinstance(result, dict) and result.get("type") == "detached_root":
-            raise Error("ElementHandle.wait_for_selector: Error: Element is not attached to the DOM")
-        return _MISSING
-
-    def _unsupported_detached_query_result(self, method: str, selector: str) -> bool:
-        if self._handle is None:
-            return False
-        if self._remote_selector_spec(selector) is not None:
-            return False
-        return self._is_detached_remote_root(method)
-
-    def _evaluate_remote_selector(self, method: str, selector: str, expression: str, arg: Any, *, all_matches: bool) -> Any:
-        full_method = f"ElementHandle.{method}"
-        expression = _normalize_string_option(expression, method=full_method, name="expression")
+    def _query_selector_handle(self, method: str, selector: str, *, all_matches: bool) -> Optional[JSHandle]:
         self._ensure_not_disposed(method)
         if self._handle is None:
-            raise Error("remote selector evaluation requires an ElementHandle")
+            return None
         if self._handle._disposed:
-            raise TargetClosedError(f"{full_method}: {_TARGET_CLOSED_MESSAGE}")
-        spec = self._remote_selector_spec(selector)
-        if spec is None:
-            raise Error("remote selector evaluation requires a supported selector engine")
-        count = self._remote_query_count(method, selector)
-        if not all_matches and count == 0:
-            raise Error(f'{full_method}: Failed to find element matching selector "{selector}"')
-        if arg is None:
-            return self._handle._evaluate_with_method(
-                self._remote_query_js(
-                    f"""
-  const __rw_fn = ({expression});
-  return __rw_fn({"matches" if all_matches else "matches[0]"});
-"""
-                ),
-                {"spec": spec},
-                method=full_method,
+            raise TargetClosedError(f"ElementHandle.{method}: {_TARGET_CLOSED_MESSAGE}")
+        object_id = self._handle._object_id
+        if not object_id:
+            raise Error(f"ElementHandle.{method}: JSHandle is not an Element")
+        payload = json.loads(
+            _call_with_method_prefix(
+                f"ElementHandle.{method}",
+                self._locator._page._core.element_handle_query_selector,
+                object_id,
+                _json(_selector_spec(selector)),
+                all_matches,
+                self._locator._page._default_timeout,
+                *self._handle._session_args(),
             )
-        return self._handle._evaluate_with_method(
-            self._remote_query_js(
-                f"""
-  const __rw_fn = ({expression});
-  return __rw_fn({"matches" if all_matches else "matches[0]"}, payload.arg);
-"""
-            ),
-            {"spec": spec, "arg": arg},
-            method=full_method,
         )
+        return JSHandle(
+            self._locator._page,
+            payload,
+            owner_frame=self._handle._owner_frame,
+        )
+
+    def _element_handle_from_remote(
+        self,
+        selector: str,
+        index: int,
+        handle: JSHandle,
+    ) -> Optional["ElementHandle"]:
+        if not handle._object_id:
+            handle.dispose()
+            return None
+        return ElementHandle(self._locator.locator(selector).nth(index), handle=handle)
+
+    def _query_selector_handles(self, method: str, selector: str) -> Optional[list["ElementHandle"]]:
+        array_handle = self._query_selector_handle(method, selector, all_matches=True)
+        if array_handle is None:
+            return None
+        try:
+            properties = array_handle.get_properties()
+        finally:
+            array_handle.dispose()
+        result = []
+        for index in range(len(properties)):
+            handle = properties.get(str(index))
+            if handle is None:
+                continue
+            element = self._element_handle_from_remote(selector, index, handle)
+            if element is not None:
+                result.append(element)
+        return result
 
     def eval_on_selector(self, selector: str, expression: str, arg: Any = None) -> Any:
         selector = _normalize_selector_option(selector, method="ElementHandle.eval_on_selector")
@@ -24739,16 +24556,20 @@ try {
             method="ElementHandle.eval_on_selector",
             name="expression",
         )
-        count = self._remote_query_count("eval_on_selector", selector)
-        if count is not None:
-            return self._evaluate_remote_selector(
-                "eval_on_selector",
-                selector,
-                expression,
-                arg,
-                all_matches=False,
-            )
-        if self._unsupported_detached_query_result("eval_on_selector", selector):
+        handle = self._query_selector_handle("eval_on_selector", selector, all_matches=False)
+        if handle is not None:
+            if not handle._object_id:
+                handle.dispose()
+                raise Error(f'ElementHandle.eval_on_selector: Failed to find element matching selector "{selector}"')
+            try:
+                return handle._evaluate_with_method(
+                    expression,
+                    arg,
+                    method="ElementHandle.eval_on_selector",
+                )
+            finally:
+                handle.dispose()
+        if self._handle is not None:
             raise Error(f'ElementHandle.eval_on_selector: Failed to find element matching selector "{selector}"')
         return self._selector_locator(selector)._evaluate_with_method(
             expression,
@@ -24763,37 +24584,16 @@ try {
             method="ElementHandle.eval_on_selector_all",
             name="expression",
         )
-        count = self._remote_query_count("eval_on_selector_all", selector)
-        if count is not None:
-            return self._evaluate_remote_selector(
-                "eval_on_selector_all",
-                selector,
-                expression,
-                arg,
-                all_matches=True,
-            )
-        if self._unsupported_detached_query_result("eval_on_selector_all", selector):
-            if self._handle is not None and not self._handle._disposed:
-                return self._handle._evaluate_with_method(
-                    f"""
-(root, arg) => {{
-  const __rw_fn = ({expression});
-  return __rw_fn([], arg);
-}}
-""",
+        handle = self._query_selector_handle("eval_on_selector_all", selector, all_matches=True)
+        if handle is not None:
+            try:
+                return handle._evaluate_with_method(
+                    expression,
                     arg,
                     method="ElementHandle.eval_on_selector_all",
                 )
-            return self._locator._evaluate_with_method(
-                f"""
-(root, arg) => {{
-  const __rw_fn = ({expression});
-  return __rw_fn([], arg);
-}}
-""",
-                arg,
-                method="ElementHandle.eval_on_selector_all",
-            )
+            finally:
+                handle.dispose()
         return self._relative_locator("eval_on_selector_all", selector)._evaluate_all_with_method(
             expression,
             arg,
@@ -24802,21 +24602,17 @@ try {
 
     def query_selector(self, selector: str) -> Optional["ElementHandle"]:
         selector = _normalize_selector_option(selector, method="ElementHandle.query_selector")
-        count = self._remote_query_count("query_selector", selector)
-        if count is not None:
-            return self._remote_child_handle(selector, 0) if count > 0 else None
-        if self._unsupported_detached_query_result("query_selector", selector):
-            return None
+        handle = self._query_selector_handle("query_selector", selector, all_matches=False)
+        if handle is not None:
+            return self._element_handle_from_remote(selector, 0, handle)
         locator = self._relative_locator("query_selector", selector)
         return _element_handle_from_locator(locator.nth(0)) if locator.count() > 0 else None
 
     def query_selector_all(self, selector: str) -> list["ElementHandle"]:
         selector = _normalize_selector_option(selector, method="ElementHandle.query_selector_all")
-        count = self._remote_query_count("query_selector_all", selector)
-        if count is not None:
-            return [self._remote_child_handle(selector, index) for index in range(count)]
-        if self._unsupported_detached_query_result("query_selector_all", selector):
-            return []
+        handles = self._query_selector_handles("query_selector_all", selector)
+        if handles is not None:
+            return handles
         locator = self._relative_locator("query_selector_all", selector)
         return [_element_handle_from_locator(locator.nth(index)) for index in range(locator.count())]
 
@@ -24832,30 +24628,45 @@ try {
         normalized_state = _normalize_wait_for_selector_state(state, method="ElementHandle.wait_for_selector")
         strict = _normalize_action_boolean(strict, method="ElementHandle.wait_for_selector", name="strict")
         timeout = self._timeout_for_method(timeout, "ElementHandle.wait_for_selector")
-        if strict is not True and self._try_fast_relative_css_wait_for_state(selector, normalized_state, timeout=timeout) is True:
-            return None
         if self._handle is not None:
-            snapshot = self._remote_element_snapshot("wait_for_selector")
-            if snapshot is not None and not snapshot.get("attached"):
-                raise Error("ElementHandle.wait_for_selector: Error: Element is not attached to the DOM")
-            root_locator = self._live_locator("wait_for_selector")
-            assert root_locator is not None
-            locator = root_locator.locator(selector)
+            self._ensure_not_disposed("wait_for_selector")
+            object_id = self._handle._object_id
+            if not object_id:
+                raise Error("ElementHandle.wait_for_selector: JSHandle is not an Element")
+            try:
+                _call_wait_with_playwright_timeout(
+                    "ElementHandle.wait_for_selector",
+                    self._locator._page._core.element_handle_wait_for_selector,
+                    object_id,
+                    _json(_selector_spec(selector)),
+                    0,
+                    normalized_state,
+                    timeout,
+                    strict,
+                    *self._handle._session_args(),
+                )
+            except (TimeoutError, TargetClosedError):
+                raise
+            except Error as exc:
+                message = str(exc)
+                if message.startswith("ElementHandle.wait_for_selector:"):
+                    raise
+                raise Error(f"ElementHandle.wait_for_selector: {message}") from None
         else:
             locator = self._locator.locator(selector)
-        locator = locator._with_strict() if strict is True else locator._without_strict()
-        try:
-            locator.wait_for(state=normalized_state, timeout=timeout)
-        except TimeoutError as exc:
-            message = str(exc)
-            if message.startswith("Locator.wait_for: "):
-                message = message.removeprefix("Locator.wait_for: ")
-            if message.startswith("ElementHandle.wait_for_selector:"):
-                raise
-            raise TimeoutError(f"ElementHandle.wait_for_selector: {message}") from None
+            locator = locator._with_strict() if strict is True else locator._without_strict()
+            try:
+                locator.wait_for(state=normalized_state, timeout=timeout)
+            except TimeoutError as exc:
+                message = str(exc)
+                if message.startswith("Locator.wait_for: "):
+                    message = message.removeprefix("Locator.wait_for: ")
+                if message.startswith("ElementHandle.wait_for_selector:"):
+                    raise
+                raise TimeoutError(f"ElementHandle.wait_for_selector: {message}") from None
         if normalized_state in {"hidden", "detached"}:
             return None
-        return _element_handle_from_locator(locator.nth(0))
+        return self.query_selector(selector)
 
     def focus(self) -> None:
         locator = self._live_locator("focus")
