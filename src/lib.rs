@@ -376,6 +376,7 @@ impl Drop for SpawnedTaskAbortGuard {
 
 const CDP_EVENT_LOG_LIMIT: usize = 8192;
 const FRAME_UTILITY_WORLD_NAME: &str = "__utility_world__";
+static NEXT_FILL_GUARD_ID: AtomicU64 = AtomicU64::new(1);
 // Closed set of structured errors carried across the Python FFI boundary. Each
 // marker prefixes exactly one JSON payload schema; user-visible prose is rebuilt
 // by the Python shim and never includes these private wire markers.
@@ -773,23 +774,76 @@ const info = {
   attached: !!el,
 };
 const strict = __STRICT__;
+let value = __VALUE__;
+const fillGuardKey = __FILL_GUARD_KEY__;
+const forced = __FORCED__;
+const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'hidden', 'image', 'radio', 'reset', 'submit']);
+const valueLikeInputTypes = new Set(['color', 'date', 'datetime-local', 'month', 'range', 'time', 'week']);
+const fillObservationInfo = target => {
+  if (!target) return {};
+  const tagName = String(target.tagName || '').toUpperCase();
+  const inputType = tagName === 'INPUT' ? String(target.type || 'text').toLowerCase() : '';
+  const disabled = disabledState(target);
+  const fillableForFill =
+    tagName === 'INPUT' || tagName === 'TEXTAREA' || target.isContentEditable;
+  return {
+    visible: visible(target),
+    enabled: !disabled,
+    tag_name: tagName,
+    input_type: inputType,
+    non_fillable_input: tagName === 'INPUT' && nonFillableInputTypes.has(inputType),
+    is_select: tagName === 'SELECT',
+    fillable_for_fill: fillableForFill,
+    editable_for_fill: fillableForFill && !disabled && !target.readOnly,
+  };
+};
+Object.assign(info, fillObservationInfo(el));
+const tagName = info.tag_name || '';
+const inputType = info.input_type || '';
+const pendingFillGuard = globalThis[fillGuardKey];
+if (
+  pendingFillGuard &&
+  typeof pendingFillGuard.valueLikeApplied === 'string'
+) {
+  if (
+    typeof pendingFillGuard.expiresAt !== 'number' ||
+    performance.now() > pendingFillGuard.expiresAt
+  ) {
+    pendingFillGuard.cleanup();
+  } else {
+    pendingFillGuard.expiresAt = performance.now() + 5000;
+    pendingFillGuard.expiryRenewed = false;
+    info.fill_guard_key = fillGuardKey;
+    return { ok: true, info };
+  }
+}
+// Concurrent fills of the same target can vicariously confirm each other. That accepted
+// boundary still produces Playwright's two trusted dispatches with the last writer winning.
+if (
+  pendingFillGuard &&
+  (pendingFillGuard.dispatched || pendingFillGuard.precursorReceived)
+) {
+  if (
+    typeof pendingFillGuard.expiresAt !== 'number' ||
+    performance.now() > pendingFillGuard.expiresAt
+  ) {
+    pendingFillGuard.cleanup();
+  } else {
+    pendingFillGuard.expiresAt = performance.now() + 5000;
+    pendingFillGuard.expiryRenewed = false;
+    info.fill_guard_key = fillGuardKey;
+    return {
+      ok: false,
+      type: 'observe-dispatch',
+      value: String(pendingFillGuard.committedValue ?? value),
+      info,
+    };
+  }
+}
 if (strict && (strictFrameViolation || matches.length > 1)) {
   return { ok: false, type: 'strict', info };
 }
 if (!el) return { ok: false, type: 'pending', info };
-const value = __VALUE__;
-const forced = __FORCED__;
-const nonFillableInputTypes = new Set(['button', 'checkbox', 'file', 'image', 'radio', 'reset', 'submit']);
-const tagName = String(el.tagName || '').toUpperCase();
-const inputType = tagName === 'INPUT' ? String(el.type || 'text').toLowerCase() : '';
-info.visible = visible(el);
-info.enabled = !disabledState(el);
-info.tag_name = tagName;
-info.input_type = inputType;
-info.non_fillable_input = tagName === 'INPUT' && nonFillableInputTypes.has(inputType);
-info.is_select = tagName === 'SELECT';
-info.fillable_for_fill = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContentEditable;
-info.editable_for_fill = info.fillable_for_fill && !disabledState(el) && !el.readOnly;
 if (tagName === 'INPUT' && nonFillableInputTypes.has(inputType)) {
   return { ok: false, type: 'input-type', inputType, info };
 }
@@ -800,30 +854,416 @@ const isFillable = tagName === 'INPUT' || tagName === 'TEXTAREA' || el.isContent
 if (!isFillable) {
   return { ok: false, type: forced ? 'force-non-fillable' : 'non-fillable', info };
 }
-if (forced && (!visible(el) || disabledState(el) || el.readOnly)) return { ok: true, info };
+if (forced && (!visible(el) || disabledState(el) || el.readOnly)) {
+  return { ok: true, info };
+}
 if (!forced && (!visible(el) || disabledState(el) || el.readOnly)) {
   return { ok: false, type: 'pending', info };
 }
+info.fill_guard_key = fillGuardKey;
+const installFillGuard = () => {
+  for (const key of Object.getOwnPropertyNames(globalThis)) {
+    if (!key.startsWith('__rustwright_fill_guard_')) continue;
+    const previous = globalThis[key];
+    if (!previous || typeof previous.cleanup !== 'function') continue;
+    if (key === fillGuardKey || typeof previous.expiresAt !== 'number') {
+      previous.cleanup();
+      continue;
+    }
+    if (performance.now() <= previous.expiresAt) continue;
+    if (previous.expiryRenewed === true) {
+      previous.cleanup();
+      continue;
+    }
+    previous.passive = true;
+    previous.expiryRenewed = true;
+    previous.expiresAt = performance.now() + 5000;
+  }
+  const guardDeadline = performance.now() + 5000;
+  // An expired active guard first becomes passive so an abandoned dispatch stops
+  // interfering while its current evidence can still be recorded. Active and
+  // already-passive guards receive the same one-time renewal.
+  const guardExpired = () => performance.now() > guard.expiresAt;
+  const doc = el.ownerDocument;
+  const view = doc.defaultView || window;
+  let fillTarget = el;
+  if (!('value' in el)) {
+    while (fillTarget.parentElement && fillTarget.parentElement.isContentEditable) {
+      fillTarget = fillTarget.parentElement;
+    }
+  }
+  const deepActiveElement = () => {
+    let active = doc.activeElement;
+    while (active && active.shadowRoot && active.shadowRoot.activeElement) {
+      active = active.shadowRoot.activeElement;
+    }
+    return active;
+  };
+  const guard = {
+    locator: el,
+    target: fillTarget,
+    observationInfo: fillObservationInfo,
+    passive: false,
+    diverted: false,
+    precursorReceived: false,
+    mutationReceived: false,
+    untrustedInputReceived: false,
+    dispatched: false,
+    committedValue: value,
+    activePrecursor: null,
+    activeBeforeInput: null,
+    resetConfirmationEvidence: null,
+    initialValue: 'value' in el ? String(el.value ?? '') : String(el.textContent ?? ''),
+    maxLength: typeof el.maxLength === 'number' ? el.maxLength : null,
+    expiresAt: guardDeadline,
+    expiryRenewed: false,
+    cleanup: null,
+  };
+  const guardHandleExpiry = () => {
+    if (!guardExpired()) return null;
+    if (!guard.expiryRenewed) {
+      // The first post-lease event stops an active guard from intervening and gives
+      // a canceled edit enough time to report its delayed untrusted commit.
+      const passivatedActive = !guard.passive;
+      guard.expiryRenewed = true;
+      guard.passive = true;
+      guard.expiresAt = performance.now() + 5000;
+      return { cleanedUp: false, passivatedActive };
+    }
+    guard.cleanup(guard.dispatched);
+    return { cleanedUp: true, passivatedActive: false };
+  };
+  const precursorName = value.length === 0 ? 'keydown' : 'beforeinput';
+  const rejectDiversion = event => {
+    if (guard.passive) return;
+    guard.diverted = true;
+    if (event.cancelable) event.preventDefault();
+    event.stopImmediatePropagation();
+  };
+  const dispatchTarget = event => {
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+    return path.length > 0 ? path[0] : event.target;
+  };
+  let recordedPrecursorEvents = new WeakSet();
+  let recordedBeforeInputEvents = new WeakSet();
+  let recordedMutationEvents = new WeakSet();
+  let recordedUntrustedInputEvents = new WeakSet();
+  guard.resetConfirmationEvidence = () => {
+    guard.untrustedInputReceived = false;
+    guard.activeBeforeInput = null;
+    guard.activePrecursor = null;
+    guard.precursorReceived = false;
+    guard.mutationReceived = false;
+    recordedPrecursorEvents = new WeakSet();
+    recordedBeforeInputEvents = new WeakSet();
+    recordedMutationEvents = new WeakSet();
+    recordedUntrustedInputEvents = new WeakSet();
+  };
+  const recordActiveBeforeInput = event => {
+    if (recordedBeforeInputEvents.has(event)) return;
+    recordedBeforeInputEvents.add(event);
+    guard.activeBeforeInput = event;
+  };
+  const recordActivePrecursor = event => {
+    if (!recordedPrecursorEvents.has(event)) {
+      recordedPrecursorEvents.add(event);
+      guard.activePrecursor = event;
+      guard.precursorReceived = true;
+    }
+    if (event.type === 'beforeinput') recordActiveBeforeInput(event);
+  };
+  const recordTrustedMutation = event => {
+    if (recordedMutationEvents.has(event)) return;
+    recordedMutationEvents.add(event);
+    guard.mutationReceived = true;
+  };
+  const recordUntrustedInput = event => {
+    if (recordedUntrustedInputEvents.has(event)) return;
+    recordedUntrustedInputEvents.add(event);
+    guard.untrustedInputReceived = true;
+  };
+  // fill replaces the whole value, so the edit about to be applied has to be aimed at the
+  // whole value. A page handler can collapse the caret after the selection is set and
+  // before the insert arrives; letting that edit through appends instead of replacing and
+  // then reports the wrong value as a success. Only value-bearing controls are checked:
+  // they report their own selection offsets, while a contenteditable selection cannot be
+  // read back reliably across a shadow boundary.
+  const selectionSpansValue = () => {
+    if (!('value' in el)) return true;
+    let start;
+    let end;
+    try {
+      start = el.selectionStart;
+      end = el.selectionEnd;
+    } catch (error) {
+      // Inputs such as type=number do not expose selection offsets at all.
+      return true;
+    }
+    if (typeof start !== 'number' || typeof end !== 'number') return true;
+    return start === 0 && end === String(el.value ?? '').length;
+  };
+  // Rewriting the value during dispatch makes any range refer to the page's new value,
+  // while a non-empty range expresses a deliberate insertion target even when the value
+  // is unchanged. In either case the page owns the edit geometry, so deferring preserves
+  // input-mask behavior. An unchanged value with only a collapsed caret expresses no
+  // comparable intent and remains the signature of a handler hijacking fill's selection.
+  const pageOwnsValueSelection = () => {
+    if (!('value' in el)) return false;
+    if (String(el.value ?? '') !== guard.initialValue) return true;
+    let start;
+    let end;
+    try {
+      start = el.selectionStart;
+      end = el.selectionEnd;
+    } catch (error) {
+      // Inputs such as type=number do not expose selection offsets at all.
+      return false;
+    }
+    if (typeof start !== 'number' || typeof end !== 'number') return false;
+    return start !== end;
+  };
+  // Chromium resolves the range an insert applies to after the precursor has finished
+  // dispatching, so re-selecting mid-dispatch is honoured: a page that collapses the
+  // caret and then repairs it in its own `beforeinput` listener still fills correctly.
+  // Restoring the selection is therefore strictly better than cancelling the edit —
+  // cancelling is irrevocable, so it loses to any page that would have repaired the
+  // selection later in the same dispatch, and a page that re-collapses on every
+  // precursor would be cancelled on every retry and never converge.
+  const restoreValueSelection = () => {
+    if (
+      guard.passive ||
+      !('value' in el) ||
+      pageOwnsValueSelection() ||
+      selectionSpansValue()
+    ) return;
+    try {
+      el.setSelectionRange(0, String(el.value ?? '').length);
+    } catch (error) {
+      // Controls such as type=number reject the selection APIs outright; their value is
+      // replaced wholesale regardless of the selection they report.
+    }
+  };
+  const guardPrecursorCapture = event => {
+    const expiry = guardHandleExpiry();
+    if (expiry && expiry.cleanedUp) return;
+    const eventTarget = dispatchTarget(event);
+    // Unified lease boundary: the trusted target event that passivates an active
+    // guard is recorded once with active semantics and is never intervened on.
+    // Every later event observes the passive guard.
+    if (expiry && expiry.passivatedActive) {
+      if (event.isTrusted && eventTarget === fillTarget) recordActivePrecursor(event);
+      return;
+    }
+    if (guard.passive) return;
+    if (!event.isTrusted) return;
+    if (eventTarget !== fillTarget) return rejectDiversion(event);
+    restoreValueSelection();
+    recordActivePrecursor(event);
+  };
+  const guardPrecursorBubble = event => {
+    const expiry = guardHandleExpiry();
+    if (expiry && expiry.cleanedUp) return;
+    const eventTarget = dispatchTarget(event);
+    if (expiry && expiry.passivatedActive) {
+      if (event.isTrusted && eventTarget === fillTarget) recordActivePrecursor(event);
+      return;
+    }
+    if (guard.passive) return;
+    if (!event.isTrusted) return;
+    if (guard.diverted) return;
+    if (eventTarget !== fillTarget) return rejectDiversion(event);
+    if (deepActiveElement() !== fillTarget) {
+      if (event.cancelable) event.preventDefault();
+      if (typeof fillTarget.focus === 'function') fillTarget.focus({ preventScroll: true });
+      return;
+    }
+    // Last listener to run before the insert is applied, so this is the final chance to
+    // undo a caret moved by a page handler during this same dispatch.
+    restoreValueSelection();
+    recordActivePrecursor(event);
+  };
+  const guardFocusChanged = () => {
+    if (guardHandleExpiry()) return;
+    if (guard.passive) return;
+    if (guard.mutationReceived || deepActiveElement() === fillTarget) return;
+    // Restore focus immediately; bubble-phase guards later cancel an edit if focus
+    // is still elsewhere, or reject it if the event was dispatched at another target.
+    if (typeof fillTarget.focus === 'function') fillTarget.focus({ preventScroll: true });
+  };
+  const guardBeforeInputCapture = event => {
+    const expiry = guardHandleExpiry();
+    if (expiry && expiry.cleanedUp) return;
+    const eventTarget = dispatchTarget(event);
+    if (expiry && expiry.passivatedActive) {
+      if (event.isTrusted && eventTarget === fillTarget) recordActivePrecursor(event);
+      return;
+    }
+    if (guard.passive) return;
+    if (!event.isTrusted) return;
+    if (eventTarget !== fillTarget) rejectDiversion(event);
+    else recordActiveBeforeInput(event);
+  };
+  const guardBeforeInputBubble = event => {
+    const expiry = guardHandleExpiry();
+    if (expiry && expiry.cleanedUp) return;
+    const eventTarget = dispatchTarget(event);
+    if (expiry && expiry.passivatedActive) {
+      if (event.isTrusted && eventTarget === fillTarget) recordActivePrecursor(event);
+      return;
+    }
+    if (guard.passive) return;
+    if (!event.isTrusted) return;
+    if (eventTarget !== fillTarget) return rejectDiversion(event);
+    if (deepActiveElement() !== fillTarget) {
+      if (event.cancelable) event.preventDefault();
+      if (typeof fillTarget.focus === 'function') fillTarget.focus({ preventScroll: true });
+      return;
+    }
+    // Only reached while clearing, where the precursor is the keydown and the deletion is
+    // driven by this later dispatch. A caret collapsed in between would make the delete
+    // remove one character instead of the value, so restore the selection here too.
+    restoreValueSelection();
+  };
+  const guardInputCapture = event => {
+    const expiry = guardHandleExpiry();
+    if (expiry && expiry.cleanedUp) return;
+    const eventTarget = dispatchTarget(event);
+    // A page's earlier window-capture input formatter can carry fill's own trusted
+    // completion past the lease. Preserve active recording for only that invocation
+    // when it closes this guard's pending precursor. User typing first passivates the
+    // guard on its own beforeinput/keydown, so its later input cannot qualify.
+    const recordExpiredActiveMutation =
+      !!expiry &&
+      expiry.passivatedActive &&
+      event.isTrusted &&
+      eventTarget === fillTarget &&
+      guard.precursorReceived &&
+      !guard.mutationReceived;
+    if (guard.passive && event.isTrusted && !recordExpiredActiveMutation) return;
+    if (eventTarget !== fillTarget) {
+      if (event.isTrusted) rejectDiversion(event);
+      return;
+    }
+    if (!event.isTrusted) {
+      if (guard.activeBeforeInput && guard.activeBeforeInput.defaultPrevented) {
+        recordUntrustedInput(event);
+      }
+      return;
+    }
+    recordTrustedMutation(event);
+  };
+  guard.cleanup = preserveDispatched => {
+    view.removeEventListener(precursorName, guardPrecursorCapture, true);
+    view.removeEventListener(precursorName, guardPrecursorBubble, false);
+    view.removeEventListener('focusin', guardFocusChanged, true);
+    fillTarget.removeEventListener('blur', guardFocusChanged, true);
+    doc.removeEventListener(precursorName, guardPrecursorCapture, true);
+    doc.removeEventListener(precursorName, guardPrecursorBubble, false);
+    if (precursorName !== 'beforeinput') {
+      view.removeEventListener('beforeinput', guardBeforeInputCapture, true);
+      doc.removeEventListener('beforeinput', guardBeforeInputCapture, true);
+      doc.removeEventListener('beforeinput', guardBeforeInputBubble, false);
+    }
+    view.removeEventListener('input', guardInputCapture, true);
+    doc.removeEventListener('input', guardInputCapture, true);
+    if (!preserveDispatched && globalThis[fillGuardKey] === guard) {
+      delete globalThis[fillGuardKey];
+    }
+  };
+  view.addEventListener(precursorName, guardPrecursorCapture, true);
+  view.addEventListener(precursorName, guardPrecursorBubble, false);
+  view.addEventListener('focusin', guardFocusChanged, true);
+  fillTarget.addEventListener('blur', guardFocusChanged, true);
+  doc.addEventListener(precursorName, guardPrecursorCapture, true);
+  doc.addEventListener(precursorName, guardPrecursorBubble, false);
+  if (precursorName !== 'beforeinput') {
+    view.addEventListener('beforeinput', guardBeforeInputCapture, true);
+    doc.addEventListener('beforeinput', guardBeforeInputCapture, true);
+    doc.addEventListener('beforeinput', guardBeforeInputBubble, false);
+  }
+  // Recording at window capture keeps page formatters from starving the guard with
+  // stopPropagation: later listeners on the same node still run. An earlier
+  // stopImmediatePropagation at window capture is the accepted observation boundary.
+  view.addEventListener('input', guardInputCapture, true);
+  doc.addEventListener('input', guardInputCapture, true);
+  globalThis[fillGuardKey] = guard;
+};
 if ('value' in el) {
+  if (inputType === 'number') {
+    value = value.trim();
+    if (Number.isNaN(Number(value))) {
+      return { ok: false, type: 'number-text', info };
+    }
+  }
+  if (inputType === 'color') value = value.toLowerCase();
+  if (tagName === 'INPUT' && valueLikeInputTypes.has(inputType)) {
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+    value = value.trim();
+    const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    valueSetter.call(el, value);
+    if (el.value !== value) {
+      return {
+        ok: false,
+        type: 'malformed',
+        value: el.value,
+        info,
+      };
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    const valueLikeMarker = {
+      valueLikeApplied: String(el.value ?? ''),
+      locator: el,
+      observationInfo: fillObservationInfo,
+      expiresAt: performance.now() + 5000,
+      expiryRenewed: false,
+      cleanup() {
+        if (globalThis[fillGuardKey] === valueLikeMarker) {
+          delete globalThis[fillGuardKey];
+        }
+      },
+    };
+    globalThis[fillGuardKey] = valueLikeMarker;
+    return { ok: true, info };
+  }
   el.scrollIntoView({ block: 'center', inline: 'center' });
   if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.value = value;
-  if (value !== '' && el.value !== value) {
-    return {
-      ok: false,
-      type: inputType === 'number' ? 'number-text' : 'malformed',
-      value: el.value,
-      info,
-    };
-  }
+  if (typeof el.select === 'function') el.select();
+  installFillGuard();
 } else {
   el.scrollIntoView({ block: 'center', inline: 'center' });
-  if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-  el.textContent = value;
+  let fillTarget = el;
+  while (fillTarget.parentElement && fillTarget.parentElement.isContentEditable) {
+    fillTarget = fillTarget.parentElement;
+  }
+  if (typeof fillTarget.focus === 'function') fillTarget.focus({ preventScroll: true });
+  const range = el.ownerDocument.createRange();
+  range.selectNodeContents(el);
+  const selection = (el.ownerDocument.defaultView || window).getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  installFillGuard();
 }
-el.dispatchEvent(new Event('input', { bubbles: true }));
-el.dispatchEvent(new Event('change', { bubbles: true }));
-return { ok: true, info };
+const deepActiveElement = () => {
+  let active = el.ownerDocument.activeElement;
+  while (active && active.shadowRoot && active.shadowRoot.activeElement) {
+    active = active.shadowRoot.activeElement;
+  }
+  return active;
+};
+let focusedTarget = el;
+if (!('value' in el)) {
+  while (focusedTarget.parentElement && focusedTarget.parentElement.isContentEditable) {
+    focusedTarget = focusedTarget.parentElement;
+  }
+}
+info.target_focused = deepActiveElement() === focusedTarget;
+if (!info.target_focused) {
+  const guard = globalThis[fillGuardKey];
+  if (guard && typeof guard.cleanup === 'function') guard.cleanup();
+}
+return { ok: false, type: 'insert-text', value, info };
 "#;
 
 const LOCATOR_SELECT_APPLY_TEMPLATE: &str = r#"
@@ -970,11 +1410,33 @@ fn locator_probe_state_body(options_json: &str) -> RwResult<String> {
         .replace("__ACTION_POSITION__", &action_position))
 }
 
-fn locator_fill_apply_body(value: &str, strict: bool, forced: bool) -> RwResult<String> {
-    Ok(LOCATOR_FILL_TEMPLATE
+#[derive(Clone, Debug)]
+struct LocatorFillScript {
+    body: String,
+    guard_key: String,
+}
+
+#[derive(Debug)]
+struct LocatorFastPathScript {
+    body: String,
+    fill_guard_key: Option<String>,
+}
+
+fn locator_fill_apply_body(value: &str, strict: bool, forced: bool) -> RwResult<LocatorFillScript> {
+    locator_fill_body(value, strict, forced)
+}
+
+fn locator_fill_body(value: &str, strict: bool, forced: bool) -> RwResult<LocatorFillScript> {
+    let guard_key = format!(
+        "__rustwright_fill_guard_{}",
+        NEXT_FILL_GUARD_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let body = LOCATOR_FILL_TEMPLATE
         .replace("__STRICT__", if strict { "true" } else { "false" })
         .replace("__FORCED__", if forced { "true" } else { "false" })
-        .replace("__VALUE__", &serde_json::to_string(value)?))
+        .replace("__VALUE__", &serde_json::to_string(value)?)
+        .replace("__FILL_GUARD_KEY__", &serde_json::to_string(&guard_key)?);
+    Ok(LocatorFillScript { body, guard_key })
 }
 
 fn locator_select_apply_body(
@@ -1091,11 +1553,28 @@ fn simple_label_fast_spec(spec: &Value, explicit_index: bool) -> bool {
         )
 }
 
+fn simple_placeholder_fast_spec(spec: &Value, explicit_index: bool) -> bool {
+    !explicit_index
+        && spec.get("kind").and_then(Value::as_str) == Some("placeholder")
+        && spec.get("value").and_then(Value::as_str).is_some()
+}
+
+fn fast_fill_body(args: &Value) -> RwResult<LocatorFillScript> {
+    let value = args.get("value").and_then(Value::as_str).ok_or_else(|| {
+        RwError::InvalidInput("locator fast fill value must be a string".to_string())
+    })?;
+    locator_fill_apply_body(
+        value,
+        args.get("strict").and_then(Value::as_bool).unwrap_or(false),
+        args.get("forced").and_then(Value::as_bool).unwrap_or(false),
+    )
+}
+
 fn locator_fast_path_body(
     locator_json: &str,
     operation: &str,
     args_json: &str,
-) -> RwResult<Option<String>> {
+) -> RwResult<Option<LocatorFastPathScript>> {
     let spec: Value = serde_json::from_str(locator_json)?;
     let args: Value = serde_json::from_str(args_json)?;
     if args
@@ -1109,48 +1588,78 @@ fn locator_fast_path_body(
         .get("explicit_index")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let (applicable, body) = match operation {
-        "css_count" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_COUNT_BODY),
-        "css_text" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_TEXT_BODY),
-        "css_all_texts" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_ALL_TEXTS_BODY),
-        "css_attribute" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_ATTRIBUTE_BODY),
-        "css_inner_html" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_INNER_HTML_BODY),
-        "css_visibility" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_VISIBILITY_BODY),
-        "css_enabled" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_ENABLED_BODY),
-        "css_bounding_box" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_BOUNDING_BOX_BODY),
-        "css_input_value" if simple_css_fast_spec(&spec) => (true, LOCATOR_FAST_INPUT_VALUE_BODY),
+    let mut fill_guard_key = None;
+    let body = match operation {
+        "css_count" if simple_css_fast_spec(&spec) => Some(LOCATOR_FAST_COUNT_BODY.to_string()),
+        "css_text" if simple_css_fast_spec(&spec) => Some(LOCATOR_FAST_TEXT_BODY.to_string()),
+        "css_all_texts" if simple_css_fast_spec(&spec) => {
+            Some(LOCATOR_FAST_ALL_TEXTS_BODY.to_string())
+        }
+        "css_attribute" if simple_css_fast_spec(&spec) => {
+            Some(LOCATOR_FAST_ATTRIBUTE_BODY.to_string())
+        }
+        "css_inner_html" if simple_css_fast_spec(&spec) => {
+            Some(LOCATOR_FAST_INNER_HTML_BODY.to_string())
+        }
+        "css_visibility" if simple_css_fast_spec(&spec) => {
+            Some(LOCATOR_FAST_VISIBILITY_BODY.to_string())
+        }
+        "css_enabled" if simple_css_fast_spec(&spec) => Some(LOCATOR_FAST_ENABLED_BODY.to_string()),
+        "css_bounding_box" if simple_css_fast_spec(&spec) => {
+            Some(LOCATOR_FAST_BOUNDING_BOX_BODY.to_string())
+        }
+        "css_input_value" if simple_css_fast_spec(&spec) => {
+            Some(LOCATOR_FAST_INPUT_VALUE_BODY.to_string())
+        }
+        "css_fill" if !explicit_index && simple_css_fast_spec(&spec) => {
+            let fill = fast_fill_body(&args)?;
+            fill_guard_key = Some(fill.guard_key);
+            Some(fill.body)
+        }
         "css_immediate_state" if simple_css_fast_spec(&spec) => {
             let state = args.get("state").and_then(Value::as_str);
-            (
-                matches!(state, Some("hidden" | "detached")),
-                LOCATOR_FAST_IMMEDIATE_STATE_BODY,
-            )
+            matches!(state, Some("hidden" | "detached"))
+                .then(|| LOCATOR_FAST_IMMEDIATE_STATE_BODY.to_string())
         }
-        "attribute_text" if simple_attribute_fast_spec(&spec) => (true, LOCATOR_FAST_TEXT_BODY),
+        "attribute_text" if simple_attribute_fast_spec(&spec) => {
+            Some(LOCATOR_FAST_TEXT_BODY.to_string())
+        }
         "attribute_visibility" if simple_attribute_fast_spec(&spec) => {
-            (true, LOCATOR_FAST_VISIBILITY_BODY)
+            Some(LOCATOR_FAST_VISIBILITY_BODY.to_string())
         }
         "role_count" if simple_role_fast_spec(&spec, explicit_index) => {
-            (true, LOCATOR_FAST_COUNT_BODY)
+            Some(LOCATOR_FAST_COUNT_BODY.to_string())
         }
         "role_attribute" if simple_role_fast_spec(&spec, explicit_index) => {
-            (true, LOCATOR_FAST_ATTRIBUTE_BODY)
+            Some(LOCATOR_FAST_ATTRIBUTE_BODY.to_string())
         }
         "role_visibility" if simple_role_fast_spec(&spec, explicit_index) => {
-            (true, LOCATOR_FAST_ROLE_VISIBILITY_BODY)
+            Some(LOCATOR_FAST_ROLE_VISIBILITY_BODY.to_string())
         }
-        "text_visibility" if simple_text_fast_spec(&spec) => (true, LOCATOR_FAST_VISIBILITY_BODY),
+        "text_visibility" if simple_text_fast_spec(&spec) => {
+            Some(LOCATOR_FAST_VISIBILITY_BODY.to_string())
+        }
         "label_count" if simple_label_fast_spec(&spec, explicit_index) => {
-            (true, LOCATOR_FAST_COUNT_BODY)
+            Some(LOCATOR_FAST_COUNT_BODY.to_string())
         }
         "label_attribute" if simple_label_fast_spec(&spec, explicit_index) => {
-            (true, LOCATOR_FAST_ATTRIBUTE_BODY)
+            Some(LOCATOR_FAST_ATTRIBUTE_BODY.to_string())
         }
-        _ => (false, ""),
+        "label_fill" if simple_label_fast_spec(&spec, explicit_index) => {
+            let fill = fast_fill_body(&args)?;
+            fill_guard_key = Some(fill.guard_key);
+            Some(fill.body)
+        }
+        "placeholder_fill" if simple_placeholder_fast_spec(&spec, explicit_index) => {
+            let fill = fast_fill_body(&args)?;
+            fill_guard_key = Some(fill.guard_key);
+            Some(fill.body)
+        }
+        _ => None,
     };
-    if !applicable {
+    let Some(body) = body else {
         return Ok(None);
-    }
+    };
     let mut effective_args = args;
     if matches!(
         operation,
@@ -1158,11 +1667,21 @@ fn locator_fast_path_body(
     ) {
         effective_args["strict"] = Value::Bool(false);
     }
-    Ok(Some(
+    let body = if fill_guard_key.is_some() {
+        // Fill owns its strictness ordering: a retained dispatch must be observed before
+        // element-count strictness is considered. Wrapping it in the generic fast-path
+        // preflight would inspect a page-created duplicate before the fill guard can
+        // confirm the already-dispatched edit.
+        body
+    } else {
         LOCATOR_FAST_PATH_TEMPLATE
             .replace("__ARGS__", &effective_args.to_string())
-            .replace("__BODY__", body),
-    ))
+            .replace("__BODY__", &body)
+    };
+    Ok(Some(LocatorFastPathScript {
+        body,
+        fill_guard_key,
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1257,8 +1776,8 @@ impl FfiWireError {
 
 #[derive(Debug)]
 pub struct ActionTimeoutError {
-    state: &'static str,
-    action: &'static str,
+    state: String,
+    action: String,
     count: u64,
     last_info_json: String,
     last_info_key: Option<&'static str>,
@@ -1266,16 +1785,16 @@ pub struct ActionTimeoutError {
 
 impl ActionTimeoutError {
     fn from_raw_json(
-        state: &'static str,
-        action: &'static str,
+        state: impl Into<String>,
+        action: impl Into<String>,
         raw_json: String,
         info: &Value,
         info_key: Option<&'static str>,
     ) -> Self {
         let count = info.get("count").and_then(Value::as_u64).unwrap_or(0);
         Self {
-            state,
-            action,
+            state: state.into(),
+            action: action.into(),
             count,
             last_info_json: raw_json,
             last_info_key: info_key,
@@ -1392,6 +1911,27 @@ fn py_err(error: RwError) -> PyErr {
 #[pyclass(name = "_RustFutureAbort")]
 struct PyRustFutureAbort {
     cancellation: RustFutureCancellation,
+}
+
+#[cfg(feature = "python")]
+#[pyclass(name = "_RustCancelToken")]
+struct PyRustCancelToken {
+    token: CancelToken,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyRustCancelToken {
+    #[new]
+    fn new() -> Self {
+        Self {
+            token: CancelToken::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.token.cancel();
+    }
 }
 
 #[cfg(feature = "python")]
@@ -2558,6 +3098,7 @@ multiline-compatible = """4.5.6"""
                 background_override_active: Arc::new(AtomicBool::new(false)),
                 screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
                 mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+                fill_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
                 default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
                 lifecycle: Arc::new(CloseLifecycle::new()),
                 target_closed: AtomicBool::new(false),
@@ -2684,6 +3225,7 @@ multiline-compatible = """4.5.6"""
                 background_override_active: Arc::new(AtomicBool::new(false)),
                 screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
                 mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+                fill_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
                 default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
                 lifecycle: Arc::new(CloseLifecycle::new()),
                 target_closed: AtomicBool::new(false),
@@ -3289,6 +3831,7 @@ multiline-compatible = """4.5.6"""
                 background_override_active: Arc::new(AtomicBool::new(false)),
                 screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
                 mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+                fill_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
                 default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
                 lifecycle: Arc::new(CloseLifecycle::new()),
                 target_closed: AtomicBool::new(false),
@@ -4102,9 +4645,20 @@ multiline-compatible = """4.5.6"""
 
         let fill = locator_fill_apply_body("Ada", true, false).unwrap();
         for placeholder in ["__STRICT__", "__FORCED__", "__VALUE__"] {
-            assert!(!fill.contains(placeholder));
+            assert!(!fill.body.contains(placeholder));
         }
-        assert!(fill.contains("const value = \"Ada\";"));
+        assert!(fill.body.contains("let value = \"Ada\";"));
+        assert!(fill.body.contains("'hidden'"));
+        assert!(fill.body.contains("value = value.trim();"));
+        assert!(fill.body.contains("value = value.toLowerCase();"));
+        assert!(fill.body.contains("composed: true"));
+        assert!(fill.body.contains("expiresAt: guardDeadline"));
+        assert!(fill
+            .body
+            .contains("valueLikeApplied: String(el.value ?? '')"));
+        assert!(fill
+            .body
+            .contains(&format!("const fillGuardKey = {:?};", fill.guard_key)));
 
         let select = locator_select_apply_body(r#"["a"]"#, "[]", "[1]").unwrap();
         for placeholder in ["__VALUES__", "__LABELS__", "__INDEXES__"] {
@@ -4145,6 +4699,25 @@ multiline-compatible = """4.5.6"""
         )
         .unwrap()
         .is_some());
+
+        let fill = locator_fast_path_body(
+            r##"{"kind":"css","selector":"#target"}"##,
+            "css_fill",
+            r#"{"strict":true,"explicit_index":false,"has_handlers":false,"value":"committed","forced":false}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(fill.fill_guard_key.is_some());
+        assert!(!fill.body.contains("const fastArgs ="));
+        assert!(
+            fill.body
+                .find("const pendingFillGuard")
+                .expect("fill guard observation")
+                < fill
+                    .body
+                    .find("if (strict && (strictFrameViolation || matches.length > 1))")
+                    .expect("fill strictness")
+        );
     }
 
     #[test]
@@ -4177,6 +4750,20 @@ multiline-compatible = """4.5.6"""
             pending.to_string(),
             format!(
                 "timed out waiting for locator to be editable while trying to fill; last state was {pending_json}"
+            )
+        );
+
+        let dispatch = ActionTimeoutError::from_raw_json(
+            "confirmed as edited",
+            "fill",
+            pending_json.clone(),
+            &pending_info,
+            None,
+        );
+        assert_eq!(
+            dispatch.to_string(),
+            format!(
+                "timed out waiting for locator to be confirmed as edited while trying to fill; last state was {pending_json}"
             )
         );
     }
@@ -4275,37 +4862,57 @@ multiline-compatible = """4.5.6"""
     #[test]
     fn native_fill_result_discriminators_match_sync_errors() {
         assert_eq!(
-            classify_fill_attempt(&json!({ "ok": true })).unwrap(),
+            classify_fill_attempt(&json!({ "ok": true }), "fill").unwrap(),
             FillAttempt::Success
         );
         assert_eq!(
-            classify_fill_attempt(&json!({ "ok": false, "type": "pending" })).unwrap(),
-            FillAttempt::Pending
+            classify_fill_attempt(&json!({ "ok": false, "type": "pending" }), "fill").unwrap(),
+            FillAttempt::PendingActionability
         );
         assert_eq!(
-            classify_fill_attempt(&json!({
-                "ok": false,
-                "type": "input-type",
-                "inputType": "checkbox",
-            }))
+            classify_fill_attempt(&json!({ "ok": false, "type": "pending-dispatch" }), "fill")
+                .unwrap(),
+            FillAttempt::PendingDispatch
+        );
+        assert_eq!(
+            classify_fill_attempt(
+                &json!({
+                    "ok": false,
+                    "type": "input-type",
+                    "inputType": "checkbox",
+                }),
+                "fill"
+            )
             .unwrap_err()
             .to_string(),
             "Locator.fill: Error: Input of type \"checkbox\" cannot be filled"
         );
         assert_eq!(
-            classify_fill_attempt(&json!({ "ok": false, "type": "number-text" }))
+            classify_fill_attempt(&json!({ "ok": false, "type": "number-text" }), "fill")
                 .unwrap_err()
                 .to_string(),
             "Locator.fill: Error: Cannot type text into input[type=number]"
         );
         assert_eq!(
-            classify_fill_attempt(&json!({ "ok": false, "type": "malformed" }))
+            classify_fill_attempt(&json!({ "ok": false, "type": "malformed" }), "fill")
                 .unwrap_err()
                 .to_string(),
             "Locator.fill: Error: Malformed value"
         );
         assert_eq!(
-            classify_fill_attempt(&json!({ "ok": false, "type": "select" }))
+            classify_fill_attempt(&json!({ "ok": false, "type": "not-editable" }), "fill")
+                .unwrap_err()
+                .to_string(),
+            "Locator.fill: Error: Element is not editable"
+        );
+        assert_eq!(
+            classify_fill_attempt(&json!({ "ok": false, "type": "malformed" }), "clear")
+                .unwrap_err()
+                .to_string(),
+            "Locator.clear: Error: Malformed value"
+        );
+        assert_eq!(
+            classify_fill_attempt(&json!({ "ok": false, "type": "select" }), "fill")
                 .unwrap_err()
                 .to_string(),
             "Locator.fill: Error: Element is not an <input>, <textarea> or [contenteditable] element"
@@ -4472,6 +5079,179 @@ multiline-compatible = """4.5.6"""
         assert_eq!(
             error.to_string(),
             "strict mode violation: locator(\"iframe[title=\"quoted\"]\") resolved to 2 elements"
+        );
+    }
+
+    #[test]
+    fn native_fill_guard_reentry_uses_one_time_expiry_grace() {
+        let expression =
+            fill_guard_reentry_observation_expression("__rustwright_fill_guard_test").unwrap();
+        assert!(expression.contains(
+            r#"if (expired) {
+  if (guard.expiryRenewed) {
+    guard.cleanup();
+    return null;
+  }
+  guard.expiryRenewed = true;
+  guard.passive = true;
+  guard.expiresAt = now + 5000;
+} else {
+  guard.expiresAt = now + 5000;
+  guard.expiryRenewed = false;
+}"#
+        ));
+        assert_eq!(
+            expression.matches("guard.expiryRenewed = false;").count(),
+            1
+        );
+        assert!(expression.contains("typeof guard.valueLikeApplied === 'string'"));
+        assert!(expression.contains("ok: true,"));
+    }
+
+    #[test]
+    fn native_fill_ready_reactivates_guard_and_resets_confirmation_evidence_before_dispatch() {
+        let expression = fill_guard_ready_expression("__rustwright_fill_guard_test").unwrap();
+        let reactivate = expression
+            .find("guard.passive = false;")
+            .expect("guard reactivation");
+        let renew_expiry = expression
+            .find("guard.expiresAt = performance.now() + 5000;")
+            .expect("guard lease renewal");
+        let renew_grace = expression
+            .find("guard.expiryRenewed = false;")
+            .expect("guard expiry grace reset");
+        let refresh_baseline = expression
+            .find("guard.initialValue =")
+            .expect("guard dispatch baseline refresh");
+        let reset_evidence = expression
+            .find("guard.resetConfirmationEvidence();")
+            .expect("guard evidence reset");
+        assert!(reactivate < renew_expiry);
+        assert!(renew_expiry < renew_grace);
+        assert!(renew_grace < refresh_baseline);
+        assert!(refresh_baseline < reset_evidence);
+
+        let reset = LOCATOR_FILL_TEMPLATE
+            .split("guard.resetConfirmationEvidence = () => {")
+            .nth(1)
+            .and_then(|tail| tail.split("\n  };").next())
+            .expect("fill guard reset closure");
+        for channel in [
+            "guard.untrustedInputReceived = false;",
+            "guard.activeBeforeInput = null;",
+            "guard.activePrecursor = null;",
+            "guard.precursorReceived = false;",
+            "guard.mutationReceived = false;",
+            "recordedPrecursorEvents = new WeakSet();",
+            "recordedBeforeInputEvents = new WeakSet();",
+            "recordedMutationEvents = new WeakSet();",
+            "recordedUntrustedInputEvents = new WeakSet();",
+        ] {
+            assert!(reset.contains(channel), "missing reset for {channel}");
+        }
+    }
+
+    #[test]
+    fn native_fill_pins_resolution_before_ready_and_input_dispatch() {
+        let source = include_str!("lib.rs");
+        let fill = source
+            .split("\nasync fn evaluate_locator_fill_for_page(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("\nasync fn evaluate_locator_handle_for_page(")
+                    .next()
+            })
+            .expect("native fill evaluator source");
+        let last_pin = fill
+            .rfind("*pinned_resolution = Some(resolution.clone());")
+            .expect("resolution pin");
+        let ready = fill
+            .find("fill_guard_ready_expression(&guard_key)?")
+            .expect("ready expression");
+        let insert = fill.find("\"Input.insertText\"").expect("input dispatch");
+
+        assert!(
+            last_pin < ready,
+            "every selected realm must be pinned before settle"
+        );
+        assert!(ready < insert, "settle must still precede input dispatch");
+        assert!(
+            !fill[insert..].contains("*pinned_resolution = Some(resolution.clone());"),
+            "the dispatch must not be the operation that earns the frame pin"
+        );
+    }
+
+    #[test]
+    fn native_fill_value_like_marker_returns_before_frame_reresolution() {
+        let source = include_str!("lib.rs");
+        let fill = source
+            .split("\nasync fn evaluate_locator_fill_for_page(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("\nasync fn evaluate_locator_handle_for_page(")
+                    .next()
+            })
+            .expect("native fill evaluator source");
+        let reentry = fill
+            .split("if reentering_dispatch {")
+            .nth(1)
+            .expect("fill guard re-entry branch");
+        let marker_success = reentry
+            .find("observation.get(\"ok\").and_then(Value::as_bool) == Some(true)")
+            .expect("value-like marker success check");
+        let terminal_return = reentry[marker_success..]
+            .find("return Ok(observation.to_string());")
+            .map(|offset| marker_success + offset)
+            .expect("value-like marker terminal return");
+        let first_unpin = reentry
+            .find("pinned_resolution.take();")
+            .expect("frame re-resolution unpin");
+
+        assert!(marker_success < terminal_return);
+        assert!(
+            terminal_return < first_unpin,
+            "a successful value-like marker must terminate in its pinned realm"
+        );
+    }
+
+    #[test]
+    fn native_fill_guard_terminal_cleanup_is_key_exact() {
+        let expression = fill_guard_cleanup_expression("__rustwright_fill_guard_own_test").unwrap();
+        assert!(expression.contains("const guard = globalThis[ownKey];"));
+        assert!(!expression.contains("Object.getOwnPropertyNames"));
+        assert!(!expression.contains("startsWith('__rustwright_fill_guard_')"));
+    }
+
+    #[test]
+    fn native_frame_owner_resolution_combines_strict_count_and_selection() {
+        let strict = frame_owner_resolution_body(-1, true);
+        let candidates = strict.find("const candidates =").unwrap();
+        let strict_check = strict
+            .find("if (true && candidates.length > 1) return candidates.length;")
+            .unwrap();
+        let selection = strict.find("let frameIndex = -1;").unwrap();
+        assert!(candidates < strict_check);
+        assert!(strict_check < selection);
+
+        let non_strict = frame_owner_resolution_body(0, false);
+        assert!(
+            non_strict.contains("if (false && candidates.length > 1) return candidates.length;")
+        );
+    }
+
+    #[test]
+    fn fill_success_cleanup_budget_is_bounded_but_not_coin_flip_short() {
+        assert_eq!(
+            fill_success_cleanup_budget(Duration::from_millis(1)),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            fill_success_cleanup_budget(Duration::from_millis(600)),
+            Duration::from_millis(600)
+        );
+        assert_eq!(
+            fill_success_cleanup_budget(Duration::from_secs(3)),
+            Duration::from_secs(1)
         );
     }
 
@@ -4725,6 +5505,7 @@ multiline-compatible = """4.5.6"""
             background_override_active: Arc::new(AtomicBool::new(false)),
             screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
             mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+            fill_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
             default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
             lifecycle: Arc::new(CloseLifecycle::new()),
             target_closed: AtomicBool::new(false),
@@ -5200,6 +5981,7 @@ multiline-compatible = """4.5.6"""
                 background_override_active: Arc::new(AtomicBool::new(false)),
                 screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
                 mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+                fill_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
                 default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
                 lifecycle: Arc::new(CloseLifecycle::new()),
                 target_closed: AtomicBool::new(false),
@@ -7716,6 +8498,7 @@ struct PageInner {
     background_override_active: Arc<AtomicBool>,
     screenshot_lock: Arc<tokio::sync::Mutex<()>>,
     mouse_dispatch_lock: Arc<tokio::sync::Mutex<()>>,
+    fill_dispatch_lock: Arc<tokio::sync::Mutex<()>>,
     default_timeouts: Mutex<DefaultTimeoutRegister>,
     lifecycle: Arc<CloseLifecycle>,
     target_closed: AtomicBool,
@@ -8683,8 +9466,16 @@ impl PageInner {
         session_id: &str,
         timeout: Duration,
     ) -> RwResult<String> {
-        if let Some(frame_id) = self.main_frame_id.lock().unwrap().clone() {
-            return Ok(frame_id);
+        // The cached id is this page's own root frame. An out-of-process iframe resolves
+        // to its own target session whose root is a different frame entirely, so reusing
+        // the cache there would hand Page.createIsolatedWorld a frame that session has
+        // never heard of — and caching what that session reports would corrupt the page's
+        // own id in the other direction.
+        let own_session = session_id == self.session_id;
+        if own_session {
+            if let Some(frame_id) = self.main_frame_id.lock().unwrap().clone() {
+                return Ok(frame_id);
+            }
         }
         let frame_tree = client
             .send("Page.getFrameTree", json!({}), Some(session_id), timeout)
@@ -8694,7 +9485,9 @@ impl PageInner {
             .and_then(Value::as_str)
             .ok_or_else(|| RwError::Message("CDP did not return a main frame id".to_string()))?
             .to_string();
-        *self.main_frame_id.lock().unwrap() = Some(frame_id.clone());
+        if own_session {
+            *self.main_frame_id.lock().unwrap() = Some(frame_id.clone());
+        }
         Ok(frame_id)
     }
 
@@ -11083,6 +11876,7 @@ async fn create_isolated_world_for_frame(
         .ok_or_else(|| RwError::Message("CDP did not return an executionContextId".to_string()))
 }
 
+#[derive(Clone)]
 struct LocatorSessionResolution {
     session_id: String,
     frame_id: Option<String>,
@@ -11152,6 +11946,648 @@ async fn evaluate_locator_for_page(
     evaluate_locator_resolution(&page, &resolution, expression, deadline, Duration::ZERO).await
 }
 
+fn fill_guard_cleanup_expression(own_key: &str) -> RwResult<String> {
+    let own_key_json = serde_json::to_string(own_key)?;
+    Ok(format!(
+        r#"(() => {{
+const ownKey = {own_key_json};
+const guard = globalThis[ownKey];
+if (guard && typeof guard.cleanup === 'function') guard.cleanup();
+return null;
+}})()"#
+    ))
+}
+
+fn fill_guard_passivation_expression(guard_key: &str) -> RwResult<String> {
+    let guard_key_json = serde_json::to_string(guard_key)?;
+    Ok(format!(
+        "(() => {{ const g = globalThis[{guard_key_json}]; if (g) g.passive = true; return null; }})()"
+    ))
+}
+
+fn fill_guard_reentry_observation_expression(guard_key: &str) -> RwResult<String> {
+    let guard_key_json = serde_json::to_string(guard_key)?;
+    Ok(format!(
+        r#"(() => {{
+const guardKey = {guard_key_json};
+const guard = globalThis[guardKey];
+if (
+  !guard ||
+  (
+    typeof guard.valueLikeApplied !== 'string' &&
+    !guard.dispatched &&
+    !guard.precursorReceived
+  )
+) return null;
+const now = performance.now();
+const expired =
+  typeof guard.expiresAt !== 'number' ||
+  now > guard.expiresAt;
+if (expired) {{
+  if (guard.expiryRenewed) {{
+    guard.cleanup();
+    return null;
+  }}
+  guard.expiryRenewed = true;
+  guard.passive = true;
+  guard.expiresAt = now + 5000;
+}} else {{
+  guard.expiresAt = now + 5000;
+  guard.expiryRenewed = false;
+}}
+const el = guard.locator || guard.target;
+const observationInfo =
+  typeof guard.observationInfo === 'function' ? guard.observationInfo(el) : {{}};
+if (typeof guard.valueLikeApplied === 'string') {{
+  return {{
+    ok: true,
+    info: {{
+      count: el ? 1 : 0,
+      frame_strict_violation: null,
+      attached: !!el && el.isConnected,
+      ...observationInfo,
+      fill_guard_key: guardKey,
+    }},
+  }};
+}}
+return {{
+  ok: false,
+  type: 'observe-dispatch',
+  value: String(guard.committedValue ?? ''),
+  info: {{
+    count: el ? 1 : 0,
+    frame_strict_violation: null,
+    attached: !!el && el.isConnected,
+    ...observationInfo,
+    fill_guard_key: guardKey,
+  }},
+}};
+}})()"#
+    ))
+}
+
+fn fill_guard_ready_expression(guard_key: &str) -> RwResult<String> {
+    let guard_key_json = serde_json::to_string(guard_key)?;
+    Ok(format!(
+        r#"new Promise(resolve => setTimeout(() => {{
+const guard = globalThis[{guard_key_json}];
+const doc = guard && guard.target ? guard.target.ownerDocument : document;
+let active = doc.activeElement;
+while (active && active.shadowRoot && active.shadowRoot.activeElement) {{
+  active = active.shadowRoot.activeElement;
+}}
+const ready = !!guard && !guard.diverted && active === guard.target;
+if (ready) {{
+  // Re-assert the whole-content selection in the same task that precedes the insert.
+  // A page focus handler can collapse the caret during the settle above, and fill
+  // replaces the entire value, so the selection has to span it when the insert lands.
+  // Re-selecting an already-correct range is not free: select() flips a backward
+  // selection forward, and that selectionchange is observable to the page.
+  const el = guard.locator;
+  if ('value' in el) {{
+    if (typeof el.select === 'function') {{
+      let selectionSpansValue = false;
+      try {{
+        const start = el.selectionStart;
+        const end = el.selectionEnd;
+        selectionSpansValue =
+          typeof start === 'number' &&
+          typeof end === 'number' &&
+          start === 0 &&
+          end === String(el.value ?? '').length;
+      }} catch {{}}
+      if (!selectionSpansValue) el.select();
+    }}
+  }} else {{
+    const range = el.ownerDocument.createRange();
+    range.selectNodeContents(el);
+    const selection = (el.ownerDocument.defaultView || window).getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }}
+  // Passivity protects user typing when a guard's fill may be dead. Reaching this
+  // fill's own pre-dispatch settle proves it is alive; abandoned guards never execute
+  // this settle again, so reactivation does not weaken their passive protection.
+  guard.passive = false;
+  guard.expiresAt = performance.now() + 5000;
+  guard.expiryRenewed = false;
+  // Only evidence observed after this settle evaluation can confirm the dispatch
+  // immediately below. In particular, an expired guard may have recorded a user's
+  // canceled edit while the Rust task was suspended before its own insert.
+  guard.initialValue =
+    'value' in el ? String(el.value ?? '') : String(el.textContent ?? '');
+  guard.resetConfirmationEvidence();
+}}
+resolve(ready);
+}}, 10))"#
+    ))
+}
+
+async fn resolve_locator_fill_session(
+    page: Arc<PageInner>,
+    locator_json: &str,
+    deadline: OperationDeadline,
+) -> RwResult<LocatorSessionResolution> {
+    let mut resolution =
+        resolve_locator_session_with_frame_mode(Arc::clone(&page), locator_json, deadline, true)
+            .await?;
+    if resolution.frame_id.is_none() {
+        resolution.frame_id = Some(
+            page.main_frame_id(
+                &page.browser.client,
+                &resolution.session_id,
+                deadline.remaining()?,
+            )
+            .await?,
+        );
+    }
+    Ok(resolution)
+}
+
+async fn cleanup_fill_guards_for_page(
+    page: Arc<PageInner>,
+    locator_json: &str,
+    guard_key: &str,
+    timeout: Duration,
+) -> RwResult<()> {
+    let deadline = OperationDeadline::new(timeout);
+    let resolution =
+        resolve_locator_fill_session(Arc::clone(&page), locator_json, deadline).await?;
+    evaluate_locator_resolution(
+        &page,
+        &resolution,
+        fill_guard_cleanup_expression(guard_key)?,
+        deadline,
+        Duration::ZERO,
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn cleanup_retained_fill_guard(
+    page: Arc<PageInner>,
+    locator_json: &str,
+    guard_key: &str,
+    pinned_resolution: Option<&LocatorSessionResolution>,
+    timeout: Duration,
+) -> RwResult<()> {
+    let deadline = OperationDeadline::new(timeout);
+    let resolution = if let Some(resolution) = pinned_resolution {
+        resolution.clone()
+    } else {
+        resolve_locator_fill_session(Arc::clone(&page), locator_json, deadline).await?
+    };
+    evaluate_locator_resolution(
+        &page,
+        &resolution,
+        fill_guard_cleanup_expression(guard_key)?,
+        deadline,
+        Duration::ZERO,
+    )
+    .await
+    .map(|_| ())
+}
+
+fn fill_success_cleanup_budget(remaining: Duration) -> Duration {
+    remaining
+        .min(Duration::from_secs(1))
+        .max(Duration::from_millis(250))
+}
+
+async fn cleanup_fill_guard_after_success(
+    page: &PageInner,
+    resolution: &LocatorSessionResolution,
+    guard_key: &str,
+    budget: Duration,
+) -> RwResult<()> {
+    let cleanup_expression = fill_guard_cleanup_expression(guard_key)?;
+    for _ in 0..2 {
+        if evaluate_locator_resolution(
+            page,
+            resolution,
+            cleanup_expression.clone(),
+            OperationDeadline::new(budget),
+            Duration::ZERO,
+        )
+        .await
+        .is_ok()
+        {
+            return Ok(());
+        }
+    }
+
+    // A successful fallback leaves only a passive guard, which cannot cancel input.
+    // Accepted boundary: a stale active guard can survive success only if cleanup,
+    // its retry, and passivation all fail against a renderer stalled for over a
+    // second; it then expires within the TTL.
+    let _ = evaluate_locator_resolution(
+        page,
+        resolution,
+        fill_guard_passivation_expression(guard_key)?,
+        OperationDeadline::new(budget),
+        Duration::ZERO,
+    )
+    .await;
+    Ok(())
+}
+
+struct FillGuardDropCleanup {
+    runtime: tokio::runtime::Handle,
+    page: Arc<PageInner>,
+    guard_key: String,
+    resolution: Option<LocatorSessionResolution>,
+    armed: bool,
+}
+
+impl FillGuardDropCleanup {
+    fn new(page: Arc<PageInner>, guard_key: String) -> Self {
+        let runtime = page.browser.runtime.handle().clone();
+        Self {
+            runtime,
+            page,
+            guard_key,
+            resolution: None,
+            armed: false,
+        }
+    }
+
+    fn arm_for_install(&mut self, resolution: &LocatorSessionResolution) {
+        self.resolution = Some(resolution.clone());
+        self.armed = true;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.resolution = None;
+    }
+}
+
+impl Drop for FillGuardDropCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(resolution) = self.resolution.take() else {
+            return;
+        };
+        let runtime = self.runtime.clone();
+        let page = Arc::clone(&self.page);
+        let guard_key = self.guard_key.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _ = runtime.spawn(async move {
+                let _ = cleanup_fill_guard_after_success(
+                    &page,
+                    &resolution,
+                    &guard_key,
+                    Duration::from_millis(250),
+                )
+                .await;
+            });
+        }));
+    }
+}
+
+async fn evaluate_locator_fill_for_page(
+    page: Arc<PageInner>,
+    locator_json: String,
+    index: usize,
+    body: String,
+    guard_key: String,
+    value: String,
+    timeout: Duration,
+    pinned_resolution: &mut Option<LocatorSessionResolution>,
+    mut drop_cleanup: Option<&mut FillGuardDropCleanup>,
+) -> RwResult<String> {
+    let deadline = OperationDeadline::new(timeout);
+    let _dispatch_guard =
+        tokio::time::timeout(deadline.remaining()?, page.fill_dispatch_lock.lock())
+            .await
+            .map_err(|_| RwError::Timeout(timeout.as_millis() as u64))?;
+    let reentering_dispatch = pinned_resolution.is_some();
+    let mut resolution = if let Some(pinned) = pinned_resolution.as_ref() {
+        pinned.clone()
+    } else {
+        resolve_locator_fill_session(Arc::clone(&page), &locator_json, deadline).await?
+    };
+    *pinned_resolution = Some(resolution.clone());
+    let outcome = async {
+        let mut json = None;
+        if reentering_dispatch {
+            let observation = evaluate_locator_resolution(
+                &page,
+                &resolution,
+                fill_guard_reentry_observation_expression(&guard_key)?,
+                deadline,
+                Duration::ZERO,
+            )
+            .await;
+            match observation {
+                Ok(observation) => {
+                    let observation = decode_runtime_serialized_value(
+                        serde_json::from_str::<Value>(&observation)?,
+                    );
+                    if observation.get("ok").and_then(Value::as_bool) == Some(true) {
+                        return Ok(observation.to_string());
+                    }
+                    if observation.get("type").and_then(Value::as_str)
+                        == Some("observe-dispatch")
+                    {
+                        json = Some(observation.to_string());
+                    } else {
+                        pinned_resolution.take();
+                        resolution = resolve_locator_fill_session(
+                            Arc::clone(&page),
+                            &locator_json,
+                            deadline,
+                        )
+                        .await?;
+                        *pinned_resolution = Some(resolution.clone());
+                    }
+                }
+                Err(error) if is_locator_wait_context_loss(&error) => {
+                    pinned_resolution.take();
+                    resolution = resolve_locator_fill_session(
+                        Arc::clone(&page),
+                        &locator_json,
+                        deadline,
+                    )
+                    .await?;
+                    *pinned_resolution = Some(resolution.clone());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let json = match json {
+            Some(json) => json,
+            None => {
+                if let Some(drop_cleanup) = drop_cleanup.as_deref_mut() {
+                    drop_cleanup.arm_for_install(&resolution);
+                }
+                let expression = locator_script(&resolution.locator_json, index, &body);
+                evaluate_locator_resolution(
+                    &page,
+                    &resolution,
+                    expression,
+                    deadline,
+                    Duration::ZERO,
+                )
+                .await?
+            }
+        };
+        let mut result = decode_runtime_serialized_value(serde_json::from_str::<Value>(&json)?);
+        let result_type = result.get("type").and_then(Value::as_str);
+        if !matches!(result_type, Some("insert-text" | "observe-dispatch")) {
+            return Ok(json);
+        }
+        let observe_only = result_type == Some("observe-dispatch");
+
+        let committed_value = result
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or(&value)
+            .to_string();
+        let returned_guard_key = result
+            .pointer("/info/fill_guard_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RwError::Message("fill guard key was not returned".to_string()))?;
+        if returned_guard_key != guard_key {
+            return Err(RwError::Message(
+                "fill guard key did not match the generated key".to_string(),
+            ));
+        }
+        let guard_key_json = serde_json::to_string(&guard_key)?;
+        if !observe_only {
+            if result
+                .pointer("/info/target_focused")
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
+                result["type"] = Value::String("pending".to_string());
+                return Ok(result.to_string());
+            }
+            let ready_expression = fill_guard_ready_expression(&guard_key)?;
+            let ready_json = evaluate_locator_resolution(
+                &page,
+                &resolution,
+                ready_expression,
+                deadline,
+                Duration::ZERO,
+            )
+            .await?;
+            let ready =
+                decode_runtime_serialized_value(serde_json::from_str::<Value>(&ready_json)?)
+                    .as_bool();
+            if ready != Some(true) {
+                result["type"] = Value::String("pending".to_string());
+                return Ok(result.to_string());
+            }
+            if committed_value.is_empty() {
+                dispatch_key_press(
+                    &page.browser.client,
+                    &resolution.session_id,
+                    "Delete",
+                    None,
+                    deadline,
+                    None,
+                )
+                .await?;
+            } else {
+                page.browser
+                    .client
+                    .send(
+                        "Input.insertText",
+                        json!({ "text": &committed_value }),
+                        Some(&resolution.session_id),
+                        deadline.remaining()?,
+                    )
+                    .await?;
+            }
+            let dispatched_expression = format!(
+                "(() => {{ const g = globalThis[{guard_key_json}]; if (g) g.dispatched = true; return null; }})()"
+            );
+            let _ = evaluate_locator_resolution(
+                &page,
+                &resolution,
+                dispatched_expression,
+                OperationDeadline::new(Duration::from_millis(100)),
+                Duration::ZERO,
+            )
+            .await;
+        }
+
+        let actual_body = format!(
+            r#"(() => {{
+const guard = globalThis[{guard_key_json}];
+const el = guard ? (guard.locator || guard.target) : null;
+const info =
+  guard && typeof guard.observationInfo === 'function'
+    ? guard.observationInfo(el)
+    : {{}};
+const dispatch = guard
+  ? {{
+      diverted: guard.diverted,
+      precursorReceived: guard.precursorReceived,
+      mutationReceived: guard.mutationReceived,
+      untrustedInputReceived: guard.untrustedInputReceived,
+      beforeInputCanceled:
+        !!guard.activeBeforeInput && guard.activeBeforeInput.defaultPrevented,
+      targetMatches: true,
+      initialValue: guard.initialValue,
+      maxLength: guard.maxLength,
+    }}
+  : {{
+      diverted: false,
+      precursorReceived: false,
+      mutationReceived: false,
+      untrustedInputReceived: false,
+      beforeInputCanceled: false,
+      targetMatches: false,
+      initialValue: null,
+      maxLength: null,
+    }};
+let actual = null;
+if (el && 'value' in el) actual = String(el.value ?? '');
+else if (el && el.isContentEditable) actual = String(el.textContent ?? '');
+return {{ actual, dispatch, info }};
+}})()
+"#
+        );
+        let actual_json = evaluate_locator_resolution(
+            &page,
+            &resolution,
+            actual_body,
+            deadline,
+            Duration::ZERO,
+        )
+        .await?;
+        let observed =
+            decode_runtime_serialized_value(serde_json::from_str::<Value>(&actual_json)?);
+        if let (Some(result_info), Some(observed_info)) = (
+            result.get_mut("info").and_then(Value::as_object_mut),
+            observed.get("info").and_then(Value::as_object),
+        ) {
+            result_info.extend(observed_info.clone());
+        }
+        let actual = observed.get("actual").and_then(Value::as_str);
+        let initial = observed
+            .pointer("/dispatch/initialValue")
+            .and_then(Value::as_str);
+        let target_stable_noop = actual == initial
+            && ((committed_value.is_empty() && initial == Some(""))
+                || observed
+                    .pointer("/dispatch/maxLength")
+                    .and_then(Value::as_i64)
+                    == Some(0));
+        let diverted = observed
+            .pointer("/dispatch/diverted")
+            .and_then(Value::as_bool)
+            == Some(true);
+        let precursor_received = observed
+            .pointer("/dispatch/precursorReceived")
+            .and_then(Value::as_bool)
+            == Some(true);
+        let mutation_received = observed
+            .pointer("/dispatch/mutationReceived")
+            .and_then(Value::as_bool)
+            == Some(true);
+        let untrusted_input_received = observed
+            .pointer("/dispatch/untrustedInputReceived")
+            .and_then(Value::as_bool)
+            == Some(true);
+        let before_input_canceled = observed
+            .pointer("/dispatch/beforeInputCanceled")
+            .and_then(Value::as_bool)
+            == Some(true);
+        let target_matches = observed
+            .pointer("/dispatch/targetMatches")
+            .and_then(Value::as_bool)
+            == Some(true);
+        let actual_matches_commit = actual == Some(committed_value.as_str());
+        let page_committed_canceled_edit = before_input_canceled
+            && untrusted_input_received
+            && actual.is_some()
+            && actual != initial;
+        // Readback comes directly from the guarded element, so a temporary duplicate or a
+        // React-style remount cannot redirect it. A trusted mutation already proves that
+        // the edit landed at that guarded target. A page can instead cancel the trusted
+        // beforeinput, commit its own value, and announce that commit with an untrusted
+        // input event. Binding those three observations to the same guard confirms that
+        // page-owned edit without accepting a canceled no-op.
+        let dispatch_confirmed = mutation_received
+            || (target_stable_noop && precursor_received && target_matches)
+            || (precursor_received
+                && !diverted
+                && target_matches
+                && (actual_matches_commit || page_committed_canceled_edit));
+        if diverted || !dispatch_confirmed {
+            result["type"] = Value::String("pending-dispatch".to_string());
+            return Ok(result.to_string());
+        }
+        result["ok"] = Value::Bool(true);
+        if let Some(result) = result.as_object_mut() {
+            result.remove("type");
+            result.remove("value");
+        }
+        Ok(result.to_string())
+    }
+    .await;
+    let (retain_guard, terminal_success) = match &outcome {
+        Ok(json) => {
+            let result = serde_json::from_str::<Value>(json)
+                .ok()
+                .map(decode_runtime_serialized_value);
+            (
+                result
+                    .as_ref()
+                    .and_then(|result| result.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("pending-dispatch"),
+                result
+                    .as_ref()
+                    .and_then(|result| result.get("ok"))
+                    .and_then(Value::as_bool)
+                    == Some(true),
+            )
+        }
+        Err(RwError::Timeout(_)) => (true, false),
+        Err(_) => (false, false),
+    };
+    if retain_guard {
+        if let Ok(passive_expression) = fill_guard_passivation_expression(&guard_key) {
+            let _ = evaluate_locator_resolution(
+                &page,
+                &resolution,
+                passive_expression,
+                OperationDeadline::new(Duration::from_millis(100)),
+                Duration::ZERO,
+            )
+            .await;
+        }
+    } else {
+        if terminal_success {
+            let cleanup_budget = fill_success_cleanup_budget(
+                deadline
+                    .at
+                    .saturating_duration_since(tokio::time::Instant::now()),
+            );
+            let _ =
+                cleanup_fill_guard_after_success(&page, &resolution, &guard_key, cleanup_budget)
+                    .await;
+        } else {
+            let _ = evaluate_locator_resolution(
+                &page,
+                &resolution,
+                fill_guard_cleanup_expression(&guard_key)?,
+                OperationDeadline::new(Duration::from_millis(100)),
+                Duration::ZERO,
+            )
+            .await;
+        }
+        pinned_resolution.take();
+    }
+    outcome
+}
+
 async fn evaluate_locator_handle_for_page(
     page: Arc<PageInner>,
     locator_json: String,
@@ -11194,6 +12630,15 @@ async fn resolve_locator_session(
     locator_json: &str,
     deadline: OperationDeadline,
 ) -> RwResult<LocatorSessionResolution> {
+    resolve_locator_session_with_frame_mode(page, locator_json, deadline, false).await
+}
+
+async fn resolve_locator_session_with_frame_mode(
+    page: Arc<PageInner>,
+    locator_json: &str,
+    deadline: OperationDeadline,
+    include_same_origin_frames: bool,
+) -> RwResult<LocatorSessionResolution> {
     let original_spec: Value = serde_json::from_str(locator_json)?;
     let _ = refresh_page_frame_tree(
         &page,
@@ -11217,6 +12662,7 @@ async fn resolve_locator_session(
             frame_id.as_deref(),
             &candidate_spec,
             deadline,
+            include_same_origin_frames,
         )
         .await?
         else {
@@ -11263,6 +12709,7 @@ async fn resolve_next_oopif_frame(
     current_frame_id: Option<&str>,
     spec: &Value,
     deadline: OperationDeadline,
+    include_same_origin_frames: bool,
 ) -> RwResult<Option<(String, (Option<String>, Value))>> {
     let frame_chain = leading_frame_chain(spec);
     if frame_chain.is_empty() {
@@ -11315,6 +12762,12 @@ async fn resolve_next_oopif_frame(
             return Ok(Some((mapped_session, (None, remaining))));
         }
         if owner.same_origin_accessible {
+            if include_same_origin_frames {
+                return Ok(Some((
+                    current_session_id.to_string(),
+                    (Some(frame_id), remaining),
+                )));
+            }
             continue;
         }
 
@@ -11477,27 +12930,31 @@ fn frame_owner_selector_spec(frame_spec: &Value) -> Value {
     json!({ "kind": "css", "selector": selector })
 }
 
+fn frame_owner_resolution_body(frame_index: i64, frame_strict: bool) -> String {
+    format!(
+        r#"
+const isFrameElement = el => el && (el.tagName === 'IFRAME' || el.tagName === 'FRAME');
+const candidates = matches.filter(isFrameElement);
+if ({frame_strict} && candidates.length > 1) return candidates.length;
+let frameIndex = {frame_index};
+if (frameIndex < 0) frameIndex = candidates.length + frameIndex;
+const frame = candidates[frameIndex] || null;
+return frame;
+"#,
+    )
+}
+
 async fn describe_frame_owner(
     client: &CdpClient,
     session_id: &str,
     current_frame_id: Option<&str>,
     owner_spec: &Value,
     frame_index: i64,
-    _frame_strict: bool,
-    _selector_label: &str,
+    frame_strict: bool,
+    selector_label: &str,
     deadline: OperationDeadline,
 ) -> RwResult<Option<FrameOwnerResolution>> {
-    let body = format!(
-        r#"
-const isFrameElement = el => el && (el.tagName === 'IFRAME' || el.tagName === 'FRAME');
-const candidates = matches.filter(isFrameElement);
-let frameIndex = {frame_index};
-if (frameIndex < 0) frameIndex = candidates.length + frameIndex;
-const frame = candidates[frameIndex] || null;
-return frame;
-"#,
-        frame_index = frame_index,
-    );
+    let body = frame_owner_resolution_body(frame_index, frame_strict);
     let owner_json = owner_spec.to_string();
     let expression = locator_script(&owner_json, 0, &body);
     let remote = if let Some(current_frame_id) = current_frame_id {
@@ -11512,6 +12969,13 @@ return frame;
     } else {
         evaluate_handle_expression_in_session(client, session_id, expression, deadline).await?
     };
+    if frame_strict {
+        if let Some(count) = remote.get("value").and_then(Value::as_u64) {
+            if count > 1 {
+                return Err(frame_strict_violation_error(selector_label, count));
+            }
+        }
+    }
     let Some(object_id) = remote.get("objectId").and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -12332,12 +13796,8 @@ fn native_action_body(template: &str) -> String {
         .replace("__ACTION_POSITION__", "null")
 }
 
-fn native_fill_body(value: &str, strict: bool) -> RwResult<String> {
-    let value_json = serde_json::to_string(value)?;
-    Ok(LOCATOR_FILL_TEMPLATE
-        .replace("__STRICT__", if strict { "true" } else { "false" })
-        .replace("__FORCED__", "false")
-        .replace("__VALUE__", &value_json))
+fn native_fill_body(value: &str, strict: bool, forced: bool) -> RwResult<LocatorFillScript> {
+    locator_fill_body(value, strict, forced)
 }
 
 fn decode_runtime_serialized_value(value: Value) -> Value {
@@ -12443,6 +13903,12 @@ fn ensure_native_action_owner_available(page: &PageInner, action: &str) -> RwRes
     Ok(())
 }
 
+fn frame_strict_violation_error(selector: &str, count: u64) -> RwError {
+    RwError::Message(format!(
+        "strict mode violation: locator(\"{selector}\") resolved to {count} elements"
+    ))
+}
+
 fn strict_violation_error(info: &Value, strict: bool, action: &str) -> Option<RwError> {
     if !strict {
         return None;
@@ -12454,9 +13920,7 @@ fn strict_violation_error(info: &Value, strict: bool, action: &str) -> Option<Rw
                 .get("selector")
                 .and_then(Value::as_str)
                 .unwrap_or("iframe");
-            return Some(RwError::Message(format!(
-                "strict mode violation: locator(\"{selector}\") resolved to {count} elements"
-            )));
+            return Some(frame_strict_violation_error(selector, count));
         }
     }
     let count = info.get("count").and_then(Value::as_u64).unwrap_or(0);
@@ -12709,15 +14173,18 @@ async fn page_click_actionable_wait_async(
 #[derive(Debug, PartialEq, Eq)]
 enum FillAttempt {
     Success,
-    Pending,
+    PendingActionability,
+    PendingDispatch,
 }
 
-fn classify_fill_attempt(result: &Value) -> RwResult<FillAttempt> {
+fn classify_fill_attempt(result: &Value, action: &str) -> RwResult<FillAttempt> {
     if result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
         return Ok(FillAttempt::Success);
     }
+    let method = format!("Locator.{action}");
     match result.get("type").and_then(Value::as_str).unwrap_or("") {
-        "pending" => Ok(FillAttempt::Pending),
+        "pending" => Ok(FillAttempt::PendingActionability),
+        "pending-dispatch" => Ok(FillAttempt::PendingDispatch),
         "input-type" => {
             let input_type = result
                 .get("inputType")
@@ -12725,26 +14192,54 @@ fn classify_fill_attempt(result: &Value) -> RwResult<FillAttempt> {
                 .or_else(|| result.pointer("/info/input_type").and_then(Value::as_str))
                 .unwrap_or("");
             Err(RwError::Message(format!(
-                "Locator.fill: Error: Input of type {input_type:?} cannot be filled"
+                "{method}: Error: Input of type {input_type:?} cannot be filled"
             )))
         }
-        "number-text" => Err(RwError::Message(
-            "Locator.fill: Error: Cannot type text into input[type=number]".to_string(),
-        )),
-        "malformed" => Err(RwError::Message(
-            "Locator.fill: Error: Malformed value".to_string(),
-        )),
+        "number-text" => Err(RwError::Message(format!(
+            "{method}: Error: Cannot type text into input[type=number]"
+        ))),
+        "malformed" => Err(RwError::Message(format!(
+            "{method}: Error: Malformed value"
+        ))),
+        "not-editable" => Err(RwError::Message(format!(
+            "{method}: Error: Element is not editable"
+        ))),
         "non-fillable" => Err(RwError::Message(
-            "Locator.fill: Error: Element is not an <input>, <textarea>, <select> or [contenteditable] and does not have a role allowing [aria-readonly]".to_string(),
+            format!("{method}: Error: Element is not an <input>, <textarea>, <select> or [contenteditable] and does not have a role allowing [aria-readonly]"),
         )),
         "select" | "force-non-fillable" => Err(RwError::Message(
-            "Locator.fill: Error: Element is not an <input>, <textarea> or [contenteditable] element"
-                .to_string(),
+            format!("{method}: Error: Element is not an <input>, <textarea> or [contenteditable] element"),
         )),
         result_type => Err(RwError::Message(format!(
-            "Locator.fill: unexpected native fill result {result_type:?}"
+            "{method}: unexpected native fill result {result_type:?}"
         ))),
     }
+}
+
+type ActionPollHook = Arc<dyn Fn(Duration) -> RwResult<()> + Send + Sync>;
+
+#[cfg(feature = "python")]
+fn python_action_poll_hook(callback: Py<PyAny>) -> ActionPollHook {
+    let callback = Arc::new(callback);
+    Arc::new(move |remaining| {
+        Python::attach(|py| {
+            callback
+                .bind(py)
+                .call1((remaining.as_secs_f64() * 1_000.0,))
+                .map(|_| ())
+                .map_err(|error| RwError::Message(error.to_string()))
+        })
+    })
+}
+
+async fn run_action_poll_hook(hook: &Option<ActionPollHook>, remaining: Duration) -> RwResult<()> {
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    let hook = Arc::clone(hook);
+    tokio::task::spawn_blocking(move || hook(remaining))
+        .await
+        .map_err(|error| RwError::Message(format!("locator handler checkpoint failed: {error}")))?
 }
 
 async fn page_fill_actionable_async(
@@ -12754,34 +14249,115 @@ async fn page_fill_actionable_async(
     value: String,
     timeout_ms: Option<f64>,
     strict: bool,
+    forced: bool,
+    action: String,
+    on_poll: Option<ActionPollHook>,
 ) -> RwResult<()> {
-    let timeout_ms = Some(sanitize_action_timeout_ms(timeout_ms, false));
-    let deadline = action_deadline(action_timeout_duration(timeout_ms, false));
-    let body = native_fill_body(&value, strict)?;
+    let fill_script = native_fill_body(&value, strict, forced)?;
+    page_fill_actionable_with_script_async(
+        page,
+        locator_json,
+        index,
+        value,
+        timeout_ms,
+        strict,
+        action,
+        fill_script,
+        on_poll,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn page_fill_actionable_with_script_async(
+    page: Arc<PageInner>,
+    locator_json: String,
+    index: usize,
+    value: String,
+    timeout_ms: Option<f64>,
+    strict: bool,
+    action: String,
+    fill_script: LocatorFillScript,
+    on_poll: Option<ActionPollHook>,
+) -> RwResult<()> {
+    let timeout_ms = Some(sanitize_action_timeout_ms(timeout_ms, true));
+    let deadline = action_deadline(action_timeout_duration(timeout_ms, true));
     let mut last_info = json!({ "count": 0 });
     let mut last_info_json = last_info.to_string();
     let mut last_info_key = None;
+    let mut last_timeout_state = "editable";
+    let mut pinned_resolution = None;
+    let mut drop_cleanup =
+        FillGuardDropCleanup::new(Arc::clone(&page), fill_script.guard_key.clone());
     loop {
-        ensure_native_action_owner_available(&page, "fill")?;
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let command_timeout = action_poll_timeout(timeout_ms, false, remaining);
+        if let Err(error) = run_action_poll_hook(&on_poll, remaining).await {
+            let _ = cleanup_retained_fill_guard(
+                Arc::clone(&page),
+                &locator_json,
+                &fill_script.guard_key,
+                pinned_resolution.as_ref(),
+                Duration::from_millis(100),
+            )
+            .await;
+            drop_cleanup.disarm();
+            return Err(error);
+        }
+        if let Err(error) = ensure_native_action_owner_available(&page, &action) {
+            let _ = cleanup_retained_fill_guard(
+                Arc::clone(&page),
+                &locator_json,
+                &fill_script.guard_key,
+                pinned_resolution.as_ref(),
+                Duration::from_millis(100),
+            )
+            .await;
+            drop_cleanup.disarm();
+            return Err(error);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let command_timeout = action_poll_timeout(timeout_ms, true, remaining);
         // Sync #106 parity: a probe timeout is transient until the outer action deadline.
-        let evaluation = evaluate_locator_for_page(
+        let evaluation = evaluate_locator_fill_for_page(
             Arc::clone(&page),
             locator_json.clone(),
             index,
-            body.clone(),
+            fill_script.body.clone(),
+            fill_script.guard_key.clone(),
+            value.clone(),
             command_timeout,
+            &mut pinned_resolution,
+            Some(&mut drop_cleanup),
         )
         .await;
         let json = match evaluation {
             Ok(json) => json,
             Err(RwError::Timeout(_)) => {
-                ensure_native_action_owner_available(&page, "fill")?;
+                if let Err(error) = ensure_native_action_owner_available(&page, &action) {
+                    let _ = cleanup_retained_fill_guard(
+                        Arc::clone(&page),
+                        &locator_json,
+                        &fill_script.guard_key,
+                        pinned_resolution.as_ref(),
+                        Duration::from_millis(100),
+                    )
+                    .await;
+                    drop_cleanup.disarm();
+                    return Err(error);
+                }
                 if Instant::now() >= deadline {
+                    let _ = cleanup_retained_fill_guard(
+                        Arc::clone(&page),
+                        &locator_json,
+                        &fill_script.guard_key,
+                        pinned_resolution.as_ref(),
+                        Duration::from_millis(100),
+                    )
+                    .await;
+                    drop_cleanup.disarm();
                     return Err(ActionTimeoutError::from_raw_json(
-                        "editable",
-                        "fill",
+                        last_timeout_state,
+                        action.clone(),
                         last_info_json,
                         &last_info,
                         last_info_key,
@@ -12796,26 +14372,99 @@ async fn page_fill_actionable_async(
                 .await;
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                drop_cleanup.disarm();
+                return Err(error);
+            }
         };
-        let result = decode_runtime_serialized_value(serde_json::from_str::<Value>(&json)?);
+        let result = match serde_json::from_str::<Value>(&json) {
+            Ok(result) => decode_runtime_serialized_value(result),
+            Err(error) => {
+                let _ = cleanup_retained_fill_guard(
+                    Arc::clone(&page),
+                    &locator_json,
+                    &fill_script.guard_key,
+                    pinned_resolution.as_ref(),
+                    Duration::from_millis(100),
+                )
+                .await;
+                drop_cleanup.disarm();
+                return Err(error.into());
+            }
+        };
         let info = result.get("info").cloned().unwrap_or_else(|| json!({}));
-        if let Some(error) = strict_violation_error(&info, strict, "fill") {
-            return Err(error);
+        let result_type = result.get("type").and_then(Value::as_str);
+        let result_succeeded = result.get("ok").and_then(Value::as_bool) == Some(true);
+        if !result_succeeded
+            && !matches!(result_type, Some("observe-dispatch" | "pending-dispatch"))
+        {
+            if let Some(error) = strict_violation_error(&info, strict, &action) {
+                let _ = cleanup_retained_fill_guard(
+                    Arc::clone(&page),
+                    &locator_json,
+                    &fill_script.guard_key,
+                    pinned_resolution.as_ref(),
+                    Duration::from_millis(100),
+                )
+                .await;
+                drop_cleanup.disarm();
+                return Err(error);
+            }
         }
-        match classify_fill_attempt(&result)? {
-            FillAttempt::Success => return Ok(()),
-            FillAttempt::Pending if Instant::now() >= deadline => {
+        let attempt = match classify_fill_attempt(&result, &action) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                let _ = cleanup_retained_fill_guard(
+                    Arc::clone(&page),
+                    &locator_json,
+                    &fill_script.guard_key,
+                    pinned_resolution.as_ref(),
+                    Duration::from_millis(100),
+                )
+                .await;
+                drop_cleanup.disarm();
+                return Err(error);
+            }
+        };
+        match attempt {
+            FillAttempt::Success => {
+                drop_cleanup.disarm();
+                return Ok(());
+            }
+            FillAttempt::PendingActionability | FillAttempt::PendingDispatch
+                if Instant::now() >= deadline =>
+            {
+                let state =
+                    if result.get("type").and_then(Value::as_str) == Some("pending-dispatch") {
+                        "confirmed as edited"
+                    } else {
+                        "editable"
+                    };
+                let _ = cleanup_retained_fill_guard(
+                    Arc::clone(&page),
+                    &locator_json,
+                    &fill_script.guard_key,
+                    pinned_resolution.as_ref(),
+                    Duration::from_millis(100),
+                )
+                .await;
+                drop_cleanup.disarm();
                 return Err(ActionTimeoutError::from_raw_json(
-                    "editable",
-                    "fill",
+                    state,
+                    action.clone(),
                     json,
                     &info,
                     Some("info"),
                 )
                 .into());
             }
-            FillAttempt::Pending => {
+            FillAttempt::PendingActionability | FillAttempt::PendingDispatch => {
+                last_timeout_state =
+                    if result.get("type").and_then(Value::as_str) == Some("pending-dispatch") {
+                        "confirmed as edited"
+                    } else {
+                        "editable"
+                    };
                 last_info = info;
                 last_info_json = json;
                 last_info_key = Some("info");
@@ -13328,34 +14977,21 @@ el.click();
         timeout_ms: Option<f64>,
         strict: bool,
     ) -> PyResult<Py<PyAny>> {
-        let value_json = serde_json::to_string(value)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let action = format!(
-            r#"
-el.scrollIntoView({{ block: 'center', inline: 'center' }});
-if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
-const value = {value_json};
-if ('value' in el) el.value = value;
-else if (el.isContentEditable) el.textContent = value;
-else el.textContent = value;
-el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-"#
-        );
         let page = Arc::clone(&self.inner);
         let runtime = page.browser.runtime.handle().clone();
-        let timeout = BrowserInner::command_timeout(timeout_ms);
         python_future_on(
             py,
             runtime,
-            page_locator_action_async(
+            page_fill_actionable_async(
                 page,
                 locator_json.to_string(),
                 index,
-                action,
-                timeout,
+                value.to_string(),
+                timeout_ms,
                 strict,
-                "fill",
+                false,
+                "fill".to_string(),
+                None,
             ),
             |py, ()| Ok(py.None()),
         )
@@ -13383,6 +15019,9 @@ el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                 value.to_string(),
                 timeout_ms,
                 strict,
+                false,
+                "fill".to_string(),
+                None,
             ),
             |py, ()| Ok(py.None()),
         )
@@ -15263,9 +16902,30 @@ return true;
         forced: bool,
         timeout_ms: Option<f64>,
     ) -> PyResult<String> {
-        let body = locator_fill_apply_body(value, strict, forced).map_err(py_err)?;
-        py.detach(|| self.evaluate_locator(locator_json, index, &body, timeout_ms))
-            .map_err(py_err)
+        let fill_script = locator_fill_apply_body(value, strict, forced).map_err(py_err)?;
+        let page = Arc::clone(&self.inner);
+        let locator_json = locator_json.to_string();
+        let value = value.to_string();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        py.detach(move || {
+            let browser = Arc::clone(&page.browser);
+            browser.block_on(async move {
+                let mut pinned_resolution = None;
+                evaluate_locator_fill_for_page(
+                    page,
+                    locator_json,
+                    index,
+                    fill_script.body,
+                    fill_script.guard_key,
+                    value,
+                    timeout,
+                    &mut pinned_resolution,
+                    None,
+                )
+                .await
+            })
+        })
+        .map_err(py_err)
     }
 
     #[pyo3(signature = (locator_json, index, values_json, labels_json, indexes_json, timeout_ms=None))]
@@ -15309,23 +16969,202 @@ return true;
         args_json: &str,
         timeout_ms: Option<f64>,
     ) -> PyResult<String> {
-        let Some(body) =
+        let Some(script) =
             locator_fast_path_body(locator_json, operation, args_json).map_err(py_err)?
         else {
             return Ok(json!({ "ok": false, "type": "not-applicable" }).to_string());
+        };
+        let fill_options = if matches!(operation, "css_fill" | "label_fill" | "placeholder_fill") {
+            let args = serde_json::from_str::<Value>(args_json)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            Some((
+                args.get("value")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        PyValueError::new_err("locator fast fill value must be a string")
+                    })?
+                    .to_string(),
+                args.get("strict").and_then(Value::as_bool).unwrap_or(false),
+            ))
+        } else {
+            None
         };
         let page = Arc::clone(&self.inner);
         let locator_json = locator_json.to_string();
         let wait_probe = operation == "css_immediate_state";
         let timeout = BrowserInner::command_timeout(timeout_ms);
         py.detach(move || {
-            if wait_probe {
-                let expression = locator_script(&locator_json, index, &body);
+            if let Some((value, strict)) = fill_options {
+                let guard_key = script.fill_guard_key.ok_or_else(|| {
+                    RwError::Message("fast fill did not return a fill guard key".to_string())
+                })?;
+                let fill_script = LocatorFillScript {
+                    body: script.body,
+                    guard_key,
+                };
+                let browser = Arc::clone(&page.browser);
+                browser.block_on(async move {
+                    let deadline = action_deadline(timeout);
+                    let mut pinned_resolution = None;
+                    let evaluation = evaluate_locator_fill_for_page(
+                        Arc::clone(&page),
+                        locator_json.clone(),
+                        index,
+                        fill_script.body.clone(),
+                        fill_script.guard_key.clone(),
+                        value.clone(),
+                        timeout,
+                        &mut pinned_resolution,
+                        None,
+                    )
+                    .await;
+                    let mut json = match evaluation {
+                        Ok(json) => json,
+                        Err(error @ RwError::Timeout(_)) => {
+                            let _ = cleanup_retained_fill_guard(
+                                Arc::clone(&page),
+                                &locator_json,
+                                &fill_script.guard_key,
+                                pinned_resolution.as_ref(),
+                                Duration::from_millis(100),
+                            )
+                            .await;
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let first_result =
+                        decode_runtime_serialized_value(serde_json::from_str::<Value>(&json)?);
+                    let first_info = first_result
+                        .get("info")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let first_result_type = first_result.get("type").and_then(Value::as_str);
+                    let first_result_succeeded =
+                        first_result.get("ok").and_then(Value::as_bool) == Some(true);
+                    if !first_result_succeeded
+                        && !matches!(
+                            first_result_type,
+                            Some("observe-dispatch" | "pending-dispatch")
+                        )
+                    {
+                        if let Some(error) = strict_violation_error(&first_info, strict, "fill") {
+                            let _ = cleanup_retained_fill_guard(
+                                Arc::clone(&page),
+                                &locator_json,
+                                &fill_script.guard_key,
+                                pinned_resolution.as_ref(),
+                                Duration::from_millis(100),
+                            )
+                            .await;
+                            return Err(error);
+                        }
+                    }
+                    match classify_fill_attempt(&first_result, "fill")? {
+                        FillAttempt::Success | FillAttempt::PendingActionability => {
+                            return Ok(json);
+                        }
+                        FillAttempt::PendingDispatch => {}
+                    }
+                    let mut last_info = first_info;
+                    let mut last_info_json = json;
+                    let mut last_timeout_state = "confirmed as edited";
+                    loop {
+                        if Instant::now() >= deadline {
+                            let _ = cleanup_retained_fill_guard(
+                                Arc::clone(&page),
+                                &locator_json,
+                                &fill_script.guard_key,
+                                pinned_resolution.as_ref(),
+                                Duration::from_millis(100),
+                            )
+                            .await;
+                            return Err(ActionTimeoutError::from_raw_json(
+                                last_timeout_state,
+                                "fill".to_string(),
+                                last_info_json,
+                                &last_info,
+                                Some("info"),
+                            )
+                            .into());
+                        }
+                        tokio::time::sleep(
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(20)),
+                        )
+                        .await;
+                        if let Err(error) = ensure_native_action_owner_available(&page, "fill") {
+                            let _ = cleanup_retained_fill_guard(
+                                Arc::clone(&page),
+                                &locator_json,
+                                &fill_script.guard_key,
+                                pinned_resolution.as_ref(),
+                                Duration::from_millis(100),
+                            )
+                            .await;
+                            return Err(error);
+                        }
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let evaluation = evaluate_locator_fill_for_page(
+                            Arc::clone(&page),
+                            locator_json.clone(),
+                            index,
+                            fill_script.body.clone(),
+                            fill_script.guard_key.clone(),
+                            value.clone(),
+                            remaining.max(Duration::from_millis(1)),
+                            &mut pinned_resolution,
+                            None,
+                        )
+                        .await;
+                        json = match evaluation {
+                            Ok(json) => json,
+                            Err(RwError::Timeout(_)) => continue,
+                            Err(error) => return Err(error),
+                        };
+                        let result =
+                            decode_runtime_serialized_value(serde_json::from_str::<Value>(&json)?);
+                        let info = result.get("info").cloned().unwrap_or_else(|| json!({}));
+                        let result_type = result.get("type").and_then(Value::as_str);
+                        let result_succeeded =
+                            result.get("ok").and_then(Value::as_bool) == Some(true);
+                        if !result_succeeded
+                            && !matches!(result_type, Some("observe-dispatch" | "pending-dispatch"))
+                        {
+                            if let Some(error) = strict_violation_error(&info, strict, "fill") {
+                                let _ = cleanup_retained_fill_guard(
+                                    Arc::clone(&page),
+                                    &locator_json,
+                                    &fill_script.guard_key,
+                                    pinned_resolution.as_ref(),
+                                    Duration::from_millis(100),
+                                )
+                                .await;
+                                return Err(error);
+                            }
+                        }
+                        match classify_fill_attempt(&result, "fill")? {
+                            FillAttempt::Success => return Ok(json),
+                            FillAttempt::PendingActionability | FillAttempt::PendingDispatch => {
+                                last_timeout_state = if result_type == Some("pending-dispatch") {
+                                    "confirmed as edited"
+                                } else {
+                                    "editable"
+                                };
+                                last_info = info;
+                                last_info_json = json;
+                            }
+                        }
+                    }
+                })
+            } else if wait_probe {
+                let expression = locator_script(&locator_json, index, &script.body);
                 evaluate_locator_wait_probe_for_page(page, expression, timeout_ms)
             } else {
                 let browser = Arc::clone(&page.browser);
                 browser.block_on(async move {
-                    evaluate_locator_for_page(page, locator_json, index, body, timeout).await
+                    evaluate_locator_for_page(page, locator_json, index, script.body, timeout).await
                 })
             }
         })
@@ -15354,6 +17193,56 @@ return true;
         .map_err(py_err)
     }
 
+    #[pyo3(signature = (
+        locator_json,
+        index,
+        value,
+        strict,
+        forced,
+        action="fill",
+        timeout_ms=None,
+        on_poll=None,
+        cancel=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn locator_fill_actionable(
+        &self,
+        py: Python<'_>,
+        locator_json: &str,
+        index: usize,
+        value: &str,
+        strict: bool,
+        forced: bool,
+        action: &str,
+        timeout_ms: Option<f64>,
+        on_poll: Option<Py<PyAny>>,
+        cancel: Option<PyRef<'_, PyRustCancelToken>>,
+    ) -> PyResult<()> {
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let locator_json = locator_json.to_string();
+        let value = value.to_string();
+        let on_poll = on_poll.map(python_action_poll_hook);
+        let cancel = cancel.map(|cancel| cancel.token.clone());
+        py.detach(move || {
+            browser.block_on(cancelable(
+                cancel,
+                page_fill_actionable_async(
+                    page,
+                    locator_json,
+                    index,
+                    value,
+                    timeout_ms,
+                    strict,
+                    forced,
+                    action.to_string(),
+                    on_poll,
+                ),
+            ))
+        })
+        .map_err(py_err)
+    }
+
     #[pyo3(signature = (locator_json, index, value, timeout_ms=None))]
     fn fill(
         &self,
@@ -15362,28 +17251,20 @@ return true;
         value: &str,
         timeout_ms: Option<f64>,
     ) -> PyResult<()> {
-        let value_json = serde_json::to_string(value)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let body = format!(
-            r#"
-if (!el) throw new Error('No element matches locator');
-el.scrollIntoView({{ block: 'center', inline: 'center' }});
-if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
-const value = {value_json};
-if ('value' in el) {{
-  el.value = value;
-}} else if (el.isContentEditable) {{
-  el.textContent = value;
-}} else {{
-  el.textContent = value;
-}}
-el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-return true;
-"#
-        );
-        self.evaluate_locator(locator_json, index, &body, timeout_ms)
-            .map(|_| ())
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        browser
+            .block_on(page_fill_actionable_async(
+                page,
+                locator_json.to_string(),
+                index,
+                value.to_string(),
+                timeout_ms,
+                false,
+                false,
+                "fill".to_string(),
+                None,
+            ))
             .map_err(py_err)
     }
 
@@ -18623,27 +20504,37 @@ impl RustwrightPage {
         cancel: Option<&CancelToken>,
     ) -> RwResult<()> {
         let locator_json = selector_to_locator_json(selector)?;
-        let value_json = serde_json::to_string(value)?;
-        let body = format!(
-            r#"
-if (!el) throw new Error('No element matches locator');
-el.scrollIntoView({{ block: 'center', inline: 'center' }});
-if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
-const value = {value_json};
-if ('value' in el) {{
-  el.value = value;
-}} else if (el.isContentEditable) {{
-  el.textContent = value;
-}} else {{
-  el.textContent = value;
-}}
-el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-return true;
-"#
-        );
-        self.evaluate_locator_json_cancelable(locator_json, 0, body, timeout_ms, cancel)
-            .map(|_| ())
+        let timeout_ms = self.resolve_timeout(timeout_ms, false);
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let fill_script = native_fill_body(value, true, false)?;
+        let guard_key = fill_script.guard_key.clone();
+        let result = browser.block_on_raw(cancelable(
+            cancel.cloned(),
+            page_fill_actionable_with_script_async(
+                Arc::clone(&page),
+                locator_json.clone(),
+                0,
+                value.to_string(),
+                timeout_ms,
+                true,
+                "fill".to_string(),
+                fill_script,
+                None,
+            ),
+        ));
+        if matches!(result, Err(RwError::Cancelled)) {
+            // CancelToken cancellation is observable here, so finish a bounded,
+            // key-scoped sweep before returning. Future-drop cancellation uses the
+            // guard owner's detached cleanup instead.
+            let _ = browser.block_on_raw(cleanup_fill_guards_for_page(
+                page,
+                &locator_json,
+                &guard_key,
+                Duration::from_secs(1),
+            ));
+        }
+        result
     }
 
     /// Type through Chromium's input domain after focusing the matching element.
@@ -20312,6 +22203,7 @@ async fn attach_existing_page_unregistered(
         background_override_active: Arc::new(AtomicBool::new(false)),
         screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
         mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+        fill_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
         default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
         lifecycle: Arc::new(CloseLifecycle::new()),
         target_closed: AtomicBool::new(false),
@@ -21083,6 +22975,7 @@ mod native_console_record_tests {
             background_override_active: Arc::new(AtomicBool::new(false)),
             screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
             mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+            fill_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
             default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
             lifecycle: Arc::new(CloseLifecycle::new()),
             target_closed: AtomicBool::new(false),
@@ -27631,6 +29524,7 @@ fn _rustwright(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     let shutdown_gate = Py::new(py, PyRustShutdownGate)?;
     PyModule::import(py, "atexit")?.call_method1("register", (shutdown_gate,))?;
     module.add_class::<PyRustFutureAbort>()?;
+    module.add_class::<PyRustCancelToken>()?;
     module.add_class::<PyRustFutureSettler>()?;
     module.add_class::<PyRustShutdownGate>()?;
     module.add_class::<PyBrowser>()?;

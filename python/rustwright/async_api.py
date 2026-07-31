@@ -235,6 +235,8 @@ async def _await_native_action(method: str, awaitable: Any) -> Any:
         return await _await_native(awaitable)
     except Error as exc:
         message = str(exc)
+        if getattr(exc, "_rustwright_error_kind", None) == "action_timeout":
+            raise
         marker = "__rustwright_action_timeout__:"
         if message.startswith(marker):
             try:
@@ -2809,12 +2811,13 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
         strict: Optional[bool] = None,
         force: Optional[bool] = None,
     ) -> None:
-        if (
+        sync_fallback = (
             not _native_page_hot_path_supported(self._sync)
             or getattr(self._sync, "_active_page_cdp_event_contexts", 0) > 0
             or no_wait_after is not None
             or force is not None
-        ):
+        )
+        if sync_fallback and _unsafe_dom_fastpath_enabled():
             await _run_sync_wait_sliced(
                 self._sync,
                 self._sync.fill,
@@ -2846,6 +2849,36 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
                     locator._strict,
                 ),
             )
+            return
+        if sync_fallback:
+            # Cancelling an executor Future does not stop its running sync call. Carry
+            # cancellation into Rust so the fill future—and its guard owner—is dropped.
+            cancellation = _rustwright._RustCancelToken()
+            on_poll = (
+                self._sync._run_locator_handlers_for_remaining
+                if getattr(self._sync, "_locator_handlers", None)
+                else None
+            )
+            try:
+                await _await_native_action(
+                    "Page.fill",
+                    _run_sync_call(
+                        self._sync._core.locator_fill_actionable,
+                        _json(locator._spec),
+                        locator._index,
+                        normalized_value,
+                        bool(locator._strict),
+                        bool(force),
+                        "fill",
+                        timeout_ms,
+                        on_poll,
+                        cancellation,
+                    ),
+                )
+            except asyncio.CancelledError:
+                cancellation.cancel()
+                raise
+            await _run_sync_call(self._sync._slow_mo)
             return
         await _await_native_action(
             "Page.fill",
