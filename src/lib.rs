@@ -38,6 +38,8 @@ use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Uri};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
+mod telemetry;
+
 pub type RwResult<T> = Result<T, RwError>;
 type CdpPendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<RwResult<Value>>>>>;
 
@@ -17484,6 +17486,7 @@ fn launch_chromium_with_options_cancellation(
         let _ = close_browser_blocking(Arc::clone(&browser));
         return Err(RwError::Message("browser launch was cancelled".to_string()));
     }
+    telemetry::record_engine_launched(&browser.runtime);
     Ok(browser)
 }
 
