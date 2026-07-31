@@ -662,6 +662,50 @@ def typescript_playwright_code(
           await expectError(() => page.locator('#checkbox-email').fill('forced checkbox', {{ force: true }}), 'Input of type "checkbox"');
         }}
 
+        async function fill_forced_ineligible_matrix(page) {{
+          await page.setContent(`
+            <input id="css-hidden" style="display:none" value="css-old">
+            <input id="disabled" disabled value="disabled-old">
+            <input id="readonly" readonly value="readonly-old">
+            <input id="type-hidden" type="hidden" value="hidden-old">
+            <input id="checkbox" type="checkbox" value="checkbox-old">
+            <div id="editable" contenteditable>editable-old</div>
+          `);
+          for (const [selector, attempted, unchanged] of [
+            ['#css-hidden', 'css-new', 'css-old'],
+            ['#disabled', 'disabled-new', 'disabled-old'],
+            ['#readonly', 'readonly-new', 'readonly-old'],
+          ]) {{
+            await page.locator(selector).fill(attempted, {{ force: true }});
+            assert(await page.locator(selector).inputValue() === unchanged);
+          }}
+          for (const [selector, attempted, unchanged, inputType] of [
+            ['#type-hidden', 'hidden-new', 'hidden-old', 'hidden'],
+            ['#checkbox', 'checkbox-new', 'checkbox-old', 'checkbox'],
+          ]) {{
+            await expectError(() => page.locator(selector).fill(attempted, {{ force: true }}), `Input of type "${{inputType}}"`);
+            assert(await page.locator(selector).inputValue() === unchanged);
+          }}
+          await page.locator('#editable').fill('editable-new', {{ force: true }});
+          assert(await page.locator('#editable').textContent() === 'editable-new');
+        }}
+
+        async function fill_browser_constrained_and_controlled_values(page) {{
+          await page.setContent(`
+            <input id="maxlength" maxlength="4">
+            <input id="controlled">
+            <script>
+            document.querySelector('#controlled').addEventListener('input', event => {{
+              event.target.value = event.target.value.toUpperCase();
+            }});
+            </script>
+          `);
+          await page.locator('#maxlength').fill('abcdef');
+          await page.locator('#controlled').fill('mixedCase');
+          assert(await page.locator('#maxlength').inputValue() === 'abcd');
+          assert(await page.locator('#controlled').inputValue() === 'MIXEDCASE');
+        }}
+
         async function type_input(page) {{
           await page.setContent('<input id="message">');
           await page.type('#message', 'hello');
@@ -897,6 +941,8 @@ def typescript_playwright_code(
           ['evaluate_json', evaluate_json],
           ['click_button', click_button],
           ['fill_input', fill_input],
+          ['fill_forced_ineligible_matrix', fill_forced_ineligible_matrix],
+          ['fill_browser_constrained_and_controlled_values', fill_browser_constrained_and_controlled_values],
           ['type_input', type_input],
           ['locator_count', locator_count],
           ['locator_nth_text', locator_nth_text],
@@ -1175,6 +1221,40 @@ def typescript_puppeteer_code(
           assert(await text(page, '#editable-email') === 'forced editable');
         }}
 
+        async function fill_forced_ineligible_matrix(page) {{
+          await page.setContent(`
+            <input id="css-hidden" style="display:none" value="css-old">
+            <input id="disabled" disabled value="disabled-old">
+            <input id="readonly" readonly value="readonly-old">
+            <input id="type-hidden" type="hidden" value="hidden-old">
+            <input id="checkbox" type="checkbox" value="checkbox-old">
+            <div id="editable" contenteditable>editable-old</div>
+          `);
+          assert(await value(page, '#css-hidden') === 'css-old');
+          assert(await value(page, '#disabled') === 'disabled-old');
+          assert(await value(page, '#readonly') === 'readonly-old');
+          assert(await value(page, '#type-hidden') === 'hidden-old');
+          assert(await page.$eval('#checkbox', el => el.type) === 'checkbox');
+          await page.$eval('#editable', el => {{ el.textContent = 'editable-new'; }});
+          assert(await text(page, '#editable') === 'editable-new');
+        }}
+
+        async function fill_browser_constrained_and_controlled_values(page) {{
+          await page.setContent(`
+            <input id="maxlength" maxlength="4">
+            <input id="controlled">
+            <script>
+            document.querySelector('#controlled').addEventListener('input', event => {{
+              event.target.value = event.target.value.toUpperCase();
+            }});
+            </script>
+          `);
+          await page.type('#maxlength', 'abcdef');
+          await page.type('#controlled', 'mixedCase');
+          assert(await value(page, '#maxlength') === 'abcd');
+          assert(await value(page, '#controlled') === 'MIXEDCASE');
+        }}
+
         async function type_input(page) {{
           await page.setContent('<input id="message">');
           await page.type('#message', 'hello');
@@ -1357,6 +1437,8 @@ def typescript_puppeteer_code(
           ['evaluate_json', evaluate_json],
           ['click_button', click_button],
           ['fill_input', fill_input],
+          ['fill_forced_ineligible_matrix', fill_forced_ineligible_matrix],
+          ['fill_browser_constrained_and_controlled_values', fill_browser_constrained_and_controlled_values],
           ['type_input', type_input],
           ['locator_count', locator_count],
           ['locator_nth_text', locator_nth_text],

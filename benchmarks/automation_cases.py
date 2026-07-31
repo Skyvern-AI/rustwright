@@ -1289,6 +1289,64 @@ def fill_input(page):
 
 
 @case
+def fill_forced_ineligible_matrix(page):
+    page.set_content(
+        """
+        <input id="css-hidden" style="display:none" value="css-old">
+        <input id="disabled" disabled value="disabled-old">
+        <input id="readonly" readonly value="readonly-old">
+        <input id="type-hidden" type="hidden" value="hidden-old">
+        <input id="checkbox" type="checkbox" value="checkbox-old">
+        <div id="editable" contenteditable>editable-old</div>
+        """
+    )
+
+    for selector, attempted, unchanged in [
+        ("#css-hidden", "css-new", "css-old"),
+        ("#disabled", "disabled-new", "disabled-old"),
+        ("#readonly", "readonly-new", "readonly-old"),
+    ]:
+        page.locator(selector).fill(attempted, force=True)
+        assert page.locator(selector).input_value() == unchanged
+
+    for selector, attempted, unchanged, input_type in [
+        ("#type-hidden", "hidden-new", "hidden-old", "hidden"),
+        ("#checkbox", "checkbox-new", "checkbox-old", "checkbox"),
+    ]:
+        try:
+            page.locator(selector).fill(attempted, force=True)
+        except Exception as exc:
+            assert f'Input of type "{input_type}"' in str(exc)
+        else:
+            raise AssertionError(f"forced fill unexpectedly accepted input[type={input_type}]")
+        assert page.locator(selector).input_value() == unchanged
+
+    page.locator("#editable").fill("editable-new", force=True)
+    assert page.locator("#editable").text_content() == "editable-new"
+
+
+@case
+def fill_browser_constrained_and_controlled_values(page):
+    page.set_content(
+        """
+        <input id="maxlength" maxlength="4">
+        <input id="controlled">
+        <script>
+        document.querySelector('#controlled').addEventListener('input', event => {
+          event.target.value = event.target.value.toUpperCase();
+        });
+        </script>
+        """
+    )
+
+    page.locator("#maxlength").fill("abcdef")
+    page.locator("#controlled").fill("mixedCase")
+
+    assert page.locator("#maxlength").input_value() == "abcd"
+    assert page.locator("#controlled").input_value() == "MIXEDCASE"
+
+
+@case
 def type_input(page):
     page.set_content("<input id='message'>")
     page.type("#message", "hello")
