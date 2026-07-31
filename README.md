@@ -345,6 +345,18 @@ Rustwright is an early alpha from [Skyvern](https://github.com/Skyvern-AI), deve
 
 Questions, ideas, or want to help? Join the Skyvern community on [**Discord**](https://discord.gg/fG2XXEuQX3).
 
+## Telemetry
+
+Rustwright sends one `engine_launched` event per process to PostHog with the Rustwright version, operating system, and CPU architecture. It sends no URLs or page content.
+
+Events carry a random installation ID, generated without using the hostname, username, or MAC address, stored at `~/.cache/rustwright/telemetry_id` (or the `$XDG_CACHE_HOME`/`%LOCALAPPDATA%` equivalent) so events from the same installation can be counted together. Delete the file to reset it. Events are marked personless, and GeoIP enrichment is disabled at the event level. The request, like any HTTPS request, exposes the sender's IP address to PostHog, but Rustwright does not store the IP address in the event payload.
+
+To opt out:
+
+```bash
+export DISABLE_TELEMETRY=1   # or DO_NOT_TRACK=1
+```
+
 ## License
 
 [MIT](LICENSE) © 2026 Ikonomos Inc (dba Skyvern)
