@@ -11,6 +11,11 @@
 [![npm](https://img.shields.io/npm/v/rustwright?logo=npm&label=npm)](https://www.npmjs.com/package/rustwright)
 [![Chromium only](https://img.shields.io/badge/browser-Chromium-4285F4?logo=googlechrome&logoColor=white)](#limitations)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/fG2XXEuQX3)
+[![PyPI downloads](https://img.shields.io/pypi/dw/rustwright?logo=pypi&logoColor=white&label=pypi%20downloads)](https://pypi.org/project/rustwright/)
+[![npm downloads](https://img.shields.io/npm/dw/rustwright?logo=npm&label=npm%20downloads)](https://www.npmjs.com/package/rustwright)
+[![crates.io downloads](https://img.shields.io/crates/dr/rustwright?logo=rust&label=crates.io%20recent%20downloads)](https://crates.io/crates/rustwright)
+[![rustwright-core downloads](https://img.shields.io/crates/dr/rustwright-core?logo=rust&label=rustwright-core%20recent%20downloads)](https://crates.io/crates/rustwright-core)
+<!-- When the tagged release publishes to RubyGems, NuGet, and Maven Central, add matching download badges here: gem/dt/rustwright, nuget/dt/Rustwright; maven-central download badges are not offered by shields — link Maven Central search instead. The MCP npm package (rustwright-mcp) publishes on the separate mcp-npm-v* tag family, not the v* release tag — only add its npm/dw badge once that tag has shipped. -->
 
 </div>
 
