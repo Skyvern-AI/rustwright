@@ -5142,6 +5142,19 @@ def test_expect_download_captures_file(page, http_server, tmp_path: Path):
     assert not saved_path.exists()
 
 
+def test_expect_download_attributes_window_open_download_to_opener(page, http_server):
+    page.set_content("<main>opener</main>")
+
+    with page.expect_download(timeout=3_000) as download_info:
+        page.evaluate("url => { window.open(url, '_blank'); }", f"{http_server}/download")
+
+    download = download_info.value
+    assert download.page is page
+    assert download.url == f"{http_server}/download"
+    assert download.suggested_filename == "report.txt"
+    assert download.failure() is None
+
+
 def test_download_save_as_fetches_when_cdp_path_is_not_local(page, http_server, tmp_path: Path):
     from playwright.sync_api import Download
 
@@ -5174,12 +5187,29 @@ def test_page_download_waiters_ignore_other_pages(browser, http_server):
             with first.expect_download(timeout=500):
                 second.evaluate("() => document.querySelector('#download').click()")
 
+        with pytest.raises(TimeoutError):
+            with first.expect_download(timeout=500):
+                second.evaluate("url => { window.open(url, '_blank'); }", f"{http_server}/download")
+
         with first.expect_download(timeout=3_000) as download_info:
             first.evaluate("() => document.querySelector('#download').click()")
 
         assert download_info.value.url == f"{http_server}/download"
     finally:
         context.close()
+
+
+def test_opener_download_waiter_ignores_established_popup_download(page, http_server):
+    with page.expect_popup() as popup_info:
+        page.evaluate("() => { window.open('about:blank'); }")
+
+    popup = popup_info.value
+    try:
+        with pytest.raises(TimeoutError):
+            with page.expect_download(timeout=500):
+                popup.evaluate("url => { window.location.href = url; }", f"{http_server}/download")
+    finally:
+        popup.close()
 
 
 def test_overlapping_download_waiters_preserve_page_metadata(page):
@@ -33313,6 +33343,28 @@ def test_async_expect_download_allows_scheduled_trigger(http_server):
             assert download.suggested_filename == "report.txt"
             assert await download.failure() is None
             assert Path(await download.path()).read_bytes() == b"download-body"
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_expect_download_attributes_window_open_download_to_opener(http_server):
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content("<main>opener</main>")
+
+            async with page.expect_download(timeout=3_000) as download_info:
+                await page.evaluate("url => { window.open(url, '_blank'); }", f"{http_server}/download")
+
+            download = await download_info.value
+            assert download.page is page
+            assert download.url == f"{http_server}/download"
+            assert download.suggested_filename == "report.txt"
+            assert await download.failure() is None
             await browser.close()
 
     asyncio.run(run())

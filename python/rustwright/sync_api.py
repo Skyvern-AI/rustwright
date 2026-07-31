@@ -15837,6 +15837,9 @@ class Page:
         return False
 
     def _download_payload_belongs_to_page(self, payload: dict[str, Any]) -> bool:
+        opener_target_id = payload.get("opener_target_id")
+        if opener_target_id is not None:
+            return bool(self._target_id) and str(opener_target_id) == self._target_id
         frame_id = payload.get("frame_id")
         if frame_id is None:
             return True
