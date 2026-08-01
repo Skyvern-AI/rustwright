@@ -13415,10 +13415,32 @@ class Frame(_EventEmitter):
                 if isinstance(child, dict)
             ]
         if isinstance(entries, list):
-            for index, entry in enumerate(entries):
-                if not isinstance(entry, dict) or index >= len(cdp_children):
+            # The DOM query orders and names the frames it can see; the protocol decides which
+            # exist. A frame in a shadow root is an ordinary child of the tree and invisible to
+            # `querySelectorAll`, so pairing the two by position would hand a light-DOM frame a
+            # shadow frame's identity. Match on URL, fall back to order, keep what was missed.
+            available = [child for child in cdp_children if isinstance(child, dict)]
+            claimed: set[int] = set()
+
+            def claim(entry: dict[str, Any]) -> Optional[dict[str, Any]]:
+                entry_url = str(entry.get("url") or "")
+                if entry_url:
+                    for position, child in enumerate(available):
+                        if position not in claimed and str(child.get("url") or "") == entry_url:
+                            claimed.add(position)
+                            return child
+                for position, child in enumerate(available):
+                    if position not in claimed:
+                        claimed.add(position)
+                        return child
+                return None
+
+            for entry in entries:
+                if not isinstance(entry, dict):
                     continue
-                cdp_frame = cdp_children[index]
+                cdp_frame = claim(entry)
+                if cdp_frame is None:
+                    continue
                 frame_id = cdp_frame.get("id")
                 if frame_id:
                     entry["id"] = str(frame_id)
@@ -13426,6 +13448,17 @@ class Frame(_EventEmitter):
                     entry["url"] = str(cdp_frame.get("url") or "")
                 if not entry.get("name") and cdp_frame.get("name"):
                     entry["name"] = str(cdp_frame.get("name") or "")
+            for position, cdp_frame in enumerate(available):
+                if position in claimed:
+                    continue
+                entries.append(
+                    {
+                        "id": cdp_frame.get("id"),
+                        "name": cdp_frame.get("name") or "",
+                        "url": cdp_frame.get("url") or "",
+                        "frame_index": len(entries),
+                    }
+                )
         return entries if isinstance(entries, list) else []
 
     def _wrap_spec(self, spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -14878,13 +14911,17 @@ class Page:
     def _cdp_frame_tree_root(self) -> Optional[dict[str, Any]]:
         frame_tree = getattr(self._core, "frame_tree", None)
         if frame_tree is not None:
+            # The core owns this tree: it answers from the frame state it maintains from protocol
+            # events and refreshes it on a bounded best-effort budget. An empty tree is an answer
+            # -- a document whose request is still paused has not committed a frame tree yet --
+            # so re-asking over a raw session here would only re-run the round trip the core just
+            # bounded, at `CDPSession.send`'s fixed 30s, once per frame walked.
             try:
                 payload = json.loads(_call(frame_tree, self._default_timeout))
-                root = payload.get("frameTree") if isinstance(payload, dict) else None
-                if isinstance(root, dict):
-                    return root
             except Exception:
-                pass
+                return None
+            root = payload.get("frameTree") if isinstance(payload, dict) else None
+            return root if isinstance(root, dict) else None
         try:
             session = CDPSession(_call(self._core.cdp_session))
             payload = session.send("Page.getFrameTree")

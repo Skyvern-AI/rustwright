@@ -1831,6 +1831,15 @@ impl std::fmt::Display for ActionTimeoutError {
 
 impl std::error::Error for ActionTimeoutError {}
 const MAX_FRAME_TREE_DEPTH: usize = 256;
+/// Longest a single `Page.getFrameTree` may block while refreshing cached frame state.
+///
+/// The refresh is best effort — a session that does not answer is skipped and the cached tree is
+/// returned anyway — so it must never spend the caller's whole timeout. A renderer will not answer
+/// this command while a `Fetch` interception is paused on its document request, which is exactly
+/// the state a route handler runs in: reading `Request.frame` there gave every session the full
+/// remaining deadline, turning a frame walk into one deadline burn per frame (measured at 38s for
+/// a 4s default timeout) and, with the timeout disabled, a 24-hour wait.
+const FRAME_TREE_REFRESH_BUDGET: Duration = Duration::from_millis(1_000);
 
 /// A terminal element state observed by an auto-waiting physical action.
 ///
@@ -5391,6 +5400,152 @@ multiline-compatible = """4.5.6"""
         let script = "const s = \"a\\tb\";\ns;";
         let wrapped = make_evaluate_expression(script, None);
         assert_eq!(wrapped, r#"(0, eval)("const s = \"a\\tb\";\ns;")"#);
+    }
+
+    #[test]
+    fn iife_containing_an_arrow_is_not_treated_as_a_function() {
+        // `looks_like_function` scanned for the first `=>` anywhere in the source and accepted
+        // the expression when the text before it started with `(`. An IIFE starts with `(`, so
+        // any IIFE whose body happens to contain an arrow was misread as a function literal,
+        // wrapped as `const __rw_fn = (<iife>)` and called again. The IIFE has already run by
+        // then, so `__rw_fn` holds its result and the call fails with
+        // "__rw_fn is not a function".
+        let script = "(function () { return [1, 2].map((value) => value * 2); })()";
+        assert!(!looks_like_function(script));
+        let wrapped = make_evaluate_expression(script, None);
+        assert!(
+            !wrapped.contains("__rw_fn"),
+            "an already-invoked IIFE must not be wrapped and called again: {wrapped}"
+        );
+    }
+
+    #[test]
+    fn parenthesised_expression_containing_an_arrow_is_not_a_function() {
+        // Same root cause without an IIFE: any parenthesised expression that mentions an arrow
+        // deeper inside is not itself an arrow function.
+        assert!(!looks_like_function("(items.map((value) => value))"));
+        assert!(!looks_like_function("(a === 1 ? b : (value) => value)()"));
+    }
+
+    #[test]
+    fn genuine_arrow_and_function_literals_are_still_detected() {
+        // The guard must not over-correct: these are the shapes callers legitimately pass.
+        assert!(looks_like_function("() => 1"));
+        assert!(looks_like_function("(x) => x + 1"));
+        assert!(looks_like_function("(a, b) => a + b"));
+        assert!(looks_like_function("async (x) => x"));
+        assert!(looks_like_function("x => x"));
+        assert!(looks_like_function("async x => x"));
+        assert!(looks_like_function("function () { return 1; }"));
+        assert!(looks_like_function("async function () { return 1; }"));
+        assert!(looks_like_function(
+            "(first, second) => {\n    return first + second;\n}"
+        ));
+    }
+
+    #[test]
+    fn webdriver_guard_does_not_short_circuit_the_rest_of_the_stealth_script() {
+        // Returning out of the script instead would drop the chrome object, console history and
+        // worker identity that follow it, on every default launch: the launch args already clear
+        // the automation flag, so `navigator.webdriver` is `false` on the common path.
+        let script = stealth_init_script();
+        let guard = script
+            .find("if (navigator.webdriver !== false)")
+            .expect("webdriver handling is guarded");
+        let chrome_object = script
+            .find("const chromeObject")
+            .expect("stealth script installs the chrome object");
+        assert!(guard < chrome_object);
+        assert!(
+            !script.contains("return;"),
+            "an early return would skip the rest of the script for every default launch"
+        );
+
+        // The guarded block has to close before the chrome object, or that setup sits inside it.
+        let mut depth = 0usize;
+        let open = script[guard..].find('{').expect("guard opens a block") + guard;
+        let mut index = open;
+        for character in script[open..].chars() {
+            match character {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                break;
+            }
+            index += character.len_utf8();
+        }
+        assert!(
+            index < chrome_object,
+            "webdriver guard swallows the chrome object setup"
+        );
+    }
+
+    #[test]
+    fn frame_tree_refresh_is_bounded_regardless_of_the_caller_timeout() {
+        // The refresh is best effort: a session that does not answer is skipped and the cached
+        // tree is returned anyway, so it must never spend the caller's whole budget. A renderer
+        // does not answer `Page.getFrameTree` while a Fetch interception is paused on its
+        // document request, which is the state a route handler runs in -- reading `Request.frame`
+        // there used to burn one full deadline per session walked.
+        assert_eq!(
+            frame_tree_refresh_timeout(Duration::from_secs(30)),
+            FRAME_TREE_REFRESH_BUDGET
+        );
+        // `command_timeout` maps a disabled timeout to 24 hours; that must not become a 24-hour
+        // wait for an optional refresh.
+        assert_eq!(
+            frame_tree_refresh_timeout(BrowserInner::command_timeout(Some(0.0))),
+            FRAME_TREE_REFRESH_BUDGET
+        );
+        // A caller asking for less than the budget still gets their shorter deadline.
+        assert_eq!(
+            frame_tree_refresh_timeout(Duration::from_millis(50)),
+            Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn keyword_prefixed_identifiers_are_not_function_literals() {
+        // `functionality()` and `asyncWork()` start with the keyword's letters but are calls.
+        assert!(!looks_like_function("functionality()"));
+        assert!(!looks_like_function("asyncWork()"));
+        assert!(!looks_like_function("functions.map(f => f())"));
+    }
+
+    #[test]
+    fn parameter_list_scan_ignores_literals_and_comments() {
+        // The arrow binding the parameter list is found by matching the opening parenthesis, so
+        // parentheses inside strings, template literals and comments must not close it early.
+        assert!(looks_like_function(r#"(a = ")") => a"#));
+        assert!(looks_like_function("(a = '(') => a"));
+        assert!(looks_like_function("(a = `)`) => a"));
+        assert!(looks_like_function("(a /* ) */) => a"));
+        assert!(looks_like_function("(a // )\n) => a"));
+        // ...and an unterminated literal must not be read as a function either.
+        assert!(!looks_like_function("(a = \") => a"));
+    }
+
+    #[test]
+    fn regex_literals_in_the_parameter_list_do_not_end_it() {
+        // A `)` inside a regular expression is not the end of the parameter list.
+        assert!(looks_like_function(
+            "(pattern = /[)]/) => pattern.test(')')"
+        ));
+        assert!(looks_like_function("(pattern = /a\\/b)/) => pattern"));
+        // Division after a value is still division, not a literal opening.
+        assert!(looks_like_function("(a, b = x / y) => a + b"));
+        // ...and a call whose argument holds a regex is still not a function literal.
+        assert!(!looks_like_function("wrap(/[)]/)"));
+    }
+
+    #[test]
+    fn nested_parameter_lists_still_resolve_to_the_binding_arrow() {
+        assert!(looks_like_function("({ a, b: [c] }) => a + c"));
+        assert!(looks_like_function("(a = (1 + 2)) => a"));
+        // A call whose argument is an arrow is not itself a function literal.
+        assert!(!looks_like_function("wrap((value) => value)"));
     }
 
     #[test]
@@ -23463,8 +23618,13 @@ mod native_network_record_tests {
     }
 }
 
+/// How long a best-effort frame-tree refresh may take, given the caller's timeout.
+fn frame_tree_refresh_timeout(timeout: Duration) -> Duration {
+    timeout.min(FRAME_TREE_REFRESH_BUDGET)
+}
+
 async fn refresh_page_frame_tree(page: &Arc<PageInner>, timeout: Duration) -> RwResult<()> {
-    let deadline = OperationDeadline::new(timeout);
+    let deadline = OperationDeadline::new(frame_tree_refresh_timeout(timeout));
     let sessions = page.frame_state.lock().unwrap().session_ids();
     for session_id in sessions {
         let Ok(remaining) = deadline.remaining() else {
@@ -23473,7 +23633,12 @@ async fn refresh_page_frame_tree(page: &Arc<PageInner>, timeout: Duration) -> Rw
         let result = page
             .browser
             .client
-            .send("Page.getFrameTree", json!({}), Some(&session_id), remaining)
+            .send(
+                "Page.getFrameTree",
+                json!({}),
+                Some(&session_id),
+                frame_tree_refresh_timeout(remaining),
+            )
             .await;
         let Ok(tree) = result else {
             continue;
@@ -23549,9 +23714,13 @@ async fn install_stealth_defaults(browser: &BrowserInner, session_id: &str) -> R
             .map(|user_agent| {
                 let user_agent = user_agent.replace("HeadlessChrome/", "Chrome/");
                 let user_agent_metadata = stealth_user_agent_metadata(&user_agent, None);
+                // No `acceptLanguage`: omitting it leaves whatever the browser was configured
+                // with, which is the only value that can be coherent with its other geo signals.
+                // Pinning one here silently overrode `--accept-lang`/`--lang`, so a browser
+                // launched for one region reported that region's timezone alongside `en-US` --
+                // an incoherence anti-bot checks read as a spoofed environment.
                 json!({
                     "userAgent": user_agent,
-                    "acceptLanguage": "en-US,en",
                     "userAgentMetadata": user_agent_metadata,
                 })
             })
@@ -23634,7 +23803,7 @@ fn start_service_worker_stealth_auto_attach_cancelable(
                     "filter": [
                         { "type": "page", "exclude": true },
                         { "type": "iframe", "exclude": true },
-                        { "type": "worker", "exclude": true },
+                        { "type": "worker", "exclude": false },
                         { "type": "shared_worker", "exclude": true },
                         { "type": "background_page", "exclude": true },
                         { "type": "service_worker", "exclude": false },
@@ -23663,7 +23832,12 @@ fn start_service_worker_stealth_auto_attach_cancelable(
             else {
                 continue;
             };
-            if info.get("type").and_then(Value::as_str) != Some("service_worker") {
+            // Dedicated workers get the identity script the same way service workers do:
+            // over their own session, while they are still paused. Rewriting the page's
+            // `Worker` constructor to load a blob shim instead moved the worker off its real
+            // script URL, which changes its `location` and origin.
+            let target_type = info.get("type").and_then(Value::as_str);
+            if !matches!(target_type, Some("service_worker") | Some("worker")) {
                 let _ = client
                     .send(
                         "Runtime.runIfWaitingForDebugger",
@@ -23805,26 +23979,31 @@ fn worker_stealth_init_script() -> String {
 
 const STEALTH_INIT_SCRIPT_TEMPLATE: &str = r#"
 (() => {
-  try {
-    delete Navigator.prototype.webdriver;
-  } catch (_) {
+  // A browser already reporting `false` gives the answer every real Chrome gives; removing the
+  // property there trades a correct answer for a missing one. Guards only this block: the
+  // default launch args clear the flag, so the rest still has to run on an ordinary launch.
+  if (navigator.webdriver !== false) {
     try {
-      delete navigator.webdriver;
-    } catch (_) {}
-  }
-  if ('webdriver' in navigator) {
-    try {
-      Object.defineProperty(Navigator.prototype, 'webdriver', {
-        get: () => undefined,
-        configurable: true
-      });
+      delete Navigator.prototype.webdriver;
     } catch (_) {
       try {
-        Object.defineProperty(navigator, 'webdriver', {
+        delete navigator.webdriver;
+      } catch (_) {}
+    }
+    if ('webdriver' in navigator) {
+      try {
+        Object.defineProperty(Navigator.prototype, 'webdriver', {
           get: () => undefined,
           configurable: true
         });
-      } catch (_) {}
+      } catch (_) {
+        try {
+          Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+            configurable: true
+          });
+        } catch (_) {}
+      }
     }
   }
   try {
@@ -24087,104 +24266,6 @@ const STEALTH_INIT_SCRIPT_TEMPLATE: &str = r#"
     try { Object.defineProperty(window, rejectionHandlerName, { value: rejectionHandler, configurable: true, enumerable: false, writable: true }); } catch (_) {}
     window.addEventListener('error', errorHandler, true);
     window.addEventListener('unhandledrejection', rejectionHandler, true);
-  } catch (_) {}
-  try {
-    const workerMarker = Symbol.for('nativeWorkerIdentityWrapped');
-    const NativeWorker = window.Worker;
-    if (typeof NativeWorker === 'function' && !NativeWorker[workerMarker]) {
-      const makeWorkerIdentitySource = () => {
-        const ua = String(navigator.userAgent || '');
-        const appVersion = String(navigator.appVersion || '');
-        const platform = String(navigator.platform || '');
-        const language = String(navigator.language || 'en-US');
-        const languages = Array.from(navigator.languages || [language]).map(String);
-        const chromeFullVersion = (ua.match(/Chrome\/([^\s]+)/) || [])[1] || '';
-        const fullVersionForBrand = brand => {
-          const name = String(brand.brand || '');
-          const version = String(brand.version || '');
-          if ((name === 'Chromium' || name === 'Google Chrome') && chromeFullVersion) return chromeFullVersion;
-          if (name === 'Not A(Brand') return '24.0.0.0';
-          return version;
-        };
-        const mapBrand = brand => ({
-          brand: String(brand.brand || ''),
-          version: String(brand.version || '')
-        });
-        const mapFullVersionBrand = brand => ({
-          brand: String(brand.brand || ''),
-          version: fullVersionForBrand(brand)
-        });
-        const uaBrands = navigator.userAgentData ? Array.from(navigator.userAgentData.brands || []).map(mapBrand) : [];
-        const uaData = navigator.userAgentData ? {
-          brands: uaBrands,
-          fullVersionList: uaBrands.map(mapFullVersionBrand),
-          mobile: !!navigator.userAgentData.mobile,
-          platform: String(navigator.userAgentData.platform || platform),
-          architecture: '__UA_ARCHITECTURE__'
-        } : null;
-        const uaDataJson = JSON.stringify(uaData);
-        return [
-          '(() => {',
-          '  const defineNavigatorValue = (name, value) => {',
-          '    try { Object.defineProperty(Object.getPrototypeOf(navigator), name, { get: () => value, configurable: true }); } catch (_) {}',
-          '    try { Object.defineProperty(navigator, name, { get: () => value, configurable: true }); } catch (_) {}',
-          '  };',
-          `  defineNavigatorValue('userAgent', ${JSON.stringify(ua)});`,
-          `  defineNavigatorValue('appVersion', ${JSON.stringify(appVersion)});`,
-          `  defineNavigatorValue('platform', ${JSON.stringify(platform)});`,
-          `  defineNavigatorValue('language', ${JSON.stringify(language)});`,
-          `  defineNavigatorValue('languages', ${JSON.stringify(languages)});`,
-          '  try { delete Object.getPrototypeOf(navigator).webdriver; } catch (_) {}',
-          '  try { delete navigator.webdriver; } catch (_) {}',
-          `  const uaData = ${uaDataJson};`,
-          '  if (uaData) {',
-          '    const data = {',
-          '      brands: uaData.brands,',
-          '      mobile: uaData.mobile,',
-          '      platform: uaData.platform,',
-          '      getHighEntropyValues: async hints => {',
-          '        const values = { brands: uaData.brands, mobile: uaData.mobile, platform: uaData.platform };',
-          '        for (const hint of hints || []) {',
-          "          if (hint === 'fullVersionList') values.fullVersionList = uaData.fullVersionList;",
-          "          if (hint === 'architecture') values.architecture = uaData.architecture;",
-          "          if (hint === 'bitness') values.bitness = '64';",
-          "          if (hint === 'model') values.model = '';",
-          "          if (hint === 'platformVersion') values.platformVersion = '';",
-          '        }',
-          '        return values;',
-          '      },',
-          '      toJSON: () => ({ brands: uaData.brands, mobile: uaData.mobile, platform: uaData.platform })',
-          '    };',
-          "    defineNavigatorValue('userAgentData', data);",
-          '  }',
-          '})();'
-        ].join('\n');
-      };
-      const WrappedWorker = function(scriptURL, options) {
-        try {
-          const workerOptions = options || {};
-          const absoluteUrl = new URL(String(scriptURL), location.href).href;
-          const identitySource = makeWorkerIdentitySource();
-          const source = workerOptions.type === 'module'
-            ? `${identitySource}\nimport ${JSON.stringify(absoluteUrl)};`
-            : `${identitySource}\nimportScripts(${JSON.stringify(absoluteUrl)});`;
-          const blobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
-          return new NativeWorker(blobUrl, workerOptions);
-        } catch (_) {
-          return new NativeWorker(scriptURL, options);
-        }
-      };
-      WrappedWorker.prototype = NativeWorker.prototype;
-      try { Object.setPrototypeOf(WrappedWorker, NativeWorker); } catch (_) {}
-      try { Object.defineProperty(WrappedWorker, 'name', { value: 'Worker', configurable: true }); } catch (_) {}
-      try { Object.defineProperty(WrappedWorker, 'toString', { value: () => 'function Worker() { [native code] }', configurable: true }); } catch (_) {}
-      try { Object.defineProperty(WrappedWorker, workerMarker, { value: true }); } catch (_) {}
-      Object.defineProperty(window, 'Worker', {
-        value: WrappedWorker,
-        configurable: true,
-        writable: true
-      });
-    }
   } catch (_) {}
 })();
 "#;
@@ -28152,23 +28233,155 @@ fn parse_js_identifier_prefix(value: &str) -> Option<String> {
     Some(identifier)
 }
 
+/// Whether `expression` is itself a function literal, and so should be wrapped and called
+/// rather than evaluated for its value.
+///
+/// This only inspects the head of the expression. Searching the whole source for `=>` misreads
+/// any parenthesised expression that merely *contains* an arrow somewhere inside it — an IIFE
+/// such as `(function () { return [1].map((v) => v); })()` has already produced its value, and
+/// calling that value fails with "__rw_fn is not a function".
 fn looks_like_function(expression: &str) -> bool {
-    expression.starts_with("function")
-        || expression.starts_with("async function")
-        || expression
-            .find("=>")
-            .map(|index| {
-                let before_arrow = expression[..index].trim();
-                if before_arrow.starts_with('(') {
-                    return true;
+    let expression = expression.trim_start();
+    if starts_with_keyword(expression, "function") {
+        return true;
+    }
+    if let Some(rest) = strip_keyword(expression, "async") {
+        return starts_with_keyword(rest, "function") || starts_with_arrow_head(rest);
+    }
+    starts_with_arrow_head(expression)
+}
+
+/// Whether `expression` opens with an arrow function's parameter list and the arrow that binds
+/// it: either `(params) =>` or a single `identifier =>`.
+fn starts_with_arrow_head(expression: &str) -> bool {
+    if expression.starts_with('(') {
+        let Some(close) = matching_parenthesis(expression) else {
+            return false;
+        };
+        return expression[close + 1..].trim_start().starts_with("=>");
+    }
+    let identifier_end = expression
+        .find(|ch: char| !is_js_identifier_continue(ch))
+        .unwrap_or(expression.len());
+    let (identifier, rest) = expression.split_at(identifier_end);
+    is_js_identifier(identifier) && rest.trim_start().starts_with("=>")
+}
+
+/// The byte index of the `)` matching the `(` that `expression` opens with.
+///
+/// Parentheses inside string and template literals, comments, and nested groups do not count,
+/// or `("(")  => 1` and `(a /* ) */) => 1` would be misread.
+fn matching_parenthesis(expression: &str) -> Option<usize> {
+    let bytes = expression.as_bytes();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
                 }
-                if let Some(parameter) = before_arrow.strip_prefix("async ") {
-                    let parameter = parameter.trim();
-                    return parameter.starts_with('(') || is_js_identifier(parameter);
-                }
-                is_js_identifier(before_arrow)
-            })
-            .unwrap_or(false)
+            }
+            quote @ (b'\'' | b'"' | b'`') => {
+                index = skip_string_literal(bytes, index, quote)?;
+            }
+            // A `/` that can only begin a value starts a regular expression, and `)` inside one
+            // does not close the parameter list: `(pattern = /[)]/) => pattern` is a function.
+            b'/' if regex_literal_can_start_at(bytes, index) => {
+                index = skip_regex_literal(bytes, index)?;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index = match expression[index..].find('\n') {
+                    Some(offset) => index + offset,
+                    None => return None,
+                };
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                let offset = expression[index + 2..].find("*/")?;
+                index = index + 2 + offset + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Whether the `/` at `index` opens a regular expression rather than a comment or a division.
+///
+/// The preceding token settles it: a `/` after a value is division, and after `=`, `,`, `(` or
+/// `[` it can only open a literal.
+fn regex_literal_can_start_at(bytes: &[u8], index: usize) -> bool {
+    if matches!(bytes.get(index + 1), Some(b'/') | Some(b'*')) {
+        return false;
+    }
+    let mut before = index;
+    while before > 0 {
+        before -= 1;
+        if !bytes[before].is_ascii_whitespace() {
+            return matches!(
+                bytes[before],
+                b'=' | b',' | b'(' | b'[' | b'{' | b'!' | b'&' | b'|' | b'?' | b':' | b';'
+            );
+        }
+    }
+    false
+}
+
+/// The byte index of the `/` closing the regular expression starting at `start`.
+///
+/// A character class can contain an unescaped `/`, so the scan tracks whether it is inside one.
+fn skip_regex_literal(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start + 1;
+    let mut in_class = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 1,
+            b'[' => in_class = true,
+            b']' => in_class = false,
+            b'\n' => return None,
+            b'/' if !in_class => return Some(index),
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// The byte index of the closing `quote` for the literal starting at `start`.
+///
+/// Template literals are treated as opaque: a `${...}` substitution cannot close the literal,
+/// and any parenthesis inside one is already ignored by virtue of being inside it.
+fn skip_string_literal(bytes: &[u8], start: usize, quote: u8) -> Option<usize> {
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 1,
+            byte if byte == quote => return Some(index),
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Whether `expression` begins with `keyword` as a whole word rather than as the prefix of a
+/// longer identifier, so `functionality()` is not mistaken for a function literal.
+fn starts_with_keyword(expression: &str, keyword: &str) -> bool {
+    expression
+        .strip_prefix(keyword)
+        .is_some_and(|rest| !rest.starts_with(is_js_identifier_continue))
+}
+
+/// `expression` with a leading `keyword` word and the whitespace after it removed.
+fn strip_keyword<'a>(expression: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = expression.strip_prefix(keyword)?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(rest.trim_start())
 }
 
 fn is_js_identifier(value: &str) -> bool {
