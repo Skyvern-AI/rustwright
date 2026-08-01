@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using Rustwright;
 using Rustwright.Runner;
@@ -202,13 +201,80 @@ internal static class RunnerApplication
 
     private static void AssertJsonEqual(object? actual, JsonElement expected)
     {
-        var actualNode = JsonSerializer.SerializeToNode(actual);
-        var expectedNode = JsonNode.Parse(expected.GetRawText());
-        if (!JsonNode.DeepEquals(actualNode, expectedNode))
+        var actualJson = JsonSerializer.SerializeToElement(actual);
+        if (!JsonValuesEqual(actualJson, expected))
         {
             throw new InvalidOperationException(
                 $"expected evaluate result {expected.GetRawText()}, got {JsonSerializer.Serialize(actual)}");
         }
+    }
+
+    private static bool JsonValuesEqual(JsonElement left, JsonElement right)
+    {
+        if (left.ValueKind == JsonValueKind.Number && right.ValueKind == JsonValueKind.Number)
+        {
+            return JsonNumbersEqual(left, right);
+        }
+
+        if (left.ValueKind != right.ValueKind)
+        {
+            return false;
+        }
+
+        switch (left.ValueKind)
+        {
+            case JsonValueKind.Object:
+                if (left.EnumerateObject().Count() != right.EnumerateObject().Count())
+                {
+                    return false;
+                }
+
+                foreach (var property in left.EnumerateObject())
+                {
+                    if (!right.TryGetProperty(property.Name, out var rightValue) ||
+                        !JsonValuesEqual(property.Value, rightValue))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            case JsonValueKind.Array:
+                if (left.GetArrayLength() != right.GetArrayLength())
+                {
+                    return false;
+                }
+
+                var leftItems = left.EnumerateArray();
+                var rightItems = right.EnumerateArray();
+                while (leftItems.MoveNext() && rightItems.MoveNext())
+                {
+                    if (!JsonValuesEqual(leftItems.Current, rightItems.Current))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            case JsonValueKind.String:
+                return string.Equals(left.GetString(), right.GetString(), StringComparison.Ordinal);
+            case JsonValueKind.True:
+            case JsonValueKind.False:
+            case JsonValueKind.Null:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static bool JsonNumbersEqual(JsonElement left, JsonElement right)
+    {
+        if (left.TryGetDecimal(out var leftDecimal) && right.TryGetDecimal(out var rightDecimal))
+        {
+            return leftDecimal == rightDecimal;
+        }
+
+        return left.GetDouble().Equals(right.GetDouble());
     }
 
     private static IReadOnlyList<ManifestCase> SelectCases(
