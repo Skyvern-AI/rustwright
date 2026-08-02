@@ -4,12 +4,16 @@ namespace Rustwright.Runner;
 
 internal sealed record Manifest(IReadOnlyList<ManifestCase> Cases);
 
-internal sealed record ManifestCase(string Id, string? Html, IReadOnlyList<JsonElement> Steps);
+internal sealed record ManifestCase(
+    string Id,
+    string? Html,
+    uint Repeat,
+    IReadOnlyList<JsonElement> Steps);
 
 internal static class ManifestParser
 {
     private static readonly HashSet<string> RootProperties = ["version", "cases"];
-    private static readonly HashSet<string> CaseProperties = ["id", "description", "html", "url", "steps"];
+    private static readonly HashSet<string> CaseProperties = ["id", "description", "html", "url", "repeat", "steps"];
 
     internal static Manifest Parse(string path)
     {
@@ -75,6 +79,15 @@ internal static class ManifestParser
         OptionalString(element, "html", context);
         OptionalString(element, "url", context);
         var html = element.TryGetProperty("html", out var htmlElement) ? htmlElement.GetString() : null;
+        var repeat = 1u;
+        if (element.TryGetProperty("repeat", out var repeatElement) &&
+            (repeatElement.ValueKind != JsonValueKind.Number ||
+             !repeatElement.TryGetUInt32(out repeat) ||
+             repeat == 0 ||
+             repeat > 1000))
+        {
+            throw new ManifestException($"{context}.repeat must be an integer between 1 and 1000");
+        }
 
         var stepsElement = element.GetProperty("steps");
         if (stepsElement.ValueKind != JsonValueKind.Array || stepsElement.GetArrayLength() == 0)
@@ -83,19 +96,30 @@ internal static class ManifestParser
         }
 
         var captures = new HashSet<string>(StringComparer.Ordinal);
+        var foundGoto = false;
         var steps = new List<JsonElement>(stepsElement.GetArrayLength());
         var stepIndex = 0;
         foreach (var step in stepsElement.EnumerateArray())
         {
-            ValidateStep(step, html is not null, context, stepIndex, captures);
+            var operation = ValidateStep(step, html is not null, context, stepIndex, captures);
             steps.Add(step.Clone());
+            if (repeat > 1 && !foundGoto && operation == "goto")
+            {
+                foundGoto = true;
+                captures = new HashSet<string>(StringComparer.Ordinal);
+            }
             stepIndex++;
         }
 
-        return new ManifestCase(id, html, steps);
+        if (repeat > 1 && !foundGoto)
+        {
+            throw new ManifestException($"case {JsonSerializer.Serialize(id)} has repeat {repeat} but no goto step");
+        }
+
+        return new ManifestCase(id, html, repeat, steps);
     }
 
-    private static void ValidateStep(
+    private static string ValidateStep(
         JsonElement step,
         bool hasCaseHtml,
         string caseContext,
@@ -152,6 +176,8 @@ internal static class ManifestParser
             default:
                 throw new ManifestException($"{context}: unknown op '{operation}'");
         }
+
+        return operation;
     }
 
     private static void ValidateGoto(JsonElement step, bool hasCaseHtml, string context)
