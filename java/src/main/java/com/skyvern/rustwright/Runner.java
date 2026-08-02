@@ -68,15 +68,12 @@ public final class Runner {
         boolean ok = true;
         String errorMessage = null;
         Page page = null;
-        int stepIndex = -1;
         try {
             page = browser.newPage();
-            for (stepIndex = 0; stepIndex < manifestCase.steps().size(); stepIndex++) {
-                executeStep(page, manifestCase, manifestCase.steps().get(stepIndex), captures);
-            }
+            executeSteps(page, manifestCase, captures);
         } catch (RuntimeException error) {
             ok = false;
-            String prefix = stepIndex < 0 ? "new page: " : "step " + (stepIndex + 1) + ": ";
+            String prefix = page == null ? "new page: " : "";
             errorMessage = prefix + usefulMessage(error);
         } finally {
             if (page != null) {
@@ -103,6 +100,50 @@ public final class Runner {
             result.put("error", errorMessage);
         }
         return result;
+    }
+
+    private static void executeSteps(Page page, ManifestCase manifestCase,
+            Map<String, Object> captures) {
+        if (manifestCase.repeat() == 1) {
+            executeStepBlock(page, manifestCase, 0, manifestCase.steps().size(), captures);
+            return;
+        }
+
+        int firstGoto = -1;
+        for (int index = 0; index < manifestCase.steps().size(); index++) {
+            if ("goto".equals(manifestCase.steps().get(index).get("op"))) {
+                firstGoto = index;
+                break;
+            }
+        }
+        if (firstGoto < 0) {
+            throw new CaseFailure("case " + Json.stringify(manifestCase.id()) + " has repeat "
+                    + manifestCase.repeat() + " but no goto step");
+        }
+
+        executeStepBlock(page, manifestCase, 0, firstGoto + 1, captures);
+        for (long iteration = 1; iteration <= manifestCase.repeat(); iteration++) {
+            Map<String, Object> iterationCaptures = new LinkedHashMap<>();
+            try {
+                executeStepBlock(page, manifestCase, firstGoto + 1,
+                        manifestCase.steps().size(), iterationCaptures);
+            } catch (RuntimeException error) {
+                captures.putAll(iterationCaptures);
+                throw new CaseFailure("iteration " + iteration + ": " + usefulMessage(error));
+            }
+            captures.putAll(iterationCaptures);
+        }
+    }
+
+    private static void executeStepBlock(Page page, ManifestCase manifestCase, int startIndex,
+            int endIndex, Map<String, Object> captures) {
+        for (int index = startIndex; index < endIndex; index++) {
+            try {
+                executeStep(page, manifestCase, manifestCase.steps().get(index), captures);
+            } catch (RuntimeException error) {
+                throw new CaseFailure("step " + (index + 1) + ": " + usefulMessage(error));
+            }
+        }
     }
 
     private static void executeStep(Page page, ManifestCase manifestCase, Map<String, Object> step,
