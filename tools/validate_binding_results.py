@@ -5,9 +5,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
+
+
+MAX_REPEAT = 1000
+ITERATION_ERROR = re.compile(r"^iteration ([1-9][0-9]*): ")
 
 
 class ValidationError(ValueError):
@@ -44,12 +50,118 @@ def unique_ids(rows: Any, label: str) -> list[str]:
     return identifiers
 
 
-def validate_results(manifest_path: Path, results_path: Path) -> dict[str, int]:
-    manifest = load_json(manifest_path, "manifest")
+def validate_manifest(manifest: Any) -> list[dict[str, Any]]:
     if not isinstance(manifest, dict):
         raise ValidationError("manifest top-level value must be an object")
-    manifest_rows = manifest.get("cases")
-    manifest_ids = unique_ids(manifest_rows, "manifest.cases")
+    version = manifest.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        raise ValidationError("manifest.version must equal 1")
+
+    rows = manifest.get("cases")
+    unique_ids(rows, "manifest.cases")
+    contracts: list[dict[str, Any]] = []
+    for index, case in enumerate(rows):
+        label = f"manifest.cases[{index}] ({case['id']!r})"
+        repeat = case.get("repeat", 1)
+        if (
+            isinstance(repeat, bool)
+            or not isinstance(repeat, int)
+            or not 1 <= repeat <= MAX_REPEAT
+        ):
+            raise ValidationError(
+                f"{label}.repeat must be an integer between 1 and {MAX_REPEAT}"
+            )
+        steps = case.get("steps")
+        if not isinstance(steps, list) or not steps:
+            raise ValidationError(f"{label}.steps must be a non-empty list")
+        capture_names: set[str] = set()
+        for step_index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                raise ValidationError(f"{label}.steps[{step_index}] must be an object")
+            if "capture" in step:
+                capture = step["capture"]
+                if not isinstance(capture, str) or not capture:
+                    raise ValidationError(
+                        f"{label}.steps[{step_index}].capture must be a non-empty string"
+                    )
+                capture_names.add(capture)
+        if repeat > 1 and not any(
+            step.get("op") == "goto" for step in steps
+        ):
+            raise ValidationError(f"{label} has repeat {repeat} but no goto step")
+        contracts.append(
+            {"id": case["id"], "repeat": repeat, "captures": capture_names}
+        )
+    return contracts
+
+
+def validate_result_row(row: dict[str, Any], contract: dict[str, Any]) -> None:
+    case_id = contract["id"]
+    label = f"result case {case_id!r}"
+    required_keys = {"id", "ok", "captures", "ms"}
+    allowed_keys = required_keys | {"error"}
+    missing_keys = sorted(required_keys - row.keys())
+    if missing_keys:
+        raise ValidationError(f"{label} is missing required key(s): {missing_keys}")
+    unexpected_keys = sorted(row.keys() - allowed_keys)
+    if unexpected_keys:
+        raise ValidationError(f"{label} has unexpected key(s): {unexpected_keys}")
+
+    ok = row["ok"]
+    if not isinstance(ok, bool):
+        raise ValidationError(f"{label}.ok must be a bool")
+
+    if "error" in row:
+        if ok:
+            raise ValidationError(f"{label}.error is only allowed when ok is false")
+        if not isinstance(row["error"], str):
+            raise ValidationError(f"{label}.error must be a string when present")
+
+    captures = row["captures"]
+    if not isinstance(captures, dict):
+        raise ValidationError(f"{label}.captures must be an object")
+    expected_captures = contract["captures"]
+    actual_captures = set(captures)
+    if actual_captures != expected_captures:
+        missing = sorted(expected_captures - actual_captures)
+        unexpected = sorted(actual_captures - expected_captures)
+        raise ValidationError(
+            f"{label}.captures keys differ from the manifest; "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+    milliseconds = row["ms"]
+    if (
+        isinstance(milliseconds, bool)
+        or not isinstance(milliseconds, (int, float))
+        or (isinstance(milliseconds, float) and not math.isfinite(milliseconds))
+        or milliseconds < 0
+    ):
+        raise ValidationError(f"{label}.ms must be a non-negative number")
+
+    repeat = contract["repeat"]
+    if not ok and repeat > 1:
+        error = row.get("error")
+        if not isinstance(error, str):
+            raise ValidationError(
+                f"{label}.error must be present when ok is false and repeat is {repeat}"
+            )
+        match = ITERATION_ERROR.match(error)
+        if match is None:
+            raise ValidationError(
+                f"{label}.error must start with 'iteration <N>: ' for repeat {repeat}"
+            )
+        iteration = int(match.group(1))
+        if not 1 <= iteration <= repeat:
+            raise ValidationError(
+                f"{label}.error iteration {iteration} is outside the range 1..{repeat}"
+            )
+
+
+def validate_results(manifest_path: Path, results_path: Path) -> dict[str, int]:
+    manifest = load_json(manifest_path, "manifest")
+    contracts = validate_manifest(manifest)
+    manifest_ids = [contract["id"] for contract in contracts]
 
     results = load_json(results_path, "results")
     if not isinstance(results, dict):
@@ -57,20 +169,29 @@ def validate_results(manifest_path: Path, results_path: Path) -> dict[str, int]:
     result_rows = results.get("results")
     result_ids = unique_ids(result_rows, "results.results")
 
-    manifest_set = set(manifest_ids)
-    result_set = set(result_ids)
-    if result_set != manifest_set:
-        missing = sorted(manifest_set - result_set)
-        unexpected = sorted(result_set - manifest_set)
-        raise ValidationError(
-            f"result case IDs differ from manifest; missing={missing}, unexpected={unexpected}"
-        )
+    for index in range(max(len(manifest_ids), len(result_ids))):
+        if index >= len(result_ids):
+            expected = manifest_ids[index]
+            raise ValidationError(
+                f"result case order is missing manifest case {expected!r} at index {index}"
+            )
+        if index >= len(manifest_ids):
+            unexpected = result_ids[index]
+            raise ValidationError(
+                f"result case order has unexpected case {unexpected!r} at index {index}"
+            )
+        expected = manifest_ids[index]
+        actual = result_ids[index]
+        if actual != expected:
+            raise ValidationError(
+                f"result case order mismatch at index {index}: "
+                f"expected {expected!r}, got {actual!r}"
+            )
 
-    failed_ids = [
-        row["id"]
-        for row in result_rows
-        if not isinstance(row.get("ok"), bool) or row["ok"] is not True
-    ]
+    for row, contract in zip(result_rows, contracts):
+        validate_result_row(row, contract)
+
+    failed_ids = [row["id"] for row in result_rows if not row["ok"]]
     if failed_ids:
         raise ValidationError(f"result cases are not ok:true: {failed_ids}")
 

@@ -14,6 +14,11 @@ from typing import Any, Iterable
 
 BINDING_LANGUAGE_ORDER = ("rust", "go", "java", "csharp", "ruby", "php")
 BASELINE_LANGUAGES = frozenset({"go", "java", "csharp", "ruby"})
+BINDING_SUITE_ORDER = ("deep", "regression")
+BINDING_SUITE_TITLES = {
+    "deep": "Deep workloads",
+    "regression": "Regression suite",
+}
 IMPLEMENTATION_ORDER = (
     "rustwright",
     "playwright",
@@ -62,6 +67,14 @@ def metric_files(root: Path) -> list[Path]:
     # file and classify by filename/content instead of assuming a literal
     # parent directory named "metrics".
     return sorted(root.rglob("*.json"))
+
+
+def binding_suite(path: Path) -> str:
+    if path.name.endswith("-deep-metrics.json"):
+        return "deep"
+    # Metrics produced before the dual-manifest artifact layout had no suite
+    # suffix. Preserve those as regression results.
+    return "regression"
 
 
 def load_metrics(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
@@ -118,7 +131,11 @@ def load_metrics(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]
             if isinstance(failed, bool) or failed != 0:
                 problems.append(f"{relative}: failed is not zero")
                 continue
-            normalized = {**payload, "_source": str(relative)}
+            normalized = {
+                **payload,
+                "_source": str(relative),
+                "_suite": binding_suite(path),
+            }
             for key in (
                 "peak_client_rss_kb",
                 "peak_excluded_process_count",
@@ -147,105 +164,117 @@ def ordered_languages(languages: Iterable[str]) -> list[str]:
     return known + sorted(present - set(BINDING_LANGUAGE_ORDER))
 
 
+def binding_table(
+    language: str,
+    suite: str,
+    implementations: dict[str, dict[str, Any]],
+    problems: list[str],
+) -> list[str]:
+    lines = [
+        "| Implementation | Wall seconds / speed multiple | Client-stack peak RSS MB / memory delta | Full-tree peak RSS MB | Browser processes | Unresolved scans / records | Cases passed | Failed |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    ordered_impls = [name for name in ("rustwright", "playwright") if name in implementations]
+    ordered_impls.extend(sorted(set(implementations) - set(ordered_impls)))
+    for implementation in ordered_impls:
+        metric = implementations[implementation]
+        wall_seconds = numeric(metric.get("wall_seconds"))
+        peak_client_rss_kb = numeric(metric.get("peak_client_rss_kb"))
+        peak_client_rss_mb = (
+            peak_client_rss_kb / 1024 if peak_client_rss_kb is not None else None
+        )
+        peak_tree_rss_kb = numeric(metric.get("peak_tree_rss_kb"))
+        peak_tree_rss_mb = (
+            peak_tree_rss_kb / 1024 if peak_tree_rss_kb is not None else None
+        )
+        unresolved_samples = metric.get("unresolved_samples")
+        unresolved_records_total = metric.get("unresolved_records_total")
+        if unresolved_samples is None and unresolved_records_total is None:
+            unresolved = "—"
+        else:
+            unresolved = (
+                f"{format_count(unresolved_samples)} / "
+                f"{format_count(unresolved_records_total)}"
+            )
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    markdown_text(implementation),
+                    format_number(wall_seconds),
+                    format_number(peak_client_rss_mb),
+                    format_number(peak_tree_rss_mb),
+                    format_count(metric.get("peak_excluded_process_count")),
+                    unresolved,
+                    format_count(metric.get("cases")),
+                    format_count(metric.get("failed")),
+                ]
+            )
+            + " |"
+        )
+
+    rustwright = implementations.get("rustwright")
+    playwright = implementations.get("playwright")
+    if rustwright is not None and playwright is not None:
+        rustwright_cases = numeric(rustwright.get("cases"))
+        playwright_cases = numeric(playwright.get("cases"))
+        if rustwright_cases != playwright_cases:
+            problems.append(
+                f"{language} {BINDING_SUITE_TITLES[suite].lower()}: Rustwright and "
+                "Playwright metrics have different case counts; savings row omitted"
+            )
+            return lines
+        rustwright_wall = numeric(rustwright.get("wall_seconds"))
+        playwright_wall = numeric(playwright.get("wall_seconds"))
+        speed_multiple = (
+            playwright_wall / rustwright_wall
+            if playwright_wall is not None and rustwright_wall is not None and rustwright_wall > 0
+            else None
+        )
+        rustwright_rss = numeric(rustwright.get("peak_client_rss_kb"))
+        playwright_rss = numeric(playwright.get("peak_client_rss_kb"))
+        memory_delta = (
+            (playwright_rss - rustwright_rss) / playwright_rss * 100
+            if playwright_rss is not None and rustwright_rss is not None and playwright_rss > 0
+            else None
+        )
+        speed_text = "—" if speed_multiple is None else f"{speed_multiple:.2f}×"
+        memory_text = "—" if memory_delta is None else f"{memory_delta:.1f}%"
+        lines.append(f"| Savings | {speed_text} | {memory_text} | — | — | — | — | — |")
+    return lines
+
+
 def binding_section(metrics: list[dict[str, Any]], problems: list[str]) -> list[str]:
     lines = ["## Language bindings", ""]
-    grouped: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    grouped: dict[str, dict[str, dict[str, dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(dict)
+    )
     for metric in metrics:
         language = str(metric.get("lang", "unknown"))
+        suite = str(metric.get("_suite", "regression"))
         implementation = str(metric.get("impl", "unknown"))
-        if implementation in grouped[language]:
+        if implementation in grouped[language][suite]:
             problems.append(
-                f"duplicate {language}/{implementation} metrics; kept "
-                f"{grouped[language][implementation]['_source']} and ignored {metric['_source']}"
+                f"duplicate {language}/{suite}/{implementation} metrics; kept "
+                f"{grouped[language][suite][implementation]['_source']} and ignored "
+                f"{metric['_source']}"
             )
             continue
-        grouped[language][implementation] = metric
+        grouped[language][suite][implementation] = metric
 
     if not grouped:
         lines.extend(["No binding metrics were available.", ""])
         return lines
 
     for language in ordered_languages(grouped):
-        lines.extend(
-            [
-                f"### {markdown_text(language)}",
-                "",
-                "| Implementation | Wall seconds / speed multiple | Client-stack peak RSS MB / memory delta | Full-tree peak RSS MB | Browser processes | Unresolved scans / records | Cases passed | Failed |",
-                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-            ]
-        )
-        implementations = grouped[language]
-        ordered_impls = [name for name in ("rustwright", "playwright") if name in implementations]
-        ordered_impls.extend(sorted(set(implementations) - set(ordered_impls)))
-        for implementation in ordered_impls:
-            metric = implementations[implementation]
-            wall_seconds = numeric(metric.get("wall_seconds"))
-            peak_client_rss_kb = numeric(metric.get("peak_client_rss_kb"))
-            peak_client_rss_mb = (
-                peak_client_rss_kb / 1024 if peak_client_rss_kb is not None else None
-            )
-            peak_tree_rss_kb = numeric(metric.get("peak_tree_rss_kb"))
-            peak_tree_rss_mb = (
-                peak_tree_rss_kb / 1024 if peak_tree_rss_kb is not None else None
-            )
-            unresolved_samples = metric.get("unresolved_samples")
-            unresolved_records_total = metric.get("unresolved_records_total")
-            if unresolved_samples is None and unresolved_records_total is None:
-                unresolved = "—"
-            else:
-                unresolved = (
-                    f"{format_count(unresolved_samples)} / "
-                    f"{format_count(unresolved_records_total)}"
-                )
-            lines.append(
-                "| "
-                + " | ".join(
-                    [
-                        markdown_text(implementation),
-                        format_number(wall_seconds),
-                        format_number(peak_client_rss_mb),
-                        format_number(peak_tree_rss_mb),
-                        format_count(metric.get("peak_excluded_process_count")),
-                        unresolved,
-                        format_count(metric.get("cases")),
-                        format_count(metric.get("failed")),
-                    ]
-                )
-                + " |"
-            )
-
-        rustwright = implementations.get("rustwright")
-        playwright = implementations.get("playwright")
-        if rustwright is not None and playwright is not None:
-            rustwright_cases = numeric(rustwright.get("cases"))
-            playwright_cases = numeric(playwright.get("cases"))
-            if rustwright_cases != playwright_cases:
-                problems.append(
-                    f"{language}: Rustwright and Playwright metrics have different case counts; "
-                    "savings row omitted"
-                )
-                lines.append("")
+        lines.extend([f"### {markdown_text(language)}", ""])
+        for suite in BINDING_SUITE_ORDER:
+            implementations = grouped[language].get(suite)
+            if not implementations:
                 continue
-            rustwright_wall = numeric(rustwright.get("wall_seconds"))
-            playwright_wall = numeric(playwright.get("wall_seconds"))
-            speed_multiple = (
-                playwright_wall / rustwright_wall
-                if playwright_wall is not None and rustwright_wall is not None and rustwright_wall > 0
-                else None
-            )
-            rustwright_rss = numeric(rustwright.get("peak_client_rss_kb"))
-            playwright_rss = numeric(playwright.get("peak_client_rss_kb"))
-            memory_delta = (
-                (playwright_rss - rustwright_rss) / playwright_rss * 100
-                if playwright_rss is not None and rustwright_rss is not None and playwright_rss > 0
-                else None
-            )
-            speed_text = "—" if speed_multiple is None else f"{speed_multiple:.2f}×"
-            memory_text = "—" if memory_delta is None else f"{memory_delta:.1f}%"
-            lines.append(
-                f"| Savings | {speed_text} | {memory_text} | — | — | — | — | — |"
-            )
-        lines.append("")
+            lines.extend([f"#### {BINDING_SUITE_TITLES[suite]}", ""])
+            lines.extend(binding_table(language, suite, implementations, problems))
+            lines.append("")
     return lines
 
 
@@ -378,11 +407,18 @@ def deep_section(payloads: list[dict[str, Any]]) -> list[str]:
 def caveats_section(
     bindings: list[dict[str, Any]], deep: list[dict[str, Any]], problems: list[str]
 ) -> list[str]:
+    regression_bindings = [
+        metric for metric in bindings if metric.get("_suite") == "regression"
+    ]
     rustwright_present = {
-        str(metric.get("lang")) for metric in bindings if metric.get("impl") == "rustwright"
+        str(metric.get("lang"))
+        for metric in regression_bindings
+        if metric.get("impl") == "rustwright"
     }
     baseline_present = {
-        str(metric.get("lang")) for metric in bindings if metric.get("impl") == "playwright"
+        str(metric.get("lang"))
+        for metric in regression_bindings
+        if metric.get("impl") == "playwright"
     }
     missing_rustwright = sorted(set(BINDING_LANGUAGE_ORDER) - rustwright_present)
     missing_baselines = sorted(BASELINE_LANGUAGES - baseline_present)
@@ -410,11 +446,11 @@ def caveats_section(
         lines.append("- The Python/Node deep-benchmark artifact was missing at aggregation time.")
     lines.extend(
         [
-            "- Each binding and its baseline run sequentially in one job against the same workflow-resolved browser executable; deep benchmark repetitions and implementations also run sequentially.",
+            "- Each binding and its baseline run the regression manifest first and the deep-workload manifest second in one job against the same workflow-resolved browser executable; Python/Node deep benchmark repetitions and implementations also run sequentially.",
             "- Binding client-stack memory excludes the workflow-resolved browser executable and each matched process's entire descendant subtree from the full process tree. The Playwright client stack still includes its driver Node process because that is part of the library's cost; Rustwright is in-process.",
             "- Binding memory fields are independent peaks sampled every 100 ms. Full-tree RSS retains the command and all descendants for context, while Browser processes is the maximum simultaneous process count pruned from the client stack.",
             "- Unresolved scans / records reports bracketed process reads dropped because identity or executable resolution was not coherent. Nonzero values reduce confidence in both memory peaks. Older artifacts without these fields show — and do not imply unresolved reads.",
-            "- Deep rows are unchanged and use the benchmark's process/self and process-tree peak RSS fields when available; missing values are shown as —.",
+            "- Python/Node deep rows are unchanged and use the benchmark's process/self and process-tree peak RSS fields when available; missing values are shown as —.",
             "- These Blacksmith-runner artifacts are release regression diagnostics, not a substitute for capped Testbox evidence for launch-facing performance claims.",
         ]
     )
