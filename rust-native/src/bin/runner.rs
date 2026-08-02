@@ -36,6 +36,8 @@ struct Case {
     html: Option<String>,
     #[allow(dead_code)]
     url: Option<String>,
+    #[serde(default = "default_repeat")]
+    repeat: u32,
     steps: Vec<Step>,
 }
 
@@ -115,7 +117,7 @@ fn run() -> Result<bool, String> {
         .map_err(|error| format!("cannot read {}: {error}", cli.manifest.display()))?;
     let raw: Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid manifest JSON: {error}"))?;
-    validate_raw_step_fields(&raw)?;
+    validate_raw_manifest_fields(&raw)?;
     let manifest: Manifest =
         serde_json::from_value(raw).map_err(|error| format!("invalid manifest: {error}"))?;
     if manifest.version != 1 {
@@ -154,11 +156,13 @@ where
     Value::deserialize(deserializer).map(Some)
 }
 
-/// Serde's internally-tagged `Step` enum silently ignores unknown fields, but
-/// manifest v1 requires rejecting fields the schema does not allow (a typo like
-/// `waitUntill` must be an error, not a no-op). Validate raw step objects
-/// against the per-op field whitelist before the typed parse.
-fn validate_raw_step_fields(raw: &Value) -> Result<(), String> {
+fn default_repeat() -> u32 {
+    1
+}
+
+/// Validate constraints that would otherwise be obscured by the typed parse,
+/// then reject step fields outside the manifest-v1 per-operation whitelist.
+fn validate_raw_manifest_fields(raw: &Value) -> Result<(), String> {
     let Some(cases) = raw.get("cases").and_then(Value::as_array) else {
         return Ok(()); // shape errors surface via the typed parse
     };
@@ -168,6 +172,17 @@ fn validate_raw_step_fields(raw: &Value) -> Result<(), String> {
             .and_then(Value::as_str)
             .map(|id| format!("case {id:?}"))
             .unwrap_or_else(|| format!("cases[{case_index}]"));
+        if let Some(repeat) = case.get("repeat") {
+            let valid = repeat
+                .as_u64()
+                .map(|repeat| (1..=1000).contains(&repeat))
+                .unwrap_or(false);
+            if !valid {
+                return Err(format!(
+                    "{case_label} repeat must be an integer between 1 and 1000"
+                ));
+            }
+        }
         let Some(steps) = case.get("steps").and_then(Value::as_array) else {
             continue;
         };
@@ -223,6 +238,23 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
         }
         if case.steps.is_empty() {
             return Err(format!("case {:?} has no steps", case.id));
+        }
+        if !(1..=1000).contains(&case.repeat) {
+            return Err(format!(
+                "case {:?} repeat must be an integer between 1 and 1000",
+                case.id
+            ));
+        }
+        if case.repeat > 1
+            && !case
+                .steps
+                .iter()
+                .any(|step| matches!(step, Step::Goto { .. }))
+        {
+            return Err(format!(
+                "case {:?} has repeat {} but no goto step",
+                case.id, case.repeat
+            ));
         }
     }
     Ok(())
@@ -340,9 +372,47 @@ fn execute_steps(
     case: &Case,
     captures: &mut Map<String, Value>,
 ) -> Result<(), String> {
-    for (index, step) in case.steps.iter().enumerate() {
+    if case.repeat == 1 {
+        return execute_step_block(page, case, &case.steps, 0, captures);
+    }
+
+    let first_goto = case
+        .steps
+        .iter()
+        .position(|step| matches!(step, Step::Goto { .. }))
+        .ok_or_else(|| {
+            format!(
+                "case {:?} has repeat {} but no goto step",
+                case.id, case.repeat
+            )
+        })?;
+
+    execute_step_block(page, case, &case.steps[..=first_goto], 0, captures)?;
+    for iteration in 1..=case.repeat {
+        let mut iteration_captures = Map::new();
+        let outcome = execute_step_block(
+            page,
+            case,
+            &case.steps[first_goto + 1..],
+            first_goto + 1,
+            &mut iteration_captures,
+        );
+        captures.extend(iteration_captures);
+        outcome.map_err(|error| format!("iteration {iteration}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn execute_step_block(
+    page: &Page,
+    case: &Case,
+    steps: &[Step],
+    index_offset: usize,
+    captures: &mut Map<String, Value>,
+) -> Result<(), String> {
+    for (index, step) in steps.iter().enumerate() {
         execute_step(page, case, step, captures)
-            .map_err(|error| format!("step {}: {error}", index + 1))?;
+            .map_err(|error| format!("step {}: {error}", index_offset + index + 1))?;
     }
     Ok(())
 }
