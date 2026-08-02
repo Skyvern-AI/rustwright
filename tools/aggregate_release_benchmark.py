@@ -118,7 +118,22 @@ def load_metrics(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]
             if isinstance(failed, bool) or failed != 0:
                 problems.append(f"{relative}: failed is not zero")
                 continue
-            bindings.append({**payload, "_source": str(relative)})
+            normalized = {**payload, "_source": str(relative)}
+            for key in (
+                "peak_client_rss_kb",
+                "peak_excluded_process_count",
+                "unresolved_samples",
+                "unresolved_records_total",
+            ):
+                if key not in payload:
+                    continue
+                value = payload[key]
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    problems.append(
+                        f"{relative}: {key} is not a non-negative integer; rendered as missing"
+                    )
+                    normalized.pop(key, None)
+            bindings.append(normalized)
         elif payload.get("kind") == "python-node-deep":
             deep.append(payload)
         elif named_as_metrics:
@@ -155,8 +170,8 @@ def binding_section(metrics: list[dict[str, Any]], problems: list[str]) -> list[
             [
                 f"### {markdown_text(language)}",
                 "",
-                "| Implementation | Wall seconds / speed multiple | Peak process-tree RSS MB / memory delta | Cases passed | Failed |",
-                "| --- | ---: | ---: | ---: | ---: |",
+                "| Implementation | Wall seconds / speed multiple | Client-stack peak RSS MB / memory delta | Full-tree peak RSS MB | Browser processes | Unresolved scans / records | Cases passed | Failed |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         implementations = grouped[language]
@@ -165,15 +180,33 @@ def binding_section(metrics: list[dict[str, Any]], problems: list[str]) -> list[
         for implementation in ordered_impls:
             metric = implementations[implementation]
             wall_seconds = numeric(metric.get("wall_seconds"))
-            peak_rss_kb = numeric(metric.get("peak_tree_rss_kb"))
-            peak_rss_mb = peak_rss_kb / 1024 if peak_rss_kb is not None else None
+            peak_client_rss_kb = numeric(metric.get("peak_client_rss_kb"))
+            peak_client_rss_mb = (
+                peak_client_rss_kb / 1024 if peak_client_rss_kb is not None else None
+            )
+            peak_tree_rss_kb = numeric(metric.get("peak_tree_rss_kb"))
+            peak_tree_rss_mb = (
+                peak_tree_rss_kb / 1024 if peak_tree_rss_kb is not None else None
+            )
+            unresolved_samples = metric.get("unresolved_samples")
+            unresolved_records_total = metric.get("unresolved_records_total")
+            if unresolved_samples is None and unresolved_records_total is None:
+                unresolved = "—"
+            else:
+                unresolved = (
+                    f"{format_count(unresolved_samples)} / "
+                    f"{format_count(unresolved_records_total)}"
+                )
             lines.append(
                 "| "
                 + " | ".join(
                     [
                         markdown_text(implementation),
                         format_number(wall_seconds),
-                        format_number(peak_rss_mb),
+                        format_number(peak_client_rss_mb),
+                        format_number(peak_tree_rss_mb),
+                        format_count(metric.get("peak_excluded_process_count")),
+                        unresolved,
                         format_count(metric.get("cases")),
                         format_count(metric.get("failed")),
                     ]
@@ -200,8 +233,8 @@ def binding_section(metrics: list[dict[str, Any]], problems: list[str]) -> list[
                 if playwright_wall is not None and rustwright_wall is not None and rustwright_wall > 0
                 else None
             )
-            rustwright_rss = numeric(rustwright.get("peak_tree_rss_kb"))
-            playwright_rss = numeric(playwright.get("peak_tree_rss_kb"))
+            rustwright_rss = numeric(rustwright.get("peak_client_rss_kb"))
+            playwright_rss = numeric(playwright.get("peak_client_rss_kb"))
             memory_delta = (
                 (playwright_rss - rustwright_rss) / playwright_rss * 100
                 if playwright_rss is not None and rustwright_rss is not None and playwright_rss > 0
@@ -209,7 +242,9 @@ def binding_section(metrics: list[dict[str, Any]], problems: list[str]) -> list[
             )
             speed_text = "—" if speed_multiple is None else f"{speed_multiple:.2f}×"
             memory_text = "—" if memory_delta is None else f"{memory_delta:.1f}%"
-            lines.append(f"| Savings | {speed_text} | {memory_text} | — | — |")
+            lines.append(
+                f"| Savings | {speed_text} | {memory_text} | — | — | — | — | — |"
+            )
         lines.append("")
     return lines
 
@@ -376,7 +411,10 @@ def caveats_section(
     lines.extend(
         [
             "- Each binding and its baseline run sequentially in one job against the same workflow-resolved browser executable; deep benchmark repetitions and implementations also run sequentially.",
-            "- Binding memory is the peak of the summed command-and-descendant RSS sampled every 100 ms. Deep rows use the benchmark's process/self and process-tree peak RSS fields when available; missing values are shown as —.",
+            "- Binding client-stack memory excludes the workflow-resolved browser executable and each matched process's entire descendant subtree from the full process tree. The Playwright client stack still includes its driver Node process because that is part of the library's cost; Rustwright is in-process.",
+            "- Binding memory fields are independent peaks sampled every 100 ms. Full-tree RSS retains the command and all descendants for context, while Browser processes is the maximum simultaneous process count pruned from the client stack.",
+            "- Unresolved scans / records reports bracketed process reads dropped because identity or executable resolution was not coherent. Nonzero values reduce confidence in both memory peaks. Older artifacts without these fields show — and do not imply unresolved reads.",
+            "- Deep rows are unchanged and use the benchmark's process/self and process-tree peak RSS fields when available; missing values are shown as —.",
             "- These Blacksmith-runner artifacts are release regression diagnostics, not a substitute for capped Testbox evidence for launch-facing performance claims.",
         ]
     )
