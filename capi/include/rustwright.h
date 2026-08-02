@@ -150,8 +150,9 @@ int32_t rw_page_text_content(RwPage *p,
 /**
  * Evaluate JavaScript and return the core's serialized JSON wire value.
  *
- * `arg_json` may be NULL or must contain one JSON value. The result is
- * caller-owned and must be freed with rw_string_free.
+ * `arg_json` may be NULL or must contain one JSON value. It is passed as the
+ * sole argument when `expression` evaluates to a function and ignored
+ * otherwise. The result is caller-owned and must be freed with rw_string_free.
  */
 int32_t rw_page_evaluate(RwPage *p,
                          const char *expression,
