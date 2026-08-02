@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "dense-form-submit",
+      "description": "Fill 36 fields, submit the form, and verify every controlled value on each iteration.",
+      "html": "<!doctype html><html><head><title>Dense Form</title><style>body{font:14px sans-serif}#fields{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}label{display:flex;flex-direction:column}output{display:block;margin-top:16px;font-weight:bold}</style></head><body><main><h1>Account migration</h1><form id='bulk-form'><div id='fields'></div><button id='submit' type='button'>Submit migration</button><output id='status'>pending</output></form></main><script>const fields=document.querySelector('#fields');fields.innerHTML=Array.from({length:36},(_,index)=>'<label>Field '+String(index+1).padStart(2,'0')+'<input id=\\'field-'+String(index+1).padStart(2,'0')+'\\' name=\\'field-'+String(index+1).padStart(2,'0')+'\\'></label>').join('');document.querySelector('#submit').addEventListener('click',()=>{const values=Array.from(document.querySelectorAll('#fields input'),input=>input.value);document.querySelector('#status').textContent='submitted:'+values.filter(Boolean).length;document.body.dataset.submissions=String(Number(document.body.dataset.submissions||0)+1);});</script></body></html>",
+      "repeat": 3,
+      "steps": [
+        { "op": "goto", "useCaseHtml": true, "waitUntil": "load" },
+        { "op": "fill", "selector": "#field-01", "value": "value-01" },
+        { "op": "fill", "selector": "#field-02", "value": "value-02" },
+        { "op": "fill", "selector": "#field-03", "value": "value-03" },
+        { "op": "fill", "selector": "#field-04", "value": "value-04" },
+        { "op": "fill", "selector": "#field-05", "value": "value-05" },
+        { "op": "fill", "selector": "#field-06", "value": "value-06" },
+        { "op": "fill", "selector": "#field-07", "value": "value-07" },
+        { "op": "fill", "selector": "#field-08", "value": "value-08" },
+        { "op": "fill", "selector": "#field-09", "value": "value-09" },
+        { "op": "fill", "selector": "#field-10", "value": "value-10" },
+        { "op": "fill", "selector": "#field-11", "value": "value-11" },
+        { "op": "fill", "selector": "#field-12", "value": "value-12" },
+        { "op": "fill", "selector": "#field-13", "value": "value-13" },
+        { "op": "fill", "selector": "#field-14", "value": "value-14" },
+        { "op": "fill", "selector": "#field-15", "value": "value-15" },
+        { "op": "fill", "selector": "#field-16", "value": "value-16" },
+        { "op": "fill", "selector": "#field-17", "value": "value-17" },
+        { "op": "fill", "selector": "#field-18", "value": "value-18" },
+        { "op": "fill", "selector": "#field-19", "value": "value-19" },
+        { "op": "fill", "selector": "#field-20", "value": "value-20" },
+        { "op": "fill", "selector": "#field-21", "value": "value-21" },
+        { "op": "fill", "selector": "#field-22", "value": "value-22" },
+        { "op": "fill", "selector": "#field-23", "value": "value-23" },
+        { "op": "fill", "selector": "#field-24", "value": "value-24" },
+        { "op": "fill", "selector": "#field-25", "value": "value-25" },
+        { "op": "fill", "selector": "#field-26", "value": "value-26" },
+        { "op": "fill", "selector": "#field-27", "value": "value-27" },
+        { "op": "fill", "selector": "#field-28", "value": "value-28" },
+        { "op": "fill", "selector": "#field-29", "value": "value-29" },
+        { "op": "fill", "selector": "#field-30", "value": "value-30" },
+        { "op": "fill", "selector": "#field-31", "value": "value-31" },
+        { "op": "fill", "selector": "#field-32", "value": "value-32" },
+        { "op": "fill", "selector": "#field-33", "value": "value-33" },
+        { "op": "fill", "selector": "#field-34", "value": "value-34" },
+        { "op": "fill", "selector": "#field-35", "value": "value-35" },
+        { "op": "fill", "selector": "#field-36", "value": "value-36" },
+        { "op": "click", "selector": "#submit" },
+        { "op": "textContent", "selector": "#status", "capture": "status" },
+        { "op": "assertText", "selector": "#status", "equals": "submitted:36" },
+        { "op": "assertEval", "expression": "Array.from(document.querySelectorAll('#fields input')).every((input,index)=>input.value==='value-'+String(index+1).padStart(2,'0'))", "equals": true }
+      ]
+    },
+    {
+      "id": "tab-navigation-loop",
+      "description": "Navigate a large in-page tab workspace repeatedly and assert the selected panel.",
+      "html": "<!doctype html><html><head><title>Tab Workspace</title><style>[role=tab]{padding:8px}.panel[hidden]{display:none}.panel{padding:16px;border:1px solid #888}</style></head><body><main><h1>Operations workspace</h1><nav id='tabs' role='tablist'></nav><div id='panels'></div><output id='active'></output></main><script>const tabs=document.querySelector('#tabs');const panels=document.querySelector('#panels');tabs.innerHTML=Array.from({length:8},(_,index)=>'<button id=\\'tab-'+index+'\\' role=\\'tab\\'>Section '+index+'</button>').join('');panels.innerHTML=Array.from({length:8},(_,index)=>'<section id=\\'panel-'+index+'\\' class=\\'panel\\'>'+Array.from({length:40},(_,row)=>'<p>Panel '+index+' deterministic content '+row+'</p>').join('')+'</section>').join('');function select(index){document.querySelectorAll('[role=tab]').forEach((tab,item)=>tab.setAttribute('aria-selected',String(item===index)));document.querySelectorAll('.panel').forEach((panel,item)=>panel.hidden=item!==index);document.querySelector('#active').textContent='active:panel-'+index;}tabs.addEventListener('click',event=>select(Number(event.target.id.split('-')[1])));select(0);</script></body></html>",
+      "repeat": 3,
+      "steps": [
+        { "op": "goto", "useCaseHtml": true },
+        { "op": "click", "selector": "#tab-1" },
+        { "op": "click", "selector": "#tab-4" },
+        { "op": "click", "selector": "#tab-2" },
+        { "op": "click", "selector": "#tab-7" },
+        { "op": "textContent", "selector": "#active", "capture": "activePanel" },
+        { "op": "assertText", "selector": "#active", "equals": "active:panel-7" },
+        { "op": "evaluate", "expression": "()=>({selected:document.querySelector('[aria-selected=true]').id,visible:document.querySelector('.panel:not([hidden])').id})", "capture": "tabState" },
+        { "op": "assertEval", "expression": "({selected:document.querySelector('[aria-selected=true]').id,visible:document.querySelector('.panel:not([hidden])').id})", "equals": { "selected": "tab-7", "visible": "panel-7" } }
+      ]
+    },
+    {
+      "id": "large-table-evaluate",
+      "description": "Run repeated aggregate computations over a deterministic 400-row ledger.",
+      "html": "<!doctype html><html><head><title>Ledger Aggregate</title><style>table{border-collapse:collapse}td,th{padding:3px 8px;border:1px solid #ccc}</style></head><body><main><h1>Regional ledger</h1><table id='ledger'><thead><tr><th>ID</th><th>Region</th><th>Amount</th></tr></thead><tbody></tbody></table></main><script>document.querySelector('#ledger tbody').innerHTML=Array.from({length:400},(_,index)=>'<tr data-region=\\'r'+index%5+'\\'><td>TX-'+String(index).padStart(4,'0')+'</td><td>r'+index%5+'</td><td class=\\'amount\\'>'+((index%25)+1)+'</td></tr>').join('');</script></body></html>",
+      "repeat": 3,
+      "steps": [
+        { "op": "goto", "useCaseHtml": true },
+        { "op": "evaluate", "expression": "()=>{const rows=Array.from(document.querySelectorAll('#ledger tbody tr'));const amounts=rows.map(row=>Number(row.querySelector('.amount').textContent));return {rows:rows.length,total:amounts.reduce((sum,value)=>sum+value,0),high:amounts.filter(value=>value>=20).length};}", "capture": "aggregate" },
+        { "op": "evaluate", "expression": "()=>Object.fromEntries(Array.from({length:5},(_,index)=>['r'+index,document.querySelectorAll('tr[data-region=r'+index+']').length]))", "capture": "regions" },
+        { "op": "evaluate", "expression": "()=>Array.from(document.querySelectorAll('#ledger tbody tr')).reduce((sum,row,index)=>sum+Number(row.children[2].textContent)*(index+1),0)", "capture": "weightedChecksum" },
+        { "op": "assertEval", "expression": "(()=>{const rows=Array.from(document.querySelectorAll('#ledger tbody tr'));const amounts=rows.map(row=>Number(row.querySelector('.amount').textContent));return {rows:rows.length,total:amounts.reduce((sum,value)=>sum+value,0),high:amounts.filter(value=>value>=20).length};})()", "equals": { "rows": 400, "total": 5200, "high": 96 } },
+        { "op": "assertEval", "expression": "Object.fromEntries(Array.from({length:5},(_,index)=>['r'+index,document.querySelectorAll('tr[data-region=r'+index+']').length]))", "equals": { "r0": 80, "r1": 80, "r2": 80, "r3": 80, "r4": 80 } }
+      ]
+    }
+  ]
+}
