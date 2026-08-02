@@ -139,8 +139,21 @@ jobs:
           set -euo pipefail
           linker="$RUNNER_TEMP/zig-cc"
           cat > "$linker" <<'SH'
-          #!/bin/sh
-          exec zig cc -target "${ZIG_TARGET}" "$@"
+          #!/usr/bin/env bash
+          # cc-rs appends clang-style --target=<rust-triple>; zig cc only
+          # understands zig-style triples, so drop incoming target flags in
+          # favor of the pinned ZIG_TARGET.
+          args=()
+          skip=0
+          for arg in "$@"; do
+            if (( skip )); then skip=0; continue; fi
+            case "$arg" in
+              --target=*) continue ;;
+              -target) skip=1; continue ;;
+              *) args+=("$arg") ;;
+            esac
+          done
+          exec zig cc -target "${ZIG_TARGET}" "${args[@]}"
           SH
           chmod +x "$linker"
           target_env="$(printf '%s' "$CARGO_BUILD_TARGET" | tr '[:lower:]-' '[:upper:]_')"
@@ -243,18 +256,6 @@ jobs:
           name: nuget-package
           path: nuget-dist
 
-      - name: Require a prerelease version
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          case "$version" in
-            *-*) ;;
-            *)
-              echo "The experimental NuGet package requires a prerelease version such as 0.2.0-alpha.1" >&2
-              exit 1
-              ;;
-          esac
 
       - name: NuGet login (Trusted Publishing)
         id: nuget_login
