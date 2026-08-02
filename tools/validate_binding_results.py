@@ -86,6 +86,8 @@ def measurement_payload(path: Path) -> dict[str, int | float]:
     peak_tree_rss_kb = payload.get("peak_tree_rss_kb")
     exit_code = payload.get("exit_code")
     samples = payload.get("samples")
+    unresolved_samples = payload.get("unresolved_samples")
+    unresolved_records_total = payload.get("unresolved_records_total")
     if (
         isinstance(wall_seconds, bool)
         or not isinstance(wall_seconds, (int, float))
@@ -102,11 +104,19 @@ def measurement_payload(path: Path) -> dict[str, int | float]:
         raise ValidationError(f"measurement.exit_code must be zero, got {exit_code!r}")
     if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
         raise ValidationError("measurement.samples must be a positive integer")
+    for key, value in (
+        ("unresolved_samples", unresolved_samples),
+        ("unresolved_records_total", unresolved_records_total),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValidationError(f"measurement.{key} must be a non-negative integer")
     return {
         "wall_seconds": float(wall_seconds),
         "peak_tree_rss_kb": peak_tree_rss_kb,
         "exit_code": exit_code,
         "samples": samples,
+        "unresolved_samples": unresolved_samples,
+        "unresolved_records_total": unresolved_records_total,
     }
 
 
