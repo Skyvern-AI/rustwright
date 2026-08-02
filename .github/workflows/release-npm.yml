@@ -94,11 +94,13 @@ jobs:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             zig: true
+            zig_target: ""
             extra_args: --use-napi-cross
           - runner: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             zig: true
-            extra_args: --use-napi-cross
+            zig_target: aarch64-linux-gnu.2.17
+            extra_args: ""
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             zig: false
@@ -135,6 +137,36 @@ jobs:
         uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
           tool: cargo-zigbuild
+
+      - name: Configure aarch64 Linux linker
+        if: ${{ matrix.platform.zig_target != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          linker="$RUNNER_TEMP/zig-cc"
+          cat > "$linker" <<'SH'
+          #!/usr/bin/env bash
+          # cc-rs appends clang-style --target=<rust-triple>; zig cc only
+          # understands zig-style triples, so drop incoming target flags in
+          # favor of the pinned ZIG_TARGET.
+          args=()
+          skip=0
+          for arg in "$@"; do
+            if (( skip )); then skip=0; continue; fi
+            case "$arg" in
+              --target=*) continue ;;
+              -target) skip=1; continue ;;
+              *) args+=("$arg") ;;
+            esac
+          done
+          exec zig cc -target "${ZIG_TARGET}" "${args[@]}"
+          SH
+          chmod +x "$linker"
+          target_env="$(printf '%s' "${{ matrix.platform.target }}" | tr '[:lower:]-' '[:upper:]_')"
+          cc_env="$(printf '%s' "${{ matrix.platform.target }}" | tr '-' '_')"
+          echo "ZIG_TARGET=${{ matrix.platform.zig_target }}" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${target_env}_LINKER=$linker" >> "$GITHUB_ENV"
+          echo "CC_${cc_env}=$linker" >> "$GITHUB_ENV"
 
       - name: Install Node.js build dependencies
         working-directory: node
