@@ -84,11 +84,8 @@ func executeCase(browser *rustwright.Browser, testCase Case) CaseResult {
 		result.MS = elapsedMilliseconds(started)
 		return result
 	}
-	for i, step := range testCase.Steps {
-		if err := executeStep(page, testCase, step, result.Captures); err != nil {
-			result.Error = fmt.Sprintf("step %d: %v", i+1, err)
-			break
-		}
+	if err := executeSteps(page, testCase, result.Captures); err != nil {
+		result.Error = err.Error()
 	}
 	if err := page.Close(nil); err != nil && result.Error == "" {
 		result.Error = "close page: " + err.Error()
@@ -96,6 +93,59 @@ func executeCase(browser *rustwright.Browser, testCase Case) CaseResult {
 	result.OK = result.Error == ""
 	result.MS = elapsedMilliseconds(started)
 	return result
+}
+
+func executeSteps(page *rustwright.Page, testCase Case, captures map[string]any) error {
+	if testCase.Repeat <= 1 {
+		return executeStepBlock(page, testCase, testCase.Steps, 0, captures)
+	}
+
+	firstGoto := -1
+	for index, step := range testCase.Steps {
+		if step.Op == "goto" {
+			firstGoto = index
+			break
+		}
+	}
+	if firstGoto == -1 {
+		return fmt.Errorf("case %q has repeat %d but no goto step", testCase.ID, testCase.Repeat)
+	}
+
+	if err := executeStepBlock(page, testCase, testCase.Steps[:firstGoto+1], 0, captures); err != nil {
+		return err
+	}
+	for iteration := 1; iteration <= int(testCase.Repeat); iteration++ {
+		iterationCaptures := make(map[string]any)
+		err := executeStepBlock(
+			page,
+			testCase,
+			testCase.Steps[firstGoto+1:],
+			firstGoto+1,
+			iterationCaptures,
+		)
+		for name, value := range iterationCaptures {
+			captures[name] = value
+		}
+		if err != nil {
+			return fmt.Errorf("iteration %d: %w", iteration, err)
+		}
+	}
+	return nil
+}
+
+func executeStepBlock(
+	page *rustwright.Page,
+	testCase Case,
+	steps []Step,
+	indexOffset int,
+	captures map[string]any,
+) error {
+	for index, step := range steps {
+		if err := executeStep(page, testCase, step, captures); err != nil {
+			return fmt.Errorf("step %d: %w", indexOffset+index+1, err)
+		}
+	}
+	return nil
 }
 
 func executeStep(page *rustwright.Page, testCase Case, step Step, captures map[string]any) error {
