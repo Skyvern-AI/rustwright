@@ -38,7 +38,7 @@ final class ManifestValidator
             if (!$case instanceof \stdClass) {
                 throw new \InvalidArgumentException($context . ' must be an object');
             }
-            self::keys($case, ['id', 'description', 'html', 'url', 'steps'], ['id', 'steps'], $context);
+            self::keys($case, ['id', 'description', 'html', 'url', 'repeat', 'steps'], ['id', 'steps'], $context);
             self::nonEmptyString($case->id, $context . '.id');
             if (isset($ids[$case->id])) {
                 throw new \InvalidArgumentException('Duplicate case id: ' . $case->id);
@@ -47,14 +47,33 @@ final class ManifestValidator
             self::optionalStringProperty($case, 'description', $context);
             self::optionalStringProperty($case, 'html', $context);
             self::optionalStringProperty($case, 'url', $context);
+            if (!property_exists($case, 'repeat')) {
+                $case->repeat = 1;
+            } elseif (!is_int($case->repeat) || $case->repeat < 1 || $case->repeat > 1000) {
+                throw new \InvalidArgumentException($context . '.repeat must be an integer between 1 and 1000');
+            }
             if (!is_array($case->steps) || $case->steps === []) {
                 throw new \InvalidArgumentException($context . '.steps must be a nonempty array');
             }
 
             $captures = [];
+            $firstGotoIndex = null;
             foreach ($case->steps as $stepIndex => $step) {
+                if ($case->repeat > 1 && $firstGotoIndex !== null && $stepIndex === $firstGotoIndex + 1) {
+                    $captures = [];
+                }
                 $stepContext = sprintf('%s step %d', $context, $stepIndex + 1);
                 self::validateStep($step, $case, $captures, $stepContext);
+                if ($firstGotoIndex === null && $step instanceof \stdClass && $step->op === 'goto') {
+                    $firstGotoIndex = $stepIndex;
+                }
+            }
+            if ($case->repeat > 1 && $firstGotoIndex === null) {
+                throw new \InvalidArgumentException(sprintf(
+                    '%s has repeat %d but no goto step',
+                    $context,
+                    $case->repeat,
+                ));
             }
             $cases[] = $case;
         }

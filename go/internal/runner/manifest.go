@@ -19,6 +19,7 @@ type Case struct {
 	Description string
 	HTML        string
 	URL         string
+	Repeat      uint32
 	Steps       []Step
 }
 
@@ -91,11 +92,11 @@ func parseCase(data []byte, index int) (Case, error) {
 		return Case{}, err
 	}
 	if err := fields(object, context,
-		[]string{"id", "description", "html", "url", "steps"},
+		[]string{"id", "description", "html", "url", "repeat", "steps"},
 		[]string{"id", "steps"}); err != nil {
 		return Case{}, err
 	}
-	var parsed Case
+	parsed := Case{Repeat: 1}
 	if parsed.ID, err = requiredNonemptyString(object, "id", context); err != nil {
 		return Case{}, err
 	}
@@ -113,6 +114,12 @@ func parseCase(data []byte, index int) (Case, error) {
 			return Case{}, fmt.Errorf("%s.url: invalid URI reference: %v", context, err)
 		}
 	}
+	if raw, present := object["repeat"]; present {
+		if err := json.Unmarshal(raw, &parsed.Repeat); err != nil ||
+			strings.TrimSpace(string(raw)) == "null" || parsed.Repeat < 1 || parsed.Repeat > 1000 {
+			return Case{}, fmt.Errorf("%s.repeat: expected an integer between 1 and 1000", context)
+		}
+	}
 	var rawSteps []json.RawMessage
 	if err := json.Unmarshal(object["steps"], &rawSteps); err != nil {
 		return Case{}, fmt.Errorf("%s.steps: expected array", context)
@@ -121,21 +128,45 @@ func parseCase(data []byte, index int) (Case, error) {
 		return Case{}, fmt.Errorf("%s.steps: expected at least one step", context)
 	}
 	parsed.Steps = make([]Step, 0, len(rawSteps))
-	captures := make(map[string]struct{})
+	firstGoto := -1
 	for i, raw := range rawSteps {
 		step, err := parseStep(raw, fmt.Sprintf("%s.steps[%d]", context, i))
 		if err != nil {
 			return Case{}, err
 		}
-		if step.Capture != "" {
-			if _, exists := captures[step.Capture]; exists {
-				return Case{}, fmt.Errorf("%s.steps[%d].capture: duplicate capture %q", context, i, step.Capture)
-			}
-			captures[step.Capture] = struct{}{}
+		if firstGoto == -1 && step.Op == "goto" {
+			firstGoto = i
 		}
 		parsed.Steps = append(parsed.Steps, step)
 	}
+	if parsed.Repeat > 1 && firstGoto == -1 {
+		return Case{}, fmt.Errorf("%s has repeat %d but no goto step", context, parsed.Repeat)
+	}
+	if err := validateCaptureScopes(parsed.Steps, parsed.Repeat, firstGoto, context); err != nil {
+		return Case{}, err
+	}
 	return parsed, nil
+}
+
+func validateCaptureScopes(steps []Step, repeat uint32, firstGoto int, context string) error {
+	ranges := [][2]int{{0, len(steps)}}
+	if repeat > 1 {
+		ranges = [][2]int{{0, firstGoto + 1}, {firstGoto + 1, len(steps)}}
+	}
+	for _, bounds := range ranges {
+		captures := make(map[string]struct{})
+		for index := bounds[0]; index < bounds[1]; index++ {
+			capture := steps[index].Capture
+			if capture == "" {
+				continue
+			}
+			if _, exists := captures[capture]; exists {
+				return fmt.Errorf("%s.steps[%d].capture: duplicate capture %q", context, index, capture)
+			}
+			captures[capture] = struct{}{}
+		}
+	}
+	return nil
 }
 
 func parseStep(data []byte, context string) (Step, error) {

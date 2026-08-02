@@ -50,7 +50,7 @@ module Rustwright
 
     def validate_case!(benchmark_case, path)
       object!(benchmark_case, path)
-      keys!(benchmark_case, %w[id description html url steps], %w[id steps], path)
+      keys!(benchmark_case, %w[id description html url repeat steps], %w[id steps], path)
       non_empty_string!(benchmark_case['id'], "#{path}.id")
       string!(benchmark_case['description'], "#{path}.description") if benchmark_case.key?('description')
       string!(benchmark_case['html'], "#{path}.html") if benchmark_case.key?('html')
@@ -62,25 +62,49 @@ module Rustwright
           raise ManifestError, "#{path}.url is not a URI reference: #{e.message}"
         end
       end
+      repeat = benchmark_case.fetch('repeat', 1)
+      unless repeat.is_a?(Integer) && repeat.between?(1, 1_000)
+        raise ManifestError, "#{path}.repeat must be an integer between 1 and 1000"
+      end
 
       steps = benchmark_case['steps']
       array!(steps, "#{path}.steps")
       raise ManifestError, "#{path}.steps must contain at least one step" if steps.empty?
 
-      captures = {}
       steps.each_with_index do |step, index|
         step_path = "#{path}.steps[#{index}]"
         validate_step!(step, step_path, benchmark_case)
+      end
+
+      first_goto = steps.index { |step| step['op'] == 'goto' }
+      if repeat > 1 && first_goto.nil?
+        raise ManifestError, "case #{benchmark_case['id'].inspect} has repeat #{repeat} but no goto step"
+      end
+
+      capture_blocks = if repeat == 1
+                         [steps]
+                       else
+                         [steps[0..first_goto], steps[(first_goto + 1)..-1]]
+                       end
+      capture_blocks.each do |block|
+        validate_unique_captures!(block, benchmark_case['id'])
+      end
+    end
+    private_class_method :validate_case!
+
+    def validate_unique_captures!(steps, case_id)
+      captures = {}
+      steps.each do |step|
         next unless CAPTURE_OPERATIONS.include?(step['op'])
 
         capture = step['capture']
         if captures.key?(capture)
-          raise ManifestError, "duplicate capture #{capture.inspect} in case #{benchmark_case['id'].inspect}"
+          raise ManifestError, "duplicate capture #{capture.inspect} in case #{case_id.inspect}"
         end
         captures[capture] = true
       end
     end
-    private_class_method :validate_case!
+    private_class_method :validate_unique_captures!
 
     def validate_step!(step, path, benchmark_case)
       object!(step, path)

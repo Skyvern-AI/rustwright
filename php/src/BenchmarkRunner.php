@@ -32,16 +32,46 @@ final class BenchmarkRunner
         $page = null;
         $errorMessage = null;
         $stepNumber = null;
+        $iterationNumber = null;
 
         try {
             $page = $browser->newPage();
-            foreach ($case->steps as $index => $step) {
-                $stepNumber = $index + 1;
-                self::executeStep($page, $case, $step, $captures);
+            $repeat = property_exists($case, 'repeat') ? $case->repeat : 1;
+            if ($repeat === 1) {
+                foreach ($case->steps as $index => $step) {
+                    $stepNumber = $index + 1;
+                    self::executeStep($page, $case, $step, $captures);
+                }
+            } else {
+                $firstGotoIndex = self::firstGotoIndex($case);
+                for ($index = 0; $index <= $firstGotoIndex; $index++) {
+                    $stepNumber = $index + 1;
+                    self::executeStep($page, $case, $case->steps[$index], $captures);
+                }
+
+                $stepNumber = null;
+                for ($iteration = 1; $iteration <= $repeat; $iteration++) {
+                    $iterationNumber = $iteration;
+                    $iterationCaptures = [];
+                    try {
+                        for ($index = $firstGotoIndex + 1; $index < count($case->steps); $index++) {
+                            $stepNumber = $index + 1;
+                            self::executeStep($page, $case, $case->steps[$index], $iterationCaptures);
+                        }
+                    } finally {
+                        $captures = array_replace($captures, $iterationCaptures);
+                    }
+                }
             }
             $stepNumber = null;
+            $iterationNumber = null;
         } catch (\Throwable $error) {
-            $prefix = $stepNumber === null ? 'page setup: ' : 'step ' . $stepNumber . ': ';
+            if ($stepNumber === null) {
+                $prefix = 'page setup: ';
+            } else {
+                $prefix = $iterationNumber === null ? '' : 'iteration ' . $iterationNumber . ': ';
+                $prefix .= 'step ' . $stepNumber . ': ';
+            }
             $errorMessage = $prefix . $error->getMessage();
         } finally {
             if ($page !== null) {
@@ -63,6 +93,17 @@ final class BenchmarkRunner
             $result['error'] = $errorMessage;
         }
         return $result;
+    }
+
+    private static function firstGotoIndex(\stdClass $case): int
+    {
+        foreach ($case->steps as $index => $step) {
+            if ($step->op === 'goto') {
+                return $index;
+            }
+        }
+        // ManifestValidator rejects this before Chromium launches.
+        throw new \LogicException(sprintf('Case %s repeats but has no goto step', $case->id));
     }
 
     /** @param array<string, mixed> $captures */

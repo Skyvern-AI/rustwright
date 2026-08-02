@@ -1,6 +1,7 @@
 package com.skyvern.rustwright;
 
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
@@ -30,7 +31,7 @@ record Manifest(List<ManifestCase> cases) {
         for (int i = 0; i < rawCases.size(); i++) {
             String context = "manifest.cases[" + i + "]";
             Map<String, Object> rawCase = object(rawCases.get(i), context);
-            allowed(rawCase, context, Set.of("id", "description", "html", "url", "steps"));
+            allowed(rawCase, context, Set.of("id", "description", "html", "url", "repeat", "steps"));
             required(rawCase, context, "id", "steps");
             String id = nonEmptyString(rawCase.get("id"), context + ".id");
             if (!ids.add(id)) {
@@ -39,6 +40,9 @@ record Manifest(List<ManifestCase> cases) {
             optionalString(rawCase, "description", context);
             String html = optionalString(rawCase, "html", context);
             String sourceUrl = optionalString(rawCase, "url", context);
+            long repeat = rawCase.containsKey("repeat")
+                    ? repeat(rawCase.get("repeat"), context + ".repeat")
+                    : 1L;
             if (sourceUrl != null) {
                 try {
                     new URI(sourceUrl);
@@ -52,18 +56,27 @@ record Manifest(List<ManifestCase> cases) {
             }
             List<Map<String, Object>> steps = new ArrayList<>(rawSteps.size());
             Set<String> captures = new HashSet<>();
+            boolean foundGoto = false;
             for (int stepIndex = 0; stepIndex < rawSteps.size(); stepIndex++) {
                 String stepContext = context + ".steps[" + stepIndex + "]";
                 Map<String, Object> step = object(rawSteps.get(stepIndex), stepContext);
-                validateStep(step, stepContext, html, captures);
+                String operation = validateStep(step, stepContext, html, captures);
                 steps.add(new LinkedHashMap<>(step));
+                if (repeat > 1 && !foundGoto && operation.equals("goto")) {
+                    foundGoto = true;
+                    captures = new HashSet<>();
+                }
             }
-            cases.add(new ManifestCase(id, html, List.copyOf(steps)));
+            if (repeat > 1 && !foundGoto) {
+                throw invalid("case " + Json.stringify(id) + " has repeat " + repeat
+                        + " but no goto step");
+            }
+            cases.add(new ManifestCase(id, html, repeat, List.copyOf(steps)));
         }
         return new Manifest(List.copyOf(cases));
     }
 
-    private static void validateStep(Map<String, Object> step, String context, String html,
+    private static String validateStep(Map<String, Object> step, String context, String html,
             Set<String> captures) {
         required(step, context, "op");
         String operation = nonEmptyString(step.get("op"), context + ".op");
@@ -134,6 +147,7 @@ record Manifest(List<ManifestCase> cases) {
             }
             default -> throw invalid(context + " has unknown op: " + operation);
         }
+        return operation;
     }
 
     private static void validateCapture(Map<String, Object> step, String context,
@@ -166,6 +180,23 @@ record Manifest(List<ManifestCase> cases) {
         } catch (NumberFormatException error) {
             return false;
         }
+    }
+
+    private static long repeat(Object value, String context) {
+        BigInteger integer;
+        if (value instanceof Byte || value instanceof Short || value instanceof Integer
+                || value instanceof Long) {
+            integer = BigInteger.valueOf(((Number) value).longValue());
+        } else if (value instanceof BigInteger bigInteger) {
+            integer = bigInteger;
+        } else {
+            throw invalid(context + " must be an integer");
+        }
+        if (integer.compareTo(BigInteger.ONE) < 0
+                || integer.compareTo(BigInteger.valueOf(1000)) > 0) {
+            throw invalid(context + " must be an integer between 1 and 1000");
+        }
+        return integer.longValue();
     }
 
     private static void allowed(Map<String, Object> object, String context, Set<String> allowed) {

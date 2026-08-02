@@ -67,16 +67,9 @@ module Rustwright
 
       begin
         page = browser.new_page
-        benchmark_case['steps'].each_with_index do |step, index|
-          begin
-            execute_step(page, benchmark_case, step, captures)
-          rescue StandardError => e
-            error = "step #{index + 1}: #{e.message}"
-            break
-          end
-        end
+        execute_steps(page, benchmark_case, captures)
       rescue StandardError => e
-        error = "page creation: #{e.message}"
+        error = page ? e.message : "page creation: #{e.message}"
       ensure
         if page
           begin
@@ -98,6 +91,43 @@ module Rustwright
       result
     end
 
+    def execute_steps(page, benchmark_case, captures)
+      steps = benchmark_case['steps']
+      repeat = benchmark_case.fetch('repeat', 1)
+      return execute_step_block(page, benchmark_case, steps, 0, captures) if repeat == 1
+
+      first_goto = steps.index { |step| step['op'] == 'goto' }
+      unless first_goto
+        raise ManifestError, "case #{benchmark_case['id'].inspect} has repeat #{repeat} but no goto step"
+      end
+
+      execute_step_block(page, benchmark_case, steps[0..first_goto], 0, captures)
+      1.upto(repeat) do |iteration|
+        iteration_captures = {}
+        begin
+          execute_step_block(
+            page,
+            benchmark_case,
+            steps[(first_goto + 1)..-1],
+            first_goto + 1,
+            iteration_captures
+          )
+        rescue StandardError => e
+          captures.merge!(iteration_captures)
+          raise Error, "iteration #{iteration}: #{e.message}"
+        end
+        captures.merge!(iteration_captures)
+      end
+    end
+
+    def execute_step_block(page, benchmark_case, steps, index_offset, captures)
+      steps.each_with_index do |step, index|
+        execute_step(page, benchmark_case, step, captures)
+      rescue StandardError => e
+        raise Error, "step #{index_offset + index + 1}: #{e.message}"
+      end
+    end
+
     def execute_step(page, benchmark_case, step, captures)
       case step['op']
       when 'goto'
@@ -108,18 +138,18 @@ module Rustwright
       when 'fill'
         page.fill(step['selector'], step['value'])
       when 'title'
-        captures[step['capture']] = page.title
+        insert_capture(captures, step['capture'], page.title)
       when 'textContent'
-        captures[step['capture']] = page.text_content(step['selector'])
+        insert_capture(captures, step['capture'], page.text_content(step['selector']))
       when 'evaluate'
         value = if step.key?('arg')
                   page.evaluate(step['expression'], step['arg'])
                 else
                   page.evaluate(step['expression'])
                 end
-        captures[step['capture']] = value
+        insert_capture(captures, step['capture'], value)
       when 'screenshot'
-        captures[step['capture']] = page.screenshot.bytesize
+        insert_capture(captures, step['capture'], page.screenshot.bytesize)
       when 'assertTitle'
         assert_string(page.title, step, 'title')
       when 'assertText'
@@ -133,6 +163,12 @@ module Rustwright
         # Validation makes this unreachable, but retain a defensive boundary.
         raise ManifestError, "unknown operation #{step['op'].inspect}"
       end
+    end
+
+    def insert_capture(captures, name, value)
+      raise ManifestError, "duplicate capture name #{name.inspect}" if captures.key?(name)
+
+      captures[name] = value
     end
 
     def assert_string(actual, step, label)

@@ -76,22 +76,11 @@ internal static class RunnerApplication
         try
         {
             page = browser.NewPage();
-            for (var index = 0; index < benchmarkCase.Steps.Count; index++)
-            {
-                try
-                {
-                    ExecuteStep(page, benchmarkCase, benchmarkCase.Steps[index], captures);
-                }
-                catch (Exception stepError)
-                {
-                    error = $"step {index + 1}: {stepError.Message}";
-                    break;
-                }
-            }
+            ExecuteSteps(page, benchmarkCase, captures);
         }
         catch (Exception pageError)
         {
-            error = $"page creation: {pageError.Message}";
+            error = page is null ? $"page creation: {pageError.Message}" : pageError.Message;
         }
         finally
         {
@@ -110,6 +99,86 @@ internal static class RunnerApplication
 
         stopwatch.Stop();
         return new CaseResult(benchmarkCase.Id, error is null, captures, stopwatch.Elapsed.TotalMilliseconds, error);
+    }
+
+    private static void ExecuteSteps(
+        Page page,
+        ManifestCase benchmarkCase,
+        Dictionary<string, object?> captures)
+    {
+        if (benchmarkCase.Repeat == 1)
+        {
+            ExecuteStepBlock(page, benchmarkCase, 0, benchmarkCase.Steps.Count, captures);
+            return;
+        }
+
+        var firstGoto = -1;
+        for (var index = 0; index < benchmarkCase.Steps.Count; index++)
+        {
+            if (benchmarkCase.Steps[index].GetProperty("op").GetString() == "goto")
+            {
+                firstGoto = index;
+                break;
+            }
+        }
+
+        if (firstGoto < 0)
+        {
+            throw new InvalidOperationException(
+                $"case {JsonSerializer.Serialize(benchmarkCase.Id)} has repeat {benchmarkCase.Repeat} but no goto step");
+        }
+
+        ExecuteStepBlock(page, benchmarkCase, 0, firstGoto + 1, captures);
+        for (ulong iteration = 1; iteration <= benchmarkCase.Repeat; iteration++)
+        {
+            var iterationCaptures = new Dictionary<string, object?>(StringComparer.Ordinal);
+            try
+            {
+                ExecuteStepBlock(
+                    page,
+                    benchmarkCase,
+                    firstGoto + 1,
+                    benchmarkCase.Steps.Count,
+                    iterationCaptures);
+            }
+            catch (Exception iterationError)
+            {
+                MergeCaptures(captures, iterationCaptures);
+                throw new InvalidOperationException($"iteration {iteration}: {iterationError.Message}", iterationError);
+            }
+
+            MergeCaptures(captures, iterationCaptures);
+        }
+    }
+
+    private static void ExecuteStepBlock(
+        Page page,
+        ManifestCase benchmarkCase,
+        int startIndex,
+        int endIndex,
+        Dictionary<string, object?> captures)
+    {
+        for (var index = startIndex; index < endIndex; index++)
+        {
+            try
+            {
+                ExecuteStep(page, benchmarkCase, benchmarkCase.Steps[index], captures);
+            }
+            catch (Exception stepError)
+            {
+                throw new InvalidOperationException($"step {index + 1}: {stepError.Message}", stepError);
+            }
+        }
+    }
+
+    private static void MergeCaptures(
+        Dictionary<string, object?> captures,
+        Dictionary<string, object?> iterationCaptures)
+    {
+        foreach (var capture in iterationCaptures)
+        {
+            captures[capture.Key] = capture.Value;
+        }
     }
 
     private static void ExecuteStep(
