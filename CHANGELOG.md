@@ -4,6 +4,10 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed downloads started by `window.open()` timing out instead of being attributed to the opener page's download event.
+
 ## [0.2.0] - 2026-07-29
 
 ### Added

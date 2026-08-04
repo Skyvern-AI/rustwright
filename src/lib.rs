@@ -9925,6 +9925,8 @@ struct PyDownloadEventWaiter {
     browser: Arc<BrowserInner>,
     receiver: Mutex<Option<broadcast::Receiver<Value>>>,
     active_downloads: Mutex<HashMap<String, Value>>,
+    transient_download_targets: Mutex<HashSet<String>>,
+    opener_target_id: String,
     download_path: String,
 }
 
@@ -18008,9 +18010,17 @@ return true;
                             timeout,
                         )
                         .await?;
-                    return Ok(());
+                } else {
+                    result?;
                 }
-                result?;
+                client
+                    .send(
+                        "Target.setDiscoverTargets",
+                        json!({ "discover": true }),
+                        None,
+                        timeout,
+                    )
+                    .await?;
                 Ok(())
             })
             .map_err(py_err)
@@ -18021,6 +18031,8 @@ return true;
             browser: Arc::clone(&self.inner.browser),
             receiver: Mutex::new(Some(self.inner.browser.client.subscribe())),
             active_downloads: Mutex::new(HashMap::new()),
+            transient_download_targets: Mutex::new(HashSet::new()),
+            opener_target_id: self.inner.target_id.clone(),
             download_path: download_path.to_string(),
         }
     }
@@ -19222,20 +19234,32 @@ impl PyDownloadEventWaiter {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("download waiter is already waiting"))?;
         let mut active_downloads = std::mem::take(&mut *self.active_downloads.lock().unwrap());
+        let mut transient_download_targets =
+            std::mem::take(&mut *self.transient_download_targets.lock().unwrap());
         let browser = Arc::clone(&self.browser);
+        let opener_target_id = self.opener_target_id.clone();
         let download_path = self.download_path.clone();
         let timeout = BrowserInner::command_timeout(timeout_ms);
-        let (result, receiver, active_downloads) = py.detach(move || {
-            let result = browser.block_on_raw(wait_for_download_event(
-                &mut receiver,
-                &download_path,
-                &mut active_downloads,
-                timeout,
-            ));
-            (result, receiver, active_downloads)
-        });
+        let (result, receiver, active_downloads, transient_download_targets) =
+            py.detach(move || {
+                let result = browser.block_on_raw(wait_for_download_event(
+                    &mut receiver,
+                    &download_path,
+                    &mut active_downloads,
+                    &opener_target_id,
+                    &mut transient_download_targets,
+                    timeout,
+                ));
+                (
+                    result,
+                    receiver,
+                    active_downloads,
+                    transient_download_targets,
+                )
+            });
         *self.receiver.lock().unwrap() = Some(receiver);
         *self.active_downloads.lock().unwrap() = active_downloads;
+        *self.transient_download_targets.lock().unwrap() = transient_download_targets;
         result.map_err(py_err)
     }
 }
@@ -26233,6 +26257,8 @@ async fn wait_for_download_event(
     events: &mut broadcast::Receiver<Value>,
     download_path: &str,
     active_downloads: &mut HashMap<String, Value>,
+    opener_target_id: &str,
+    transient_download_targets: &mut HashSet<String>,
     timeout: Duration,
 ) -> RwResult<String> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -26245,8 +26271,23 @@ async fn wait_for_download_event(
         match tokio::time::timeout(remaining, events.recv()).await {
             Ok(Ok(event)) => {
                 let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+                update_transient_download_targets(
+                    &event,
+                    opener_target_id,
+                    transient_download_targets,
+                );
                 if method == "Browser.downloadWillBegin" {
-                    if let Some(payload) = download_from_begin_event(&event, download_path) {
+                    if let Some(mut payload) = download_from_begin_event(&event, download_path) {
+                        let frame_id = payload
+                            .get("frame_id")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string);
+                        if let Some(frame_id) = frame_id {
+                            if transient_download_targets.remove(&frame_id) {
+                                payload["opener_target_id"] =
+                                    Value::String(opener_target_id.to_string());
+                            }
+                        }
                         if let Some(guid) = payload.get("guid").and_then(Value::as_str) {
                             if !guid.is_empty() {
                                 active_downloads.insert(guid.to_string(), payload);
@@ -26974,6 +27015,104 @@ fn download_from_begin_event(event: &Value, download_path: &str) -> Option<Value
         "suggested_filename": suggested_filename,
         "path": PathBuf::from(download_path).join(guid).to_string_lossy().to_string(),
     }))
+}
+
+fn update_transient_download_targets(
+    event: &Value,
+    opener_target_id: &str,
+    targets: &mut HashSet<String>,
+) {
+    match event.get("method").and_then(Value::as_str) {
+        Some("Target.targetCreated" | "Target.targetInfoChanged") => {
+            let info = event.pointer("/params/targetInfo").unwrap_or(&Value::Null);
+            let Some(target_id) = info.get("targetId").and_then(Value::as_str) else {
+                return;
+            };
+            let is_initial_popup = info.get("type").and_then(Value::as_str) == Some("page")
+                && info.get("openerId").and_then(Value::as_str) == Some(opener_target_id)
+                && info
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty);
+            if is_initial_popup {
+                targets.insert(target_id.to_string());
+            } else {
+                targets.remove(target_id);
+            }
+        }
+        Some("Target.targetDestroyed") => {
+            if let Some(target_id) = event.pointer("/params/targetId").and_then(Value::as_str) {
+                targets.remove(target_id);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod transient_download_target_tests {
+    use super::*;
+
+    #[test]
+    fn tracks_only_initial_popup_targets_for_the_waiters_opener() {
+        let mut targets = HashSet::new();
+        update_transient_download_targets(
+            &json!({
+                "method": "Target.targetCreated",
+                "params": { "targetInfo": {
+                    "targetId": "popup",
+                    "type": "page",
+                    "url": "",
+                    "openerId": "opener"
+                }}
+            }),
+            "opener",
+            &mut targets,
+        );
+        update_transient_download_targets(
+            &json!({
+                "method": "Target.targetCreated",
+                "params": { "targetInfo": {
+                    "targetId": "other-popup",
+                    "type": "page",
+                    "url": "",
+                    "openerId": "other"
+                }}
+            }),
+            "opener",
+            &mut targets,
+        );
+
+        assert_eq!(targets, HashSet::from(["popup".to_string()]));
+    }
+
+    #[test]
+    fn stops_treating_a_popup_as_transient_after_it_navigates_or_closes() {
+        let mut targets = HashSet::from(["popup".to_string(), "closed".to_string()]);
+        update_transient_download_targets(
+            &json!({
+                "method": "Target.targetInfoChanged",
+                "params": { "targetInfo": {
+                    "targetId": "popup",
+                    "type": "page",
+                    "url": "about:blank",
+                    "openerId": "opener"
+                }}
+            }),
+            "opener",
+            &mut targets,
+        );
+        update_transient_download_targets(
+            &json!({
+                "method": "Target.targetDestroyed",
+                "params": { "targetId": "closed" }
+            }),
+            "opener",
+            &mut targets,
+        );
+
+        assert!(targets.is_empty());
+    }
 }
 
 fn console_from_event(event: &Value) -> Option<Value> {
