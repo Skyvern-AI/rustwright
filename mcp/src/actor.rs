@@ -4354,7 +4354,11 @@ mod tests {
         io::{Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
         process::Command,
-        sync::{OnceLock, atomic::AtomicBool, atomic::AtomicUsize, mpsc},
+        sync::{
+            OnceLock,
+            atomic::{AtomicBool, AtomicU64, AtomicUsize},
+            mpsc,
+        },
     };
 
     use super::*;
@@ -6115,7 +6119,33 @@ mod tests {
         captures: mpsc::Receiver<String>,
         stop: Arc<AtomicBool>,
         thread: Option<thread::JoinHandle<()>>,
+        started: std::time::Instant,
+        arm_gen: Arc<AtomicU64>,
+        probe_resolved: Arc<AtomicU64>,
+        arm_deadline_ms: Arc<AtomicU64>,
+        arm_armed_ms: Arc<AtomicU64>,
+        arm_path: Arc<Mutex<(u64, String)>>,
+        /// Connection-level trace, printed only when the owning test is
+        /// unwinding. This is the discriminator for the intermittent CI
+        /// navigation stall: if Chromium reports `Network.requestWillBeSent`
+        /// and this log shows no accept in the same window, the request never
+        /// reached the fixture and the stall is browser-side, not server-side.
+        /// Timings and connection indices only — never paths, headers, or
+        /// bodies, so the password-masking properties stay intact.
+        trace: Arc<std::sync::Mutex<Vec<String>>>,
     }
+
+    // Bounds how long a handler can sit on a connection, and therefore how long
+    // `Drop` can hold the browser test lock while joining handlers. The old 30s
+    // let a single idle speculative socket stall teardown. Kept well above the
+    // sub-millisecond loopback norm: this runner demonstrably starves for seconds
+    // under load, and cutting a legitimately slow request would trade an
+    // intermittent hang for a connection reset, which is no better.
+    const ACTION_FIXTURE_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+    // The clock runs from each navigation arm so the snapshot lands while that
+    // navigation is still stalled and the fixture is alive to record it.
+    const ACTION_FIXTURE_STALL_PROBE: Duration = Duration::from_secs(8);
 
     impl ActionFixtureServer {
         fn start() -> Self {
@@ -6127,22 +6157,155 @@ mod tests {
             let (captures_tx, captures) = mpsc::channel();
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = Arc::clone(&stop);
+            let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let loop_trace = Arc::clone(&trace);
+            let started = std::time::Instant::now();
+            let arm_gen = Arc::new(AtomicU64::new(0));
+            let thread_arm_gen = Arc::clone(&arm_gen);
+            let probe_resolved = Arc::new(AtomicU64::new(0));
+            let thread_probe_resolved = Arc::clone(&probe_resolved);
+            let arm_deadline_ms = Arc::new(AtomicU64::new(0));
+            let thread_arm_deadline_ms = Arc::clone(&arm_deadline_ms);
+            let arm_armed_ms = Arc::new(AtomicU64::new(0));
+            let thread_arm_armed_ms = Arc::clone(&arm_armed_ms);
+            let arm_path = Arc::new(Mutex::new((0, String::new())));
+            let thread_arm_path = Arc::clone(&arm_path);
+            // Recorded so that a port reused across tests in one run is visible
+            // by inspection of a single job log rather than by inference.
+            action_fixture_trace(&loop_trace, format!("t=0ms bound {addr}"));
             let thread = thread::spawn(move || {
                 let mut handlers = Vec::new();
+                let mut accepted = 0usize;
                 while !thread_stop.load(Ordering::Relaxed) {
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    // This Acquire pairs with arm's Release store, so the
+                    // deadline and armed timestamp reads are no older than the arm.
+                    let generation = thread_arm_gen.load(Ordering::Acquire);
+                    if generation != 0
+                        && thread_probe_resolved.load(Ordering::Relaxed) < generation
+                        && elapsed_ms >= thread_arm_deadline_ms.load(Ordering::Relaxed)
+                        && thread_probe_resolved.fetch_max(generation, Ordering::Relaxed)
+                            < generation
+                    {
+                        let armed_ms = thread_arm_armed_ms.load(Ordering::Relaxed);
+                        let probe_trace = Arc::clone(&loop_trace);
+                        let spawn_trace = Arc::clone(&probe_trace);
+                        match thread::Builder::new().spawn(move || {
+                            let walk_started = std::time::Instant::now();
+                            let states = action_fixture_socket_states(addr.port());
+                            let walk_ms = walk_started.elapsed().as_millis();
+                            action_fixture_trace(
+                                &spawn_trace,
+                                format!(
+                                    "t={}ms kernel sockets (arm#{generation} armed t={armed_ms}ms, walk={walk_ms}ms): {states}",
+                                    started.elapsed().as_millis(),
+                                ),
+                            );
+                        }) {
+                            Ok(handler) => handlers.push(handler),
+                            Err(error) => {
+                                let walk_started = std::time::Instant::now();
+                                let states = action_fixture_socket_states(addr.port());
+                                let walk_ms = walk_started.elapsed().as_millis();
+                                action_fixture_trace(
+                                    &probe_trace,
+                                    format!(
+                                        "t={}ms kernel sockets (arm#{generation} armed t={armed_ms}ms, walk={walk_ms}ms): {states} (walker spawn failed: {error}, walked inline)",
+                                        started.elapsed().as_millis(),
+                                    ),
+                                );
+                            }
+                        }
+                    }
                     match listener.accept() {
-                        Ok((mut stream, _)) => {
+                        Ok((mut stream, peer)) => {
+                            if thread_stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            // The single lock keeps the generation and path coherent. The pair may
+                            // lag the newest arm during its tiny pre-publish window, which is stale
+                            // but coherent and harmless for this accepted connection.
+                            let (accepted_gen, accepted_path) = thread_arm_path
+                                .lock()
+                                .expect("lock action fixture arm path")
+                                .clone();
+                            accepted += 1;
+                            let index = accepted;
+                            action_fixture_trace(
+                                &loop_trace,
+                                format!(
+                                    "t={}ms conn#{index} accepted from {peer}",
+                                    started.elapsed().as_millis()
+                                ),
+                            );
                             let captures = captures_tx.clone();
+                            let handler_trace = Arc::clone(&loop_trace);
+                            let handler_probe_resolved = Arc::clone(&thread_probe_resolved);
                             handlers.push(thread::spawn(move || {
-                                serve_action_fixture(&mut stream, addr.port(), &captures)
+                                let outcome =
+                                    serve_action_fixture(&mut stream, addr.port(), &captures);
+                                if let ActionFixtureOutcome::Served(served_path) = &outcome
+                                    && accepted_gen != 0
+                                    && served_path == &accepted_path
+                                {
+                                    // Serving the navigation document does not prove the browser-side load
+                                    // completed, and a retried request for the same path on an old connection
+                                    // could still resolve a newer same-path arm. This is accepted because the
+                                    // alternative (any-served disarm) suppressed genuine stalls.
+                                    handler_probe_resolved
+                                        .fetch_max(accepted_gen, Ordering::Relaxed);
+                                    action_fixture_trace(
+                                        &handler_trace,
+                                        format!(
+                                            "t={}ms conn#{index} resolved arm#{accepted_gen}",
+                                            started.elapsed().as_millis()
+                                        ),
+                                    );
+                                }
+                                action_fixture_trace(
+                                    &handler_trace,
+                                    format!(
+                                        "t={}ms conn#{index} handler-returned: {outcome}",
+                                        started.elapsed().as_millis()
+                                    ),
+                                );
                             }));
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::yield_now();
+                            thread::sleep(Duration::from_millis(2));
                         }
                         Err(error) => panic!("action fixture accept failed: {error}"),
                     }
                 }
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let generation = thread_arm_gen.load(Ordering::Acquire);
+                let resolved_generation = thread_probe_resolved.load(Ordering::Relaxed);
+                let deadline_ms = thread_arm_deadline_ms.load(Ordering::Relaxed);
+                if generation != 0
+                    && resolved_generation < generation
+                    && elapsed_ms >= deadline_ms
+                    && thread_probe_resolved.fetch_max(generation, Ordering::Relaxed) < generation
+                {
+                    let armed_ms = thread_arm_armed_ms.load(Ordering::Relaxed);
+                    let walk_started = std::time::Instant::now();
+                    let states = action_fixture_socket_states(addr.port());
+                    let walk_ms = walk_started.elapsed().as_millis();
+                    action_fixture_trace(
+                        &loop_trace,
+                        format!(
+                            "t={}ms kernel sockets at teardown (arm#{generation} armed t={armed_ms}ms, walk={walk_ms}ms): {states}",
+                            started.elapsed().as_millis(),
+                        ),
+                    );
+                }
+                action_fixture_trace(
+                    &loop_trace,
+                    format!(
+                        "t={}ms accept loop exiting, {accepted} accepted, joining {} handler(s)",
+                        started.elapsed().as_millis(),
+                        handlers.len()
+                    ),
+                );
                 for handler in handlers {
                     handler.join().expect("join action fixture connection");
                 }
@@ -6152,10 +6315,32 @@ mod tests {
                 captures,
                 stop,
                 thread: Some(thread),
+                started,
+                arm_gen,
+                probe_resolved,
+                arm_deadline_ms,
+                arm_armed_ms,
+                arm_path,
+                trace,
             }
         }
 
+        fn arm(&self, path: &str, probe_after: Duration) {
+            // Arms are issued only by the single test thread, so this relaxed
+            // read plus one computes the unique next generation.
+            let next = self.arm_gen.load(Ordering::Relaxed) + 1;
+            *self.arm_path.lock().expect("lock action fixture arm path") = (next, path.to_owned());
+            let now_ms = self.started.elapsed().as_millis() as u64;
+            self.arm_armed_ms.store(now_ms, Ordering::Relaxed);
+            self.arm_deadline_ms
+                .store(now_ms + probe_after.as_millis() as u64, Ordering::Relaxed);
+            // Store the generation last: this Release publishes the coherent
+            // pair, armed timestamp, and deadline to the loop's Acquire load.
+            self.arm_gen.store(next, Ordering::Release);
+        }
+
         fn url(&self, path: &str) -> String {
+            self.arm(path, ACTION_FIXTURE_STALL_PROBE);
             format!("http://{}{path}", self.addr)
         }
 
@@ -6166,6 +6351,173 @@ mod tests {
         }
     }
 
+    /// Appends to the fixture connection trace. A poisoned lock is ignored
+    /// rather than propagated: this is diagnostic bookkeeping, and panicking
+    /// here would replace the failure under investigation with its own.
+    fn action_fixture_trace(trace: &Arc<std::sync::Mutex<Vec<String>>>, entry: String) {
+        if let Ok(mut entries) = trace.lock() {
+            entries.push(entry);
+        }
+    }
+
+    /// What became of one accepted fixture connection.
+    ///
+    /// The byte count is the point. A stalled navigation that leaves the
+    /// handler at zero bytes means Chromium completed the TCP handshake and
+    /// then never wrote the request; a partial count means it began writing
+    /// and stopped. Those have different causes, and until now the trace
+    /// could not tell them apart because `read_http_headers` discards its
+    /// partial buffer on error.
+    enum ActionFixtureOutcome {
+        Served(String),
+        ReadFailed {
+            bytes: usize,
+            kind: std::io::ErrorKind,
+        },
+    }
+
+    impl fmt::Display for ActionFixtureOutcome {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Served(_) => write!(formatter, "served"),
+                Self::ReadFailed { bytes, kind } => {
+                    write!(formatter, "read-failed after {bytes} byte(s): {kind:?}")
+                }
+            }
+        }
+    }
+
+    /// Header read that reports how far it got. Behaviourally identical to
+    /// `read_http_headers`; it differs only in surfacing the partial length
+    /// instead of dropping it, so the caller can record it.
+    fn read_action_fixture_headers(
+        stream: &mut TcpStream,
+    ) -> Result<Vec<u8>, (usize, std::io::ErrorKind)> {
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            if headers.len() >= 64 * 1024 {
+                return Err((headers.len(), std::io::ErrorKind::InvalidData));
+            }
+            let mut byte = [0_u8; 1];
+            if let Err(error) = stream.read_exact(&mut byte) {
+                return Err((headers.len(), error.kind()));
+            }
+            headers.push(byte[0]);
+        }
+        Ok(headers)
+    }
+
+    fn action_fixture_parse_proc_tcp(table: &str, contents: &str, port: u16) -> Vec<String> {
+        fn state_name(state: u8) -> &'static str {
+            match state {
+                0x01 => "ESTABLISHED",
+                0x02 => "SYN_SENT",
+                0x03 => "SYN_RECV",
+                0x04 => "FIN_WAIT1",
+                0x05 => "FIN_WAIT2",
+                0x06 => "TIME_WAIT",
+                0x07 => "CLOSE",
+                0x08 => "CLOSE_WAIT",
+                0x09 => "LAST_ACK",
+                0x0A => "LISTEN",
+                0x0B => "CLOSING",
+                0x0C => "NEW_SYN_RECV",
+                0x0D => "BOUND_INACTIVE",
+                _ => "UNKNOWN",
+            }
+        }
+
+        // `sl local:port rem:port st tx:rx tr:when retrnsmt uid timeout inode`
+        fn endpoint_port(raw: &str) -> Option<u16> {
+            let (_, port) = raw.rsplit_once(':')?;
+            u16::from_str_radix(port, 16).ok()
+        }
+
+        let mut rows = Vec::new();
+        let mut unparsed = 0usize;
+        let mut first_unparsed = None;
+        for line in contents.lines().skip(1) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 10 {
+                unparsed += 1;
+                first_unparsed.get_or_insert_with(|| line.chars().take(160).collect::<String>());
+                continue;
+            }
+            let (Some(local), Some(remote)) = (endpoint_port(fields[1]), endpoint_port(fields[2]))
+            else {
+                unparsed += 1;
+                first_unparsed.get_or_insert_with(|| line.chars().take(160).collect::<String>());
+                continue;
+            };
+            // Match ports only so address decoding cannot hide the true socket; emit raw endpoints instead.
+            if local != port && remote != port {
+                continue;
+            }
+            let state = u8::from_str_radix(fields[3], 16).unwrap_or(0);
+            let side = if local == port { "local" } else { "peer" };
+            rows.push(format!(
+                "{table}/{side} local={} peer={} local_port={local} peer_port={remote} {} queues={} timer={} retransmits={} inode={}",
+                fields[1],
+                fields[2],
+                state_name(state),
+                fields[4],
+                fields[5],
+                fields[6],
+                fields[9]
+            ));
+        }
+        if unparsed != 0 {
+            rows.push(format!(
+                "unparsed={unparsed} sample=\"{}\"",
+                first_unparsed.expect("unparsed line sample")
+            ));
+        }
+        rows
+    }
+
+    /// Kernel-side view of every TCP socket touching `port`, read straight out
+    /// of `/proc/net/tcp{,6}`.
+    ///
+    /// This exists because the stall has now survived three explanations that
+    /// were argued rather than measured. It answers the one question the
+    /// userspace trace cannot: at the moment the navigation is stuck, has
+    /// Chromium opened a socket to the fixture at all, and what state is it in?
+    ///
+    /// Deliberately `/proc` rather than `ss`: `ss` is not guaranteed installed
+    /// on the runner image, and a missing binary would silently cost a whole
+    /// CI cycle. Metadata only — states, counts, queue depths, retransmit
+    /// counters — never payload, so the password-masking properties of these
+    /// tests are untouched.
+    #[cfg(target_os = "linux")]
+    fn action_fixture_socket_states(port: u16) -> String {
+        let mut rows = Vec::new();
+        let mut unreadable = Vec::new();
+        for (table, path) in [("tcp", "/proc/net/tcp"), ("tcp6", "/proc/net/tcp6")] {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    rows.extend(action_fixture_parse_proc_tcp(table, &contents, port));
+                }
+                Err(_) => unreadable.push(table),
+            }
+        }
+
+        if rows.is_empty() && unreadable.is_empty() {
+            rows.push("no socket for this port".to_owned());
+        }
+        if !unreadable.is_empty() {
+            rows.push(format!("unreadable: {}", unreadable.join(",")));
+        }
+        rows.join(" | ")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn action_fixture_socket_states(_port: u16) -> String {
+        "unavailable off linux".to_owned()
+    }
+
     impl Drop for ActionFixtureServer {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
@@ -6173,18 +6525,43 @@ mod tests {
             if let Some(thread) = self.thread.take() {
                 thread.join().expect("join action fixture");
             }
+            if thread::panicking() {
+                let entries = match self.trace.lock() {
+                    Ok(entries) => entries.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
+                eprintln!(
+                    "===== ACTION FIXTURE CONNECTION TRACE ({}) =====",
+                    self.addr
+                );
+                if entries.is_empty() {
+                    eprintln!("  (no connection was ever accepted)");
+                }
+                for entry in entries {
+                    eprintln!("  {entry}");
+                }
+                eprintln!("===== ACTION FIXTURE CONNECTION TRACE END =====");
+            }
         }
     }
 
-    fn serve_action_fixture(stream: &mut TcpStream, port: u16, captures: &mpsc::Sender<String>) {
+    fn serve_action_fixture(
+        stream: &mut TcpStream,
+        port: u16,
+        captures: &mpsc::Sender<String>,
+    ) -> ActionFixtureOutcome {
         stream
             .set_nonblocking(false)
             .expect("set action fixture connection blocking");
         stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
+            .set_read_timeout(Some(ACTION_FIXTURE_IO_TIMEOUT))
             .expect("set action fixture read timeout");
-        let Ok(request) = read_http_headers(stream) else {
-            return;
+        stream
+            .set_write_timeout(Some(ACTION_FIXTURE_IO_TIMEOUT))
+            .expect("set action fixture write timeout");
+        let request = match read_action_fixture_headers(stream) {
+            Ok(request) => request,
+            Err((bytes, kind)) => return ActionFixtureOutcome::ReadFailed { bytes, kind },
         };
         let request = String::from_utf8_lossy(&request);
         let target = request
@@ -6255,6 +6632,7 @@ mod tests {
         stream
             .write_all(response.as_bytes())
             .expect("write action fixture response");
+        ActionFixtureOutcome::Served(path.to_owned())
     }
 
     fn actionability_fixture() -> String {
@@ -10356,6 +10734,8 @@ document.visibilityState
             assert_eq!(check_events[2]["checked"], Value::Bool(true));
             assert_eq!(check_events[5]["checked"], Value::Bool(false));
 
+            // The click budget is 3s, so the probe must fire inside 2s.
+            server.arm("/arrived", Duration::from_secs(2));
             page.click("#navigate", ActionOptions::timeout(3_000.0))
                 .expect("click navigation link");
             assert_eq!(
