@@ -42,6 +42,7 @@ mod telemetry;
 
 pub type RwResult<T> = Result<T, RwError>;
 type CdpPendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<RwResult<Value>>>>>;
+type CdpOutstandingMap = Arc<Mutex<HashMap<u64, CdpOutstandingCommand>>>;
 
 /// A thread-safe cancellation signal for synchronous facade operations.
 ///
@@ -349,22 +350,40 @@ where
 struct PendingCommandGuard {
     id: u64,
     pending: CdpPendingMap,
+    outstanding: CdpOutstandingMap,
+    traffic_log: Arc<Mutex<CdpTrafficLog>>,
 }
 
 struct SpawnedTaskAbortGuard(tokio::task::AbortHandle);
 
 impl PendingCommandGuard {
-    fn new(id: u64, pending: &CdpPendingMap) -> Self {
+    fn new(
+        id: u64,
+        pending: &CdpPendingMap,
+        outstanding: &CdpOutstandingMap,
+        traffic_log: &Arc<Mutex<CdpTrafficLog>>,
+    ) -> Self {
         Self {
             id,
             pending: Arc::clone(pending),
+            outstanding: Arc::clone(outstanding),
+            traffic_log: Arc::clone(traffic_log),
         }
     }
 }
 
 impl Drop for PendingCommandGuard {
     fn drop(&mut self) {
-        self.pending.lock().unwrap().remove(&self.id);
+        let was_pending = self.pending.lock().unwrap().remove(&self.id).is_some();
+        let outstanding = self.outstanding.lock().unwrap().remove(&self.id);
+        if was_pending {
+            if let Some(outstanding) = outstanding {
+                self.traffic_log
+                    .lock()
+                    .unwrap()
+                    .push(outstanding.traffic_entry("abandoned-without-response"));
+            }
+        }
     }
 }
 
@@ -375,6 +394,10 @@ impl Drop for SpawnedTaskAbortGuard {
 }
 
 const CDP_EVENT_LOG_LIMIT: usize = 8192;
+const CDP_DIAGNOSTIC_TRAFFIC_LIMIT: usize = 32;
+const CDP_DIAGNOSTIC_LIST_LIMIT: usize = 32;
+const CDP_DIAGNOSTIC_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
+const TIMEOUT_DIAGNOSTIC_BANNER: &str = "RUSTWRIGHT TIMEOUT DIAGNOSTIC";
 const FRAME_UTILITY_WORLD_NAME: &str = "__utility_world__";
 static NEXT_FILL_GUARD_ID: AtomicU64 = AtomicU64::new(1);
 // Closed set of structured errors carried across the Python FFI boundary. Each
@@ -2856,6 +2879,140 @@ multiline-compatible = """4.5.6"""
     }
 
     #[test]
+    fn cdp_diagnostic_traffic_ring_evicts_oldest_entries() {
+        let mut log = CdpTrafficLog::new();
+        for id in 0..(CDP_DIAGNOSTIC_TRAFFIC_LIMIT as u64 + 5) {
+            log.push(CdpTrafficEntry {
+                recorded_at: Instant::now(),
+                command_elapsed_ms: Some(0),
+                direction: "outbound",
+                status: "sent",
+                id: Some(id),
+                method: format!("Test.command{id}"),
+                session_id: Some("test-session".to_string()),
+                transport_state: Some("written"),
+            });
+        }
+
+        let snapshot = log.snapshot();
+        assert_eq!(snapshot.len(), CDP_DIAGNOSTIC_TRAFFIC_LIMIT);
+        assert_eq!(snapshot.first().and_then(|entry| entry.id), Some(5));
+        assert_eq!(
+            snapshot.last().and_then(|entry| entry.id),
+            Some(CDP_DIAGNOSTIC_TRAFFIC_LIMIT as u64 + 4)
+        );
+    }
+
+    #[test]
+    fn navigation_diagnostic_keeps_stage_after_traffic_eviction() {
+        let started_at = Instant::now();
+        let mut log = CdpTrafficLog::new();
+        for (direction, status) in [("outbound", "sent"), ("inbound", "response")] {
+            log.push(CdpTrafficEntry {
+                recorded_at: Instant::now(),
+                command_elapsed_ms: None,
+                direction,
+                status,
+                id: Some(7),
+                method: "Page.navigate".to_string(),
+                session_id: Some("navigation-session".to_string()),
+                transport_state: None,
+            });
+        }
+        for id in 0..CDP_DIAGNOSTIC_TRAFFIC_LIMIT as u64 {
+            log.push(CdpTrafficEntry {
+                recorded_at: Instant::now(),
+                command_elapsed_ms: None,
+                direction: "inbound",
+                status: "event",
+                id: Some(id),
+                method: "Runtime.consoleAPICalled".to_string(),
+                session_id: Some("navigation-session".to_string()),
+                transport_state: None,
+            });
+        }
+
+        assert!(log
+            .snapshot()
+            .iter()
+            .all(|entry| entry.method != "Page.navigate"));
+        assert_eq!(
+            log.page_navigate_waiting_for("navigation-session", started_at),
+            Some("CDP navigation lifecycle event load")
+        );
+        assert_eq!(
+            log.page_navigate_waiting_for("other-session", started_at),
+            None
+        );
+    }
+
+    #[test]
+    fn timeout_diagnostic_renders_metadata_without_sensitive_values() {
+        let secret = "<password-secret>";
+        let cookie = "session=<cookie-secret>";
+        let private_url = "https://example.test/private?token=<url-secret>";
+        let event = json!({
+            "method": "Network.requestWillBeSent",
+            "sessionId": "session-1",
+            "params": {
+                "requestId": "request-1",
+                "request": {
+                    "url": private_url,
+                    "headers": { "Cookie": cookie },
+                    "postData": secret,
+                },
+                "password": secret,
+            },
+        });
+        let mut traffic_log = CdpTrafficLog::new();
+        traffic_log.push(CdpTrafficEntry::received_event(&event));
+        let write_state = Arc::new(CdpWriteState::new());
+        assert!(write_state.begin_write());
+        write_state.finish(true);
+        traffic_log.push(
+            CdpOutstandingCommand {
+                id: 7,
+                method: "Input.insertText".to_string(),
+                session_id: Some("session-1".to_string()),
+                started_at: Instant::now(),
+                write_state,
+            }
+            .traffic_entry("sent"),
+        );
+        let captured_at = Instant::now();
+        let rendered = render_browser_timeout_diagnostic(&BrowserTimeoutDiagnostic {
+            operation: "Page.goto",
+            waiting_for: "CDP navigation lifecycle event load".to_string(),
+            started_at: captured_at - Duration::from_secs(30),
+            cdp_connected: true,
+            process: BrowserProcessDiagnostic::Remote,
+            cdp: CdpClientDiagnosticSnapshot {
+                captured_at,
+                traffic: traffic_log.snapshot(),
+                outstanding: Vec::new(),
+                outstanding_total: 0,
+            },
+            attached_pages: vec![AttachedPageDiagnostic {
+                target_id: "target-1".to_string(),
+                session_id: "session-1".to_string(),
+                context_id: None,
+                closed: false,
+                crashed: false,
+            }],
+            attached_pages_total: 1,
+            target_query: BrowserTargetQueryDiagnostic::Unavailable("timeout"),
+        });
+
+        assert!(rendered.contains(TIMEOUT_DIAGNOSTIC_BANNER));
+        assert!(rendered.contains("Network.requestWillBeSent"));
+        assert!(rendered.contains("Input.insertText"));
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains(cookie));
+        assert!(!rendered.contains(private_url));
+        assert!(!rendered.contains("example.test"));
+    }
+
+    #[test]
     fn default_timeout_register_general_precedence_lattice() {
         let mut register = DefaultTimeoutRegister {
             general: DefaultTimeoutSlots {
@@ -3062,8 +3219,10 @@ multiline-compatible = """4.5.6"""
         let client = Arc::new(CdpClient {
             write_tx,
             pending: Arc::clone(&pending),
+            outstanding: Arc::new(Mutex::new(HashMap::new())),
             events: events.clone(),
             event_log: Arc::clone(&event_log),
+            traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -3189,8 +3348,10 @@ multiline-compatible = """4.5.6"""
         let client = Arc::new(CdpClient {
             write_tx,
             pending: Arc::clone(&pending),
+            outstanding: Arc::new(Mutex::new(HashMap::new())),
             events: events.clone(),
             event_log: Arc::clone(&event_log),
+            traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -3240,7 +3401,9 @@ multiline-compatible = """4.5.6"""
             tokio::time::timeout(Duration::from_secs(5), async move {
                 loop {
                     let command = match write_rx.recv().await.unwrap() {
-                        CdpOutgoing::Text { payload, tracker } => {
+                        CdpOutgoing::Text {
+                            payload, tracker, ..
+                        } => {
                             if let Some(tracker) = tracker {
                                 assert!(tracker.begin_write());
                                 tracker.finish(true);
@@ -3290,8 +3453,10 @@ multiline-compatible = """4.5.6"""
         let client = CdpClient {
             write_tx,
             pending: Arc::clone(&pending),
+            outstanding: Arc::new(Mutex::new(HashMap::new())),
             events: events.clone(),
             event_log: Arc::clone(&event_log),
+            traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -3509,6 +3674,7 @@ multiline-compatible = """4.5.6"""
                     state: Arc::clone(&blocker_state),
                     ack: blocker_ack_tx,
                 }),
+                diagnostic_id: None,
             })
             .is_ok());
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -3534,6 +3700,7 @@ multiline-compatible = """4.5.6"""
             .send(CdpOutgoing::Text {
                 payload: "sentinel".to_string(),
                 tracker: None,
+                diagnostic_id: None,
             })
             .is_ok());
 
@@ -3630,8 +3797,10 @@ multiline-compatible = """4.5.6"""
         let client = CdpClient {
             write_tx,
             pending: Arc::clone(&pending),
+            outstanding: Arc::new(Mutex::new(HashMap::new())),
             events: events.clone(),
             event_log: Arc::clone(&event_log),
+            traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -3652,7 +3821,9 @@ multiline-compatible = """4.5.6"""
             async {
                 tokio::time::timeout(Duration::from_secs(5), async {
                     let key_down = match write_rx.recv().await.unwrap() {
-                        CdpOutgoing::Text { payload, tracker } => {
+                        CdpOutgoing::Text {
+                            payload, tracker, ..
+                        } => {
                             let tracker = tracker.expect("key-down write tracker");
                             assert!(tracker.begin_write());
                             tracker.finish(true);
@@ -3701,8 +3872,10 @@ multiline-compatible = """4.5.6"""
         let client = CdpClient {
             write_tx,
             pending,
+            outstanding: Arc::new(Mutex::new(HashMap::new())),
             events,
             event_log,
+            traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -3722,7 +3895,9 @@ multiline-compatible = """4.5.6"""
             async {
                 tokio::time::timeout(Duration::from_secs(5), async {
                     match write_rx.recv().await.unwrap() {
-                        CdpOutgoing::Text { payload, tracker } => {
+                        CdpOutgoing::Text {
+                            payload, tracker, ..
+                        } => {
                             let tracker = tracker.expect("insertText write tracker");
                             assert!(tracker.begin_write());
                             tracker.finish(true);
@@ -3795,8 +3970,10 @@ multiline-compatible = """4.5.6"""
             client: Arc::new(CdpClient {
                 write_tx,
                 pending: Arc::new(Mutex::new(HashMap::new())),
+                outstanding: Arc::new(Mutex::new(HashMap::new())),
                 events,
                 event_log: Arc::new(Mutex::new(CdpEventLog::new())),
+                traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
                 next_id: AtomicU64::new(1),
                 sent_runtime_enable_count: AtomicU64::new(0),
                 sent_target_close_count: AtomicU64::new(0),
@@ -5549,8 +5726,10 @@ multiline-compatible = """4.5.6"""
                 client: Arc::new(CdpClient {
                     write_tx,
                     pending: Arc::new(Mutex::new(HashMap::new())),
+                    outstanding: Arc::new(Mutex::new(HashMap::new())),
                     events,
                     event_log: Arc::new(Mutex::new(CdpEventLog::new())),
+                    traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
                     next_id: AtomicU64::new(1),
                     sent_runtime_enable_count: AtomicU64::new(0),
                     sent_target_close_count: AtomicU64::new(0),
@@ -5612,8 +5791,10 @@ multiline-compatible = """4.5.6"""
             client: Arc::new(CdpClient {
                 write_tx,
                 pending: Arc::new(Mutex::new(HashMap::new())),
+                outstanding: Arc::new(Mutex::new(HashMap::new())),
                 events,
                 event_log: Arc::new(Mutex::new(CdpEventLog::new())),
+                traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
                 next_id: AtomicU64::new(1),
                 sent_runtime_enable_count: AtomicU64::new(0),
                 sent_target_close_count: AtomicU64::new(0),
@@ -5690,8 +5871,10 @@ multiline-compatible = """4.5.6"""
         let client = CdpClient {
             write_tx,
             pending: Arc::clone(&pending),
+            outstanding: Arc::new(Mutex::new(HashMap::new())),
             events: events.clone(),
             event_log: Arc::clone(&event_log),
+            traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -5765,8 +5948,10 @@ multiline-compatible = """4.5.6"""
         let client = CdpClient {
             write_tx,
             pending: Arc::clone(&pending),
+            outstanding: Arc::new(Mutex::new(HashMap::new())),
             events: events.clone(),
             event_log: Arc::clone(&event_log),
+            traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -5847,8 +6032,10 @@ multiline-compatible = """4.5.6"""
         let client = CdpClient {
             write_tx,
             pending: Arc::clone(&pending),
+            outstanding: Arc::new(Mutex::new(HashMap::new())),
             events: events.clone(),
             event_log: Arc::clone(&event_log),
+            traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -5919,8 +6106,10 @@ multiline-compatible = """4.5.6"""
         let client = Arc::new(CdpClient {
             write_tx,
             pending: Arc::clone(&pending),
+            outstanding: Arc::new(Mutex::new(HashMap::new())),
             events,
             event_log: Arc::new(Mutex::new(CdpEventLog::new())),
+            traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -6089,8 +6278,10 @@ multiline-compatible = """4.5.6"""
             client: Arc::new(CdpClient {
                 write_tx,
                 pending: Arc::new(Mutex::new(HashMap::new())),
+                outstanding: Arc::new(Mutex::new(HashMap::new())),
                 events,
                 event_log: Arc::new(Mutex::new(CdpEventLog::new())),
+                traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
                 next_id: AtomicU64::new(1),
                 sent_runtime_enable_count: AtomicU64::new(0),
                 sent_target_close_count: AtomicU64::new(0),
@@ -6790,9 +6981,124 @@ multiline-compatible = """4.5.6"""
         assert_eq!(batch[0]["payload"]["frameId"], "frame-1");
     }
 
+    struct NavigationTestHarness {
+        page: Arc<PageInner>,
+        write_rx: mpsc::UnboundedReceiver<CdpOutgoing>,
+        pending: CdpPendingMap,
+        events: broadcast::Sender<Value>,
+        event_log: Arc<Mutex<CdpEventLog>>,
+    }
+
+    impl NavigationTestHarness {
+        async fn next_command_any(&mut self) -> Value {
+            let command: Value = match self.write_rx.recv().await.expect("CDP test command") {
+                CdpOutgoing::Text { payload, .. } => serde_json::from_str(&payload).unwrap(),
+                CdpOutgoing::Close => panic!("unexpected transport close"),
+            };
+            command
+        }
+
+        async fn next_command(&mut self, expected_method: &str) -> Value {
+            let command = self.next_command_any().await;
+            assert_eq!(command["method"], expected_method);
+            command
+        }
+
+        fn reply(&self, command: &Value, result: Value) {
+            dispatch_cdp_payload(
+                json!({ "id": command["id"], "result": result }),
+                Arc::clone(&self.pending),
+                self.events.clone(),
+                Arc::clone(&self.event_log),
+            );
+        }
+
+        async fn reply_next(&mut self, expected_method: &str, result: Value) {
+            let command = self.next_command(expected_method).await;
+            self.reply(&command, result);
+        }
+
+        fn emit(&self, event: Value) {
+            dispatch_cdp_payload(
+                event,
+                Arc::clone(&self.pending),
+                self.events.clone(),
+                Arc::clone(&self.event_log),
+            );
+        }
+    }
+
+    fn navigation_test_harness(event_capacity: usize) -> NavigationTestHarness {
+        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(event_capacity);
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let (alive_tx, _) = watch::channel(true);
+        let client = Arc::new(CdpClient {
+            write_tx,
+            pending: Arc::clone(&pending),
+            outstanding: Arc::new(Mutex::new(HashMap::new())),
+            events: events.clone(),
+            event_log: Arc::clone(&event_log),
+            traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            next_id: AtomicU64::new(1),
+            sent_runtime_enable_count: AtomicU64::new(0),
+            sent_target_close_count: AtomicU64::new(0),
+            sent_context_dispose_count: AtomicU64::new(0),
+            alive: Arc::new(AtomicBool::new(true)),
+            alive_tx,
+        });
+        let browser = Arc::new(BrowserInner {
+            runtime: OwnedRuntime(None),
+            client,
+            process: Mutex::new(None),
+            profile_dir: Mutex::new(None),
+            owned: false,
+            ws_endpoint: "ws://test.invalid".to_string(),
+            stealth_user_agent_override: Mutex::new(None),
+            single_process_fallback: false,
+            lifecycle: Arc::new(CloseLifecycle::new()),
+            attached_pages: AttachedPageRegistry::default(),
+            next_native_network_index: AtomicU64::new(1),
+        });
+        let page = Arc::new(PageInner {
+            browser,
+            target_id: "test-target".to_string(),
+            registry_generation: 0,
+            session_id: "page-session".to_string(),
+            context_id: None,
+            main_frame_id: Mutex::new(None),
+            frame_state: Mutex::new(PageFrameState::new("page-session".to_string())),
+            network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
+            console_records: Mutex::new(ConsoleRecordStore::default()),
+            console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+            native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
+            event_stream_start_cursor: 0,
+            background_override_active: Arc::new(AtomicBool::new(false)),
+            screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+            mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+            fill_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+            default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
+            lifecycle: Arc::new(CloseLifecycle::new()),
+            target_closed: AtomicBool::new(false),
+            crashed: AtomicBool::new(false),
+            close_target_on_drop: AtomicBool::new(false),
+        });
+        NavigationTestHarness {
+            page,
+            write_rx,
+            pending,
+            events,
+            event_log,
+        }
+    }
+
     #[tokio::test]
     async fn navigation_wait_completes_on_expected_same_document_url() {
-        let (events, mut receiver) = broadcast::channel(4);
+        let harness = navigation_test_harness(4);
+        let client = Arc::clone(&harness.page.browser.client);
+        let (mut receiver, event_cursor) = client.subscribe_with_cursor();
+        let events = harness.events;
         events
             .send(json!({
                 "sessionId": "page-session",
@@ -6805,19 +7111,205 @@ multiline-compatible = """4.5.6"""
             .expect("queue same-document navigation");
 
         let response = wait_for_navigation(
+            &client,
             &mut receiver,
+            event_cursor,
             "page-session",
             "load",
             None,
             Some("https://example.test/app#second"),
             "Page.go_forward",
-            Duration::from_millis(100),
+            OperationDeadline::new(Duration::from_millis(100)),
         )
         .await
         .expect("same-document navigation should complete");
 
         assert!(response.response.is_none());
         assert!(response.same_document);
+    }
+
+    #[tokio::test]
+    async fn navigation_reconciles_missing_domcontentloaded_event_from_ready_state() {
+        let mut harness = navigation_test_harness(4);
+        let navigation = page_goto_async(
+            Arc::clone(&harness.page),
+            "https://example.test/ready".to_string(),
+            "domcontentloaded".to_string(),
+            Duration::from_millis(120),
+            None,
+        );
+        let responder = async move {
+            harness
+                .reply_next(
+                    "Page.navigate",
+                    json!({ "frameId": "frame-1", "loaderId": "loader-1" }),
+                )
+                .await;
+            harness
+                .reply_next(
+                    "Runtime.evaluate",
+                    json!({ "result": { "type": "string", "value": "interactive" } }),
+                )
+                .await;
+            harness
+                .reply_next(
+                    "Page.getFrameTree",
+                    json!({ "frameTree": { "frame": { "id": "frame-1" } } }),
+                )
+                .await;
+        };
+
+        let (result, ()) = tokio::time::timeout(Duration::from_millis(500), async {
+            tokio::join!(navigation, responder)
+        })
+        .await
+        .expect("missing lifecycle reconciliation should stay bounded");
+        assert!(
+            result.is_ok(),
+            "ready document should satisfy navigation: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn navigation_uses_one_deadline_when_page_never_loads() {
+        let mut harness = navigation_test_harness(4);
+        let timeout = Duration::from_millis(150);
+        let started = tokio::time::Instant::now();
+        let navigation = page_goto_async(
+            Arc::clone(&harness.page),
+            "https://example.test/loading".to_string(),
+            "load".to_string(),
+            timeout,
+            None,
+        );
+        let responder = async move {
+            let navigate = harness.next_command("Page.navigate").await;
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            harness.reply(
+                &navigate,
+                json!({ "frameId": "frame-1", "loaderId": "loader-1" }),
+            );
+            harness.next_command("Runtime.evaluate").await;
+        };
+
+        let (result, ()) = tokio::time::timeout(Duration::from_millis(210), async {
+            tokio::join!(navigation, responder)
+        })
+        .await
+        .expect("navigation must not start a second full timeout after Page.navigate");
+        assert!(matches!(result, Err(RwError::Timeout(150))));
+        assert!(
+            started.elapsed() >= Duration::from_millis(125),
+            "the navigation failed before using its caller-supplied budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn lagged_navigation_receiver_reconciles_live_page_state() {
+        let mut harness = navigation_test_harness(2);
+        let navigation = page_goto_async(
+            Arc::clone(&harness.page),
+            "https://example.test/lagged".to_string(),
+            "load".to_string(),
+            Duration::from_secs(1),
+            None,
+        );
+        let responder = async move {
+            harness
+                .reply_next(
+                    "Page.navigate",
+                    json!({ "frameId": "frame-1", "loaderId": "loader-1" }),
+                )
+                .await;
+            for index in 0..3 {
+                harness.emit(json!({
+                    "sessionId": "page-session",
+                    "method": "Runtime.consoleAPICalled",
+                    "params": { "index": index },
+                }));
+            }
+            harness
+                .reply_next(
+                    "Runtime.evaluate",
+                    json!({ "result": { "type": "string", "value": "complete" } }),
+                )
+                .await;
+            harness
+                .reply_next(
+                    "Page.getFrameTree",
+                    json!({ "frameTree": { "frame": { "id": "frame-1" } } }),
+                )
+                .await;
+        };
+
+        let (result, ()) = tokio::time::timeout(Duration::from_millis(300), async {
+            tokio::join!(navigation, responder)
+        })
+        .await
+        .expect("lag reconciliation should run immediately instead of waiting for the deadline");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn interactive_ready_state_does_not_satisfy_load_navigation() {
+        let mut harness = navigation_test_harness(4);
+        let navigation = page_goto_async(
+            Arc::clone(&harness.page),
+            "https://example.test/interactive".to_string(),
+            "load".to_string(),
+            Duration::from_millis(80),
+            None,
+        );
+        let responder = async move {
+            harness
+                .reply_next(
+                    "Page.navigate",
+                    json!({ "frameId": "frame-1", "loaderId": "loader-1" }),
+                )
+                .await;
+            for index in 0..5 {
+                harness.emit(json!({
+                    "sessionId": "page-session",
+                    "method": "Runtime.consoleAPICalled",
+                    "params": { "index": index },
+                }));
+            }
+            let mut evaluate_count = 0;
+            loop {
+                let command = harness.next_command_any().await;
+                match command["method"].as_str() {
+                    Some("Runtime.evaluate") => {
+                        evaluate_count += 1;
+                        harness.reply(
+                            &command,
+                            json!({
+                                "result": { "type": "string", "value": "interactive" }
+                            }),
+                        );
+                    }
+                    Some("Target.getTargets") => {
+                        harness.reply(&command, json!({ "targetInfos": [] }));
+                        break;
+                    }
+                    Some("Page.getFrameTree") => {
+                        panic!("interactive readyState must not be treated as a completed load")
+                    }
+                    method => panic!("unexpected CDP test command: {method:?}"),
+                }
+            }
+            evaluate_count
+        };
+
+        let (result, evaluate_count) = tokio::time::timeout(Duration::from_millis(300), async {
+            tokio::join!(navigation, responder)
+        })
+        .await
+        .expect("interactive load-state rejection should stay bounded");
+        assert!(matches!(result, Err(RwError::Timeout(80))));
+        assert!(
+            evaluate_count > 0,
+            "the test must exercise readyState probing"
+        );
     }
 
     #[test]
@@ -7244,6 +7736,7 @@ enum CdpOutgoing {
     Text {
         payload: String,
         tracker: Option<CdpWriteTracker>,
+        diagnostic_id: Option<u64>,
     },
     Close,
 }
@@ -7330,11 +7823,239 @@ impl CdpWriteTracker {
     }
 }
 
+#[derive(Clone)]
+struct CdpOutstandingCommand {
+    id: u64,
+    method: String,
+    session_id: Option<String>,
+    started_at: Instant,
+    write_state: Arc<CdpWriteState>,
+}
+
+impl CdpOutstandingCommand {
+    fn traffic_entry(&self, status: &'static str) -> CdpTrafficEntry {
+        let recorded_at = Instant::now();
+        CdpTrafficEntry {
+            recorded_at,
+            command_elapsed_ms: Some(
+                recorded_at
+                    .saturating_duration_since(self.started_at)
+                    .as_millis(),
+            ),
+            direction: "outbound",
+            status,
+            id: Some(self.id),
+            method: self.method.clone(),
+            session_id: self.session_id.clone(),
+            transport_state: Some(cdp_write_state_label(self.write_state.load())),
+        }
+    }
+
+    fn render(&self, now: Instant) -> String {
+        let elapsed_ms = now.saturating_duration_since(self.started_at).as_millis();
+        format!(
+            "elapsed_ms={elapsed_ms} id={} method={} session={} transport={}",
+            self.id,
+            diagnostic_atom(&self.method),
+            diagnostic_atom(self.session_id.as_deref().unwrap_or("<browser>")),
+            cdp_write_state_label(self.write_state.load()),
+        )
+    }
+}
+
+#[derive(Clone)]
+struct CdpTrafficEntry {
+    recorded_at: Instant,
+    command_elapsed_ms: Option<u128>,
+    direction: &'static str,
+    status: &'static str,
+    id: Option<u64>,
+    method: String,
+    session_id: Option<String>,
+    transport_state: Option<&'static str>,
+}
+
+impl CdpTrafficEntry {
+    fn received_event(payload: &Value) -> Self {
+        Self {
+            recorded_at: Instant::now(),
+            command_elapsed_ms: None,
+            direction: "inbound",
+            status: "event",
+            id: None,
+            method: payload
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown-event>")
+                .to_string(),
+            session_id: payload
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            transport_state: None,
+        }
+    }
+
+    fn received_response(payload: &Value, command: Option<&CdpOutstandingCommand>) -> Self {
+        let is_error = payload.get("error").is_some();
+        let recorded_at = Instant::now();
+        Self {
+            recorded_at,
+            command_elapsed_ms: command.map(|command| {
+                recorded_at
+                    .saturating_duration_since(command.started_at)
+                    .as_millis()
+            }),
+            direction: "inbound",
+            status: if is_error {
+                "error-response"
+            } else {
+                "response"
+            },
+            id: payload.get("id").and_then(Value::as_u64),
+            method: command
+                .map(|command| command.method.clone())
+                .unwrap_or_else(|| "<unknown-command>".to_string()),
+            session_id: payload
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .or_else(|| command.and_then(|command| command.session_id.clone())),
+            transport_state: Some("written"),
+        }
+    }
+
+    fn render(&self, now: Instant) -> String {
+        let age_ms = now.saturating_duration_since(self.recorded_at).as_millis();
+        let id = self
+            .id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let session = diagnostic_atom(self.session_id.as_deref().unwrap_or("<browser>"));
+        let transport = self
+            .transport_state
+            .map(|state| format!(" transport={state}"))
+            .unwrap_or_default();
+        let command_elapsed = self
+            .command_elapsed_ms
+            .map(|elapsed| format!(" command_elapsed_ms={elapsed}"))
+            .unwrap_or_default();
+        format!(
+            "age_ms={age_ms} direction={} status={} id={id} method={} session={session}{transport}{command_elapsed}",
+            self.direction,
+            self.status,
+            diagnostic_atom(&self.method),
+        )
+    }
+}
+
+fn diagnostic_atom(value: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let mut bounded = value.chars().take(MAX_CHARS).collect::<String>();
+    if value.chars().count() > MAX_CHARS {
+        bounded.push('…');
+    }
+    serde_json::to_string(&bounded).unwrap_or_else(|_| "\"<unrenderable>\"".to_string())
+}
+
+struct CdpTrafficLog {
+    entries: VecDeque<CdpTrafficEntry>,
+    last_page_navigate: HashMap<String, (u64, bool, Instant)>,
+}
+
+impl CdpTrafficLog {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::with_capacity(CDP_DIAGNOSTIC_TRAFFIC_LIMIT),
+            last_page_navigate: HashMap::new(),
+        }
+    }
+
+    fn push(&mut self, entry: CdpTrafficEntry) {
+        if entry.method == "Page.navigate" {
+            if let (Some(id), Some(session_id)) = (entry.id, entry.session_id.as_ref()) {
+                if entry.direction == "inbound"
+                    && matches!(entry.status, "response" | "error-response")
+                {
+                    if self
+                        .last_page_navigate
+                        .get(session_id)
+                        .is_some_and(|(latest_id, _, _)| *latest_id == id)
+                    {
+                        self.last_page_navigate
+                            .insert(session_id.clone(), (id, true, entry.recorded_at));
+                    }
+                } else if entry.direction == "outbound" {
+                    if self.last_page_navigate.len() >= CDP_DIAGNOSTIC_LIST_LIMIT
+                        && !self.last_page_navigate.contains_key(session_id)
+                    {
+                        if let Some(oldest_session) = self
+                            .last_page_navigate
+                            .iter()
+                            .min_by_key(|(_, (_, _, recorded_at))| *recorded_at)
+                            .map(|(session_id, _)| session_id.clone())
+                        {
+                            self.last_page_navigate.remove(&oldest_session);
+                        }
+                    }
+                    self.last_page_navigate
+                        .insert(session_id.clone(), (id, false, entry.recorded_at));
+                }
+            }
+        }
+        self.entries.push_back(entry);
+        while self.entries.len() > CDP_DIAGNOSTIC_TRAFFIC_LIMIT {
+            self.entries.pop_front();
+        }
+    }
+
+    fn snapshot(&self) -> Vec<CdpTrafficEntry> {
+        self.entries.iter().cloned().collect()
+    }
+
+    fn page_navigate_waiting_for(
+        &self,
+        session_id: &str,
+        started_at: Instant,
+    ) -> Option<&'static str> {
+        self.last_page_navigate
+            .get(session_id)
+            .filter(|(_, _, recorded_at)| *recorded_at >= started_at)
+            .map(|(_, response_received, _)| {
+                if *response_received {
+                    "CDP navigation lifecycle event load"
+                } else {
+                    "CDP command Page.navigate response"
+                }
+            })
+    }
+}
+
+struct CdpClientDiagnosticSnapshot {
+    captured_at: Instant,
+    traffic: Vec<CdpTrafficEntry>,
+    outstanding: Vec<CdpOutstandingCommand>,
+    outstanding_total: usize,
+}
+
+fn cdp_write_state_label(state: u8) -> &'static str {
+    match state {
+        CDP_WRITE_QUEUED => "queued",
+        CDP_WRITE_WRITING => "writing",
+        CDP_WRITE_WRITTEN => "written",
+        CDP_WRITE_FAILED => "write-failed",
+        CDP_WRITE_ABANDONED => "abandoned-before-write",
+        _ => "unknown",
+    }
+}
+
 struct CdpClient {
     write_tx: mpsc::UnboundedSender<CdpOutgoing>,
     pending: CdpPendingMap,
+    outstanding: CdpOutstandingMap,
     events: broadcast::Sender<Value>,
     event_log: Arc<Mutex<CdpEventLog>>,
+    traffic_log: Arc<Mutex<CdpTrafficLog>>,
     next_id: AtomicU64,
     sent_runtime_enable_count: AtomicU64,
     sent_target_close_count: AtomicU64,
@@ -7473,14 +8194,24 @@ fn cdp_websocket_connect_error(
     }
 }
 
-fn dispatch_cdp_payload(
+fn dispatch_cdp_payload_with_diagnostics(
     mut payload: Value,
     pending: CdpPendingMap,
+    outstanding: CdpOutstandingMap,
     events: broadcast::Sender<Value>,
     event_log: Arc<Mutex<CdpEventLog>>,
+    traffic_log: Arc<Mutex<CdpTrafficLog>>,
 ) {
     if let Some(id) = payload.get("id").and_then(Value::as_u64) {
         let sender = pending.lock().unwrap().remove(&id);
+        let command = outstanding.lock().unwrap().remove(&id);
+        traffic_log
+            .lock()
+            .unwrap()
+            .push(CdpTrafficEntry::received_response(
+                &payload,
+                command.as_ref(),
+            ));
         if let Some(sender) = sender {
             let result = if let Some(error) = payload.get("error") {
                 let message = error
@@ -7498,21 +8229,56 @@ fn dispatch_cdp_payload(
             let _ = sender.send(result);
         }
     } else {
+        traffic_log
+            .lock()
+            .unwrap()
+            .push(CdpTrafficEntry::received_event(&payload));
         let mut event_log = event_log.lock().unwrap();
         event_log.push(payload.clone());
         let _ = events.send(payload);
     }
 }
 
-fn close_pending_cdp_commands(pending: CdpPendingMap) {
-    let senders = {
+#[cfg(test)]
+fn dispatch_cdp_payload(
+    payload: Value,
+    pending: CdpPendingMap,
+    events: broadcast::Sender<Value>,
+    event_log: Arc<Mutex<CdpEventLog>>,
+) {
+    dispatch_cdp_payload_with_diagnostics(
+        payload,
+        pending,
+        Arc::new(Mutex::new(HashMap::new())),
+        events,
+        event_log,
+        Arc::new(Mutex::new(CdpTrafficLog::new())),
+    );
+}
+
+fn close_pending_cdp_commands(
+    pending: CdpPendingMap,
+    outstanding: CdpOutstandingMap,
+    traffic_log: Arc<Mutex<CdpTrafficLog>>,
+) {
+    let pending_commands = {
         let mut pending = pending.lock().unwrap();
-        pending
-            .drain()
-            .map(|(_, sender)| sender)
+        pending.drain().collect::<Vec<_>>()
+    };
+    let closed_commands = {
+        let mut outstanding = outstanding.lock().unwrap();
+        pending_commands
+            .iter()
+            .filter_map(|(id, _)| outstanding.remove(id))
             .collect::<Vec<_>>()
     };
-    for sender in senders {
+    {
+        let mut traffic_log = traffic_log.lock().unwrap();
+        for command in closed_commands {
+            traffic_log.push(command.traffic_entry("transport-closed"));
+        }
+    }
+    for (_, sender) in pending_commands {
         let _ = sender.send(Err(RwError::Disconnected));
     }
 }
@@ -7594,10 +8360,16 @@ impl CdpClient {
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<CdpOutgoing>();
         let pending: CdpPendingMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_reader = Arc::clone(&pending);
+        let outstanding: CdpOutstandingMap = Arc::new(Mutex::new(HashMap::new()));
+        let outstanding_writer = Arc::clone(&outstanding);
+        let outstanding_reader = Arc::clone(&outstanding);
         let (events, _) = broadcast::channel(4096);
         let events_reader = events.clone();
         let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
         let event_log_reader = Arc::clone(&event_log);
+        let traffic_log = Arc::new(Mutex::new(CdpTrafficLog::new()));
+        let traffic_log_writer = Arc::clone(&traffic_log);
+        let traffic_log_reader = Arc::clone(&traffic_log);
         let alive = Arc::new(AtomicBool::new(true));
         let alive_writer = Arc::clone(&alive);
         let alive_reader = Arc::clone(&alive);
@@ -7608,17 +8380,35 @@ impl CdpClient {
         tokio::spawn(async move {
             while let Some(message) = write_rx.recv().await {
                 match message {
-                    CdpOutgoing::Text { payload, tracker } => {
+                    CdpOutgoing::Text {
+                        payload,
+                        tracker,
+                        diagnostic_id,
+                    } => {
+                        let diagnostic = diagnostic_id
+                            .and_then(|id| outstanding_writer.lock().unwrap().get(&id).cloned());
                         // The sender abandons a command whose deadline expired; skipping it here is
                         // what makes "not written" a promise rather than a guess.
                         if let Some(tracker) = &tracker {
                             if !tracker.begin_write() {
                                 continue;
                             }
+                        } else if let Some(diagnostic) = &diagnostic {
+                            let _ = diagnostic.write_state.begin_write();
                         }
                         let written = write.send(Message::Text(payload.into())).await.is_ok();
                         if let Some(tracker) = tracker {
                             tracker.finish(written);
+                        } else if let Some(diagnostic) = &diagnostic {
+                            diagnostic.write_state.finish(written);
+                        }
+                        if written {
+                            if let Some(diagnostic) = diagnostic {
+                                traffic_log_writer
+                                    .lock()
+                                    .unwrap()
+                                    .push(diagnostic.traffic_entry("sent"));
+                            }
                         }
                         if !written {
                             alive_writer.store(false, Ordering::SeqCst);
@@ -7646,23 +8436,27 @@ impl CdpClient {
                     continue;
                 };
 
-                dispatch_cdp_payload(
+                dispatch_cdp_payload_with_diagnostics(
                     payload,
                     Arc::clone(&pending_reader),
+                    Arc::clone(&outstanding_reader),
                     events_reader.clone(),
                     Arc::clone(&event_log_reader),
+                    Arc::clone(&traffic_log_reader),
                 );
             }
             alive_reader.store(false, Ordering::SeqCst);
             alive_tx_reader.send_replace(false);
-            close_pending_cdp_commands(pending_reader);
+            close_pending_cdp_commands(pending_reader, outstanding_reader, traffic_log_reader);
         });
 
         Ok(Arc::new(Self {
             write_tx,
             pending,
+            outstanding,
             events,
             event_log,
+            traffic_log,
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -7681,10 +8475,16 @@ impl CdpClient {
         let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel::<Value>();
         let pending: CdpPendingMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_dispatcher = Arc::clone(&pending);
+        let outstanding: CdpOutstandingMap = Arc::new(Mutex::new(HashMap::new()));
+        let outstanding_writer = Arc::clone(&outstanding);
+        let outstanding_dispatcher = Arc::clone(&outstanding);
         let (events, _) = broadcast::channel(4096);
         let events_dispatcher = events.clone();
         let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
         let event_log_dispatcher = Arc::clone(&event_log);
+        let traffic_log = Arc::new(Mutex::new(CdpTrafficLog::new()));
+        let traffic_log_writer = Arc::clone(&traffic_log);
+        let traffic_log_dispatcher = Arc::clone(&traffic_log);
         let alive = Arc::new(AtomicBool::new(true));
         let alive_writer = Arc::clone(&alive);
         let alive_dispatcher = Arc::clone(&alive);
@@ -7695,18 +8495,36 @@ impl CdpClient {
         tokio::task::spawn_blocking(move || {
             while let Some(message) = write_rx.blocking_recv() {
                 match message {
-                    CdpOutgoing::Text { payload, tracker } => {
+                    CdpOutgoing::Text {
+                        payload,
+                        tracker,
+                        diagnostic_id,
+                    } => {
+                        let diagnostic = diagnostic_id
+                            .and_then(|id| outstanding_writer.lock().unwrap().get(&id).cloned());
                         // The sender abandons a command whose deadline expired; skipping it here is
                         // what makes "not written" a promise rather than a guess.
                         if let Some(tracker) = &tracker {
                             if !tracker.begin_write() {
                                 continue;
                             }
+                        } else if let Some(diagnostic) = &diagnostic {
+                            let _ = diagnostic.write_state.begin_write();
                         }
                         let written = pipe_write.write_all(payload.as_bytes()).is_ok()
                             && pipe_write.write_all(&[0]).is_ok();
                         if let Some(tracker) = tracker {
                             tracker.finish(written);
+                        } else if let Some(diagnostic) = &diagnostic {
+                            diagnostic.write_state.finish(written);
+                        }
+                        if written {
+                            if let Some(diagnostic) = diagnostic {
+                                traffic_log_writer
+                                    .lock()
+                                    .unwrap()
+                                    .push(diagnostic.traffic_entry("sent"));
+                            }
                         }
                         if !written {
                             alive_writer.store(false, Ordering::SeqCst);
@@ -7747,23 +8565,31 @@ impl CdpClient {
 
         tokio::spawn(async move {
             while let Some(payload) = incoming_rx.recv().await {
-                dispatch_cdp_payload(
+                dispatch_cdp_payload_with_diagnostics(
                     payload,
                     Arc::clone(&pending_dispatcher),
+                    Arc::clone(&outstanding_dispatcher),
                     events_dispatcher.clone(),
                     Arc::clone(&event_log_dispatcher),
+                    Arc::clone(&traffic_log_dispatcher),
                 );
             }
             alive_dispatcher.store(false, Ordering::SeqCst);
             alive_tx_dispatcher.send_replace(false);
-            close_pending_cdp_commands(pending_dispatcher);
+            close_pending_cdp_commands(
+                pending_dispatcher,
+                outstanding_dispatcher,
+                traffic_log_dispatcher,
+            );
         });
 
         Ok(Arc::new(Self {
             write_tx,
             pending,
+            outstanding,
             events,
             event_log,
+            traffic_log,
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -7775,6 +8601,12 @@ impl CdpClient {
 
     fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.events.subscribe()
+    }
+
+    fn subscribe_with_cursor(&self) -> (broadcast::Receiver<Value>, u64) {
+        let event_log = self.event_log.lock().unwrap();
+        let receiver = self.events.subscribe();
+        (receiver, event_log.cursor())
     }
 
     fn event_cursor(&self) -> u64 {
@@ -7827,6 +8659,44 @@ impl CdpClient {
 
     fn pending_command_count(&self) -> usize {
         self.pending.lock().unwrap().len()
+    }
+
+    fn diagnostic_snapshot(&self) -> CdpClientDiagnosticSnapshot {
+        let captured_at = Instant::now();
+        let traffic = self.traffic_log.lock().unwrap().snapshot();
+        let mut outstanding = self
+            .outstanding
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        outstanding.sort_by_key(|command| command.started_at);
+        let outstanding_total = outstanding.len();
+        outstanding.truncate(CDP_DIAGNOSTIC_LIST_LIMIT);
+        CdpClientDiagnosticSnapshot {
+            captured_at,
+            traffic,
+            outstanding,
+            outstanding_total,
+        }
+    }
+
+    fn navigation_waiting_for(&self, session_id: &str, started_at: Instant) -> String {
+        if self.outstanding.lock().unwrap().values().any(|command| {
+            command.method == "Page.navigate"
+                && command.session_id.as_deref() == Some(session_id)
+                && command.started_at >= started_at
+        }) {
+            return "CDP command Page.navigate response".to_string();
+        }
+
+        self.traffic_log
+            .lock()
+            .unwrap()
+            .page_navigate_waiting_for(session_id, started_at)
+            .unwrap_or("Page.goto cancellation before Page.navigate was sent")
+            .to_string()
     }
 
     async fn send(
@@ -7914,7 +8784,22 @@ impl CdpClient {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        let _pending_guard = PendingCommandGuard::new(id, &self.pending);
+        let write_state = tracker
+            .as_ref()
+            .map(|tracker| Arc::clone(&tracker.state))
+            .unwrap_or_else(|| Arc::new(CdpWriteState::new()));
+        self.outstanding.lock().unwrap().insert(
+            id,
+            CdpOutstandingCommand {
+                id,
+                method: method.to_string(),
+                session_id: session_id.map(ToString::to_string),
+                started_at: Instant::now(),
+                write_state,
+            },
+        );
+        let _pending_guard =
+            PendingCommandGuard::new(id, &self.pending, &self.outstanding, &self.traffic_log);
 
         let mut payload = json!({
             "id": id,
@@ -7932,6 +8817,7 @@ impl CdpClient {
             .send(CdpOutgoing::Text {
                 payload: payload.to_string(),
                 tracker,
+                diagnostic_id: Some(id),
             })
             .is_err()
         {
@@ -7966,7 +8852,18 @@ impl CdpClient {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        let _pending_guard = PendingCommandGuard::new(id, &self.pending);
+        self.outstanding.lock().unwrap().insert(
+            id,
+            CdpOutstandingCommand {
+                id,
+                method: method.to_string(),
+                session_id: session_id.map(ToString::to_string),
+                started_at: Instant::now(),
+                write_state: Arc::new(CdpWriteState::new()),
+            },
+        );
+        let _pending_guard =
+            PendingCommandGuard::new(id, &self.pending, &self.outstanding, &self.traffic_log);
 
         let method_json = serde_json::to_string(method)?;
         let payload = if let Some(session_id) = session_id {
@@ -7983,6 +8880,7 @@ impl CdpClient {
             .send(CdpOutgoing::Text {
                 payload,
                 tracker: None,
+                diagnostic_id: Some(id),
             })
             .is_err()
         {
@@ -8024,7 +8922,18 @@ impl CdpClient {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
             let (tx, rx) = oneshot::channel();
             self.pending.lock().unwrap().insert(id, tx);
-            let pending_guard = PendingCommandGuard::new(id, &self.pending);
+            self.outstanding.lock().unwrap().insert(
+                id,
+                CdpOutstandingCommand {
+                    id,
+                    method: method.to_string(),
+                    session_id: session_id.map(ToString::to_string),
+                    started_at: Instant::now(),
+                    write_state: Arc::new(CdpWriteState::new()),
+                },
+            );
+            let pending_guard =
+                PendingCommandGuard::new(id, &self.pending, &self.outstanding, &self.traffic_log);
 
             let payload = if let Some(session_id_json) = &session_id_json {
                 format!(
@@ -8039,6 +8948,7 @@ impl CdpClient {
                 .send(CdpOutgoing::Text {
                     payload,
                     tracker: None,
+                    diagnostic_id: Some(id),
                 })
                 .is_err()
             {
@@ -8118,6 +9028,15 @@ struct AttachedPageEntry {
     page: Weak<PageInner>,
     attach_lock: Weak<tokio::sync::Mutex<()>>,
     registered: bool,
+}
+
+#[derive(Clone)]
+struct AttachedPageDiagnostic {
+    target_id: String,
+    session_id: String,
+    context_id: Option<String>,
+    closed: bool,
+    crashed: bool,
 }
 
 enum AttachedPageReservation {
@@ -8267,6 +9186,30 @@ impl AttachedPageRegistry {
 
     fn clear(&self) {
         self.entries.lock().unwrap().clear();
+    }
+
+    fn diagnostic_snapshot(&self) -> (Vec<AttachedPageDiagnostic>, usize) {
+        let mut pages = self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(target_id, entry)| {
+                let page = entry.page.upgrade()?;
+                Some(AttachedPageDiagnostic {
+                    target_id: target_id.clone(),
+                    session_id: page.session_id.clone(),
+                    context_id: page.context_id.clone(),
+                    closed: page.lifecycle.is_closing_or_closed()
+                        || page.target_closed.load(Ordering::SeqCst),
+                    crashed: page.crashed.load(Ordering::SeqCst),
+                })
+            })
+            .collect::<Vec<_>>();
+        pages.sort_by(|left, right| left.target_id.cmp(&right.target_id));
+        let total = pages.len();
+        pages.truncate(CDP_DIAGNOSTIC_LIST_LIMIT);
+        (pages, total)
     }
 
     #[cfg(test)]
@@ -8453,6 +9396,257 @@ impl BrowserInner {
         self.lifecycle.finish(sender, &result, true);
         result
     }
+}
+
+enum BrowserProcessDiagnostic {
+    Alive { pid: u32 },
+    Exited { pid: u32, code: Option<i32> },
+    ProbeFailed { pid: u32 },
+    Remote,
+    HandleUnavailable,
+}
+
+impl BrowserProcessDiagnostic {
+    fn render(&self) -> String {
+        match self {
+            Self::Alive { pid } => format!("alive pid={pid}"),
+            Self::Exited { pid, code } => match code {
+                Some(code) => format!("exited pid={pid} code={code}"),
+                None => format!("exited pid={pid} code=<signal-or-unknown>"),
+            },
+            Self::ProbeFailed { pid } => format!("unknown pid={pid} probe=failed"),
+            Self::Remote => "not-owned (remote CDP connection)".to_string(),
+            Self::HandleUnavailable => "unknown (owned process handle unavailable)".to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BrowserTargetDiagnostic {
+    target_id: String,
+    target_type: String,
+    attached: Option<bool>,
+    context_id: Option<String>,
+}
+
+enum BrowserTargetQueryDiagnostic {
+    Available {
+        targets: Vec<BrowserTargetDiagnostic>,
+        total: usize,
+    },
+    Unavailable(&'static str),
+}
+
+struct BrowserTimeoutDiagnostic {
+    operation: &'static str,
+    waiting_for: String,
+    started_at: Instant,
+    cdp_connected: bool,
+    process: BrowserProcessDiagnostic,
+    cdp: CdpClientDiagnosticSnapshot,
+    attached_pages: Vec<AttachedPageDiagnostic>,
+    attached_pages_total: usize,
+    target_query: BrowserTargetQueryDiagnostic,
+}
+
+fn browser_process_diagnostic(browser: &BrowserInner) -> BrowserProcessDiagnostic {
+    let mut process = browser.process.lock().unwrap();
+    let Some(child) = process.as_mut() else {
+        return if browser.owned {
+            BrowserProcessDiagnostic::HandleUnavailable
+        } else {
+            BrowserProcessDiagnostic::Remote
+        };
+    };
+    let pid = child.id();
+    match child.try_wait() {
+        Ok(None) => BrowserProcessDiagnostic::Alive { pid },
+        Ok(Some(status)) => BrowserProcessDiagnostic::Exited {
+            pid,
+            code: status.code(),
+        },
+        Err(_) => BrowserProcessDiagnostic::ProbeFailed { pid },
+    }
+}
+
+fn diagnostic_error_kind(error: &RwError) -> &'static str {
+    match error {
+        RwError::Timeout(_) => "timeout",
+        RwError::Disconnected | RwError::Closed | RwError::TargetClosed(_) => "disconnected",
+        RwError::Cdp { .. } => "protocol-error",
+        RwError::Io(_) | RwError::WebSocket(_) | RwError::ConnectFailed => "transport-error",
+        RwError::Cancelled => "cancelled",
+        _ => "unavailable",
+    }
+}
+
+async fn query_browser_targets_for_diagnostic(
+    client: Arc<CdpClient>,
+) -> BrowserTargetQueryDiagnostic {
+    if !client.is_connected() {
+        return BrowserTargetQueryDiagnostic::Unavailable("cdp-disconnected");
+    }
+    let response = match client
+        .send(
+            "Target.getTargets",
+            json!({}),
+            None,
+            CDP_DIAGNOSTIC_QUERY_TIMEOUT,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return BrowserTargetQueryDiagnostic::Unavailable(diagnostic_error_kind(&error))
+        }
+    };
+    let Some(target_infos) = response.get("targetInfos").and_then(Value::as_array) else {
+        return BrowserTargetQueryDiagnostic::Unavailable("malformed-response");
+    };
+    let total = target_infos.len();
+    let mut targets = target_infos
+        .iter()
+        .take(CDP_DIAGNOSTIC_LIST_LIMIT)
+        .map(|target| BrowserTargetDiagnostic {
+            target_id: target
+                .get("targetId")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>")
+                .to_string(),
+            target_type: target
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>")
+                .to_string(),
+            attached: target.get("attached").and_then(Value::as_bool),
+            context_id: target
+                .get("browserContextId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| left.target_id.cmp(&right.target_id));
+    BrowserTargetQueryDiagnostic::Available { targets, total }
+}
+
+fn render_browser_timeout_diagnostic(diagnostic: &BrowserTimeoutDiagnostic) -> String {
+    let now = diagnostic.cdp.captured_at;
+    let elapsed_ms = now
+        .saturating_duration_since(diagnostic.started_at)
+        .as_millis();
+    let mut lines = vec![
+        format!("========== {TIMEOUT_DIAGNOSTIC_BANNER} BEGIN =========="),
+        format!("operation={}", diagnostic_atom(diagnostic.operation)),
+        format!(
+            "outstanding={} elapsed_ms={elapsed_ms}",
+            diagnostic_atom(&diagnostic.waiting_for)
+        ),
+        format!(
+            "browser_process={} cdp_connected={}",
+            diagnostic.process.render(),
+            diagnostic.cdp_connected
+        ),
+        format!(
+            "registered_target_sessions count={} shown={}",
+            diagnostic.attached_pages_total,
+            diagnostic.attached_pages.len()
+        ),
+    ];
+    if diagnostic.attached_pages.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for page in &diagnostic.attached_pages {
+            lines.push(format!(
+                "  target={} session={} context={} closed={} crashed={}",
+                diagnostic_atom(&page.target_id),
+                diagnostic_atom(&page.session_id),
+                diagnostic_atom(page.context_id.as_deref().unwrap_or("<default>")),
+                page.closed,
+                page.crashed,
+            ));
+        }
+    }
+    match &diagnostic.target_query {
+        BrowserTargetQueryDiagnostic::Available { targets, total } => {
+            lines.push(format!(
+                "browser_targets count={total} shown={}",
+                targets.len()
+            ));
+            if targets.is_empty() {
+                lines.push("  (none)".to_string());
+            } else {
+                for target in targets {
+                    lines.push(format!(
+                        "  target={} type={} attached={} context={}",
+                        diagnostic_atom(&target.target_id),
+                        diagnostic_atom(&target.target_type),
+                        target
+                            .attached
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "<unknown>".to_string()),
+                        diagnostic_atom(target.context_id.as_deref().unwrap_or("<default>")),
+                    ));
+                }
+            }
+        }
+        BrowserTargetQueryDiagnostic::Unavailable(reason) => {
+            lines.push(format!("browser_targets unavailable={reason}"));
+        }
+    }
+    lines.push(format!(
+        "pending_cdp_commands count={} shown={}",
+        diagnostic.cdp.outstanding_total,
+        diagnostic.cdp.outstanding.len()
+    ));
+    if diagnostic.cdp.outstanding.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for command in &diagnostic.cdp.outstanding {
+            lines.push(format!("  {}", command.render(now)));
+        }
+    }
+    lines.push(format!(
+        "recent_cdp_traffic count={} order=oldest-to-newest",
+        diagnostic.cdp.traffic.len()
+    ));
+    if diagnostic.cdp.traffic.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for entry in &diagnostic.cdp.traffic {
+            lines.push(format!("  {}", entry.render(now)));
+        }
+    }
+    lines.push(format!(
+        "========== {TIMEOUT_DIAGNOSTIC_BANNER} END =========="
+    ));
+    lines.join("\n")
+}
+
+async fn emit_browser_timeout_diagnostic(
+    browser: Arc<BrowserInner>,
+    operation: &'static str,
+    waiting_for: String,
+    started_at: Instant,
+) {
+    // Snapshot traffic before the failure-only Target.getTargets probe so the
+    // probe cannot push the messages that explain the timeout out of the ring.
+    let cdp = browser.client.diagnostic_snapshot();
+    let cdp_connected = browser.client.is_connected();
+    let process = browser_process_diagnostic(&browser);
+    let (attached_pages, attached_pages_total) = browser.attached_pages.diagnostic_snapshot();
+    let target_query = query_browser_targets_for_diagnostic(Arc::clone(&browser.client)).await;
+    let dump = render_browser_timeout_diagnostic(&BrowserTimeoutDiagnostic {
+        operation,
+        waiting_for,
+        started_at,
+        cdp_connected,
+        process,
+        cdp,
+        attached_pages,
+        attached_pages_total,
+        target_query,
+    });
+    eprintln!("{dump}");
 }
 
 impl Drop for BrowserInner {
@@ -13423,18 +14617,39 @@ async fn page_goto_async(
     timeout: Duration,
     referer: Option<String>,
 ) -> RwResult<String> {
+    let deadline = OperationDeadline::new(timeout);
+    let started_at = Instant::now();
     let client = Arc::clone(&page.browser.client);
     let session_id = page.session_id.clone();
-    let mut events = client.subscribe();
+    let (mut events, event_cursor) = client.subscribe_with_cursor();
     let target_url = url.clone();
     let mut params = json!({ "url": url });
     if let Some(referer) = referer {
         params["referrer"] = Value::String(referer);
         params["referrerPolicy"] = Value::String("unsafeUrl".to_string());
     }
-    let result = client
-        .send("Page.navigate", params, Some(&session_id), timeout)
-        .await?;
+    let result = match client
+        .send(
+            "Page.navigate",
+            params,
+            Some(&session_id),
+            deadline.remaining()?,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(error @ RwError::Timeout(_)) => {
+            emit_browser_timeout_diagnostic(
+                Arc::clone(&page.browser),
+                "Page.goto",
+                "CDP command Page.navigate response".to_string(),
+                started_at,
+            )
+            .await;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     if let Some(error_text) = result.get("errorText").and_then(Value::as_str) {
         let failed_url = result
             .get("url")
@@ -13454,16 +14669,38 @@ async fn page_goto_async(
         }
         return Ok(Value::Null.to_string());
     }
-    let response = wait_for_navigation(
+    let response = match wait_for_navigation(
+        &client,
         &mut events,
+        event_cursor,
         &session_id,
         &wait_until,
         loader_id.as_deref(),
         None,
         "Page.goto",
-        timeout,
+        deadline,
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(error @ RwError::Timeout(_)) => {
+            let lifecycle = match wait_until.as_str() {
+                "commit" => "commit",
+                "domcontentloaded" => "domcontentloaded",
+                "networkidle" => "networkidle",
+                _ => "load",
+            };
+            emit_browser_timeout_diagnostic(
+                Arc::clone(&page.browser),
+                "Page.goto",
+                format!("CDP navigation lifecycle event {lifecycle}"),
+                started_at,
+            )
+            .await;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     Ok(response
         .response
         .unwrap_or_else(|| {
@@ -15988,60 +17225,8 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         let referer = referer.map(ToString::to_string);
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
-        let client = Arc::clone(&browser.client);
-        let session_id = page.session_id.clone();
         py.detach(move || {
-            browser.block_on(async move {
-                let mut events = client.subscribe();
-                let target_url = url.clone();
-                let mut params = json!({ "url": url });
-                if let Some(referer) = referer {
-                    params["referrer"] = Value::String(referer);
-                    params["referrerPolicy"] = Value::String("unsafeUrl".to_string());
-                }
-                let result = client
-                    .send("Page.navigate", params, Some(&session_id), timeout)
-                    .await?;
-                if let Some(error_text) = result.get("errorText").and_then(Value::as_str) {
-                    let failed_url = result
-                        .get("url")
-                        .and_then(Value::as_str)
-                        .unwrap_or(target_url.as_str());
-                    return Err(RwError::Message(format!(
-                        "Page.goto: {error_text} at {failed_url}"
-                    )));
-                }
-                let loader_id = result
-                    .get("loaderId")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string);
-                if loader_id.is_none() {
-                    if let Some(frame_id) = result.get("frameId").and_then(Value::as_str) {
-                        page.record_main_frame_navigation_url(frame_id, &target_url);
-                    }
-                    return Ok(Value::Null.to_string());
-                }
-                let response = wait_for_navigation(
-                    &mut events,
-                    &session_id,
-                    &wait_until,
-                    loader_id.as_deref(),
-                    None,
-                    "Page.goto",
-                    timeout,
-                )
-                .await?;
-                let _ = client;
-                Ok(response
-                    .response
-                    .unwrap_or_else(|| {
-                        json!({
-                            "url": result.get("url").cloned().unwrap_or(Value::Null),
-                            "loader_id": loader_id,
-                        })
-                    })
-                    .to_string())
-            })
+            browser.block_on(page_goto_async(page, url, wait_until, timeout, referer))
         })
         .map_err(py_err)
     }
@@ -16067,7 +17252,8 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         let session_id = page.session_for_frame_id(&frame_id);
         py.detach(move || {
             browser.block_on(async move {
-                let mut events = client.subscribe();
+                let deadline = OperationDeadline::new(timeout);
+                let (mut events, event_cursor) = client.subscribe_with_cursor();
                 let target_url = url.clone();
                 let mut params = json!({ "url": url, "frameId": frame_id });
                 if let Some(referer) = referer {
@@ -16075,7 +17261,12 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                     params["referrerPolicy"] = Value::String("unsafeUrl".to_string());
                 }
                 let result = client
-                    .send("Page.navigate", params, Some(&session_id), timeout)
+                    .send(
+                        "Page.navigate",
+                        params,
+                        Some(&session_id),
+                        deadline.remaining()?,
+                    )
                     .await?;
                 if let Some(error_text) = result.get("errorText").and_then(Value::as_str) {
                     let failed_url = result
@@ -16102,13 +17293,15 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                     return Ok(Value::Null.to_string());
                 }
                 let response = wait_for_navigation(
+                    &client,
                     &mut events,
+                    event_cursor,
                     &session_id,
                     &wait_until,
                     loader_id.as_deref(),
                     None,
                     "Frame.goto",
-                    timeout,
+                    deadline,
                 )
                 .await?;
                 let _ = client;
@@ -19426,12 +20619,13 @@ impl PyPage {
         let session_id = page.session_id.clone();
         browser
             .block_on(async move {
+                let deadline = OperationDeadline::new(timeout);
                 let history = client
                     .send(
                         "Page.getNavigationHistory",
                         json!({}),
                         Some(&session_id),
-                        timeout,
+                        deadline.remaining()?,
                     )
                     .await?;
                 let current_index = history
@@ -19466,17 +20660,19 @@ impl PyPage {
                     .get("url")
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
-                let mut events = client.subscribe();
+                let (mut events, event_cursor) = client.subscribe_with_cursor();
                 client
                     .send(
                         "Page.navigateToHistoryEntry",
                         json!({ "entryId": entry_id }),
                         Some(&session_id),
-                        timeout,
+                        deadline.remaining()?,
                     )
                     .await?;
                 let response = wait_for_navigation(
+                    &client,
                     &mut events,
+                    event_cursor,
                     &session_id,
                     &wait_until,
                     None,
@@ -19486,7 +20682,7 @@ impl PyPage {
                     } else {
                         "Page.go_forward"
                     },
-                    timeout,
+                    deadline,
                 )
                 .await?;
                 Ok(response.response.unwrap_or(Value::Null).to_string())
@@ -20282,6 +21478,26 @@ impl RustwrightBrowser {
 impl RustwrightPage {
     pub fn target_id(&self) -> String {
         self.inner.target_id.clone()
+    }
+
+    /// Emit the failure-only diagnostic used when a caller-owned navigation
+    /// deadline cancels `Page.goto` before its native timeout can fire.
+    #[doc(hidden)]
+    pub fn emit_navigation_timeout_diagnostic(&self, elapsed: Duration) {
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let started_at = Instant::now()
+            .checked_sub(elapsed)
+            .unwrap_or_else(Instant::now);
+        let waiting_for = browser
+            .client
+            .navigation_waiting_for(&page.session_id, started_at);
+        browser.block_on_raw(emit_browser_timeout_diagnostic(
+            Arc::clone(&browser),
+            "browser_navigate",
+            waiting_for,
+            started_at,
+        ));
     }
 
     pub fn url(&self) -> String {
@@ -21430,7 +22646,7 @@ return waitForScrollSettle();
                     .get("url")
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
-                let mut events = operation_client.subscribe();
+                let (mut events, event_cursor) = operation_client.subscribe_with_cursor();
                 operation_client
                     .send(
                         "Page.navigateToHistoryEntry",
@@ -21440,7 +22656,9 @@ return waitForScrollSettle();
                     )
                     .await?;
                 let response = wait_for_navigation(
+                    &operation_client,
                     &mut events,
+                    event_cursor,
                     &operation_session_id,
                     &wait_until,
                     None,
@@ -21450,7 +22668,7 @@ return waitForScrollSettle();
                     } else {
                         "Page.go_forward"
                     },
-                    deadline.remaining()?,
+                    deadline,
                 )
                 .await?;
                 if !response.same_document && wait_until != "commit" {
@@ -23275,8 +24493,10 @@ mod native_console_record_tests {
             client: Arc::new(CdpClient {
                 write_tx,
                 pending: Arc::clone(&pending),
+                outstanding: Arc::new(Mutex::new(HashMap::new())),
                 events: events.clone(),
                 event_log: Arc::clone(&event_log),
+                traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
                 next_id: AtomicU64::new(1),
                 sent_runtime_enable_count: AtomicU64::new(0),
                 sent_target_close_count: AtomicU64::new(0),
@@ -27237,16 +28457,137 @@ fn completed_navigation(response: Option<Value>, same_document: bool) -> Navigat
     }
 }
 
+const NAVIGATION_RECONCILIATION_MAX_BUDGET: Duration = Duration::from_millis(250);
+
+fn navigation_timeout(deadline: OperationDeadline) -> RwError {
+    RwError::Timeout(duration_millis_u64(deadline.timeout))
+}
+
+fn navigation_ready_state_satisfies(state: &str, ready_state: &str) -> bool {
+    match state {
+        "domcontentloaded" => matches!(ready_state, "interactive" | "complete"),
+        "load" => ready_state == "complete",
+        _ => false,
+    }
+}
+
+async fn reconcile_navigation_state(
+    client: &CdpClient,
+    session_id: &str,
+    state: &str,
+    deadline: OperationDeadline,
+) -> RwResult<bool> {
+    if !matches!(state, "domcontentloaded" | "load") {
+        return Ok(false);
+    }
+
+    let probe_budget = deadline
+        .remaining()?
+        .min(NAVIGATION_RECONCILIATION_MAX_BUDGET);
+    let probe_deadline = OperationDeadline {
+        at: tokio::time::Instant::now() + probe_budget,
+        timeout: deadline.timeout,
+    };
+    let ready_state = match client
+        .send(
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.readyState",
+                "returnByValue": true,
+            }),
+            Some(session_id),
+            probe_deadline.remaining()?,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(RwError::Timeout(_)) => return Err(navigation_timeout(deadline)),
+        Err(error)
+            if is_locator_wait_context_loss(&error) || is_page_not_attached_error(&error) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    let ready_state = ready_state
+        .pointer("/result/value")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !navigation_ready_state_satisfies(state, ready_state) {
+        return Ok(false);
+    }
+
+    match client
+        .send(
+            "Page.getFrameTree",
+            json!({}),
+            Some(session_id),
+            probe_deadline.remaining()?,
+        )
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(RwError::Timeout(_)) => Err(navigation_timeout(deadline)),
+        Err(error) if is_page_not_attached_error(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NavigationTerminalEvent {
+    SameDocument,
+    Lifecycle,
+}
+
+fn navigation_terminal_event(
+    event: &Value,
+    session_id: &str,
+    state: &str,
+    expected_url: Option<&str>,
+) -> Option<NavigationTerminalEvent> {
+    if event.get("sessionId").and_then(Value::as_str) != Some(session_id) {
+        return None;
+    }
+    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+    let frame_navigated_to_expected = method == "Page.frameNavigated"
+        && expected_url
+            .zip(event.pointer("/params/frame/url").and_then(Value::as_str))
+            .map(|(expected, actual)| expected == actual)
+            .unwrap_or(false);
+    let navigated_within_document_to_expected = method == "Page.navigatedWithinDocument"
+        && expected_url
+            .zip(event.pointer("/params/url").and_then(Value::as_str))
+            .map(|(expected, actual)| expected == actual)
+            .unwrap_or(false);
+    if navigated_within_document_to_expected {
+        return Some(NavigationTerminalEvent::SameDocument);
+    }
+    let reached_state = match state {
+        "domcontentloaded" => method == "Page.domContentEventFired" || frame_navigated_to_expected,
+        "networkidle" | "load" => method == "Page.loadEventFired" || frame_navigated_to_expected,
+        _ => method == "Page.loadEventFired" || frame_navigated_to_expected,
+    };
+    reached_state.then_some(NavigationTerminalEvent::Lifecycle)
+}
+
 async fn wait_for_navigation(
+    client: &CdpClient,
     events: &mut broadcast::Receiver<Value>,
+    event_cursor: u64,
     session_id: &str,
     state: &str,
     loader_id: Option<&str>,
     expected_url: Option<&str>,
     method_label: &str,
-    timeout: Duration,
+    deadline: OperationDeadline,
 ) -> RwResult<NavigationWaitResult> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let initial_remaining = deadline.remaining()?;
+    let reconciliation_budget = (initial_remaining / 4)
+        .max(Duration::from_millis(1))
+        .min(NAVIGATION_RECONCILIATION_MAX_BUDGET)
+        .min(initial_remaining);
+    let reconciliation_at = deadline.at - reconciliation_budget;
+    let mut deadline_reconciliation_attempted = false;
     let mut response = None;
     let mut requests: HashMap<String, Value> = HashMap::new();
     let mut response_extra_infos: HashMap<String, Value> = HashMap::new();
@@ -27259,8 +28600,15 @@ async fn wait_for_navigation(
     let mut state_reached_deadline: Option<tokio::time::Instant> = None;
     loop {
         let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return Err(RwError::Timeout(timeout.as_millis() as u64));
+        if now >= deadline.at {
+            return Err(navigation_timeout(deadline));
+        }
+        if !deadline_reconciliation_attempted && now >= reconciliation_at {
+            deadline_reconciliation_attempted = true;
+            if reconcile_navigation_state(client, session_id, state, deadline).await? {
+                return Ok(completed_navigation(response, false));
+            }
+            continue;
         }
         if state == "networkidle"
             && load_reached
@@ -27293,7 +28641,10 @@ async fn wait_for_navigation(
                 return Ok(completed_navigation(response, false));
             }
         }
-        let mut remaining = deadline - now;
+        let mut remaining = deadline.at - now;
+        if !deadline_reconciliation_attempted {
+            remaining = remaining.min(reconciliation_at.saturating_duration_since(now));
+        }
         if state == "networkidle" {
             if let Some(idle_deadline) = network_idle_deadline {
                 remaining = remaining.min(idle_deadline - now);
@@ -27435,30 +28786,12 @@ async fn wait_for_navigation(
                     continue;
                 }
 
-                let frame_navigated_to_expected = method == "Page.frameNavigated"
-                    && expected_url
-                        .zip(event.pointer("/params/frame/url").and_then(Value::as_str))
-                        .map(|(expected, actual)| expected == actual)
-                        .unwrap_or(false);
-                let navigated_within_document_to_expected = method
-                    == "Page.navigatedWithinDocument"
-                    && expected_url
-                        .zip(event.pointer("/params/url").and_then(Value::as_str))
-                        .map(|(expected, actual)| expected == actual)
-                        .unwrap_or(false);
-                if navigated_within_document_to_expected {
-                    return Ok(completed_navigation(response, true));
-                }
-                let reached_state = match state {
-                    "domcontentloaded" => {
-                        method == "Page.domContentEventFired" || frame_navigated_to_expected
+                if let Some(terminal_event) =
+                    navigation_terminal_event(&event, session_id, state, expected_url)
+                {
+                    if terminal_event == NavigationTerminalEvent::SameDocument {
+                        return Ok(completed_navigation(response, true));
                     }
-                    "networkidle" | "load" => {
-                        method == "Page.loadEventFired" || frame_navigated_to_expected
-                    }
-                    _ => method == "Page.loadEventFired" || frame_navigated_to_expected,
-                };
-                if reached_state {
                     if state == "networkidle" {
                         load_reached = true;
                         if active_requests.is_empty() {
@@ -27479,9 +28812,62 @@ async fn wait_for_navigation(
                     continue;
                 }
             }
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                let replayed_terminal = {
+                    let event_log = client.event_log.lock().unwrap();
+                    event_log
+                        .entries_since(event_cursor)
+                        .into_iter()
+                        .filter_map(|(_, event)| {
+                            navigation_terminal_event(&event, session_id, state, expected_url)
+                        })
+                        .fold(None, |replayed, terminal| {
+                            if replayed == Some(NavigationTerminalEvent::SameDocument)
+                                || terminal == NavigationTerminalEvent::SameDocument
+                            {
+                                Some(NavigationTerminalEvent::SameDocument)
+                            } else {
+                                Some(terminal)
+                            }
+                        })
+                };
+                if let Some(terminal_event) = replayed_terminal {
+                    if terminal_event == NavigationTerminalEvent::SameDocument {
+                        return Ok(completed_navigation(response, true));
+                    }
+                    if state == "networkidle" {
+                        if !load_reached {
+                            load_reached = true;
+                            if active_requests.is_empty() {
+                                network_idle_deadline =
+                                    Some(tokio::time::Instant::now() + Duration::from_millis(500));
+                            }
+                        }
+                        continue;
+                    }
+                    if response.is_some() {
+                        if response_extra_deadline.is_some() {
+                            state_ready_to_return = true;
+                            continue;
+                        }
+                        return Ok(completed_navigation(response, false));
+                    }
+                    state_reached_deadline =
+                        Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                    continue;
+                }
+                if reconcile_navigation_state(client, session_id, state, deadline).await? {
+                    return Ok(completed_navigation(response, false));
+                }
+                continue;
+            }
             Ok(Err(_)) => return Err(RwError::Message("CDP event stream closed".to_string())),
             Err(_) => {
+                if !deadline_reconciliation_attempted
+                    && tokio::time::Instant::now() >= reconciliation_at
+                {
+                    continue;
+                }
                 if state == "networkidle"
                     && load_reached
                     && response.is_some()
@@ -27492,7 +28878,7 @@ async fn wait_for_navigation(
                 if state_reached_deadline.is_some() {
                     return Ok(completed_navigation(response, false));
                 }
-                return Err(RwError::Timeout(timeout.as_millis() as u64));
+                return Err(navigation_timeout(deadline));
             }
         }
     }
