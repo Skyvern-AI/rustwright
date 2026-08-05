@@ -664,6 +664,12 @@ impl Page {
         Ok(serde_json::from_str(&json)?)
     }
 
+    /// Emit the failure-only navigation dump for a caller-owned timeout.
+    #[doc(hidden)]
+    pub fn emit_navigation_timeout_diagnostic(&self, elapsed: Duration) {
+        self.inner.emit_navigation_timeout_diagnostic(elapsed);
+    }
+
     /// Navigate to the previous history entry, if one exists.
     pub fn go_back(&self, options: GotoOptions) -> Result<Value> {
         self.go_back_with_cancel(options, None)
