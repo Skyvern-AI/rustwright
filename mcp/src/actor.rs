@@ -1392,6 +1392,7 @@ impl BrowserState {
     fn navigate(&mut self, url: &str, request: &ActorRequest) -> TextResult {
         self.current_refs.clear();
         let remaining = Self::remaining(request)?;
+        let started_at = Instant::now();
         let result = self.ensure_page(request)?.goto_with_cancel(
             url,
             GotoOptions::default()
@@ -1399,14 +1400,21 @@ impl BrowserState {
                 .timeout(Self::engine_timeout(remaining)),
             Some(&request.cancellation.engine),
         );
-        result.map_err(|error| {
-            self.operation_error(
+        if let Err(error) = result {
+            if matches!(error, Error::Cancelled)
+                && request.cancellation.reason() == CancellationReason::Deadline
+            {
+                if let Some(page) = self.page.as_ref() {
+                    page.emit_navigation_timeout_diagnostic(started_at.elapsed());
+                }
+            }
+            return Err(self.operation_error(
                 "navigation failed",
                 error,
                 &request.cancellation,
                 request.timeout_ms,
-            )
-        })?;
+            ));
+        }
         self.snapshot(request)
     }
 
