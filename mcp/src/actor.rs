@@ -4364,6 +4364,29 @@ mod tests {
     use super::*;
     use rustwright::ActionabilityError;
 
+    struct WorkerGuard<T> {
+        cancel: CancelToken,
+        worker: Option<thread::JoinHandle<T>>,
+    }
+
+    impl<T> WorkerGuard<T> {
+        fn join(mut self) -> thread::Result<T> {
+            self.worker
+                .take()
+                .expect("worker handle must be present")
+                .join()
+        }
+    }
+
+    impl<T> Drop for WorkerGuard<T> {
+        fn drop(&mut self) {
+            if let Some(worker) = self.worker.take() {
+                self.cancel.cancel();
+                let _ = worker.join();
+            }
+        }
+    }
+
     struct HangingServer {
         addr: SocketAddr,
         stop: Arc<std::sync::atomic::AtomicBool>,
@@ -7596,13 +7619,17 @@ mod tests {
             let cancel = CancelToken::new();
             let click_cancel = cancel.clone();
             let click_page = page.clone();
-            let click = thread::spawn(move || {
-                click_page.click_with_cancel(
-                    "#cancel",
-                    ActionOptions::timeout(10_000.0),
-                    Some(&click_cancel),
-                )
-            });
+            // Declared after `browser` so unwind cancels and joins the worker before browser cleanup.
+            let click = WorkerGuard {
+                cancel: cancel.clone(),
+                worker: Some(thread::spawn(move || {
+                    click_page.click_with_cancel(
+                        "#cancel",
+                        ActionOptions::timeout(10_000.0),
+                        Some(&click_cancel),
+                    )
+                })),
+            };
             assert_eq!(server.capture(), "actionability-started");
             cancel.cancel();
             assert!(matches!(
@@ -7639,13 +7666,17 @@ mod tests {
             let cancel = CancelToken::new();
             let click_cancel = cancel.clone();
             let click_page = page.clone();
-            let click = thread::spawn(move || {
-                click_page.click_with_cancel(
-                    "#atomic",
-                    ActionOptions::timeout(5_000.0),
-                    Some(&click_cancel),
-                )
-            });
+            // Declared after `browser` so unwind cancels and joins the worker before browser cleanup.
+            let click = WorkerGuard {
+                cancel: cancel.clone(),
+                worker: Some(thread::spawn(move || {
+                    click_page.click_with_cancel(
+                        "#atomic",
+                        ActionOptions::timeout(5_000.0),
+                        Some(&click_cancel),
+                    )
+                })),
+            };
             assert_eq!(server.capture(), "atomic-mousedown");
             cancel.cancel();
             click
