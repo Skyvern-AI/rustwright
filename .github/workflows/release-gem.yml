@@ -42,18 +42,31 @@ jobs:
           gemspec = Gem::Specification.load('ruby/rustwright.gemspec')
           abort 'Unable to load ruby/rustwright.gemspec' unless gemspec
 
+          # RubyGems rewrites a SemVer prerelease when it parses it, so a
+          # Cargo.toml version of "0.3.0-beta.1" reaches the gemspec as
+          # "0.3.0.pre.beta.1". Those raw strings can never match, so compare
+          # parsed Gem::Version values here.
           versions = {
-            'Cargo.toml' => cargo_version,
-            'ruby/rustwright.gemspec' => gemspec.version.to_s
+            'Cargo.toml' => Gem::Version.new(cargo_version),
+            'ruby/rustwright.gemspec' => gemspec.version
           }
           expected = versions.values.first
-          abort "Package versions do not match: #{versions}" unless versions.values.all? { |value| value == expected }
+          unless versions.values.all? { |value| value == expected }
+            abort "Package versions do not match: #{versions.transform_values(&:to_s)}"
+          end
 
+          # The tag is compared literally, not as a Gem::Version. Parsed
+          # equality also accepts "0.2" for "0.2.0" and "0.3.0-rc1" for
+          # "0.3.0-rc.1", and the other four workflows compare tag strings
+          # exactly. A looser check here would let one tag publish the gem
+          # while every other registry rejected it.
           if ENV['GITHUB_REF_TYPE'] == 'tag'
             tag_version = ENV.fetch('GITHUB_REF_NAME').sub(/^v/, '')
-            abort "Tag version #{tag_version.inspect} does not match package version #{expected.inspect}" unless tag_version == expected
+            unless tag_version == cargo_version
+              abort "Tag version #{tag_version.inspect} does not match package version #{cargo_version.inspect}"
+            end
           end
-          puts "Validated package version #{expected}"
+          puts "Validated package version #{cargo_version}"
           RUBY
 
   native:
@@ -227,7 +240,6 @@ jobs:
         with:
           name: gem-package
           path: gem-dist
-
 
       - name: Publish experimental platform gems
         shell: bash

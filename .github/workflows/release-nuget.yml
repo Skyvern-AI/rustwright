@@ -256,7 +256,6 @@ jobs:
           name: nuget-package
           path: nuget-dist
 
-
       - name: NuGet login (Trusted Publishing)
         id: nuget_login
         uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
