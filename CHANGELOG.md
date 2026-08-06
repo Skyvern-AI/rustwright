@@ -4,10 +4,12 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-07-29
+## [0.2.0] - 2026-08-03
 
 ### Added
 
+- Added anonymous, opt-out launch telemetry; set `DISABLE_TELEMETRY=1` or `RUSTWRIGHT_DISABLE_TELEMETRY=1` to disable it.
+- Added shadow-piercing CSS selectors backed by a real selector lexer and DOM-tree ancestry.
 - Added a persistent `rustwright` CLI for browser sessions, accessibility snapshots, and element-reference actions.
 - Added `rustwright-mcp`, an MCP stdio server that exposes browser automation tools to MCP clients.
 - Added native console-message capture and the mirror-profile `browser_console_messages` MCP tool.
@@ -28,6 +30,9 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ### Fixed
 
+- Fixed `evaluate()` string handling by restoring the statement-forms runtime probe an internal refactor had reverted: IIFEs, declaration-plus-invocation programs, and other program-form strings evaluate correctly again in every binding, and arguments apply only when the evaluated value is invoked as a function.
+- Fixed `fill()` on React-controlled inputs so the native engine's writes survive controlled-component re-renders.
+- Fixed `evaluate()` arguments and comparisons to use JavaScript number semantics across the language bindings.
 - Fixed locator waits so they re-arm after mid-wait navigation against the original timeout instead of surfacing execution-context errors.
 - Fixed remote-CDP actionability probes so they receive the full remaining action budget rather than a short per-probe cap.
 - Fixed Node.js evaluation decoding for special numeric values, BigInt, and regular expressions; Go/C-ABI and native Rust now use the core's canonical wire decoder.
