@@ -15,7 +15,10 @@
 [![npm downloads](https://img.shields.io/npm/dw/rustwright?logo=npm&label=npm%20downloads)](https://www.npmjs.com/package/rustwright)
 [![crates.io downloads](https://img.shields.io/crates/dr/rustwright?logo=rust&label=crates.io%20recent%20downloads)](https://crates.io/crates/rustwright)
 [![rustwright-core downloads](https://img.shields.io/crates/dr/rustwright-core?logo=rust&label=rustwright-core%20recent%20downloads)](https://crates.io/crates/rustwright-core)
-<!-- When the tagged release publishes to RubyGems, NuGet, and Maven Central, add matching download badges here: gem/dt/rustwright, nuget/dt/Rustwright; maven-central download badges are not offered by shields — link Maven Central search instead. The MCP npm package (rustwright-mcp) publishes on the separate mcp-npm-v* tag family, not the v* release tag — only add its npm/dw badge once that tag has shipped. -->
+[![gem downloads](https://img.shields.io/gem/dt/rustwright?logo=rubygems&logoColor=white&label=gem%20downloads)](https://rubygems.org/gems/rustwright)
+[![NuGet downloads](https://img.shields.io/nuget/dt/Rustwright?logo=nuget&label=nuget%20downloads)](https://www.nuget.org/packages/Rustwright/)
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.skyvern-ai/rustwright?logo=apachemaven&label=maven%20central)](https://central.sonatype.com/artifact/io.github.skyvern-ai/rustwright)
+<!-- The MCP npm package (rustwright-mcp) publishes on the separate mcp-npm-v* tag family, not the v* release tag — only add its npm/dw badge once that tag has shipped. -->
 
 </div>
 
