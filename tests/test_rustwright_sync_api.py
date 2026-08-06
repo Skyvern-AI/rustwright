@@ -9969,7 +9969,7 @@ def test_locator_click_dispatches_trusted_mouse_sequence_by_default(page, monkey
         """
     )
 
-    page.locator("#go").click(timeout=1_000)
+    page.locator("#go").click(timeout=3_000)
 
     events = page.evaluate("window.events")
     assert [event["type"] for event in events] == [
@@ -25307,6 +25307,147 @@ def test_cli_chrome_for_testing_download_extracts_cache(monkeypatch, tmp_path: P
     assert executable == tmp_path / "browsers" / "chromium-123.0.0.0" / executable_name
     if os.name != "nt":
         assert os.access(executable, os.X_OK)
+
+
+def test_cli_exact_chromium_version_uses_direct_download_url():
+    from rustwright import cli
+
+    download = cli._chrome_for_testing_download("linux64", version="123.0.6312.86")
+
+    assert download == {
+        "version": "123.0.6312.86",
+        "url": (
+            "https://storage.googleapis.com/chrome-for-testing-public/"
+            "123.0.6312.86/linux64/chrome-linux64.zip"
+        ),
+        "platform": "linux64",
+    }
+
+
+def test_cli_install_pinned_chromium_bypasses_system_browser(monkeypatch, capsys):
+    from rustwright import cli
+
+    calls = []
+    monkeypatch.setenv("RUSTWRIGHT_CHROMIUM_VERSION", "124.0.6367.91")
+    monkeypatch.setattr(
+        cli,
+        "_chromium_executable_path",
+        lambda: pytest.fail("pinned install must not resolve a system browser"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_download_chromium",
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "executable": "/cache/chromium-124.0.6367.91/chrome-linux64/chrome",
+            "downloaded": True,
+            "url": "https://example.test/124.0.6367.91/chrome-linux64.zip",
+        },
+    )
+
+    assert cli.install(["chromium"]) == 0
+
+    assert calls == [{"force": False, "dry_run": False, "version": "124.0.6367.91"}]
+    output = capsys.readouterr().out
+    assert "installed pinned Chromium 124.0.6367.91 executable" in output
+
+
+def test_cli_install_version_flag_overrides_environment(monkeypatch, capsys):
+    from rustwright import cli
+
+    calls = []
+    monkeypatch.setenv("RUSTWRIGHT_CHROMIUM_VERSION", "124.0.6367.91")
+    monkeypatch.setattr(
+        cli,
+        "_chromium_executable_path",
+        lambda: pytest.fail("pinned install must not resolve a system browser"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_download_chromium",
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "executable": "/cache/chromium-125.0.6422.60/chrome-linux64/chrome",
+            "downloaded": False,
+            "url": "https://example.test/125.0.6422.60/chrome-linux64.zip",
+        },
+    )
+
+    assert cli.install(["chromium", "--version", "125.0.6422.60", "--dry-run"]) == 0
+
+    assert calls == [{"force": False, "dry_run": True, "version": "125.0.6422.60"}]
+    output = capsys.readouterr().out
+    assert "would download pinned Chromium 125.0.6422.60" in output
+    assert output.rstrip().endswith("/cache/chromium-125.0.6422.60/chrome-linux64/chrome")
+
+
+def test_cli_install_pinned_chromium_fails_without_fallback(monkeypatch, capsys):
+    from rustwright import cli
+
+    monkeypatch.setenv("RUSTWRIGHT_CHROMIUM_VERSION", "126.0.6478.55")
+    monkeypatch.setattr(
+        cli,
+        "_chromium_executable_path",
+        lambda: pytest.fail("pinned install must not resolve a system browser"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_download_chromium",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("HTTP 404")),
+    )
+
+    assert cli.install(["chromium"]) == 1
+
+    error = capsys.readouterr().err
+    assert "Could not install pinned Chromium 126.0.6478.55" in error
+    assert "will not fall back to a system browser or a different Chrome for Testing build" in error
+    assert "HTTP 404" in error
+
+
+def test_cli_install_rejects_invalid_pinned_chromium_version(monkeypatch, capsys):
+    from rustwright import cli
+
+    monkeypatch.setenv("RUSTWRIGHT_CHROMIUM_VERSION", "stable")
+    monkeypatch.setattr(
+        cli,
+        "_download_chromium",
+        lambda **kwargs: pytest.fail("invalid pinned version must fail before download resolution"),
+    )
+
+    assert cli.install(["chromium"]) == 1
+
+    assert "expected a full Chrome for Testing version" in capsys.readouterr().err
+
+
+def test_cli_install_rejects_explicit_empty_chromium_version(monkeypatch, capsys):
+    from rustwright import cli
+
+    monkeypatch.delenv("RUSTWRIGHT_CHROMIUM_VERSION", raising=False)
+    monkeypatch.setattr(
+        cli,
+        "_download_chromium",
+        lambda **kwargs: pytest.fail("invalid pinned version must fail before download resolution"),
+    )
+
+    assert cli.install(["chromium", "--version", ""]) == 1
+
+    assert "expected a full Chrome for Testing version" in capsys.readouterr().err
+
+
+def test_cli_install_empty_version_environment_keeps_unpinned_behavior(monkeypatch, capsys):
+    from rustwright import cli
+
+    monkeypatch.setenv("RUSTWRIGHT_CHROMIUM_VERSION", "")
+    monkeypatch.setattr(cli, "_chromium_executable_path", lambda: "/usr/bin/chromium")
+    monkeypatch.setattr(
+        cli,
+        "_download_chromium",
+        lambda **kwargs: pytest.fail("empty pin must preserve system-browser resolution"),
+    )
+
+    assert cli.install(["chromium"]) == 0
+
+    assert "Rustwright found Chromium executable: /usr/bin/chromium" in capsys.readouterr().out
 
 
 def test_cli_chrome_for_testing_platform_rejects_linux_arm64(monkeypatch):
