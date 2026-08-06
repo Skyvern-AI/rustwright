@@ -5133,7 +5133,7 @@ def mouse_wheel_dispatches_single_trusted_event_like_playwright(page):
 
     page.mouse.move(50, 50)
     page.mouse.wheel(0, 40)
-    page.wait_for_timeout(100)
+    page.wait_for_function("() => window.events.length >= 2", timeout=5_000)
 
     assert page.evaluate("window.events") == [
         {

@@ -68,12 +68,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/workspace/target \
     python -m pip install --no-build-isolation -e ".[dev]"
 
+COPY .github/chromium-version ./.github/chromium-version
+
 RUN --mount=type=cache,target=/var/cache/rustwright-browsers \
     python -m rustwright.cli install-deps chromium \
     && mkdir -p "$RUSTWRIGHT_BROWSERS_PATH" \
     && case "$(uname -m)" in \
         aarch64|arm64) echo "Using Playwright's Linux arm64 Chromium for Rustwright runtime in this image." ;; \
-        *) RUSTWRIGHT_BROWSERS_PATH=/var/cache/rustwright-browsers python -m rustwright.cli install chromium \
+        *) chromium_version="$(tr -d '[:space:]' < .github/chromium-version)" \
+           && RUSTWRIGHT_BROWSERS_PATH=/var/cache/rustwright-browsers \
+              python -m rustwright.cli install chromium --version "$chromium_version" \
            && cp -a /var/cache/rustwright-browsers/. "$RUSTWRIGHT_BROWSERS_PATH"/ ;; \
        esac
 
@@ -102,10 +106,22 @@ RUN for root in "$RUSTWRIGHT_BROWSERS_PATH" "$PLAYWRIGHT_BROWSERS_PATH"; do \
 
 RUN case "$(uname -m)" in \
         aarch64|arm64) browser="$(find "$PLAYWRIGHT_BROWSERS_PATH" -path '*/chrome-linux/chrome' -type f | head -n 1)" ;; \
-        *) browser="$(find "$RUSTWRIGHT_BROWSERS_PATH" -path '*/chrome-linux64/chrome' -type f | head -n 1)" ;; \
+        *) chromium_version="$(tr -d '[:space:]' < .github/chromium-version)" \
+           && browser="$RUSTWRIGHT_BROWSERS_PATH/chromium-$chromium_version/chrome-linux64/chrome" ;; \
     esac \
     && test -n "$browser" \
-    && ln -sf "$browser" "$RUSTWRIGHT_CHROMIUM"
+    && test -x "$browser" \
+    && ln -sf "$browser" "$RUSTWRIGHT_CHROMIUM" \
+    && echo "Chromium executable: $RUSTWRIGHT_CHROMIUM" \
+    && resolved_version="$("$RUSTWRIGHT_CHROMIUM" --version)" \
+    && echo "Chromium version: $resolved_version" \
+    && case "$(uname -m)" in \
+         aarch64|arm64) ;; \
+         *) case "$resolved_version" in \
+              *"$chromium_version"*) ;; \
+              *) echo "Pinned Chromium mismatch: expected $chromium_version, got $resolved_version" >&2; exit 1 ;; \
+            esac ;; \
+       esac
 
 RUN --mount=type=cache,target=/root/.npm \
     if [ "$INSTALL_PUPPETEER" = "1" ]; then \

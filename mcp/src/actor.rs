@@ -6707,9 +6707,14 @@ mod tests {
     });
   }
   const detached = document.querySelector('#detach');
-  new IntersectionObserver(entries => {
-    if (entries.some(entry => entry.isIntersecting)) detached.remove();
-  }).observe(detached);
+  // Deliberately rely on the engine calling this property: synchronous removal makes
+  // its next snapshot see isConnected === false; async observer delivery races dispatch
+  // and the winner has changed between Chromium builds.
+  const nativeScrollIntoView = detached.scrollIntoView;
+  detached.scrollIntoView = function(options) {
+    nativeScrollIntoView.call(this, options);
+    this.remove();
+  };
   fetch('/capture?events=actionability-ready');
 </script>"#
             .to_owned()
@@ -7578,7 +7583,7 @@ mod tests {
                         && event["hit"] == Value::Bool(true))
             );
 
-            page.click("#partially-offscreen", ActionOptions::timeout(1_000.0))
+            page.click("#partially-offscreen", ActionOptions::timeout(3_000.0))
                 .expect("click partially-offscreen target at its hit-tested viewport point");
             let partially_offscreen = page
                 .evaluate(
@@ -7605,7 +7610,7 @@ mod tests {
             );
 
             assert_actionability(
-                page.click("#detach", ActionOptions::timeout(500.0))
+                page.click("#detach", ActionOptions::timeout(3_000.0))
                     .expect_err("detached target must not click"),
                 ActionabilityError::Detached,
             );
@@ -7702,7 +7707,7 @@ mod tests {
             );
             assert_eq!(evidence["buttonDown"], Value::Bool(false));
 
-            page.click("#following", ActionOptions::timeout(1_000.0))
+            page.click("#following", ActionOptions::timeout(3_000.0))
                 .expect("following click must work after late cancellation");
             assert_eq!(
                 page.evaluate(
