@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -78,6 +79,9 @@ _SCREENSHOT_VALUE_FLAGS = _AGENT_GLOBAL_VALUE_FLAGS | {
     "--quality",
 }
 CHROME_FOR_TESTING_URL = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
+CHROME_FOR_TESTING_DOWNLOAD_BASE_URL = "https://storage.googleapis.com/chrome-for-testing-public"
+CHROMIUM_VERSION_ENV = "RUSTWRIGHT_CHROMIUM_VERSION"
+CHROMIUM_VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+\.\d+")
 LINUX_TOOLS_DEPS = [
     "xvfb",
     "fonts-noto-color-emoji",
@@ -149,6 +153,10 @@ def _install_parser(program: str = "playwright") -> argparse.ArgumentParser:
     parser.add_argument("--with-deps", action="store_true", help="Accepted for Playwright CLI compatibility.")
     parser.add_argument("--dry-run", action="store_true", help="Print the resolved browser path without launching a download.")
     parser.add_argument("--force", action="store_true", help="Accepted for Playwright CLI compatibility.")
+    parser.add_argument(
+        "--version",
+        help=f"Install an exact Chrome for Testing version (or set {CHROMIUM_VERSION_ENV}).",
+    )
     parser.add_argument("--only-shell", action="store_true", help="Accepted for Playwright CLI compatibility.")
     parser.add_argument("--no-shell", action="store_true", help="Accepted for Playwright CLI compatibility.")
     return parser
@@ -392,8 +400,37 @@ def _ensure_browser_executable(executable: Path) -> None:
         raise RuntimeError(f"Could not mark Chromium executable at {executable} as executable: {exc}") from exc
 
 
-def _chrome_for_testing_download(platform_name: str | None = None) -> dict[str, str]:
+def _validate_chromium_version(version: str) -> str:
+    normalized = version.strip()
+    if not CHROMIUM_VERSION_PATTERN.fullmatch(normalized):
+        raise ValueError(
+            f"Invalid Chromium version {version!r}; expected a full Chrome for Testing version like 123.0.6312.86"
+        )
+    return normalized
+
+
+def _requested_chromium_version(cli_version: str | None) -> str | None:
+    if cli_version is not None:
+        return _validate_chromium_version(cli_version)
+    requested = os.environ.get(CHROMIUM_VERSION_ENV)
+    if requested is None or not requested.strip():
+        return None
+    return _validate_chromium_version(requested)
+
+
+def _chrome_for_testing_download(
+    platform_name: str | None = None,
+    *,
+    version: str | None = None,
+) -> dict[str, str]:
     platform_name = platform_name or _chrome_for_testing_platform()
+    if version is not None:
+        version = _validate_chromium_version(version)
+        return {
+            "version": version,
+            "url": f"{CHROME_FOR_TESTING_DOWNLOAD_BASE_URL}/{version}/{platform_name}/chrome-{platform_name}.zip",
+            "platform": platform_name,
+        }
     with url_request.urlopen(CHROME_FOR_TESTING_URL, timeout=30) as response:
         payload = json.loads(response.read().decode("utf-8"))
     stable = payload.get("channels", {}).get("Stable", {})
@@ -405,8 +442,17 @@ def _chrome_for_testing_download(platform_name: str | None = None) -> dict[str, 
     raise RuntimeError(f"Could not find a Chrome for Testing download for {platform_name}")
 
 
-def _download_chromium(*, force: bool = False, dry_run: bool = False) -> dict[str, object]:
-    download = _chrome_for_testing_download()
+def _download_chromium(
+    *,
+    force: bool = False,
+    dry_run: bool = False,
+    version: str | None = None,
+) -> dict[str, object]:
+    download = (
+        _chrome_for_testing_download(version=version)
+        if version is not None
+        else _chrome_for_testing_download()
+    )
     platform_name = download["platform"]
     install_dir = _browser_cache_dir() / f"chromium-{download['version']}"
     executable = install_dir / _chrome_for_testing_executable(platform_name)
@@ -866,6 +912,40 @@ def install(argv: Sequence[str], *, program: str = "playwright") -> int:
     if not ok:
         print(message, file=sys.stderr)
         return 1
+    try:
+        pinned_version = _requested_chromium_version(args.version)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    if pinned_version is not None:
+        if any(browser != "chromium" for browser in browsers):
+            print(
+                "An exact Chromium version can only be used with the chromium install target.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            result = _download_chromium(
+                force=bool(args.force),
+                dry_run=bool(args.dry_run),
+                version=pinned_version,
+            )
+        except Exception as exc:
+            print(
+                f"Could not install pinned Chromium {pinned_version}. Rustwright will not fall back to a system "
+                f"browser or a different Chrome for Testing build. Details: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        if args.with_deps:
+            print("Rustwright does not install OS packages; ensure Chromium runtime dependencies are present.")
+        if args.dry_run:
+            print(f"Rustwright would download pinned Chromium {pinned_version} from: {result['url']}")
+            print(result["executable"])
+        else:
+            verb = "installed" if result["downloaded"] else "found"
+            print(f"Rustwright {verb} pinned Chromium {pinned_version} executable: {result['executable']}")
+        return 0
     if any(browser in BRANDED_INSTALL_BROWSERS for browser in browsers):
         status = 0
         for browser in browsers:
