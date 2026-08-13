@@ -5506,16 +5506,19 @@ def test_persistent_context_env_is_passed_to_chromium_process(playwright, tmp_pa
         context.close()
 
 
-def test_launch_defaults_to_no_sandbox_argument(playwright, tmp_path: Path):
+def test_launch_includes_default_chromium_arguments(playwright, tmp_path: Path):
     args_file = tmp_path / "launch-args.txt"
     wrapper = chromium_arg_probe_wrapper(tmp_path, playwright.chromium.executable_path, args_file)
 
     browser = playwright.chromium.launch(headless=True, executable_path=str(wrapper))
     try:
         page = browser.new_page()
-        page.set_content("<title>Sandbox</title>")
+        page.set_content("<title>Default Arguments</title>")
 
-        assert "--no-sandbox" in args_file.read_text(encoding="utf-8").splitlines()
+        launch_args = args_file.read_text(encoding="utf-8").splitlines()
+        assert "--no-sandbox" in launch_args
+        assert "--password-store=basic" in launch_args
+        assert "--use-mock-keychain" in launch_args
     finally:
         browser.close()
 
@@ -5541,7 +5544,11 @@ def test_launch_ignore_default_args_filters_selected_defaults(playwright, tmp_pa
     browser = playwright.chromium.launch(
         headless=True,
         executable_path=str(wrapper),
-        ignore_default_args=["--mute-audio", "--enable-features=CDPScreenshotNewSurface"],
+        ignore_default_args=[
+            "--mute-audio",
+            "--enable-features=CDPScreenshotNewSurface",
+            "--use-mock-keychain",
+        ],
         args=["--disable-features=RustwrightIgnoreDefaultArgsProbe"],
     )
     try:
@@ -5551,6 +5558,8 @@ def test_launch_ignore_default_args_filters_selected_defaults(playwright, tmp_pa
         launch_args = args_file.read_text(encoding="utf-8").splitlines()
         assert "--mute-audio" not in launch_args
         assert "--enable-features=CDPScreenshotNewSurface" not in launch_args
+        assert "--use-mock-keychain" not in launch_args
+        assert "--password-store=basic" in launch_args
         assert "--no-sandbox" in launch_args
         assert "--disable-features=RustwrightIgnoreDefaultArgsProbe" in launch_args
     finally:
@@ -5573,6 +5582,8 @@ def test_launch_ignore_all_default_args_keeps_user_args(playwright, tmp_path: Pa
         launch_args = args_file.read_text(encoding="utf-8").splitlines()
         assert "--no-first-run" not in launch_args
         assert "--mute-audio" not in launch_args
+        assert "--password-store=basic" not in launch_args
+        assert "--use-mock-keychain" not in launch_args
         assert "--headless=new" in launch_args
         assert "--no-sandbox" in launch_args
         assert any(arg.startswith("--remote-debugging-port=") for arg in launch_args)

@@ -4663,6 +4663,14 @@ multiline-compatible = """4.5.6"""
     }
 
     #[test]
+    fn chromium_default_launch_args_disable_system_keychains() {
+        let args = chromium_default_launch_args(&LaunchOptions::default());
+
+        assert!(args.iter().any(|arg| arg == "--password-store=basic"));
+        assert!(args.iter().any(|arg| arg == "--use-mock-keychain"));
+    }
+
+    #[test]
     fn chromium_launch_failure_message_includes_stderr_tail() {
         let stderr = NamedTempFile::new().unwrap();
         fs::write(
@@ -28595,6 +28603,32 @@ fn launch_chromium_process(
     }
 }
 
+fn chromium_default_launch_args(options: &LaunchOptions) -> Vec<String> {
+    let mut default_args = vec![
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--password-store=basic".to_string(),
+        "--use-mock-keychain".to_string(),
+        "--disable-background-networking".to_string(),
+        "--disable-background-timer-throttling".to_string(),
+        "--disable-dev-shm-usage".to_string(),
+        "--disable-blink-features=AutomationControlled".to_string(),
+        "--disable-renderer-backgrounding".to_string(),
+        "--disable-popup-blocking".to_string(),
+        "--disable-prompt-on-repost".to_string(),
+        "--enable-features=CDPScreenshotNewSurface".to_string(),
+        "--mute-audio".to_string(),
+    ];
+    if options.headless {
+        default_args.push("--headless=new".to_string());
+        default_args.push("--hide-scrollbars".to_string());
+    }
+    if !options.chromium_sandbox {
+        default_args.push("--no-sandbox".to_string());
+    }
+    default_args
+}
+
 fn launch_chromium_attempt(
     executable: &Path,
     options: &LaunchOptions,
@@ -28645,26 +28679,7 @@ fn launch_chromium_attempt(
         }
     }
 
-    let mut default_args = vec![
-        "--no-first-run".to_string(),
-        "--no-default-browser-check".to_string(),
-        "--disable-background-networking".to_string(),
-        "--disable-background-timer-throttling".to_string(),
-        "--disable-dev-shm-usage".to_string(),
-        "--disable-blink-features=AutomationControlled".to_string(),
-        "--disable-renderer-backgrounding".to_string(),
-        "--disable-popup-blocking".to_string(),
-        "--disable-prompt-on-repost".to_string(),
-        "--enable-features=CDPScreenshotNewSurface".to_string(),
-        "--mute-audio".to_string(),
-    ];
-    if options.headless {
-        default_args.push("--headless=new".to_string());
-        default_args.push("--hide-scrollbars".to_string());
-    }
-    if !options.chromium_sandbox {
-        default_args.push("--no-sandbox".to_string());
-    }
+    let default_args = chromium_default_launch_args(options);
     if !options.ignore_all_default_args {
         for arg in default_args {
             if !launch_default_arg_ignored(&arg, &options.ignore_default_args) {
