@@ -7,7 +7,8 @@
 [![status: alpha](https://img.shields.io/badge/status-alpha-orange)](#project-status)
 [![tests](https://img.shields.io/github/actions/workflow/status/Skyvern-AI/rustwright/test.yml?label=tests)](https://github.com/Skyvern-AI/rustwright/actions/workflows/test.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![Python 3.9–3.14 + 3.15 pre-release](https://img.shields.io/badge/python-3.9%E2%80%933.14%20%2B%203.15%20pre--release-3776AB?logo=python&logoColor=white)](pyproject.toml)
+CPython 3.15 support is verified on 3.15.0rc1 and remains pre-release; CI tracks 3.15-dev until GA.
 [![npm](https://img.shields.io/npm/v/rustwright?logo=npm&label=npm)](https://www.npmjs.com/package/rustwright)
 [![Chromium only](https://img.shields.io/badge/browser-Chromium-4285F4?logo=googlechrome&logoColor=white)](#limitations)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/fG2XXEuQX3)
