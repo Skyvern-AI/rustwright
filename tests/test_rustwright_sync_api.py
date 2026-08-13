@@ -3249,6 +3249,80 @@ def test_context_tracing_writes_trace_zip(browser, http_server, tmp_path: Path):
     context.close()
 
 
+def test_sync_trace_source_stacks_cover_all_action_hooks_and_error_relationships(browser, http_server, tmp_path: Path):
+    context = browser.new_context()
+    trace_path = tmp_path / "sync-action-stacks.zip"
+    page = context.new_page()
+    captured_errors = []
+    expected_lines = {}
+
+    def user_action_helper() -> None:
+        expected_lines["goto"] = inspect.currentframe().f_lineno + 1
+        page.goto(f"{http_server}/page")
+        expected_lines["setContent"] = inspect.currentframe().f_lineno + 1
+        page.set_content("<input id='name'><button id='submit'>Submit</button>")
+        expected_lines["evaluate"] = inspect.currentframe().f_lineno + 1
+        page.evaluate("() => document.body.dataset.evaluated = 'yes'")
+        expected_lines["fill"] = inspect.currentframe().f_lineno + 1
+        page.fill("#name", "Ada")
+        expected_lines["click"] = inspect.currentframe().f_lineno + 1
+        page.click("#submit")
+        with pytest.raises(TimeoutError) as exc_info:
+            expected_lines["failed-click"] = inspect.currentframe().f_lineno + 1
+            page.click("#missing", timeout=1)
+        captured_errors.append(exc_info.value)
+
+    context.tracing.start(sources=True)
+    user_action_helper()
+    public_error = captured_errors[0]
+    assert type(public_error) is TimeoutError
+    assert public_error.args == (str(public_error),)
+    assert str(public_error)
+    context.tracing.stop(path=trace_path)
+    context.close()
+
+    with zipfile.ZipFile(trace_path) as archive:
+        stack_payload = json.loads(archive.read("trace.stacks"))
+        events = [json.loads(line) for line in archive.read("trace.trace").splitlines() if line]
+
+    before = [event for event in events if event.get("type") == "before"]
+    after = [event for event in events if event.get("type") == "after"]
+    methods = ["goto", "setContent", "evaluate", "fill", "click", "click"]
+    assert [event["method"] for event in before] == methods
+    assert [event["callId"] for event in after] == [event["callId"] for event in before]
+    assert all(event["callId"].startswith("call@") for event in before)
+    assert len({event["callId"] for event in before}) == len(before)
+    after_by_call = {event["callId"]: event for event in after}
+    successful_results = [after_by_call[event["callId"]]["result"] for event in before[:-1]]
+    goto_response = successful_results[0]["response"]
+    assert goto_response == {"url": f"{http_server}/page", "status": 200}
+    assert successful_results[1:] == [{}, {"value": "yes"}, {}, {}]
+    assert all("error" not in after_by_call[event["callId"]] for event in before[:-1])
+    failure = after_by_call[before[-1]["callId"]]
+    assert "result" not in failure
+    assert failure["error"] == {"name": "TimeoutError", "message": str(public_error)}
+
+    stacks_by_call = {stack_id: frames for stack_id, frames in stack_payload["stacks"]}
+    files = stack_payload["files"]
+    expected_stack_lines = [
+        expected_lines["goto"],
+        expected_lines["setContent"],
+        expected_lines["evaluate"],
+        expected_lines["fill"],
+        expected_lines["click"],
+        expected_lines["failed-click"],
+    ]
+    for event, expected_line in zip(before, expected_stack_lines):
+        stack_id = int(event["callId"].rsplit("@", 1)[1])
+        serialized = stacks_by_call[stack_id]
+        assert serialized
+        assert [files[serialized[0][0]], serialized[0][1], serialized[0][3]] == [
+            __file__,
+            expected_line,
+            "user_action_helper",
+        ]
+
+
 def test_context_tracing_chunks_can_be_exported_separately(browser, http_server, tmp_path: Path):
     context = browser.new_context()
     page = context.new_page()
