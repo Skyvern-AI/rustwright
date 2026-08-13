@@ -16,16 +16,34 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmcp::model::RequestId;
 use rustwright::{
-    ActionOptions, Browser, CancelToken, CloseOptions, ConnectOptions, Dialog, DialogKind, Error,
-    EventReceiver, FileChooser, GotoOptions, LaunchOptions, NetworkBody, Page, PageEvent,
-    ScreenshotOptions, chromium,
+    ActionOptions, Browser, CancelToken, CloseOptions, ConnectOptions, ConsoleRecord,
+    ConsoleRecords, Dialog, DialogKind, Error, EventReceiver, FileChooser, GotoOptions,
+    LaunchOptions, NavigationDetail, NavigationDetailReceiver, NavigationObservation, NetworkBody,
+    NetworkRecord, NetworkRecords, Page, PageEvent, ScreenshotOptions, TargetLifecycleEvent,
+    TargetLifecycleReceiver, chromium,
 };
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
-use crate::tools::{ConsoleLevel, NetworkPart};
+use crate::{
+    config::FeatureConfig,
+    shaping::{
+        FindStructure, ModalRecovery, NetworkSection, NetworkStructure, ResponseShape,
+        SnapshotStructure, TabEntry, TabsStructure,
+    },
+    tools::{ConsoleLevel, NetworkPart},
+};
 
 const SNAPSHOT_JS: &str = include_str!("snapshot.js");
+const SNAPSHOT_LEGACY_JS: &str = include_str!("snapshot_legacy.js");
+
+fn selected_snapshot_script(distill: bool) -> &'static str {
+    if distill {
+        SNAPSHOT_JS
+    } else {
+        SNAPSHOT_LEGACY_JS
+    }
+}
 const BEGIN_SENSITIVE_SNAPSHOT_TRACKING_JS: &str = r#"(input) => {
   const trackingKey = Symbol.for('rustwright.mcp.sensitiveSnapshot');
   const tracking = globalThis[trackingKey] || {};
@@ -487,6 +505,27 @@ pub(crate) enum BrowserOp {
     Close,
 }
 
+impl BrowserOp {
+    /// Explicit file acknowledgements and screenshot-to-file fallbacks are legacy
+    /// output contracts, not observation payloads. Capture this provenance before
+    /// the operation is moved to the actor thread.
+    pub(crate) fn bypass_response_shaping(&self) -> bool {
+        matches!(
+            self,
+            Self::ConsoleMessages {
+                filename: Some(_),
+                ..
+            } | Self::NetworkRequests {
+                filename: Some(_),
+                ..
+            } | Self::NetworkRequest {
+                filename: Some(_),
+                ..
+            } | Self::TakeScreenshot { .. }
+        )
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct RegexSpec {
     pub(crate) pattern: String,
@@ -543,6 +582,10 @@ impl ScreenshotType {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BrowserOutput {
     Text(String),
+    ShapedText {
+        text: String,
+        shape: ResponseShape,
+    },
     Image {
         bytes: Vec<u8>,
         mime: &'static str,
@@ -559,6 +602,7 @@ impl From<String> for BrowserOutput {
 impl PartialEq<String> for BrowserOutput {
     fn eq(&self, other: &String) -> bool {
         matches!(self, Self::Text(text) if text == other)
+            || matches!(self, Self::ShapedText { text, .. } if text == other)
     }
 }
 
@@ -856,16 +900,25 @@ pub(crate) struct BrowserActor {
 }
 
 impl BrowserActor {
+    #[cfg(test)]
     pub(crate) fn spawn() -> Self {
-        Self::spawn_with_startup(BrowserStartup::from_env())
+        Self::spawn_with_features(FeatureConfig::default())
+    }
+
+    pub(crate) fn spawn_with_features(features: FeatureConfig) -> Self {
+        Self::spawn_with_startup_and_features(BrowserStartup::from_env(), features)
     }
 
     fn spawn_with_startup(startup: BrowserStartup) -> Self {
+        Self::spawn_with_startup_and_features(startup, FeatureConfig::default())
+    }
+
+    fn spawn_with_startup_and_features(startup: BrowserStartup, features: FeatureConfig) -> Self {
         let shared = Arc::new(ActorShared::new());
         let actor_shared = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name("mcp-browser-actor".to_owned())
-            .spawn(move || actor_main(actor_shared, startup))
+            .spawn(move || actor_main(actor_shared, startup, features))
             .expect("failed to spawn browser actor");
         Self {
             shared,
@@ -1004,25 +1057,534 @@ impl Drop for BrowserActor {
     }
 }
 
-#[derive(Default)]
 struct BrowserState {
+    features: FeatureConfig,
     browser: Option<Browser>,
-    page: Option<Page>,
+    page: Option<ActivePageHandle>,
+    active_target_id: Option<String>,
     pages: HashMap<String, PageRuntime>,
     tab_order: Vec<String>,
+    tab_inventory: HashMap<String, String>,
+    target_lifecycle: Option<Box<dyn LifecycleReceiver>>,
     closing_targets: HashSet<String>,
     remote: bool,
     remote_options: Option<ConnectOptions>,
     startup_error: Option<&'static str>,
     next_ref: u64,
     current_refs: HashSet<String>,
+    response_shape: Option<ResponseShape>,
+    header_state: Option<BrowserHeaderState>,
+    inventory_stale: bool,
+    snapshot_evaluator: Option<SnapshotEvaluationSeam>,
+    page_record_source: Option<Box<dyn PageRecordSource>>,
+    lifecycle_subscription_provider: LifecycleSubscriptionProvider,
+    browser_query_provider: Box<dyn BrowserQueryProvider>,
+    page_lifecycle_seam: Option<Box<dyn PageLifecycleSeam>>,
+}
+
+type SnapshotEvaluationSeam = Box<dyn FnMut(&'static str, &Value) -> Result<Value, BrowserError>>;
+type PageObservation = (Option<String>, Option<(usize, usize)>);
+type LifecycleSubscriptionProvider =
+    Box<dyn FnMut(Option<&Browser>) -> Option<Box<dyn LifecycleReceiver>>>;
+
+trait PageRecordSource {
+    fn console_records(
+        &mut self,
+        include_previous_navigations: bool,
+        clear: bool,
+    ) -> Result<ConsoleRecords, Error>;
+
+    fn network_records(
+        &mut self,
+        include_previous_navigations: bool,
+        clear: bool,
+    ) -> NetworkRecords;
+}
+
+#[derive(Clone)]
+struct ActivePageHandle {
+    page: Option<Page>,
+    target_id: String,
+    url: String,
+}
+
+struct PageCandidate {
+    registration: Box<dyn PageRegistration>,
+    handle: ActivePageHandle,
+}
+
+trait PageLifecycleSeam {
+    fn attach_remote(&mut self, request: &ActorRequest) -> Result<PageCandidate, BrowserError>;
+
+    fn discover_pages(
+        &mut self,
+        request: &ActorRequest,
+    ) -> Result<Vec<PageCandidate>, BrowserError>;
+
+    fn close_page(
+        &mut self,
+        page: &ActivePageHandle,
+        request: &ActorRequest,
+    ) -> Result<(), BrowserError>;
+
+    fn new_page(&mut self, request: &ActorRequest) -> Result<PageCandidate, BrowserError>;
+}
+
+impl ActivePageHandle {
+    fn live(page: Page) -> Self {
+        Self {
+            target_id: page.target_id(),
+            url: page.url(),
+            page: Some(page),
+        }
+    }
+
+    fn target_id(&self) -> String {
+        self.page
+            .as_ref()
+            .map_or_else(|| self.target_id.clone(), Page::target_id)
+    }
+
+    fn url(&self) -> String {
+        self.page
+            .as_ref()
+            .map_or_else(|| self.url.clone(), Page::url)
+    }
+
+    fn live_page(&self) -> Option<&Page> {
+        self.page.as_ref()
+    }
+}
+
+impl std::ops::Deref for ActivePageHandle {
+    type Target = Page;
+
+    fn deref(&self) -> &Self::Target {
+        self.live_page()
+            .expect("test active-page handles only support lifecycle processing")
+    }
+}
+
+struct BrowserInventoryEntry {
+    target_id: String,
+    url: String,
+    page: Option<Page>,
+}
+
+trait BrowserQueryProvider {
+    fn inventory(
+        &mut self,
+        browser: Option<&Browser>,
+        request: &ActorRequest,
+    ) -> Result<Vec<BrowserInventoryEntry>, BrowserError>;
+
+    fn active_page(&mut self, page: Option<&ActivePageHandle>) -> Option<(String, String)>;
+
+    fn pending_modal(&mut self, pages: &HashMap<String, PageRuntime>, target_id: &str) -> bool;
+
+    fn observe(&mut self, page: Option<&Page>, request: &ActorRequest) -> PageObservation;
+}
+
+struct LiveBrowserQueryProvider;
+
+impl BrowserQueryProvider for LiveBrowserQueryProvider {
+    fn inventory(
+        &mut self,
+        browser: Option<&Browser>,
+        request: &ActorRequest,
+    ) -> Result<Vec<BrowserInventoryEntry>, BrowserError> {
+        let remaining = BrowserState::remaining(request)?;
+        browser
+            .ok_or_else(|| BrowserError::Message("browser is not initialized".to_owned()))?
+            .pages_with_cancel(
+                remaining.saturating_add(ENGINE_TIMEOUT_CUSHION),
+                Some(&request.cancellation.engine),
+            )
+            .map_err(|error| {
+                if matches!(error, Error::Cancelled) {
+                    request
+                        .cancellation
+                        .reason()
+                        .error(request.timeout_ms)
+                        .unwrap_or(BrowserError::Cancelled)
+                } else if matches!(error, Error::Timeout(_)) {
+                    BrowserError::Timeout(request.timeout_ms)
+                } else {
+                    BrowserError::Message(format!("tab listing failed: {error}"))
+                }
+            })
+            .map(|pages| {
+                pages
+                    .into_iter()
+                    .map(|page| BrowserInventoryEntry {
+                        target_id: page.target_id(),
+                        url: page.url(),
+                        page: Some(page),
+                    })
+                    .collect()
+            })
+    }
+
+    fn active_page(&mut self, page: Option<&ActivePageHandle>) -> Option<(String, String)> {
+        page.map(|page| (page.target_id(), page.url()))
+    }
+
+    fn pending_modal(&mut self, pages: &HashMap<String, PageRuntime>, target_id: &str) -> bool {
+        pages.get(target_id).is_some_and(|runtime| {
+            runtime.pending_dialog.is_some() || runtime.pending_file_chooser.is_some()
+        })
+    }
+
+    fn observe(&mut self, page: Option<&Page>, request: &ActorRequest) -> PageObservation {
+        live_page_observation(page, request)
+    }
+}
+
+fn live_page_observation(page: Option<&Page>, request: &ActorRequest) -> PageObservation {
+    let Some(page) = page else {
+        return (None, None);
+    };
+    let title = BrowserState::remaining(request).ok().and_then(|remaining| {
+        page.title(ActionOptions::timeout(BrowserState::engine_timeout(
+            remaining,
+        )))
+        .ok()
+    });
+    let console_counts = page.console_records(false, false).ok().map(|records| {
+        records
+            .records
+            .iter()
+            .fold((0, 0), |(errors, warnings), record| {
+                match record.message_type.as_str() {
+                    "error" | "assert" => (errors + 1, warnings),
+                    "warning" | "warn" => (errors, warnings + 1),
+                    _ => (errors, warnings),
+                }
+            })
+    });
+    (title, console_counts)
+}
+
+impl Default for BrowserState {
+    fn default() -> Self {
+        Self {
+            features: FeatureConfig::default(),
+            browser: None,
+            page: None,
+            active_target_id: None,
+            pages: HashMap::new(),
+            tab_order: Vec::new(),
+            tab_inventory: HashMap::new(),
+            target_lifecycle: None,
+            closing_targets: HashSet::new(),
+            remote: false,
+            remote_options: None,
+            startup_error: None,
+            next_ref: 0,
+            current_refs: HashSet::new(),
+            response_shape: None,
+            header_state: None,
+            inventory_stale: false,
+            snapshot_evaluator: None,
+            page_record_source: None,
+            lifecycle_subscription_provider: Box::new(|browser| {
+                browser.map(|browser| {
+                    Box::new(browser.target_lifecycle()) as Box<dyn LifecycleReceiver>
+                })
+            }),
+            browser_query_provider: Box::new(LiveBrowserQueryProvider),
+            page_lifecycle_seam: None,
+        }
+    }
+}
+
+trait LifecycleReceiver {
+    fn try_recv_lifecycle(&self) -> Result<Option<TargetLifecycleEvent>, ()>;
+}
+
+impl LifecycleReceiver for TargetLifecycleReceiver {
+    fn try_recv_lifecycle(&self) -> Result<Option<TargetLifecycleEvent>, ()> {
+        self.try_recv().map_err(|_| ())
+    }
+}
+
+impl LifecycleReceiver for std::sync::mpsc::Receiver<TargetLifecycleEvent> {
+    fn try_recv_lifecycle(&self) -> Result<Option<TargetLifecycleEvent>, ()> {
+        match self.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(()),
+        }
+    }
+}
+
+trait DetailReceiver {
+    fn dropped_count(&self) -> u64;
+    fn latest_sequence(&self) -> u64;
+    fn try_recv_detail(&self) -> Option<(u64, NavigationDetail)>;
+}
+
+impl DetailReceiver for NavigationDetailReceiver {
+    fn dropped_count(&self) -> u64 {
+        NavigationDetailReceiver::dropped_count(self)
+    }
+
+    fn latest_sequence(&self) -> u64 {
+        NavigationDetailReceiver::latest_sequence(self)
+    }
+
+    fn try_recv_detail(&self) -> Option<(u64, NavigationDetail)> {
+        self.recv_timeout_sequenced(Duration::ZERO)
+    }
+}
+
+trait PageEventReceiver {
+    fn try_recv_page_event(&self) -> Option<PageEvent>;
+}
+
+impl PageEventReceiver for EventReceiver {
+    fn try_recv_page_event(&self) -> Option<PageEvent> {
+        self.recv_timeout(Duration::ZERO)
+    }
+}
+
+impl PageEventReceiver for std::sync::mpsc::Receiver<PageEvent> {
+    fn try_recv_page_event(&self) -> Option<PageEvent> {
+        self.try_recv().ok()
+    }
 }
 
 struct PageRuntime {
-    events: EventReceiver,
+    events: Option<Box<dyn PageEventReceiver>>,
+    navigation_details: Option<Box<dyn DetailReceiver>>,
+    detail_dropped_count: u64,
     pending_dialog: Option<PendingDialog>,
     pending_file_chooser: Option<PendingFileChooser>,
     title: Option<String>,
+    header: Option<PageHeaderRuntime>,
+}
+
+struct NavigationDetailReceiverSeam {
+    receiver: std::sync::mpsc::Receiver<(u64, NavigationDetail)>,
+    latest_sequence: Arc<std::sync::atomic::AtomicU64>,
+    dropped_count: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl DetailReceiver for NavigationDetailReceiverSeam {
+    fn dropped_count(&self) -> u64 {
+        self.dropped_count.load(Ordering::SeqCst)
+    }
+
+    fn latest_sequence(&self) -> u64 {
+        self.latest_sequence.load(Ordering::SeqCst)
+    }
+
+    fn try_recv_detail(&self) -> Option<(u64, NavigationDetail)> {
+        self.receiver.try_recv().ok()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PageHeader {
+    url: String,
+    title: Option<String>,
+    status: Option<u16>,
+    console_err: usize,
+    console_warn: usize,
+}
+
+#[derive(Default)]
+struct PageHeaderRuntime {
+    current: PageHeader,
+    last_rendered: Option<PageHeader>,
+    last_observed_title: Option<String>,
+    pending_observed_url: Option<String>,
+    pending_observed_after_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TabSignature {
+    tabs: Vec<(String, String)>,
+    active_id: Option<String>,
+    stale: bool,
+}
+
+#[derive(Default)]
+struct BrowserHeaderState {
+    last_rendered_tab_signature: Option<TabSignature>,
+}
+
+fn apply_navigation_detail(
+    runtime: &mut PageHeaderRuntime,
+    sequence: u64,
+    detail: NavigationDetail,
+) {
+    let after_boundary = runtime
+        .pending_observed_after_sequence
+        .is_some_and(|boundary| sequence > boundary);
+    if runtime.pending_observed_after_sequence.is_some() && !after_boundary {
+        return;
+    }
+    let initiated =
+        after_boundary && runtime.pending_observed_url.as_deref() == Some(detail.url.as_str());
+    if after_boundary {
+        runtime.pending_observed_url = None;
+        runtime.pending_observed_after_sequence = None;
+    }
+    runtime.current.url = detail.url;
+    if !detail.same_document {
+        runtime.current.title = None;
+        runtime.last_observed_title = None;
+        if !initiated {
+            runtime.current.status = None;
+        }
+    }
+}
+
+fn apply_observed_navigation(
+    runtime: &mut PageHeaderRuntime,
+    url: String,
+    observation: &NavigationObservation,
+    replace_same_document_status: bool,
+) {
+    runtime.current.url = url.clone();
+    if replace_same_document_status || !observation.same_document {
+        runtime.current.status = observation.main_status;
+    }
+    if !observation.same_document {
+        runtime.current.title = None;
+        runtime.last_observed_title = None;
+    }
+}
+
+fn page_runtime_for_registration(
+    header_enabled: bool,
+    events: impl FnOnce() -> Option<Box<dyn PageEventReceiver>>,
+    details: impl FnOnce() -> Option<Box<dyn DetailReceiver>>,
+    url: impl FnOnce() -> String,
+) -> PageRuntime {
+    PageRuntime {
+        events: events(),
+        navigation_details: if header_enabled { details() } else { None },
+        detail_dropped_count: 0,
+        pending_dialog: None,
+        pending_file_chooser: None,
+        title: None,
+        header: header_enabled.then(|| PageHeaderRuntime {
+            current: PageHeader {
+                url: url(),
+                ..PageHeader::default()
+            },
+            ..PageHeaderRuntime::default()
+        }),
+    }
+}
+
+trait PageRegistration {
+    fn registration_target_id(&self) -> String;
+    fn registration_arm_console_capture(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn registration_events(&self) -> Option<Box<dyn PageEventReceiver>>;
+    fn registration_details(&self) -> Option<Box<dyn DetailReceiver>>;
+    fn registration_url(&self) -> String;
+}
+
+impl PageRegistration for Page {
+    fn registration_target_id(&self) -> String {
+        self.target_id()
+    }
+
+    fn registration_arm_console_capture(&self) -> Result<(), Error> {
+        self.arm_console_capture()
+    }
+
+    fn registration_events(&self) -> Option<Box<dyn PageEventReceiver>> {
+        Some(Box::new(self.events()))
+    }
+
+    fn registration_details(&self) -> Option<Box<dyn DetailReceiver>> {
+        Some(Box::new(self.navigation_details()))
+    }
+
+    fn registration_url(&self) -> String {
+        self.url()
+    }
+}
+
+fn apply_observed_title(
+    runtime: &mut PageHeaderRuntime,
+    pending_modal: bool,
+    observed_title: Option<String>,
+) {
+    if let Some(title) = observed_title {
+        runtime.last_observed_title = Some(title.clone());
+        runtime.current.title = Some(title);
+    } else if pending_modal {
+        runtime.current.title = runtime.last_observed_title.clone();
+    }
+}
+
+fn modal_safe_page_observation(
+    pending_modal: bool,
+    query: impl FnOnce() -> (Option<String>, Option<(usize, usize)>),
+) -> (Option<String>, Option<(usize, usize)>) {
+    if pending_modal { (None, None) } else { query() }
+}
+
+const MAX_DIGEST_URL_BYTES: usize = 1_536;
+const MAX_DIGEST_TITLE_BYTES: usize = 512;
+
+fn digest_field(value: &str, max_bytes: usize) -> String {
+    let value = value.replace(['\r', '\n'], " ");
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut cut = max_bytes.min(value.len());
+    while cut > 0 && !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let omitted = value.len() - cut;
+    format!("{}… ({omitted} bytes omitted)", &value[..cut])
+}
+
+fn render_page_header(header: &PageHeader) -> String {
+    let mut lines = vec![
+        "### Page".to_owned(),
+        format!("URL: {}", digest_field(&header.url, MAX_DIGEST_URL_BYTES)),
+    ];
+    if let Some(title) = header.title.as_deref() {
+        lines.push(format!(
+            "Title: {}",
+            digest_field(title, MAX_DIGEST_TITLE_BYTES)
+        ));
+    }
+    lines.push(format!(
+        "Status: {}",
+        header
+            .status
+            .map_or_else(|| "unknown".to_owned(), |status| status.to_string())
+    ));
+    lines.push(format!(
+        "Console: {} errors, {} warnings",
+        header.console_err, header.console_warn
+    ));
+    lines.join("\n")
+}
+
+fn record_page_render(
+    runtime: &mut PageHeaderRuntime,
+    browser: &mut BrowserHeaderState,
+    current: &PageHeader,
+    signature: TabSignature,
+) -> bool {
+    let changed = runtime.last_rendered.as_ref() != Some(current)
+        || browser.last_rendered_tab_signature.as_ref() != Some(&signature);
+    if changed {
+        runtime.last_rendered = Some(current.clone());
+        browser.last_rendered_tab_signature = Some(signature);
+    }
+    changed
 }
 
 struct PendingDialog {
@@ -1037,8 +1599,14 @@ struct PendingFileChooser {
 }
 
 impl BrowserState {
-    fn new(startup: BrowserStartup) -> Self {
-        let mut state = Self::default();
+    fn new(startup: BrowserStartup, features: FeatureConfig) -> Self {
+        let header_state = features.header.then(BrowserHeaderState::default);
+        let mut state = Self {
+            features,
+            header_state,
+            inventory_stale: true,
+            ..Self::default()
+        };
         match startup {
             BrowserStartup::Local => {}
             BrowserStartup::InvalidRemote => {
@@ -1059,6 +1627,12 @@ impl BrowserState {
         mut options: ConnectOptions,
         request: &ActorRequest,
     ) -> Result<(), BrowserError> {
+        if let Some(mut seam) = self.page_lifecycle_seam.take() {
+            let candidate = seam.attach_remote(request);
+            self.page_lifecycle_seam = Some(seam);
+            let candidate = candidate?;
+            return self.commit_remote_attach(candidate, None, request);
+        }
         let remaining = Self::remaining(request)?;
         options.timeout = options
             .timeout
@@ -1081,11 +1655,26 @@ impl BrowserState {
                     .new_page_with_cancel(Some(&request.cancellation.engine))
                     .map_err(|error| Self::remote_attach_error(error, request))
             })?;
-        self.page = Some(page);
-        self.browser = Some(browser);
-        if let Some(page) = self.page.clone() {
-            self.register_page(&page);
-        }
+        self.commit_remote_attach(
+            PageCandidate {
+                registration: Box::new(page.clone()),
+                handle: ActivePageHandle::live(page),
+            },
+            Some(browser),
+            request,
+        )
+    }
+
+    fn commit_remote_attach(
+        &mut self,
+        candidate: PageCandidate,
+        browser: Option<Browser>,
+        request: &ActorRequest,
+    ) -> Result<(), BrowserError> {
+        self.register_page_with_browser(candidate.registration.as_ref(), browser.as_ref())
+            .map_err(|error| Self::remote_attach_error(error, request))?;
+        self.page = Some(candidate.handle);
+        self.browser = browser;
         Ok(())
     }
 
@@ -1103,7 +1692,7 @@ impl BrowserState {
         BrowserError::Message(REMOTE_UNREACHABLE.to_owned())
     }
 
-    fn ensure_page(&mut self, request: &ActorRequest) -> Result<&Page, BrowserError> {
+    fn ensure_page(&mut self, request: &ActorRequest) -> Result<&ActivePageHandle, BrowserError> {
         self.ensure_page_for(request, false)
     }
 
@@ -1119,7 +1708,7 @@ impl BrowserState {
         &mut self,
         request: &ActorRequest,
         committed_observation: bool,
-    ) -> Result<&Page, BrowserError> {
+    ) -> Result<&ActivePageHandle, BrowserError> {
         if !committed_observation
             && !request.cancellation.is_committed()
             && let Some(error) = request.cancellation.reason().error(request.timeout_ms)
@@ -1150,6 +1739,37 @@ impl BrowserState {
                 .page
                 .as_ref()
                 .ok_or_else(|| BrowserError::Message(REMOTE_UNREACHABLE.to_owned()));
+        }
+        if self.page.is_none()
+            && let Some(mut seam) = self.page_lifecycle_seam.take()
+        {
+            let discovered = seam.discover_pages(request);
+            self.page_lifecycle_seam = Some(seam);
+            let mut discovered = discovered?;
+            let candidate = if discovered.is_empty() {
+                let mut seam = self
+                    .page_lifecycle_seam
+                    .take()
+                    .expect("page lifecycle seam was restored");
+                let candidate = seam.new_page(request);
+                self.page_lifecycle_seam = Some(seam);
+                candidate?
+            } else {
+                discovered.remove(0)
+            };
+            self.install_active_page(candidate.registration.as_ref(), candidate.handle, None)
+                .map_err(|error| {
+                    self.operation_error(
+                        "console capture arm failed",
+                        error,
+                        &request.cancellation,
+                        request.timeout_ms,
+                    )
+                })?;
+            return Ok(self.page.as_ref().expect("test page was installed"));
+        }
+        if self.page_lifecycle_seam.is_some() && self.page.is_some() {
+            return Ok(self.page.as_ref().expect("test page is already installed"));
         }
         if self.browser.is_none() {
             eprintln!("browser actor: launching Chromium lazily");
@@ -1188,49 +1808,167 @@ impl BrowserState {
                 .into_iter()
                 .next();
             self.page = match existing {
-                Some(page) => Some(page),
+                Some(page) => Some(ActivePageHandle::live(page)),
                 None => {
                     let created = self
                         .browser
                         .as_ref()
                         .expect("browser was initialized")
                         .new_page_with_cancel(Some(&request.cancellation.engine));
-                    Some(created.map_err(|error| {
+                    Some(ActivePageHandle::live(created.map_err(|error| {
                         self.operation_error(
                             "new page failed",
                             error,
                             &request.cancellation,
                             request.timeout_ms,
                         )
-                    })?)
+                    })?))
                 }
             };
         }
         if let Some(page) = self.page.clone() {
-            self.register_page(&page);
+            if let Err(error) = self.register_page(
+                page.live_page()
+                    .expect("local active page should contain a live page"),
+            ) {
+                return Err(self.operation_error(
+                    "console capture arm failed",
+                    error,
+                    &request.cancellation,
+                    request.timeout_ms,
+                ));
+            }
         }
         Ok(self.page.as_ref().expect("page was initialized"))
     }
 
-    fn register_page(&mut self, page: &Page) {
-        let target_id = page.target_id();
+    fn register_page(&mut self, page: &(impl PageRegistration + ?Sized)) -> Result<(), Error> {
+        self.register_page_with_browser(page, None)
+    }
+
+    fn register_page_with_browser(
+        &mut self,
+        page: &(impl PageRegistration + ?Sized),
+        registration_browser: Option<&Browser>,
+    ) -> Result<(), Error> {
+        let target_id = page.registration_target_id();
+        let header_enabled = self.header_state.is_some();
         if !self.pages.contains_key(&target_id) {
+            // The MCP actor owns navigation-scoped console presentation, so it
+            // arms capture at registration before an operation can navigate the
+            // page. Nothing actor-visible is published before this succeeds, so
+            // failed arms leave the page unregistered and retryable.
+            page.registration_arm_console_capture()?;
+            if header_enabled && self.target_lifecycle.is_none() {
+                self.target_lifecycle = (self.lifecycle_subscription_provider)(
+                    registration_browser.or(self.browser.as_ref()),
+                );
+            }
             self.tab_order.push(target_id.clone());
+            let url = header_enabled.then(|| page.registration_url());
+            if let Some(url) = url.as_ref() {
+                self.tab_inventory.insert(target_id.clone(), url.clone());
+            }
             self.pages.insert(
                 target_id,
-                PageRuntime {
-                    events: page.events(),
-                    pending_dialog: None,
-                    pending_file_chooser: None,
-                    title: None,
-                },
+                page_runtime_for_registration(
+                    header_enabled,
+                    || page.registration_events(),
+                    || page.registration_details(),
+                    || url.expect("header-enabled registration captured a URL"),
+                ),
             );
+        }
+        Ok(())
+    }
+
+    fn install_active_page(
+        &mut self,
+        registration: &(impl PageRegistration + ?Sized),
+        handle: ActivePageHandle,
+        registration_browser: Option<&Browser>,
+    ) -> Result<(), Error> {
+        self.register_page_with_browser(registration, registration_browser)?;
+        self.page = Some(handle);
+        Ok(())
+    }
+
+    fn clear_active_target(&mut self, target_id: &str) {
+        if self.active_target_id.as_deref() == Some(target_id)
+            || self
+                .page
+                .as_ref()
+                .is_some_and(|page| page.target_id() == target_id)
+        {
+            self.page = None;
+            self.active_target_id = None;
         }
     }
 
+    fn retire_closed_target(&mut self, target_id: &str) {
+        self.clear_active_target(target_id);
+        self.closing_targets.insert(target_id.to_owned());
+        self.pages.remove(target_id);
+        self.tab_order.retain(|registered| registered != target_id);
+    }
+
     fn poll_events(&mut self) {
-        for runtime in self.pages.values_mut() {
-            while let Some(event) = runtime.events.recv_timeout(Duration::ZERO) {
+        if let Some(page) = self.page.as_ref() {
+            self.active_target_id = Some(page.target_id());
+        }
+        while self.header_state.is_some() {
+            let lifecycle = self
+                .target_lifecycle
+                .as_ref()
+                .map(|events| events.try_recv_lifecycle())
+                .transpose()
+                .map(|event| event.flatten())
+                .map_err(|_| ());
+            let lifecycle = match lifecycle {
+                Ok(Some(lifecycle)) => lifecycle,
+                Ok(None) => break,
+                Err(()) => {
+                    self.inventory_stale = true;
+                    self.target_lifecycle = None;
+                    break;
+                }
+            };
+            match lifecycle {
+                TargetLifecycleEvent::Upsert { target_id, url } => {
+                    if !self.tab_order.contains(&target_id) {
+                        self.tab_order.push(target_id.clone());
+                    }
+                    self.tab_inventory.insert(target_id, url);
+                }
+                TargetLifecycleEvent::Destroyed { target_id } => {
+                    self.pages.remove(&target_id);
+                    self.tab_inventory.remove(&target_id);
+                    self.tab_order.retain(|candidate| candidate != &target_id);
+                    self.clear_active_target(&target_id);
+                }
+            }
+        }
+        let mut closed_targets = Vec::new();
+        for (target_id, runtime) in self.pages.iter_mut() {
+            if let Some(header) = runtime.header.as_mut() {
+                if let Some(details) = runtime.navigation_details.as_ref() {
+                    let dropped = details.dropped_count();
+                    if dropped != runtime.detail_dropped_count {
+                        runtime.detail_dropped_count = dropped;
+                        header.pending_observed_url = None;
+                        header.pending_observed_after_sequence = None;
+                    }
+                    while let Some((sequence, detail)) = details.try_recv_detail() {
+                        apply_navigation_detail(header, sequence, detail);
+                    }
+                }
+            }
+            loop {
+                let event = runtime
+                    .events
+                    .as_ref()
+                    .and_then(|events| events.try_recv_page_event());
+                let Some(event) = event else { break };
                 match event {
                     PageEvent::Dialog {
                         kind,
@@ -1247,10 +1985,229 @@ impl BrowserState {
                         runtime.pending_file_chooser =
                             Some(PendingFileChooser { multiple, chooser });
                     }
-                    PageEvent::Closed | PageEvent::PageCrashed => {}
+                    PageEvent::Closed => closed_targets.push(target_id.clone()),
+                    PageEvent::PageCrashed => {}
                     PageEvent::Navigated { .. } | PageEvent::Download { .. } => {}
                 }
             }
+        }
+        for target_id in closed_targets {
+            self.pages.remove(&target_id);
+            self.tab_inventory.remove(&target_id);
+            self.tab_order.retain(|candidate| candidate != &target_id);
+            self.clear_active_target(&target_id);
+        }
+        for (target_id, runtime) in &self.pages {
+            if let Some(header) = runtime.header.as_ref() {
+                self.tab_inventory
+                    .insert(target_id.clone(), header.current.url.clone());
+            }
+        }
+    }
+
+    fn begin_observed_navigation(&mut self, target_id: &str, url: Option<String>) {
+        self.poll_events();
+        let Some(runtime) = self.pages.get_mut(target_id) else {
+            return;
+        };
+        let Some(header) = runtime.header.as_mut() else {
+            return;
+        };
+        let Some((dropped_count, latest_sequence)) = runtime
+            .navigation_details
+            .as_ref()
+            .map(|details| (details.dropped_count(), details.latest_sequence()))
+        else {
+            return;
+        };
+        runtime.detail_dropped_count = dropped_count;
+        header.pending_observed_url = url;
+        header.pending_observed_after_sequence = Some(latest_sequence);
+    }
+
+    fn cancel_observed_navigation(&mut self, target_id: &str) {
+        if let Some(header) = self
+            .pages
+            .get_mut(target_id)
+            .and_then(|runtime| runtime.header.as_mut())
+        {
+            header.pending_observed_url = None;
+            header.pending_observed_after_sequence = None;
+        }
+    }
+
+    fn record_observed_navigation(
+        &mut self,
+        target_id: &str,
+        url: String,
+        observation: &NavigationObservation,
+        replace_same_document_status: bool,
+    ) {
+        let Some(header) = self
+            .pages
+            .get_mut(target_id)
+            .and_then(|runtime| runtime.header.as_mut())
+        else {
+            return;
+        };
+        apply_observed_navigation(header, url, observation, replace_same_document_status);
+        if header.pending_observed_after_sequence.is_some() {
+            header.pending_observed_url = Some(header.current.url.clone());
+        }
+    }
+
+    fn tab_signature(&self) -> TabSignature {
+        TabSignature {
+            tabs: self
+                .tab_order
+                .iter()
+                .filter_map(|target_id| {
+                    Some((
+                        target_id.clone(),
+                        self.tab_inventory.get(target_id)?.clone(),
+                    ))
+                })
+                .collect(),
+            active_id: self.page.as_ref().map(ActivePageHandle::target_id),
+            stale: self.inventory_stale,
+        }
+    }
+
+    fn reconcile_digest_inventory(&mut self, inventory: Vec<BrowserInventoryEntry>) {
+        let discovered_targets = inventory
+            .iter()
+            .map(|entry| entry.target_id.clone())
+            .collect::<HashSet<_>>();
+        self.closing_targets
+            .retain(|target_id| discovered_targets.contains(target_id));
+        let reconciled_tab_order = inventory
+            .iter()
+            .filter(|entry| !self.closing_targets.contains(&entry.target_id))
+            .map(|entry| entry.target_id.clone())
+            .collect();
+        self.tab_inventory
+            .retain(|target_id, _| discovered_targets.contains(target_id));
+        self.pages
+            .retain(|target_id, _| discovered_targets.contains(target_id));
+
+        for entry in inventory {
+            if self.closing_targets.contains(&entry.target_id) {
+                continue;
+            }
+            if let Some(page) = entry.page.as_ref() {
+                if let Err(error) = self.register_page(page) {
+                    eprintln!("browser actor: digest console capture arm failed: {error}");
+                    self.inventory_stale = true;
+                    continue;
+                }
+            } else if !self.pages.contains_key(&entry.target_id) {
+                self.pages.insert(
+                    entry.target_id.clone(),
+                    PageRuntime {
+                        events: None,
+                        navigation_details: None,
+                        detail_dropped_count: 0,
+                        pending_dialog: None,
+                        pending_file_chooser: None,
+                        title: None,
+                        header: Some(PageHeaderRuntime {
+                            current: PageHeader {
+                                url: entry.url.clone(),
+                                ..PageHeader::default()
+                            },
+                            ..PageHeaderRuntime::default()
+                        }),
+                    },
+                );
+            }
+            self.tab_inventory
+                .insert(entry.target_id.clone(), entry.url.clone());
+            if let Some(header) = self
+                .pages
+                .get_mut(&entry.target_id)
+                .and_then(|runtime| runtime.header.as_mut())
+            {
+                header.current.url = entry.url;
+            }
+        }
+        self.tab_order = reconciled_tab_order;
+    }
+
+    fn page_digest(&mut self, request: &ActorRequest) -> Option<String> {
+        self.header_state.as_ref()?;
+        if self.inventory_stale {
+            let inventory = self
+                .browser_query_provider
+                .inventory(self.browser.as_ref(), request);
+            self.inventory_stale = inventory.is_err();
+            if let Ok(inventory) = inventory {
+                self.reconcile_digest_inventory(inventory);
+            }
+        }
+        self.poll_events();
+        let (target_id, active_url) = self
+            .browser_query_provider
+            .active_page(self.page.as_ref())?;
+        let pending_modal = self
+            .browser_query_provider
+            .pending_modal(&self.pages, &target_id);
+        let live_page = self
+            .page
+            .as_ref()
+            .and_then(ActivePageHandle::live_page)
+            .filter(|page| page.target_id() == target_id);
+        let (title, console_counts) = modal_safe_page_observation(pending_modal, || {
+            self.browser_query_provider.observe(live_page, request)
+        });
+        let current = {
+            let runtime = self.pages.get_mut(&target_id)?;
+            let header = runtime.header.as_mut()?;
+            header.current.url = active_url;
+            apply_observed_title(header, pending_modal, title);
+            if let Some((errors, warnings)) = console_counts {
+                header.current.console_err = errors;
+                header.current.console_warn = warnings;
+            }
+            header.current.clone()
+        };
+        self.tab_inventory
+            .insert(target_id.clone(), current.url.clone());
+        let mut signature = self.tab_signature();
+        signature.active_id = Some(target_id.clone());
+        let header = self
+            .pages
+            .get_mut(&target_id)
+            .and_then(|runtime| runtime.header.as_mut())?;
+        let state = self.header_state.as_mut()?;
+        if !record_page_render(header, state, &current, signature) {
+            return None;
+        }
+        Some(render_page_header(&current))
+    }
+
+    fn add_page_digest(&mut self, output: BrowserOutput, request: &ActorRequest) -> BrowserOutput {
+        if matches!(output, BrowserOutput::Image { .. }) {
+            return output;
+        }
+        let Some(page) = self.page_digest(request) else {
+            return output;
+        };
+        match output {
+            BrowserOutput::Text(text) => BrowserOutput::ShapedText {
+                text: format!("{page}\n\n{text}"),
+                shape: ResponseShape {
+                    page: Some(page),
+                    ..ResponseShape::default()
+                },
+            },
+            BrowserOutput::ShapedText { text, mut shape } => {
+                shape.page = Some(page.clone());
+                BrowserOutput::ShapedText {
+                    text: format!("{page}\n\n{text}"),
+                    shape,
+                }
+            }
+            image => image,
         }
     }
 
@@ -1281,8 +2238,9 @@ impl BrowserState {
     /// reachable route exercises, free to drift from the first.
     fn modal_response(&mut self, result: &str, _request: &ActorRequest) -> String {
         self.poll_events();
-        let active_target = self.page.as_ref().map(Page::target_id);
+        let active_target = self.page.as_ref().map(ActivePageHandle::target_id);
         let mut lines = Vec::new();
+        let mut recovery = Vec::new();
         for target_id in &self.tab_order {
             let Some(runtime) = self.pages.get(target_id) else {
                 continue;
@@ -1303,6 +2261,12 @@ impl BrowserState {
                     Self::dialog_kind_name(&pending.kind),
                     message
                 ));
+                recovery.push(ModalRecovery {
+                    owner,
+                    kind: Self::dialog_kind_name(&pending.kind).to_owned(),
+                    message: message.clone(),
+                    instruction: "Call browser_handle_dialog.",
+                });
             }
             if let Some(pending) = &runtime.pending_file_chooser {
                 let owner = if active_target.as_ref() == Some(target_id) {
@@ -1318,11 +2282,20 @@ impl BrowserState {
                 lines.push(format!(
                     "- {owner}: File chooser pending: {hint}. Call browser_file_upload."
                 ));
+                recovery.push(ModalRecovery {
+                    owner,
+                    kind: "file chooser".to_owned(),
+                    message: hint.to_owned(),
+                    instruction: "Call browser_file_upload.",
+                });
             }
         }
         if lines.is_empty() {
             result.to_owned()
         } else {
+            self.response_shape
+                .get_or_insert_with(ResponseShape::default)
+                .modal_recovery = recovery;
             format!("{result}\n\n### Modal\n{}", lines.join("\n"))
         }
     }
@@ -1390,97 +2363,135 @@ impl BrowserState {
     }
 
     fn navigate(&mut self, url: &str, request: &ActorRequest) -> TextResult {
+        self.poll_events();
         self.current_refs.clear();
         let remaining = Self::remaining(request)?;
         let started_at = Instant::now();
-        let result = self.ensure_page(request)?.goto_with_cancel(
+        let page = self.ensure_page(request)?.clone();
+        let target_id = page.target_id();
+        self.begin_observed_navigation(&target_id, Some(url.to_owned()));
+        let result = page.goto_with_cancel_observed(
             url,
             GotoOptions::default()
                 .wait_until("load")
                 .timeout(Self::engine_timeout(remaining)),
             Some(&request.cancellation.engine),
         );
-        if let Err(error) = result {
-            if matches!(error, Error::Cancelled)
-                && request.cancellation.reason() == CancellationReason::Deadline
-            {
-                if let Some(page) = self.page.as_ref() {
-                    page.emit_navigation_timeout_diagnostic(started_at.elapsed());
+        let observation = match result {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.cancel_observed_navigation(&target_id);
+                if matches!(error, Error::Cancelled)
+                    && request.cancellation.reason() == CancellationReason::Deadline
+                {
+                    if let Some(page) = self.page.as_ref() {
+                        page.emit_navigation_timeout_diagnostic(started_at.elapsed());
+                    }
                 }
+                return Err(self.operation_error(
+                    "navigation failed",
+                    error,
+                    &request.cancellation,
+                    request.timeout_ms,
+                ));
             }
-            return Err(self.operation_error(
-                "navigation failed",
-                error,
-                &request.cancellation,
-                request.timeout_ms,
-            ));
-        }
+        };
+        self.record_observed_navigation(&target_id, page.url(), &observation, false);
         self.snapshot(request)
     }
 
     fn navigate_back(&mut self, request: &ActorRequest) -> TextResult {
+        self.poll_events();
         self.current_refs.clear();
         let remaining = Self::remaining(request)?;
-        let result = self.ensure_page(request)?.go_back_with_cancel_status(
+        let page = self.ensure_page(request)?.clone();
+        let target_id = page.target_id();
+        self.begin_observed_navigation(&target_id, None);
+        let result = page.go_back_with_cancel_observed(
             GotoOptions::default()
                 .wait_until("load")
                 .timeout(Self::engine_timeout(remaining)),
             Some(&request.cancellation.engine),
         );
-        let (had_entry, _response) = result.map_err(|error| {
-            self.operation_error(
-                "back navigation failed",
-                error,
-                &request.cancellation,
-                request.timeout_ms,
-            )
-        })?;
-        if !had_entry {
+        let observation = match result {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.cancel_observed_navigation(&target_id);
+                return Err(self.operation_error(
+                    "back navigation failed",
+                    error,
+                    &request.cancellation,
+                    request.timeout_ms,
+                ));
+            }
+        };
+        if !observation.had_entry {
+            self.cancel_observed_navigation(&target_id);
             return Err(BrowserError::Message("no back history".to_owned()));
         }
+        self.record_observed_navigation(&target_id, page.url(), &observation.navigation, false);
         self.snapshot(request)
     }
 
     fn navigate_forward(&mut self, request: &ActorRequest) -> TextResult {
+        self.poll_events();
         self.current_refs.clear();
         let remaining = Self::remaining(request)?;
-        let result = self.ensure_page(request)?.go_forward_with_cancel_status(
+        let page = self.ensure_page(request)?.clone();
+        let target_id = page.target_id();
+        self.begin_observed_navigation(&target_id, None);
+        let result = page.go_forward_with_cancel_observed(
             GotoOptions::default()
                 .wait_until("load")
                 .timeout(Self::engine_timeout(remaining)),
             Some(&request.cancellation.engine),
         );
-        let (had_entry, _response) = result.map_err(|error| {
-            self.operation_error(
-                "forward navigation failed",
-                error,
-                &request.cancellation,
-                request.timeout_ms,
-            )
-        })?;
-        if !had_entry {
+        let observation = match result {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.cancel_observed_navigation(&target_id);
+                return Err(self.operation_error(
+                    "forward navigation failed",
+                    error,
+                    &request.cancellation,
+                    request.timeout_ms,
+                ));
+            }
+        };
+        if !observation.had_entry {
+            self.cancel_observed_navigation(&target_id);
             return Err(BrowserError::Message("no forward history".to_owned()));
         }
+        self.record_observed_navigation(&target_id, page.url(), &observation.navigation, false);
         self.snapshot(request)
     }
 
     fn reload(&mut self, request: &ActorRequest) -> TextResult {
+        self.poll_events();
         self.current_refs.clear();
         let remaining = Self::remaining(request)?;
-        let result = self.ensure_page(request)?.reload_with_cancel(
+        let page = self.ensure_page(request)?.clone();
+        let target_id = page.target_id();
+        self.begin_observed_navigation(&target_id, Some(page.url()));
+        let result = page.reload_with_cancel_observed(
             GotoOptions::default()
                 .wait_until("load")
                 .timeout(Self::engine_timeout(remaining)),
             Some(&request.cancellation.engine),
         );
-        result.map_err(|error| {
-            self.operation_error(
-                "reload failed",
-                error,
-                &request.cancellation,
-                request.timeout_ms,
-            )
-        })?;
+        let observation = match result {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.cancel_observed_navigation(&target_id);
+                return Err(self.operation_error(
+                    "reload failed",
+                    error,
+                    &request.cancellation,
+                    request.timeout_ms,
+                ));
+            }
+        };
+        self.record_observed_navigation(&target_id, page.url(), &observation, true);
         self.snapshot(request)
     }
 
@@ -1651,28 +2662,91 @@ impl BrowserState {
                 request,
             ));
         }
+        let (value, start_ref) = self.evaluate_snapshot(
+            request,
+            target,
+            depth,
+            boxes,
+            cancel,
+            remaining_override,
+            None,
+        )?;
+        let outline = value
+            .get("outline")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BrowserError::Message(format!("snapshot returned no outline: {value}")))?
+            .to_owned();
+        let units: Vec<String> = value
+            .get("units")
+            .and_then(Value::as_array)
+            .map(|units| {
+                units
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_else(|| outline.lines().map(ToOwned::to_owned).collect());
+        let renderer_incomplete = value
+            .get("rendererIncomplete")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let renderer_incomplete_index = renderer_incomplete
+            .as_ref()
+            .map(|_| units.len().saturating_sub(1));
+        self.response_shape
+            .get_or_insert_with(ResponseShape::default)
+            .snapshot = Some(SnapshotStructure {
+            legacy: outline.clone(),
+            head: units.first().cloned(),
+            units,
+            renderer_incomplete,
+            renderer_incomplete_index,
+        });
+        self.commit_snapshot_refs(&value, start_ref)?;
+        Ok(outline)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_snapshot(
+        &mut self,
+        request: &ActorRequest,
+        target: Option<&str>,
+        depth: Option<u32>,
+        boxes: bool,
+        cancel: Option<&CancelToken>,
+        remaining_override: Option<Duration>,
+        find: Option<Value>,
+    ) -> Result<(Value, u64), BrowserError> {
         let start_ref = self.next_ref.max(1);
         let remaining = match remaining_override {
             Some(remaining) => remaining,
             None => Self::remaining(request)?,
         };
+        // Select legacy before entering the page. The W2 script therefore cannot
+        // clear or replace refs while the experiment switch is off.
+        let script = selected_snapshot_script(self.features.distill);
+        let input = json!({
+            "startRef": start_ref,
+            "target": target.map(|target| format!(r#"[data-mcp-ref="{target}"]"#)),
+            "maxDepth": depth,
+            "boxes": boxes,
+            "mask": SECRET_MASK,
+            "find": find,
+        });
+        if let Some(evaluate) = self.snapshot_evaluator.as_mut() {
+            return evaluate(script, &input).map(|value| (value, start_ref));
+        }
         // A `remaining_override` is only ever supplied by the committed post-action
         // path, which also passes no cancel token; both say the same thing, that this
         // snapshot observes an action that already landed.
-        let result = self
-            .ensure_page_for(request, remaining_override.is_some())?
-            .evaluate_with_cancel(
-                SNAPSHOT_JS,
-                Some(&json!({
-                    "startRef": start_ref,
-                    "target": target.map(|target| format!(r#"[data-mcp-ref="{target}"]"#)),
-                    "maxDepth": depth,
-                    "boxes": boxes,
-                    "mask": SECRET_MASK,
-                })),
-                ActionOptions::timeout(Self::engine_timeout(remaining)),
-                cancel,
-            );
+        let page = self.ensure_page_for(request, remaining_override.is_some())?;
+        let result = page.evaluate_with_cancel(
+            script,
+            Some(&input),
+            ActionOptions::timeout(Self::engine_timeout(remaining)),
+            cancel,
+        );
         let value = result.map_err(|error| {
             self.operation_error(
                 "snapshot evaluation failed",
@@ -1681,11 +2755,10 @@ impl BrowserState {
                 request.timeout_ms,
             )
         })?;
-        let outline = value
-            .get("outline")
-            .and_then(Value::as_str)
-            .ok_or_else(|| BrowserError::Message(format!("snapshot returned no outline: {value}")))?
-            .to_owned();
+        Ok((value, start_ref))
+    }
+
+    fn commit_snapshot_refs(&mut self, value: &Value, start_ref: u64) -> Result<(), BrowserError> {
         let next_ref = value
             .get("nextRef")
             .and_then(Value::as_u64)
@@ -1708,7 +2781,7 @@ impl BrowserState {
             })
             .unwrap_or_else(|| (start_ref..next_ref).map(|n| format!("e{n}")).collect());
         self.next_ref = next_ref;
-        Ok(outline)
+        Ok(())
     }
 
     fn begin_sensitive_snapshot_tracking(
@@ -1819,6 +2892,9 @@ impl BrowserState {
         regex: Option<&RegexSpec>,
         request: &ActorRequest,
     ) -> TextResult {
+        if self.features.distill {
+            return self.find_constructed(text, regex, request);
+        }
         let outline = self.snapshot(request)?;
         if self.has_pending_modal() {
             return Ok(outline);
@@ -1863,7 +2939,101 @@ impl BrowserState {
         } else {
             Vec::new()
         };
-        Ok(render_find_matches(&lines, &matching_indices))
+        let (rendered, structure) = render_find_matches(&lines, &matching_indices);
+        self.response_shape
+            .get_or_insert_with(ResponseShape::default)
+            .find = Some(structure);
+        Ok(rendered)
+    }
+
+    fn find_constructed(
+        &mut self,
+        text: Option<&str>,
+        regex: Option<&RegexSpec>,
+        request: &ActorRequest,
+    ) -> TextResult {
+        if self.has_pending_modal() {
+            return self.snapshot(request);
+        }
+        let query = if let Some(text) = text {
+            json!({"kind": "text", "value": text})
+        } else if let Some(regex) = regex {
+            json!({"kind": "regex", "pattern": regex.pattern, "flags": regex.flags})
+        } else {
+            json!({"kind": "text", "value": ""})
+        };
+        let (value, start_ref) = self.evaluate_snapshot(
+            request,
+            None,
+            None,
+            false,
+            Some(&request.cancellation.engine),
+            None,
+            Some(query),
+        )?;
+        self.commit_snapshot_refs(&value, start_ref)?;
+        let find = value.get("find").ok_or_else(|| {
+            BrowserError::Message(format!("constructed find returned no result: {value}"))
+        })?;
+        let matches = find
+            .get("matches")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                BrowserError::Message("constructed find returned no matches".to_owned())
+            })?;
+        let total = find
+            .get("totalMatches")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                BrowserError::Message("constructed find returned no total match count".to_owned())
+            })? as usize;
+        let blocks = matches
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let path = item.get("path").and_then(Value::as_str).unwrap_or("(root)");
+                let line = item.get("line").and_then(Value::as_str).unwrap_or("");
+                format!("Match {}\nPath: {path}\n> {line}", index + 1)
+            })
+            .collect::<Vec<_>>();
+        let incomplete = if find.get("incomplete").and_then(Value::as_bool) == Some(true) {
+            let covered = find
+                .get("coveredElements")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let reason = find
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("construction valve");
+            Some(format!(
+                "… snapshot construction incomplete after covering {covered} elements ({reason})."
+            ))
+        } else {
+            None
+        };
+        let mut rendered = if blocks.is_empty() {
+            "No matches in the constructed page subset.".to_owned()
+        } else {
+            blocks.join("\n\n")
+        };
+        let actor_omitted = total.saturating_sub(blocks.len());
+        if actor_omitted > 0 {
+            rendered.push_str(&format!(
+                "\n\n… {actor_omitted} additional matches truncated; refine the text or regex query."
+            ));
+        }
+        if let Some(marker) = incomplete.as_deref() {
+            rendered.push_str("\n\n");
+            rendered.push_str(marker);
+        }
+        self.response_shape
+            .get_or_insert_with(ResponseShape::default)
+            .find = Some(FindStructure {
+            blocks,
+            actor_omitted,
+            incomplete,
+        });
+        Ok(rendered)
     }
 
     fn dispatch_ref_action<Action, PostSnapshot>(
@@ -2734,8 +3904,12 @@ impl BrowserState {
         filename: Option<&str>,
         request: &ActorRequest,
     ) -> TextResult {
-        let page = self.ensure_page(request)?.clone();
-        let records = page.console_records(all, false).map_err(|error| {
+        let records = if let Some(source) = self.page_record_source.as_mut() {
+            source.console_records(all, false)
+        } else {
+            self.ensure_page(request)?.console_records(all, false)
+        }
+        .map_err(|error| {
             self.operation_error(
                 "console capture failed",
                 error,
@@ -2743,49 +3917,19 @@ impl BrowserState {
                 request.timeout_ms,
             )
         })?;
-        let threshold = console_level_rank(level);
-        let mut lines = records
-            .records
-            .iter()
-            .filter(|record| console_message_rank(&record.message_type) <= threshold)
-            .map(|record| {
-                let level = console_level_name(&record.message_type);
-                let location = record.location.as_ref().map_or_else(
-                    || "(unknown)".to_owned(),
-                    |location| {
-                        let url = if location.url.is_empty() {
-                            "(unknown)"
-                        } else {
-                            &location.url
-                        };
-                        format!("{url}:{}", location.line_number)
-                    },
-                );
-                format!(
-                    "{level} {location} {}",
-                    record.text.replace(['\r', '\n'], " ")
-                )
-            })
-            .collect::<Vec<_>>();
-        if records.evicted > 0 {
-            lines.push(format!(
-                "(console ring buffer evicted {} earlier matching-scope records)",
-                records.evicted
-            ));
-        }
-        let content = if lines.is_empty() {
-            "(no console messages)".to_owned()
-        } else {
-            lines.join("\n")
-        };
+        let presentation = console_records_presentation(
+            &records,
+            level,
+            self.features.console_dedup && filename.is_none(),
+        );
         if let Some(filename) = filename {
-            let artifact = write_text_output(&content, filename, "console")?;
+            let artifact = write_text_output(&presentation.text, filename, "console")?;
             Ok(format!(
                 "Console messages written to `{}`.",
                 artifact.display()
             ))
         } else {
-            Ok(content)
+            Ok(presentation.text)
         }
     }
 
@@ -2796,64 +3940,50 @@ impl BrowserState {
         filename: Option<&str>,
         request: &ActorRequest,
     ) -> TextResult {
-        let records = self.ensure_page(request)?.network_records(false, false);
+        let records = if let Some(source) = self.page_record_source.as_mut() {
+            source.network_records(false, false)
+        } else {
+            self.ensure_page(request)?.network_records(false, false)
+        };
         let filter = filter
             .map(NetworkRegex::compile)
             .transpose()
             .map_err(|message| {
                 BrowserError::Message(format!("invalid network filter regex: {message}"))
             })?;
-        let mut lines = Vec::new();
-        for record in &records.records {
-            let successful_static = matches!(
-                record.resource_type.as_str(),
-                "image" | "media" | "font" | "stylesheet"
-            ) && record
-                .response_status
-                .is_some_and(|status| (200..400).contains(&status));
-            if !include_static && successful_static {
-                continue;
-            }
-            if filter
-                .as_ref()
-                .is_some_and(|filter| !filter.is_match(&record.url))
-            {
-                continue;
-            }
-            let status = record.response_status.map_or_else(
-                || {
-                    if record.failure.is_some() {
-                        "FAILED".to_owned()
-                    } else {
-                        "PENDING".to_owned()
-                    }
-                },
-                |status| status.to_string(),
-            );
-            lines.push(format!(
-                "[{}] {} {status} {} ({})",
-                record.index, record.method, record.url, record.resource_type
-            ));
-        }
-        if records.evicted > 0 {
-            lines.push(format!(
-                "(network ring buffer evicted {} earlier current-epoch records)",
-                records.evicted
-            ));
-        }
-        let content = if lines.is_empty() {
-            "(no matching network requests)".to_owned()
-        } else {
-            lines.join("\n")
-        };
+        let presentation = network_records_presentation(
+            &records,
+            include_static,
+            filter.as_ref(),
+            self.features.net_note,
+            filename.is_some(),
+        );
+        let legacy_content = network_list_presentation(&presentation.legacy_lines, None);
         if let Some(filename) = filename {
-            let artifact = write_text_output(&content, filename, "network")?;
+            let artifact = write_text_output(&legacy_content, filename, "network")?;
             Ok(format!(
                 "Network requests written to `{}`.",
                 artifact.display()
             ))
         } else {
-            Ok(content)
+            let (entries, mut tail_notices): (Vec<_>, Vec<_>) = presentation
+                .legacy_lines
+                .iter()
+                .cloned()
+                .partition(|line| line.starts_with('['));
+            if let Some(hidden_static) = presentation.hidden_static.filter(|count| *count > 0) {
+                tail_notices.push(format!("({hidden_static} successful static requests hidden; use static:true to include them)"));
+            }
+            self.response_shape
+                .get_or_insert_with(ResponseShape::default)
+                .network = Some(NetworkStructure::List {
+                entries,
+                tail_notices,
+            });
+            Ok(network_list_presentation(
+                &presentation.legacy_lines,
+                presentation.hidden_static,
+            ))
         }
     }
 
@@ -2903,31 +4033,34 @@ impl BrowserState {
             |part| vec![part],
         );
         let mut rendered = Vec::new();
+        let mut structured = Vec::new();
         for selected in parts {
-            let (name, value) = match selected {
-                NetworkPart::RequestHeaders => {
-                    ("request-headers", headers_json(&record.request_headers))
-                }
-                NetworkPart::RequestBody => (
-                    "request-body",
-                    record
+            let (name, value, body_marker) = match selected {
+                NetworkPart::RequestHeaders => (
+                    "request-headers",
+                    headers_json(&record.request_headers),
+                    None,
+                ),
+                NetworkPart::RequestBody => {
+                    let body = record
                         .request_body
                         .as_deref()
                         .filter(|body| !body.is_empty())
-                        .map(|body| {
-                            bounded_network_detail_text(
-                                body,
-                                if filename.is_some() {
-                                    FILE_BODY_BYTES
-                                } else {
-                                    INLINE_BODY_BYTES
-                                },
-                                "request body",
-                                filename.is_none(),
-                            )
-                        })
-                        .unwrap_or_else(|| "(empty request body)".to_owned()),
-                ),
+                        .unwrap_or("");
+                    let max = if filename.is_some() {
+                        FILE_BODY_BYTES
+                    } else {
+                        INLINE_BODY_BYTES
+                    };
+                    let value = if body.is_empty() {
+                        "(empty request body)".to_owned()
+                    } else {
+                        bounded_network_detail_text(body, max, "request body", filename.is_none())
+                    };
+                    let marker = (filename.is_none() && body.len() > max).then(||
+                        format!("(request body truncated to {max} bytes inline; use filename for a larger bounded body)"));
+                    ("request-body", value, marker)
+                }
                 NetworkPart::ResponseHeaders => (
                     "response-headers",
                     if record.response_status.is_none() {
@@ -2935,6 +4068,7 @@ impl BrowserState {
                     } else {
                         headers_json(&record.response_headers)
                     },
+                    None,
                 ),
                 NetworkPart::ResponseBody => {
                     let max_bytes = if filename.is_some() {
@@ -2952,6 +4086,7 @@ impl BrowserState {
                                 request.timeout_ms,
                             )
                         })?;
+                    let mut actor_marker = None;
                     let value = match body {
                         NetworkBody::Text {
                             text,
@@ -2969,9 +4104,12 @@ impl BrowserState {
                                         "\n(response body truncated to {max_bytes} of {total_bytes} bytes)"
                                     ));
                                 } else {
-                                    value.push_str(&format!(
-                                        "\n(response body truncated to {max_bytes} bytes inline; use filename for a larger bounded body)"
-                                    ));
+                                    let marker = format!(
+                                        "(response body truncated to {max_bytes} bytes inline; use filename for a larger bounded body)"
+                                    );
+                                    value.push('\n');
+                                    value.push_str(&marker);
+                                    actor_marker = Some(marker);
                                 }
                             }
                             value
@@ -2985,9 +4123,14 @@ impl BrowserState {
                             format!("(body unavailable: {reason})")
                         }
                     };
-                    ("response-body", value)
+                    ("response-body", value, actor_marker)
                 }
             };
+            structured.push(NetworkSection {
+                name,
+                payload: value.clone(),
+                body_marker,
+            });
             rendered.push(format!("#### {name}\n{value}"));
         }
         let content = rendered.join("\n\n");
@@ -2998,11 +4141,57 @@ impl BrowserState {
                 artifact.display()
             ))
         } else {
+            self.response_shape
+                .get_or_insert_with(ResponseShape::default)
+                .network = Some(NetworkStructure::Detail {
+                sections: structured,
+            });
             Ok(content)
         }
     }
 
-    fn list_pages(&mut self, request: &ActorRequest) -> Result<Vec<Page>, BrowserError> {
+    fn list_pages(
+        &mut self,
+        request: &ActorRequest,
+    ) -> Result<Vec<ActivePageHandle>, BrowserError> {
+        if let Some(mut seam) = self.page_lifecycle_seam.take() {
+            let discovered = seam.discover_pages(request);
+            self.page_lifecycle_seam = Some(seam);
+            let discovered = discovered?;
+            let discovered_targets = discovered
+                .iter()
+                .map(|candidate| candidate.handle.target_id())
+                .collect::<HashSet<_>>();
+            self.closing_targets
+                .retain(|target_id| discovered_targets.contains(target_id));
+            self.tab_order
+                .retain(|target_id| discovered_targets.contains(target_id));
+            self.tab_inventory
+                .retain(|target_id, _| discovered_targets.contains(target_id));
+            self.pages
+                .retain(|target_id, _| discovered_targets.contains(target_id));
+            for candidate in &discovered {
+                self.register_page(candidate.registration.as_ref())
+                    .map_err(|error| {
+                        self.operation_error(
+                            "console capture arm failed",
+                            error,
+                            &request.cancellation,
+                            request.timeout_ms,
+                        )
+                    })?;
+            }
+            let mut by_target = discovered
+                .into_iter()
+                .map(|candidate| (candidate.handle.target_id(), candidate.handle))
+                .collect::<HashMap<_, _>>();
+            self.inventory_stale = false;
+            return Ok(self
+                .tab_order
+                .iter()
+                .filter_map(|target_id| by_target.remove(target_id))
+                .collect());
+        }
         let remaining = Self::remaining(request)?;
         let discovered = self
             .browser
@@ -3036,15 +4225,25 @@ impl BrowserState {
             .collect::<HashSet<_>>();
         self.tab_order
             .retain(|target_id| discovered_targets.contains(target_id));
+        self.tab_inventory
+            .retain(|target_id, _| discovered_targets.contains(target_id));
         self.pages
             .retain(|target_id, _| discovered_targets.contains(target_id));
         for page in &discovered {
-            self.register_page(page);
+            self.register_page(page).map_err(|error| {
+                self.operation_error(
+                    "console capture arm failed",
+                    error,
+                    &request.cancellation,
+                    request.timeout_ms,
+                )
+            })?;
         }
         let mut by_target = discovered
             .into_iter()
-            .map(|page| (page.target_id(), page))
+            .map(|page| (page.target_id(), ActivePageHandle::live(page)))
             .collect::<HashMap<_, _>>();
+        self.inventory_stale = false;
         Ok(self
             .tab_order
             .iter()
@@ -3052,10 +4251,17 @@ impl BrowserState {
             .collect())
     }
 
-    fn render_tabs(&mut self, pages: &[Page], request: &ActorRequest) -> String {
+    fn render_tabs(
+        &mut self,
+        pages: &[ActivePageHandle],
+        selected_index: Option<usize>,
+        request: &ActorRequest,
+    ) -> (String, TabsStructure) {
         self.poll_events();
-        let active_target = self.page.as_ref().map(Page::target_id);
+        let active_target = self.page.as_ref().map(ActivePageHandle::target_id);
         let mut lines = Vec::new();
+        let mut entries = Vec::new();
+        let mut exact_selected_url = None;
         for (index, page) in pages.iter().enumerate() {
             let target_id = page.target_id();
             let pending = self.pages.get(&target_id).is_some_and(|runtime| {
@@ -3084,9 +4290,31 @@ impl BrowserState {
             let marker = (Some(target_id) == active_target)
                 .then_some(" (active)")
                 .unwrap_or("");
-            lines.push(format!("- {index}: {title} — {}{marker}", page.url()));
+            let title = title.replace(['\r', '\n'], " ");
+            let raw_url = page.url();
+            let (url, selected_exact_url) = tab_url_values(index, selected_index, &raw_url);
+            lines.push(format!("- {index}: {title} — {url}{marker}"));
+            entries.push(TabEntry {
+                index,
+                title,
+                url,
+                active: !marker.is_empty(),
+            });
+            if let Some(selected_exact_url) = selected_exact_url {
+                exact_selected_url = Some(selected_exact_url);
+            }
         }
-        format!("### Tabs\n{}", lines.join("\n"))
+        let active_index = pages
+            .iter()
+            .position(|page| Some(page.target_id()) == active_target);
+        (
+            format!("### Tabs\n{}", lines.join("\n")),
+            TabsStructure {
+                entries,
+                active_index,
+                selected_exact_url: exact_selected_url,
+            },
+        )
     }
 
     fn tabs(
@@ -3115,25 +4343,38 @@ impl BrowserState {
                             request.timeout_ms,
                         )
                     })?;
-                self.register_page(&page);
-                self.page = Some(page.clone());
+                self.register_page(&page).map_err(|error| {
+                    self.operation_error(
+                        "console capture arm failed",
+                        error,
+                        &request.cancellation,
+                        request.timeout_ms,
+                    )
+                })?;
+                self.page = Some(ActivePageHandle::live(page.clone()));
                 if let Some(url) = url {
                     let remaining = Self::remaining(request)?;
-                    page.goto_with_cancel(
+                    let target_id = page.target_id();
+                    self.begin_observed_navigation(&target_id, Some(url.to_owned()));
+                    let observation = match page.goto_with_cancel_observed(
                         url,
                         GotoOptions::default()
                             .wait_until("load")
                             .timeout(Self::engine_timeout(remaining)),
                         Some(&request.cancellation.engine),
-                    )
-                    .map_err(|error| {
-                        self.operation_error(
-                            "new tab navigation failed",
-                            error,
-                            &request.cancellation,
-                            request.timeout_ms,
-                        )
-                    })?;
+                    ) {
+                        Ok(observation) => observation,
+                        Err(error) => {
+                            self.cancel_observed_navigation(&target_id);
+                            return Err(self.operation_error(
+                                "new tab navigation failed",
+                                error,
+                                &request.cancellation,
+                                request.timeout_ms,
+                            ));
+                        }
+                    };
+                    self.record_observed_navigation(&target_id, page.url(), &observation, false);
                 }
                 self.current_refs.clear();
                 snapshot = Some(self.snapshot(request)?);
@@ -3157,7 +4398,7 @@ impl BrowserState {
                 let active_target = self
                     .page
                     .as_ref()
-                    .map(Page::target_id)
+                    .map(ActivePageHandle::target_id)
                     .ok_or_else(|| BrowserError::Message("no active tab".to_owned()))?;
                 let closing_index = index.unwrap_or_else(|| {
                     pages
@@ -3180,43 +4421,72 @@ impl BrowserState {
                         "Tab {closing_index} has a pending modal; handle it before closing."
                     )));
                 }
-                closing.close(CloseOptions::default()).map_err(|error| {
-                    self.operation_error(
-                        "tab close failed",
-                        error,
-                        &request.cancellation,
-                        request.timeout_ms,
-                    )
-                })?;
-                self.closing_targets.insert(target_id.clone());
-                self.pages.remove(&target_id);
-                self.tab_order.retain(|registered| registered != &target_id);
+                if let Some(mut seam) = self.page_lifecycle_seam.take() {
+                    let closed = seam.close_page(&closing, request);
+                    self.page_lifecycle_seam = Some(seam);
+                    closed?;
+                } else {
+                    closing.close(CloseOptions::default()).map_err(|error| {
+                        self.operation_error(
+                            "tab close failed",
+                            error,
+                            &request.cancellation,
+                            request.timeout_ms,
+                        )
+                    })?;
+                }
+                self.retire_closed_target(&target_id);
                 pages = self.list_pages(request)?;
                 if pages.is_empty() {
-                    let page = self
-                        .browser
-                        .as_ref()
-                        .expect("browser initialized")
-                        .new_page_with_cancel(Some(&request.cancellation.engine))
+                    let candidate = if let Some(mut seam) = self.page_lifecycle_seam.take() {
+                        let candidate = seam.new_page(request);
+                        self.page_lifecycle_seam = Some(seam);
+                        candidate?
+                    } else {
+                        let page = self
+                            .browser
+                            .as_ref()
+                            .expect("browser initialized")
+                            .new_page_with_cancel(Some(&request.cancellation.engine))
+                            .map_err(|error| {
+                                self.operation_error(
+                                    "replacement tab failed",
+                                    error,
+                                    &request.cancellation,
+                                    request.timeout_ms,
+                                )
+                            })?;
+                        PageCandidate {
+                            registration: Box::new(page.clone()),
+                            handle: ActivePageHandle::live(page),
+                        }
+                    };
+                    let handle = candidate.handle.clone();
+                    self.install_active_page(candidate.registration.as_ref(), handle.clone(), None)
                         .map_err(|error| {
                             self.operation_error(
-                                "replacement tab failed",
+                                "console capture arm failed",
                                 error,
                                 &request.cancellation,
                                 request.timeout_ms,
                             )
                         })?;
-                    self.register_page(&page);
-                    pages.push(page);
+                    pages.push(handle);
                 }
-                if target_id == active_target {
+                if target_id == active_target && self.page.is_none() {
                     self.page = Some(pages[closing_index.min(pages.len() - 1)].clone());
                 }
                 self.current_refs.clear();
                 snapshot = Some(self.snapshot(request)?);
             }
         }
-        let tabs = self.render_tabs(&pages, request);
+        let selected_index = matches!(action, TabAction::Select)
+            .then_some(index)
+            .flatten();
+        let (tabs, tabs_structure) = self.render_tabs(&pages, selected_index, request);
+        self.response_shape
+            .get_or_insert_with(ResponseShape::default)
+            .tabs = Some(tabs_structure);
         Ok(snapshot.map_or(tabs.clone(), |snapshot| {
             format!("{tabs}\n\n### Snapshot\n{snapshot}")
         }))
@@ -3229,7 +4499,7 @@ impl BrowserState {
         request: &ActorRequest,
     ) -> TextResult {
         self.poll_events();
-        let active_target = self.page.as_ref().map(Page::target_id);
+        let active_target = self.page.as_ref().map(ActivePageHandle::target_id);
         let pending_target = active_target
             .filter(|target_id| {
                 self.pages
@@ -3274,7 +4544,7 @@ impl BrowserState {
 
     fn file_upload(&mut self, paths: &[String], request: &ActorRequest) -> TextResult {
         self.poll_events();
-        let active_target = self.page.as_ref().map(Page::target_id);
+        let active_target = self.page.as_ref().map(ActivePageHandle::target_id);
         let pending_target = active_target
             .filter(|target_id| {
                 self.pages
@@ -3469,6 +4739,7 @@ impl BrowserState {
     }
 
     fn run(&mut self, request: &ActorRequest) -> BrowserResult {
+        self.response_shape = None;
         if !matches!(
             request.op,
             BrowserOp::HandleDialog { .. }
@@ -3480,15 +4751,20 @@ impl BrowserState {
                 | BrowserOp::Close
         ) && self.has_pending_modal()
         {
-            return Ok(BrowserOutput::Text(self.modal_response(
+            let text = self.modal_response(
                 &format!(
                     "{} deferred until the pending modal is handled.",
                     browser_op_name(&request.op)
                 ),
                 request,
-            )));
+            );
+            let output = match self.response_shape.take() {
+                Some(shape) => BrowserOutput::ShapedText { text, shape },
+                None => BrowserOutput::Text(text),
+            };
+            return Ok(self.add_page_digest(output, request));
         }
-        match &request.op {
+        let result = match &request.op {
             BrowserOp::Navigate(url) => self.navigate(url, request).map(BrowserOutput::Text),
             BrowserOp::NavigateBack => self.navigate_back(request).map(BrowserOutput::Text),
             BrowserOp::NavigateForward => self.navigate_forward(request).map(BrowserOutput::Text),
@@ -3630,7 +4906,18 @@ impl BrowserState {
                     "No browser session was open.".to_owned()
                 }))
             }
-        }
+        };
+        let output = result.map(|output| match (output, self.response_shape.take()) {
+            (BrowserOutput::Text(text), Some(mut shape)) => {
+                if let Some(snapshot) = shape.snapshot.as_ref() {
+                    let suffix = format!("\n\n### Snapshot\n{}", snapshot.legacy);
+                    shape.result_prefix = text.strip_suffix(&suffix).map(ToOwned::to_owned);
+                }
+                BrowserOutput::ShapedText { text, shape }
+            }
+            (output, _) => output,
+        })?;
+        Ok(self.add_page_digest(output, request))
     }
 
     fn close(&mut self) {
@@ -3685,6 +4972,17 @@ fn partial_completion_result(
 
 fn render_drag_result(start_display: &str, end_display: &str, snapshot: &str) -> String {
     format!("### Result\nDragged {start_display} to {end_display}.\n\n### Snapshot\n{snapshot}")
+}
+
+fn tab_url_values(
+    index: usize,
+    selected_index: Option<usize>,
+    raw_url: &str,
+) -> (String, Option<String>) {
+    (
+        raw_url.replace(['\r', '\n'], " "),
+        (Some(index) == selected_index).then(|| raw_url.to_owned()),
+    )
 }
 
 fn browser_op_name(op: &BrowserOp) -> &'static str {
@@ -3751,10 +5049,17 @@ fn file_upload_retry_error(error: BrowserError) -> BrowserError {
     ))
 }
 
-fn render_find_matches(lines: &[String], matching_indices: &[usize]) -> String {
+fn render_find_matches(lines: &[String], matching_indices: &[usize]) -> (String, FindStructure) {
     const LIMIT: usize = 20;
     if matching_indices.is_empty() {
-        return "No matches in the current snapshot outline.".to_owned();
+        return (
+            "No matches in the current snapshot outline.".to_owned(),
+            FindStructure {
+                blocks: Vec::new(),
+                actor_omitted: 0,
+                incomplete: None,
+            },
+        );
     }
     let mut rendered = Vec::new();
     for (match_number, &index) in matching_indices.iter().take(LIMIT).enumerate() {
@@ -3813,7 +5118,14 @@ fn render_find_matches(lines: &[String], matching_indices: &[usize]) -> String {
     if truncated > 0 {
         result.push_str(&format!("\n\n… {truncated} additional matches truncated."));
     }
-    result
+    (
+        result,
+        FindStructure {
+            blocks: rendered,
+            actor_omitted: truncated,
+            incomplete: None,
+        },
+    )
 }
 
 fn outline_indent(line: &str) -> usize {
@@ -3827,6 +5139,270 @@ fn console_level_rank(level: ConsoleLevel) -> u8 {
         ConsoleLevel::Info => 2,
         ConsoleLevel::Debug => 3,
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ConsoleRecordsPresentation {
+    text: String,
+    w4_state_writes: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ConsolePresentationKey {
+    navigation_epoch: u64,
+    severity: &'static str,
+    normalized_text: String,
+}
+
+fn render_console_record(record: &ConsoleRecord, use_attributed_location: bool) -> String {
+    let level = console_level_name(&record.message_type);
+    let selected_location = if use_attributed_location {
+        record
+            .attributed_location
+            .as_ref()
+            .or(record.location.as_ref())
+    } else {
+        record.location.as_ref()
+    };
+    let location = selected_location.map_or_else(
+        || "(unknown)".to_owned(),
+        |location| {
+            let url = if location.url.is_empty() {
+                "(unknown)"
+            } else {
+                &location.url
+            };
+            format!("{url}:{}", location.line_number)
+        },
+    );
+    format!(
+        "{level} {location} {}",
+        record.text.replace(['\r', '\n'], " ")
+    )
+}
+
+fn console_records_presentation(
+    records: &ConsoleRecords,
+    level: ConsoleLevel,
+    deduplicate: bool,
+) -> ConsoleRecordsPresentation {
+    let threshold = console_level_rank(level);
+    if !deduplicate {
+        let mut lines = records
+            .records
+            .iter()
+            .filter(|record| console_message_rank(&record.message_type) <= threshold)
+            .map(|record| render_console_record(record, false))
+            .collect::<Vec<_>>();
+        append_console_eviction_notice(&mut lines, records.evicted);
+        return ConsoleRecordsPresentation {
+            text: console_lines_presentation(&lines),
+            w4_state_writes: 0,
+        };
+    }
+
+    let mut lines = Vec::new();
+    let mut state_writes = 0;
+    let mut index = 0;
+    while index < records.records.len() {
+        let first = &records.records[index];
+        let key = console_presentation_key(first);
+        state_writes += 1;
+        let mut end = index + 1;
+        while end < records.records.len() && console_presentation_key(&records.records[end]) == key
+        {
+            end += 1;
+            state_writes += 1;
+        }
+        let count = end - index;
+        if console_message_rank(&first.message_type) <= threshold {
+            let rendered = render_console_record(first, true);
+            lines.push(if count == 1 {
+                rendered
+            } else {
+                format!("{rendered} (repeated {count} times)")
+            });
+        }
+        index = end;
+    }
+    // Adjacency is evaluated on the unfiltered structured stream. Therefore a
+    // hidden-severity record and every navigation boundary separate otherwise
+    // identical visible records, as required by the W4 contract.
+    append_console_eviction_notice(&mut lines, records.evicted);
+    ConsoleRecordsPresentation {
+        text: console_lines_presentation(&lines),
+        w4_state_writes: state_writes,
+    }
+}
+
+fn append_console_eviction_notice(lines: &mut Vec<String>, evicted: u64) {
+    if evicted > 0 {
+        lines.push(format!(
+            "(console ring buffer evicted {evicted} earlier matching-scope records)"
+        ));
+    }
+}
+
+fn console_lines_presentation(lines: &[String]) -> String {
+    if lines.is_empty() {
+        "(no console messages)".to_owned()
+    } else {
+        lines.join("\n")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NetworkListPresentation {
+    Legacy,
+    StaticNote {
+        hidden_static: usize,
+        state_writes: usize,
+    },
+}
+
+impl NetworkListPresentation {
+    fn new(net_note: bool, include_static: bool, has_filename: bool) -> Self {
+        if net_note && !include_static && !has_filename {
+            Self::StaticNote {
+                hidden_static: 0,
+                state_writes: 0,
+            }
+        } else {
+            Self::Legacy
+        }
+    }
+
+    fn hide_filtered_static(&mut self) {
+        if let Self::StaticNote {
+            hidden_static,
+            state_writes,
+        } = self
+        {
+            *hidden_static += 1;
+            *state_writes += 1;
+        }
+    }
+
+    fn hidden_static(&self) -> Option<usize> {
+        match self {
+            Self::Legacy => None,
+            Self::StaticNote { hidden_static, .. } => Some(*hidden_static),
+        }
+    }
+
+    fn state_writes(&self) -> usize {
+        match self {
+            Self::Legacy => 0,
+            Self::StaticNote { state_writes, .. } => *state_writes,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NetworkRecordsPresentation {
+    legacy_lines: Vec<String>,
+    hidden_static: Option<usize>,
+    w4_state_writes: usize,
+}
+
+fn network_records_presentation(
+    records: &NetworkRecords,
+    include_static: bool,
+    filter: Option<&NetworkRegex>,
+    net_note: bool,
+    has_filename: bool,
+) -> NetworkRecordsPresentation {
+    // Legacy mode has no hidden-count field, so an off switch cannot mutate W4 state.
+    let mut note = NetworkListPresentation::new(net_note, include_static, has_filename);
+    let mut legacy_lines = Vec::new();
+    for record in &records.records {
+        let successful_static = is_successful_static_record(record);
+        if filter.is_some_and(|filter| !filter.is_match(&record.url)) {
+            continue;
+        }
+        if !include_static && successful_static {
+            note.hide_filtered_static();
+            continue;
+        }
+        let status = record.response_status.map_or_else(
+            || {
+                if record.failure.is_some() {
+                    "FAILED".to_owned()
+                } else {
+                    "PENDING".to_owned()
+                }
+            },
+            |status| status.to_string(),
+        );
+        legacy_lines.push(format!(
+            "[{}] {} {status} {} ({})",
+            record.index, record.method, record.url, record.resource_type
+        ));
+    }
+    if records.evicted > 0 {
+        legacy_lines.push(format!(
+            "(network ring buffer evicted {} earlier current-epoch records)",
+            records.evicted
+        ));
+    }
+    NetworkRecordsPresentation {
+        legacy_lines,
+        hidden_static: note.hidden_static(),
+        w4_state_writes: note.state_writes(),
+    }
+}
+
+fn is_successful_static_record(record: &NetworkRecord) -> bool {
+    matches!(
+        record.resource_type.as_str(),
+        "image" | "media" | "font" | "stylesheet"
+    ) && record
+        .response_status
+        .is_some_and(|status| (200..400).contains(&status))
+}
+
+fn network_list_presentation(lines: &[String], hidden_static: Option<usize>) -> String {
+    let mut output = if lines.is_empty() {
+        "(no matching network requests)".to_owned()
+    } else {
+        lines.join("\n")
+    };
+    if let Some(hidden_static) = hidden_static.filter(|count| *count > 0) {
+        output.push_str(&format!(
+            "\n({hidden_static} successful static requests hidden; use static:true to include them)"
+        ));
+    }
+    output
+}
+
+fn console_presentation_key(record: &ConsoleRecord) -> ConsolePresentationKey {
+    ConsolePresentationKey {
+        navigation_epoch: record.navigation_epoch,
+        severity: console_level_name(&record.message_type),
+        normalized_text: normalize_console_text(&record.text),
+    }
+}
+
+fn normalize_console_text(text: &str) -> String {
+    // W4 normalization is deliberately limited to ASCII space and tab: trim
+    // them at the edges and collapse interior runs to one ASCII space. Other
+    // whitespace (including NBSP, em-space, and line breaks) remains distinct.
+    let mut normalized = String::with_capacity(text.len());
+    let mut pending_ascii_space = false;
+    for character in text.chars() {
+        if matches!(character, ' ' | '\t') {
+            if !normalized.is_empty() {
+                pending_ascii_space = true;
+            }
+        } else {
+            if pending_ascii_space {
+                normalized.push(' ');
+                pending_ascii_space = false;
+            }
+            normalized.push(character);
+        }
+    }
+    normalized
 }
 
 fn console_message_rank(message_type: &str) -> u8 {
@@ -4336,8 +5912,8 @@ fn mime_for_path(path: &Path) -> &'static str {
     }
 }
 
-fn actor_main(shared: Arc<ActorShared>, startup: BrowserStartup) {
-    let mut state = BrowserState::new(startup);
+fn actor_main(shared: Arc<ActorShared>, startup: BrowserStartup, features: FeatureConfig) {
+    let mut state = BrowserState::new(startup, features);
     eprintln!("browser actor: ready");
     while let Some(request) = shared.next() {
         let result = state.run(&request);
@@ -4362,6 +5938,1424 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn header_switch_off_allocates_no_header_state() {
+        let name = "RUSTWRIGHT_MCP_HEADER";
+        let previous = std::env::var_os(name);
+        // SAFETY: no other test in this crate mutates this variable, and it is
+        // restored before any assertion can panic.
+        unsafe { std::env::set_var(name, "off") };
+        let off_features = FeatureConfig::from_env();
+        match previous {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+        let off = BrowserState::new(BrowserStartup::Local, off_features);
+        assert!(off.header_state.is_none());
+
+        let mut features = FeatureConfig::default();
+        features.header = true;
+        let on = BrowserState::new(BrowserStartup::Local, features);
+        assert!(on.header_state.is_some());
+    }
+
+    #[test]
+    fn header_off_registration_and_polling_perform_no_detail_subscription_or_header_write() {
+        struct RegistrationSeam {
+            console_arms: Arc<AtomicUsize>,
+            detail_subscriptions: Arc<AtomicUsize>,
+            header_writes: Arc<AtomicUsize>,
+        }
+        impl PageRegistration for RegistrationSeam {
+            fn registration_target_id(&self) -> String {
+                "page".to_owned()
+            }
+            fn registration_arm_console_capture(&self) -> Result<(), Error> {
+                self.console_arms.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn registration_events(&self) -> Option<Box<dyn PageEventReceiver>> {
+                None
+            }
+            fn registration_details(&self) -> Option<Box<dyn DetailReceiver>> {
+                self.detail_subscriptions.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+            fn registration_url(&self) -> String {
+                self.header_writes.fetch_add(1, Ordering::SeqCst);
+                "https://example.test/".to_owned()
+            }
+        }
+        let console_arms = Arc::new(AtomicUsize::new(0));
+        let detail_subscriptions = Arc::new(AtomicUsize::new(0));
+        let header_writes = Arc::new(AtomicUsize::new(0));
+        let lifecycle_subscriptions = Arc::new(AtomicUsize::new(0));
+        let lifecycle_count = Arc::clone(&lifecycle_subscriptions);
+        let (lifecycle_tx, lifecycle_rx) = std::sync::mpsc::channel();
+        let lifecycle_rx = Arc::new(Mutex::new(Some(lifecycle_rx)));
+        let mut state = BrowserState::default();
+        state.lifecycle_subscription_provider = Box::new(move |_| {
+            lifecycle_count.fetch_add(1, Ordering::SeqCst);
+            lifecycle_rx
+                .lock()
+                .unwrap()
+                .take()
+                .map(|receiver| Box::new(receiver) as Box<dyn LifecycleReceiver>)
+        });
+        state
+            .register_page(&RegistrationSeam {
+                console_arms: Arc::clone(&console_arms),
+                detail_subscriptions: Arc::clone(&detail_subscriptions),
+                header_writes: Arc::clone(&header_writes),
+            })
+            .unwrap();
+        state
+            .register_page(&RegistrationSeam {
+                console_arms: Arc::clone(&console_arms),
+                detail_subscriptions: Arc::clone(&detail_subscriptions),
+                header_writes: Arc::clone(&header_writes),
+            })
+            .unwrap();
+        lifecycle_tx
+            .send(TargetLifecycleEvent::Upsert {
+                target_id: "background".to_owned(),
+                url: "https://example.test/background".to_owned(),
+            })
+            .unwrap();
+        state.poll_events();
+        assert_eq!(console_arms.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle_subscriptions.load(Ordering::SeqCst), 0);
+        assert_eq!(detail_subscriptions.load(Ordering::SeqCst), 0);
+        assert_eq!(header_writes.load(Ordering::SeqCst), 0);
+        assert!(state.tab_inventory.is_empty());
+        assert!(state.pages["page"].header.is_none());
+    }
+
+    #[derive(Clone, Copy)]
+    enum RegistrationFailure {
+        Timeout,
+        Cancelled,
+    }
+
+    #[derive(Clone)]
+    struct RetryRegistrationSeam {
+        control: FakePageLifecycleControl,
+        target_id: String,
+    }
+
+    impl PageRegistration for RetryRegistrationSeam {
+        fn registration_target_id(&self) -> String {
+            self.target_id.clone()
+        }
+
+        fn registration_arm_console_capture(&self) -> Result<(), Error> {
+            let mut state = self.control.0.lock().unwrap();
+            let arms = state.arms;
+            state.arms += 1;
+            if arms == 0 {
+                return Err(match state.failure {
+                    RegistrationFailure::Timeout => Error::Timeout(1),
+                    RegistrationFailure::Cancelled => Error::Cancelled,
+                });
+            }
+            Ok(())
+        }
+
+        fn registration_events(&self) -> Option<Box<dyn PageEventReceiver>> {
+            None
+        }
+
+        fn registration_details(&self) -> Option<Box<dyn DetailReceiver>> {
+            None
+        }
+
+        fn registration_url(&self) -> String {
+            "https://example.test/".to_owned()
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakePageLifecycleControl(Arc<Mutex<FakePageLifecycleState>>);
+
+    struct FakePageLifecycleState {
+        failure: RegistrationFailure,
+        inventory: Vec<String>,
+        arms: usize,
+        attach_calls: usize,
+        discovery_calls: usize,
+        close_calls: usize,
+        new_calls: usize,
+    }
+
+    impl FakePageLifecycleControl {
+        fn new(failure: RegistrationFailure, inventory: Vec<&str>) -> Self {
+            Self(Arc::new(Mutex::new(FakePageLifecycleState {
+                failure,
+                inventory: inventory.into_iter().map(str::to_owned).collect(),
+                arms: 0,
+                attach_calls: 0,
+                discovery_calls: 0,
+                close_calls: 0,
+                new_calls: 0,
+            })))
+        }
+
+        fn candidate(&self, target_id: &str) -> PageCandidate {
+            PageCandidate {
+                registration: Box::new(RetryRegistrationSeam {
+                    control: self.clone(),
+                    target_id: target_id.to_owned(),
+                }),
+                handle: inactive_page_handle(target_id),
+            }
+        }
+    }
+
+    impl PageLifecycleSeam for FakePageLifecycleControl {
+        fn attach_remote(
+            &mut self,
+            _request: &ActorRequest,
+        ) -> Result<PageCandidate, BrowserError> {
+            self.0.lock().unwrap().attach_calls += 1;
+            Ok(self.candidate("remote"))
+        }
+
+        fn discover_pages(
+            &mut self,
+            _request: &ActorRequest,
+        ) -> Result<Vec<PageCandidate>, BrowserError> {
+            let inventory = {
+                let mut state = self.0.lock().unwrap();
+                state.discovery_calls += 1;
+                state.inventory.clone()
+            };
+            Ok(inventory
+                .iter()
+                .map(|target_id| self.candidate(target_id))
+                .collect())
+        }
+
+        fn close_page(
+            &mut self,
+            page: &ActivePageHandle,
+            _request: &ActorRequest,
+        ) -> Result<(), BrowserError> {
+            let mut state = self.0.lock().unwrap();
+            state.close_calls += 1;
+            state
+                .inventory
+                .retain(|target_id| target_id != &page.target_id());
+            Ok(())
+        }
+
+        fn new_page(&mut self, _request: &ActorRequest) -> Result<PageCandidate, BrowserError> {
+            let mut state = self.0.lock().unwrap();
+            state.new_calls += 1;
+            state.inventory.push("replacement".to_owned());
+            drop(state);
+            Ok(self.candidate("replacement"))
+        }
+    }
+
+    fn inactive_page_handle(target_id: &str) -> ActivePageHandle {
+        ActivePageHandle {
+            page: None,
+            target_id: target_id.to_owned(),
+            url: "https://example.test/".to_owned(),
+        }
+    }
+
+    #[test]
+    fn remote_ensure_page_retries_timeout_and_cancellation_before_publishing_page() {
+        for failure in [RegistrationFailure::Timeout, RegistrationFailure::Cancelled] {
+            let control = FakePageLifecycleControl::new(failure, vec!["remote"]);
+            let mut state = BrowserState::new(
+                BrowserStartup::Remote(ConnectOptions::new("ws://test.invalid")),
+                FeatureConfig::default(),
+            );
+            state.page_lifecycle_seam = Some(Box::new(control.clone()));
+
+            let first_request = digest_request();
+            assert!(state.ensure_page(&first_request).is_err());
+            assert!(state.page.is_none());
+            assert!(state.browser.is_none());
+            assert!(!state.pages.contains_key("remote"));
+            assert!(state.tab_order.is_empty());
+
+            let second_request = digest_request();
+            let target_id = state
+                .ensure_page(&second_request)
+                .expect("the second real request must retry remote attachment")
+                .target_id();
+            assert_eq!(target_id, "remote");
+            assert!(state.pages.contains_key("remote"));
+            let observed = control.0.lock().unwrap();
+            assert_eq!(observed.attach_calls, 2);
+            assert_eq!(observed.arms, 2);
+        }
+    }
+
+    #[test]
+    fn close_replacement_arm_failure_is_retried_by_next_ordinary_request() {
+        let control = FakePageLifecycleControl::new(RegistrationFailure::Timeout, vec!["closed"]);
+        let mut state = BrowserState {
+            page: Some(inactive_page_handle("closed")),
+            active_target_id: Some("closed".to_owned()),
+            tab_order: vec!["closed".to_owned()],
+            page_lifecycle_seam: Some(Box::new(control.clone())),
+            ..BrowserState::default()
+        };
+        state.pages.insert(
+            "closed".to_owned(),
+            page_runtime_for_registration(false, || None, || None, String::new),
+        );
+        let close_request = digest_request();
+        assert!(
+            state
+                .tabs(TabAction::Close, None, None, &close_request)
+                .is_err(),
+            "replacement arming must fail the close request"
+        );
+        assert!(state.page.is_none());
+        assert!(state.active_target_id.is_none());
+        assert!(!state.pages.contains_key("closed"));
+        assert!(!state.pages.contains_key("replacement"));
+
+        let next_request = digest_request();
+        let target_id = state
+            .ensure_page(&next_request)
+            .expect("an ordinary request must rediscover and arm the replacement")
+            .target_id();
+        assert_eq!(target_id, "replacement");
+        assert!(state.pages.contains_key("replacement"));
+        let observed = control.0.lock().unwrap();
+        assert_eq!(observed.close_calls, 1);
+        assert_eq!(observed.new_calls, 1);
+        assert_eq!(observed.arms, 2);
+        assert!(observed.discovery_calls >= 3);
+    }
+
+    fn digest_request() -> ActorRequest {
+        let (reply, _response) = oneshot::channel();
+        ActorRequest {
+            request_id: request_id(51_540),
+            op: BrowserOp::Snapshot {
+                target: None,
+                depth: None,
+                boxes: false,
+            },
+            cancellation: Arc::new(CommandCancellation::new()),
+            deadline: Instant::now() + Duration::from_secs(1),
+            timeout_ms: 1_000,
+            reply,
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeBrowserQueryControl(Arc<Mutex<FakeBrowserQueryState>>);
+
+    struct FakeBrowserQueryState {
+        inventory: Vec<(String, String)>,
+        inventory_error: bool,
+        inventory_queries: usize,
+        active: Option<(String, String)>,
+        modal_targets: HashSet<String>,
+        observation: PageObservation,
+        observation_queries: usize,
+    }
+
+    impl FakeBrowserQueryControl {
+        fn new(inventory: Vec<(String, String)>, active: Option<(String, String)>) -> Self {
+            Self(Arc::new(Mutex::new(FakeBrowserQueryState {
+                inventory,
+                inventory_error: false,
+                inventory_queries: 0,
+                active,
+                modal_targets: HashSet::new(),
+                observation: (None, None),
+                observation_queries: 0,
+            })))
+        }
+
+        fn provider(&self) -> Box<dyn BrowserQueryProvider> {
+            Box::new(FakeBrowserQueryProvider(self.clone()))
+        }
+    }
+
+    struct FakeBrowserQueryProvider(FakeBrowserQueryControl);
+
+    impl BrowserQueryProvider for FakeBrowserQueryProvider {
+        fn inventory(
+            &mut self,
+            _browser: Option<&Browser>,
+            _request: &ActorRequest,
+        ) -> Result<Vec<BrowserInventoryEntry>, BrowserError> {
+            let mut state = self.0.0.lock().unwrap();
+            state.inventory_queries += 1;
+            if state.inventory_error {
+                return Err(BrowserError::Message("inventory unavailable".to_owned()));
+            }
+            Ok(state
+                .inventory
+                .iter()
+                .map(|(target_id, url)| BrowserInventoryEntry {
+                    target_id: target_id.clone(),
+                    url: url.clone(),
+                    page: None,
+                })
+                .collect())
+        }
+
+        fn active_page(&mut self, _page: Option<&ActivePageHandle>) -> Option<(String, String)> {
+            self.0.0.lock().unwrap().active.clone()
+        }
+
+        fn pending_modal(
+            &mut self,
+            _pages: &HashMap<String, PageRuntime>,
+            target_id: &str,
+        ) -> bool {
+            self.0.0.lock().unwrap().modal_targets.contains(target_id)
+        }
+
+        fn observe(&mut self, _page: Option<&Page>, _request: &ActorRequest) -> PageObservation {
+            let mut state = self.0.0.lock().unwrap();
+            state.observation_queries += 1;
+            state.observation.clone()
+        }
+    }
+
+    struct ReceiverRegistrationSeam {
+        target_id: String,
+        url: String,
+        events: Mutex<Option<Box<dyn PageEventReceiver>>>,
+        details: Mutex<Option<Box<dyn DetailReceiver>>>,
+    }
+
+    impl ReceiverRegistrationSeam {
+        fn new(target_id: &str, url: &str) -> Self {
+            Self {
+                target_id: target_id.to_owned(),
+                url: url.to_owned(),
+                events: Mutex::new(None),
+                details: Mutex::new(None),
+            }
+        }
+    }
+
+    impl PageRegistration for ReceiverRegistrationSeam {
+        fn registration_target_id(&self) -> String {
+            self.target_id.clone()
+        }
+
+        fn registration_events(&self) -> Option<Box<dyn PageEventReceiver>> {
+            self.events.lock().unwrap().take()
+        }
+
+        fn registration_details(&self) -> Option<Box<dyn DetailReceiver>> {
+            self.details.lock().unwrap().take()
+        }
+
+        fn registration_url(&self) -> String {
+            self.url.clone()
+        }
+    }
+
+    fn install_lifecycle_subscription(
+        state: &mut BrowserState,
+    ) -> std::sync::mpsc::Sender<TargetLifecycleEvent> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let receiver = Arc::new(Mutex::new(Some(receiver)));
+        state.lifecycle_subscription_provider = Box::new(move |_| {
+            receiver
+                .lock()
+                .unwrap()
+                .take()
+                .map(|receiver| Box::new(receiver) as Box<dyn LifecycleReceiver>)
+        });
+        sender
+    }
+
+    #[test]
+    fn page_digest_provider_covers_active_order_stale_current_and_modal_bypass() {
+        let inventory = vec![
+            (
+                "active".to_owned(),
+                "https://example.test/active".to_owned(),
+            ),
+            (
+                "background".to_owned(),
+                "https://example.test/background".to_owned(),
+            ),
+        ];
+        let mut features = FeatureConfig::default();
+        features.header = true;
+        let mut state = BrowserState::new(BrowserStartup::Local, features);
+        let query = FakeBrowserQueryControl::new(inventory.clone(), Some(inventory[0].clone()));
+        query.0.lock().unwrap().observation = (Some("Active".to_owned()), Some((1, 2)));
+        state.browser_query_provider = query.provider();
+        let request = digest_request();
+        assert_eq!(
+            state.page_digest(&request).as_deref(),
+            Some(
+                "### Page\nURL: https://example.test/active\nTitle: Active\nStatus: unknown\nConsole: 1 errors, 2 warnings"
+            )
+        );
+        assert_eq!(state.page_digest(&request), None);
+
+        query.0.lock().unwrap().active = Some(inventory[1].clone());
+        assert!(state.page_digest(&request).unwrap().contains("/background"));
+        assert_eq!(
+            state
+                .header_state
+                .as_ref()
+                .unwrap()
+                .last_rendered_tab_signature
+                .as_ref()
+                .unwrap()
+                .active_id
+                .as_deref(),
+            Some("background")
+        );
+
+        let previous_signature = state
+            .header_state
+            .as_ref()
+            .unwrap()
+            .last_rendered_tab_signature
+            .clone()
+            .unwrap();
+        state.inventory_stale = true;
+        query.0.lock().unwrap().inventory.reverse();
+        assert!(state.page_digest(&request).is_some());
+        assert_eq!(
+            state.tab_order,
+            vec!["background".to_owned(), "active".to_owned()]
+        );
+        let reordered_signature = state
+            .header_state
+            .as_ref()
+            .unwrap()
+            .last_rendered_tab_signature
+            .clone()
+            .unwrap();
+        assert_ne!(reordered_signature, previous_signature);
+        assert_eq!(
+            reordered_signature.tabs,
+            vec![
+                (
+                    "background".to_owned(),
+                    "https://example.test/background".to_owned()
+                ),
+                (
+                    "active".to_owned(),
+                    "https://example.test/active".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(query.0.lock().unwrap().inventory_queries, 2);
+
+        state.inventory_stale = true;
+        query
+            .0
+            .lock()
+            .unwrap()
+            .inventory
+            .iter_mut()
+            .find(|(target_id, _)| target_id == "active")
+            .unwrap()
+            .1 = "https://example.test/active/reconciled".to_owned();
+        assert!(state.page_digest(&request).is_some());
+        assert_eq!(
+            state.tab_inventory["active"],
+            "https://example.test/active/reconciled"
+        );
+        assert_eq!(query.0.lock().unwrap().inventory_queries, 3);
+
+        state
+            .pages
+            .get_mut("background")
+            .unwrap()
+            .header
+            .as_mut()
+            .unwrap()
+            .current
+            .title = Some("Stale".to_owned());
+        query.0.lock().unwrap().observation = (Some("Fresh".to_owned()), None);
+        let fresh = state.page_digest(&request).unwrap();
+        assert!(fresh.contains("Title: Fresh"));
+        assert!(!fresh.contains("Title: Stale"));
+
+        state.inventory_stale = true;
+        query.0.lock().unwrap().inventory_error = true;
+        assert!(state.page_digest(&request).is_some());
+        assert!(
+            state
+                .header_state
+                .as_ref()
+                .unwrap()
+                .last_rendered_tab_signature
+                .as_ref()
+                .unwrap()
+                .stale
+        );
+
+        query.0.lock().unwrap().inventory_error = false;
+        query.0.lock().unwrap().observation = (Some("blocked".to_owned()), None);
+        let observation_queries = query.0.lock().unwrap().observation_queries;
+        query
+            .0
+            .lock()
+            .unwrap()
+            .modal_targets
+            .insert("background".to_owned());
+        state
+            .pages
+            .get_mut("background")
+            .unwrap()
+            .header
+            .as_mut()
+            .unwrap()
+            .current
+            .status = Some(204);
+        let modal = state.page_digest(&request).unwrap();
+        assert_eq!(
+            query.0.lock().unwrap().observation_queries,
+            observation_queries
+        );
+        assert!(modal.contains("Status: 204"));
+    }
+
+    #[test]
+    fn screenshot_does_not_consume_changed_page_digest_before_next_text_response() {
+        let initial = (
+            "active".to_owned(),
+            "https://example.test/before".to_owned(),
+        );
+        let mut features = FeatureConfig::default();
+        features.header = true;
+        let mut state = BrowserState::new(BrowserStartup::Local, features);
+        let query = FakeBrowserQueryControl::new(vec![initial.clone()], Some(initial));
+        state.browser_query_provider = query.provider();
+        let request = digest_request();
+
+        let first = state.add_page_digest(BrowserOutput::Text("first".to_owned()), &request);
+        assert!(output_text(&first).contains("URL: https://example.test/before"));
+
+        query.0.lock().unwrap().active =
+            Some(("active".to_owned(), "https://example.test/after".to_owned()));
+        let screenshot = state.add_page_digest(
+            BrowserOutput::Image {
+                bytes: vec![1, 2, 3],
+                mime: "image/png",
+                extension: "png",
+            },
+            &request,
+        );
+        assert!(matches!(screenshot, BrowserOutput::Image { .. }));
+
+        let next = state.add_page_digest(BrowserOutput::Text("next".to_owned()), &request);
+        assert!(output_text(&next).contains("URL: https://example.test/after"));
+    }
+
+    #[test]
+    fn background_tab_lifecycle_navigation_and_close_change_digest_signature() {
+        let mut features = FeatureConfig::default();
+        features.header = true;
+        let mut state = BrowserState::new(BrowserStartup::Local, features);
+        let inventory = vec![(
+            "active".to_owned(),
+            "https://example.test/active".to_owned(),
+        )];
+        let query = FakeBrowserQueryControl::new(inventory.clone(), Some(inventory[0].clone()));
+        state.browser_query_provider = query.provider();
+        let lifecycle_tx = install_lifecycle_subscription(&mut state);
+        state
+            .register_page(&ReceiverRegistrationSeam::new(
+                "active",
+                "https://example.test/active",
+            ))
+            .unwrap();
+        assert!(state.target_lifecycle.is_some());
+        let request = digest_request();
+        assert!(state.page_digest(&request).is_some());
+
+        lifecycle_tx
+            .send(TargetLifecycleEvent::Upsert {
+                target_id: "background".to_owned(),
+                url: "https://example.test/background".to_owned(),
+            })
+            .unwrap();
+        assert!(state.page_digest(&request).is_some());
+        lifecycle_tx
+            .send(TargetLifecycleEvent::Upsert {
+                target_id: "background".to_owned(),
+                url: "https://example.test/background/next".to_owned(),
+            })
+            .unwrap();
+        assert!(state.page_digest(&request).is_some());
+        assert_eq!(
+            state.tab_inventory["background"],
+            "https://example.test/background/next"
+        );
+
+        lifecycle_tx
+            .send(TargetLifecycleEvent::Destroyed {
+                target_id: "background".to_owned(),
+            })
+            .unwrap();
+        assert!(state.page_digest(&request).is_some());
+        assert!(!state.tab_inventory.contains_key("background"));
+    }
+
+    #[test]
+    fn active_target_destruction_clears_actor_page_identity() {
+        let mut features = FeatureConfig::default();
+        features.header = true;
+        let mut state = BrowserState::new(BrowserStartup::Local, features);
+        let lifecycle_tx = install_lifecycle_subscription(&mut state);
+        state
+            .register_page(&ReceiverRegistrationSeam::new(
+                "active",
+                "https://example.test/active",
+            ))
+            .unwrap();
+        state.page = Some(ActivePageHandle {
+            page: None,
+            target_id: "active".to_owned(),
+            url: "https://example.test/active".to_owned(),
+        });
+        assert!(state.page.is_some());
+        lifecycle_tx
+            .send(TargetLifecycleEvent::Destroyed {
+                target_id: "active".to_owned(),
+            })
+            .unwrap();
+
+        state.poll_events();
+
+        assert!(state.page.is_none());
+        assert!(state.active_target_id.is_none());
+        assert!(!state.tab_order.iter().any(|id| id == "active"));
+        assert!(!state.tab_inventory.contains_key("active"));
+    }
+
+    #[test]
+    fn lifecycle_disconnect_marks_inventory_stale_for_reconciliation() {
+        let mut features = FeatureConfig::default();
+        features.header = true;
+        let mut state = BrowserState::new(BrowserStartup::Local, features);
+        state.inventory_stale = false;
+        let lifecycle_tx = install_lifecycle_subscription(&mut state);
+        state
+            .register_page(&ReceiverRegistrationSeam::new(
+                "active",
+                "https://example.test/active",
+            ))
+            .unwrap();
+        assert!(state.target_lifecycle.is_some());
+        drop(lifecycle_tx);
+
+        state.poll_events();
+
+        assert!(state.inventory_stale);
+        assert!(state.target_lifecycle.is_none());
+    }
+
+    #[test]
+    fn page_closed_event_uses_production_receiver_loop_and_clears_active_identity() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut features = FeatureConfig::default();
+        features.header = true;
+        let mut state = BrowserState::new(BrowserStartup::Local, features);
+        let _lifecycle_tx = install_lifecycle_subscription(&mut state);
+        let registration = ReceiverRegistrationSeam::new("active", "https://example.test/active");
+        *registration.events.lock().unwrap() = Some(Box::new(event_rx));
+        state.register_page(&registration).unwrap();
+        state.active_target_id = Some("active".to_owned());
+        event_tx.send(PageEvent::Closed).unwrap();
+
+        state.poll_events();
+
+        assert!(state.page.is_none());
+        assert!(state.active_target_id.is_none());
+        assert!(!state.pages.contains_key("active"));
+        assert!(!state.tab_order.iter().any(|id| id == "active"));
+    }
+
+    #[test]
+    fn navigation_details_retain_same_document_status_and_clear_unobserved_documents() {
+        let mut runtime = PageHeaderRuntime {
+            current: PageHeader {
+                url: "https://example.test/a".to_owned(),
+                title: Some("A".to_owned()),
+                status: Some(200),
+                ..PageHeader::default()
+            },
+            last_observed_title: Some("A".to_owned()),
+            ..PageHeaderRuntime::default()
+        };
+        apply_navigation_detail(
+            &mut runtime,
+            1,
+            NavigationDetail {
+                url: "https://example.test/a#same".to_owned(),
+                same_document: true,
+            },
+        );
+        assert_eq!(runtime.current.status, Some(200));
+
+        apply_navigation_detail(
+            &mut runtime,
+            2,
+            NavigationDetail {
+                url: "https://example.test/b".to_owned(),
+                same_document: false,
+            },
+        );
+        assert_eq!(runtime.current.status, None);
+        assert_eq!(runtime.last_observed_title, None);
+
+        runtime.current.status = Some(204);
+        runtime.pending_observed_url = Some("https://example.test/c".to_owned());
+        runtime.pending_observed_after_sequence = Some(2);
+        apply_navigation_detail(
+            &mut runtime,
+            3,
+            NavigationDetail {
+                url: "https://example.test/c".to_owned(),
+                same_document: false,
+            },
+        );
+        assert_eq!(runtime.current.status, Some(204));
+    }
+
+    struct NavigationDetailSeamControl {
+        sender: std::sync::mpsc::Sender<(u64, NavigationDetail)>,
+        latest_sequence: Arc<AtomicU64>,
+        dropped_count: Arc<AtomicU64>,
+        _lifecycle_sender: std::sync::mpsc::Sender<TargetLifecycleEvent>,
+    }
+
+    impl NavigationDetailSeamControl {
+        fn send(&self, detail: NavigationDetail) {
+            let sequence = self.publish();
+            self.deliver(sequence, detail);
+        }
+
+        fn publish(&self) -> u64 {
+            self.latest_sequence.fetch_add(1, Ordering::SeqCst) + 1
+        }
+
+        fn deliver(&self, sequence: u64, detail: NavigationDetail) {
+            self.sender.send((sequence, detail)).unwrap();
+        }
+
+        fn record_drop(&self) {
+            self.dropped_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn polling_state_with_header(
+        header: PageHeaderRuntime,
+    ) -> (BrowserState, NavigationDetailSeamControl) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let latest_sequence = Arc::new(AtomicU64::new(0));
+        let dropped_count = Arc::new(AtomicU64::new(0));
+        let mut features = FeatureConfig::default();
+        features.header = true;
+        let mut state = BrowserState::new(BrowserStartup::Local, features);
+        let lifecycle_sender = install_lifecycle_subscription(&mut state);
+        let registration = ReceiverRegistrationSeam::new("page", "https://example.test/start");
+        *registration.details.lock().unwrap() = Some(Box::new(NavigationDetailReceiverSeam {
+            receiver: rx,
+            latest_sequence: Arc::clone(&latest_sequence),
+            dropped_count: Arc::clone(&dropped_count),
+        }));
+        state.register_page(&registration).unwrap();
+        *state
+            .pages
+            .get_mut("page")
+            .unwrap()
+            .header
+            .as_mut()
+            .unwrap() = header;
+        assert!(state.target_lifecycle.is_some());
+        assert!(state.pages["page"].navigation_details.is_some());
+        (
+            state,
+            NavigationDetailSeamControl {
+                sender: tx,
+                latest_sequence,
+                dropped_count,
+                _lifecycle_sender: lifecycle_sender,
+            },
+        )
+    }
+
+    #[test]
+    fn poll_events_correlates_delayed_mismatched_dropped_and_pre_operation_details() {
+        let observation = NavigationObservation {
+            response_json: Value::Null,
+            main_status: Some(204),
+            same_document: false,
+        };
+
+        let (mut delayed, delayed_tx) = polling_state_with_header(PageHeaderRuntime::default());
+        delayed.begin_observed_navigation("page", Some("https://example.test/owned".to_owned()));
+        delayed.record_observed_navigation(
+            "page",
+            "https://example.test/owned".to_owned(),
+            &observation,
+            false,
+        );
+        delayed.poll_events();
+        assert_eq!(
+            delayed.pages["page"]
+                .header
+                .as_ref()
+                .unwrap()
+                .current
+                .status,
+            Some(204)
+        );
+        delayed_tx.send(NavigationDetail {
+            url: "https://example.test/owned".to_owned(),
+            same_document: false,
+        });
+        delayed.poll_events();
+        assert_eq!(
+            delayed.pages["page"]
+                .header
+                .as_ref()
+                .unwrap()
+                .current
+                .status,
+            Some(204)
+        );
+
+        let (mut mismatched, mismatched_tx) =
+            polling_state_with_header(PageHeaderRuntime::default());
+        mismatched.begin_observed_navigation("page", Some("https://example.test/owned".to_owned()));
+        mismatched.record_observed_navigation(
+            "page",
+            "https://example.test/owned".to_owned(),
+            &observation,
+            false,
+        );
+        mismatched_tx.send(NavigationDetail {
+            url: "https://example.test/click".to_owned(),
+            same_document: false,
+        });
+        mismatched.poll_events();
+        assert_eq!(
+            mismatched.pages["page"]
+                .header
+                .as_ref()
+                .unwrap()
+                .current
+                .status,
+            None
+        );
+
+        let (mut dropped, dropped_tx) = polling_state_with_header(PageHeaderRuntime::default());
+        dropped.begin_observed_navigation("page", Some("https://example.test/dropped".to_owned()));
+        dropped.record_observed_navigation(
+            "page",
+            "https://example.test/dropped".to_owned(),
+            &observation,
+            false,
+        );
+        dropped_tx.record_drop();
+        dropped_tx.send(NavigationDetail {
+            url: "https://example.test/later-click".to_owned(),
+            same_document: false,
+        });
+        dropped.poll_events();
+        assert_eq!(
+            dropped.pages["page"]
+                .header
+                .as_ref()
+                .unwrap()
+                .current
+                .status,
+            None
+        );
+
+        let (mut stale, stale_tx) = polling_state_with_header(PageHeaderRuntime::default());
+        stale_tx.send(NavigationDetail {
+            url: "https://example.test/owned".to_owned(),
+            same_document: false,
+        });
+        stale.begin_observed_navigation("page", Some("https://example.test/owned".to_owned()));
+        stale.record_observed_navigation(
+            "page",
+            "https://example.test/owned".to_owned(),
+            &observation,
+            false,
+        );
+        assert_eq!(
+            stale.pages["page"]
+                .header
+                .as_ref()
+                .unwrap()
+                .pending_observed_after_sequence,
+            Some(1)
+        );
+        stale_tx.send(NavigationDetail {
+            url: "https://example.test/owned".to_owned(),
+            same_document: false,
+        });
+        stale.poll_events();
+        assert_eq!(
+            stale.pages["page"].header.as_ref().unwrap().current.status,
+            Some(204)
+        );
+    }
+
+    #[test]
+    fn pre_boundary_detail_delivered_late_stays_pre_boundary_in_receiver_loop() {
+        let observation = NavigationObservation {
+            response_json: Value::Null,
+            main_status: Some(204),
+            same_document: false,
+        };
+        let (mut state, details) = polling_state_with_header(PageHeaderRuntime::default());
+        let pre_boundary_sequence = details.publish();
+
+        state.begin_observed_navigation("page", Some("https://example.test/owned".to_owned()));
+        state.record_observed_navigation(
+            "page",
+            "https://example.test/owned".to_owned(),
+            &observation,
+            false,
+        );
+        details.deliver(
+            pre_boundary_sequence,
+            NavigationDetail {
+                url: "https://example.test/unrelated-before".to_owned(),
+                same_document: false,
+            },
+        );
+        state.poll_events();
+
+        let header = state.pages["page"].header.as_ref().unwrap();
+        assert_eq!(header.current.url, "https://example.test/owned");
+        assert_eq!(header.current.status, Some(204));
+        assert_eq!(header.pending_observed_after_sequence, Some(1));
+    }
+
+    #[test]
+    fn actor_goto_new_tab_and_reload_map_observed_status() {
+        let mut goto = PageHeaderRuntime::default();
+        let goto_observation = NavigationObservation {
+            response_json: Value::Null,
+            main_status: Some(201),
+            same_document: false,
+        };
+        apply_observed_navigation(
+            &mut goto,
+            "https://example.test/goto".to_owned(),
+            &goto_observation,
+            false,
+        );
+        assert_eq!(goto.current.status, Some(201));
+
+        let mut new_tab = PageHeaderRuntime::default();
+        let new_tab_observation = NavigationObservation {
+            main_status: Some(202),
+            ..goto_observation.clone()
+        };
+        apply_observed_navigation(
+            &mut new_tab,
+            "https://example.test/new-tab".to_owned(),
+            &new_tab_observation,
+            false,
+        );
+        assert_eq!(new_tab.current.status, Some(202));
+
+        let mut reload = PageHeaderRuntime {
+            current: PageHeader {
+                status: Some(200),
+                ..PageHeader::default()
+            },
+            ..PageHeaderRuntime::default()
+        };
+        let same_document_reload = NavigationObservation {
+            response_json: Value::Null,
+            main_status: None,
+            same_document: true,
+        };
+        apply_observed_navigation(
+            &mut reload,
+            "https://example.test/reload#same".to_owned(),
+            &same_document_reload,
+            true,
+        );
+        assert_eq!(reload.current.status, None);
+    }
+
+    #[test]
+    fn absent_cached_title_is_omitted_from_modal_safe_header() {
+        let mut cached = PageHeaderRuntime {
+            last_observed_title: Some("Cached title".to_owned()),
+            ..PageHeaderRuntime::default()
+        };
+        apply_observed_title(&mut cached, true, None);
+        assert_eq!(cached.current.title.as_deref(), Some("Cached title"));
+
+        let mut absent = PageHeaderRuntime::default();
+        apply_observed_title(&mut absent, true, None);
+        let rendered = render_page_header(&PageHeader {
+            url: "https://example.test/modal".to_owned(),
+            title: absent.current.title,
+            status: None,
+            console_err: 0,
+            console_warn: 0,
+        });
+        assert!(!rendered.contains("Title:"));
+        assert!(rendered.contains("Status: unknown"));
+
+        let observed = modal_safe_page_observation(true, || {
+            panic!("title or console query ran while a modal was pending")
+        });
+        assert_eq!(observed, (None, None));
+    }
+
+    #[test]
+    fn page_digest_fields_are_utf8_safe_and_bounded_with_truthful_omissions() {
+        let url = "🙂".repeat(2_000);
+        let title = "é".repeat(2_000);
+        let rendered = render_page_header(&PageHeader {
+            url: url.clone(),
+            title: Some(title.clone()),
+            status: Some(200),
+            console_err: 0,
+            console_warn: 0,
+        });
+        assert!(rendered.len() < 2_200, "{}", rendered.len());
+        let url_cut = MAX_DIGEST_URL_BYTES - (MAX_DIGEST_URL_BYTES % '🙂'.len_utf8());
+        let title_cut = MAX_DIGEST_TITLE_BYTES - (MAX_DIGEST_TITLE_BYTES % 'é'.len_utf8());
+        assert!(rendered.contains(&format!("{} bytes omitted", url.len() - url_cut)));
+        assert!(rendered.contains(&format!("{} bytes omitted", title.len() - title_cut)));
+    }
+
+    #[test]
+    fn distill_switch_selects_legacy_before_page_evaluation() {
+        assert_ne!(SNAPSHOT_JS, SNAPSHOT_LEGACY_JS);
+        for (distill, expected) in [(false, SNAPSHOT_LEGACY_JS), (true, SNAPSHOT_JS)] {
+            let captured = Arc::new(Mutex::new(None));
+            let capture = Arc::clone(&captured);
+            let mut features = FeatureConfig::default();
+            features.distill = distill;
+            let mut state = BrowserState {
+                features,
+                snapshot_evaluator: Some(Box::new(move |script, _input| {
+                    *capture.lock().unwrap() = Some(script);
+                    Ok(json!({ "outline": "captured", "nextRef": 1, "refs": [] }))
+                })),
+                ..BrowserState::default()
+            };
+            let (reply, _response) = oneshot::channel();
+            let request = ActorRequest {
+                request_id: request_id(if distill { 47_876 } else { 47_875 }),
+                op: BrowserOp::Snapshot {
+                    target: None,
+                    depth: None,
+                    boxes: false,
+                },
+                cancellation: Arc::new(CommandCancellation::new()),
+                deadline: Instant::now() + Duration::from_secs(1),
+                timeout_ms: 1_000,
+                reply,
+            };
+
+            let (value, start_ref) = state
+                .evaluate_snapshot(&request, None, None, false, None, None, None)
+                .expect("capturing page evaluator should return its fixture value");
+            assert_eq!(value["outline"], "captured");
+            assert_eq!(start_ref, 1);
+            assert_eq!(*captured.lock().unwrap(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn selected_tab_url_provenance_preserves_raw_value_for_only_the_selected_index() {
+        let raw = "https://example.invalid/a\r\nb\t\0\\\"\u{2028}\u{2029}";
+        let (preview, exact) = tab_url_values(7, Some(7), raw);
+        assert_eq!(
+            preview,
+            "https://example.invalid/a  b\t\0\\\"\u{2028}\u{2029}"
+        );
+        assert_eq!(exact.as_deref(), Some(raw));
+
+        let (_, non_selected) = tab_url_values(6, Some(7), raw);
+        assert_eq!(non_selected, None);
+        let (_, list_action) = tab_url_values(7, None, raw);
+        assert_eq!(list_action, None);
+    }
+
+    fn console_record(epoch: u64, severity: &str, location: &str, text: &str) -> ConsoleRecord {
+        ConsoleRecord {
+            message_type: severity.to_owned(),
+            text: text.to_owned(),
+            args: Vec::new(),
+            location: Some(rustwright::ConsoleLocation {
+                url: location.to_owned(),
+                line_number: epoch + 10,
+                column_number: 0,
+            }),
+            attributed_location: None,
+            navigation_epoch: epoch,
+        }
+    }
+
+    fn console_records(records: Vec<ConsoleRecord>) -> ConsoleRecords {
+        ConsoleRecords {
+            records,
+            navigation_epoch: 2,
+            evicted: 0,
+        }
+    }
+
+    fn network_record(index: u64, url: &str, resource_type: &str) -> NetworkRecord {
+        NetworkRecord {
+            index,
+            method: "GET".to_owned(),
+            url: url.to_owned(),
+            resource_type: resource_type.to_owned(),
+            response_status: Some(200),
+            failure: None,
+            request_headers: Vec::new(),
+            request_body: None,
+            response_headers: Vec::new(),
+            navigation_epoch: 0,
+            completed: true,
+        }
+    }
+
+    fn network_records(records: Vec<NetworkRecord>) -> NetworkRecords {
+        NetworkRecords {
+            records,
+            navigation_epoch: 0,
+            navigation_start_index: 1,
+            evicted: 0,
+        }
+    }
+
+    struct FixturePageRecordSource {
+        console: ConsoleRecords,
+        network: NetworkRecords,
+    }
+
+    impl PageRecordSource for FixturePageRecordSource {
+        fn console_records(
+            &mut self,
+            _include_previous_navigations: bool,
+            _clear: bool,
+        ) -> Result<ConsoleRecords, Error> {
+            Ok(self.console.clone())
+        }
+
+        fn network_records(
+            &mut self,
+            _include_previous_navigations: bool,
+            _clear: bool,
+        ) -> NetworkRecords {
+            self.network.clone()
+        }
+    }
+
+    fn actor_with_record_source(
+        features: FeatureConfig,
+        console: ConsoleRecords,
+        network: NetworkRecords,
+    ) -> BrowserState {
+        BrowserState {
+            features,
+            page_record_source: Some(Box::new(FixturePageRecordSource { console, network })),
+            ..BrowserState::default()
+        }
+    }
+
+    #[test]
+    fn console_messages_deduplicates_structured_unfiltered_adjacent_runs() {
+        let records = console_records(vec![
+            console_record(0, "warning", "first location", "repeat   text"),
+            console_record(0, "warn", "second location", "repeat\ttext"),
+            console_record(0, "debug", "hidden boundary", "not visible"),
+            console_record(0, "warning", "third location", "repeat text"),
+            console_record(0, "error", "severity boundary", "repeat text"),
+            console_record(0, "warning", "nbsp", "repeat\u{a0}text"),
+            console_record(0, "warning", "space", "repeat text"),
+            console_record(1, "warning", "next navigation", "repeat text"),
+            console_record(1, "warning", "next duplicate", "repeat\ttext"),
+        ]);
+        let mut features = FeatureConfig::default();
+        features.console_dedup = true;
+        let mut state = actor_with_record_source(features, records, network_records(Vec::new()));
+        let request = digest_request();
+        let rendered = state
+            .console_messages(ConsoleLevel::Info, false, None, &request)
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "WARNING first location:10 repeat   text (repeated 2 times)\n\
+             WARNING third location:10 repeat text\n\
+             ERROR severity boundary:10 repeat text\n\
+             WARNING nbsp:10 repeat\u{a0}text\n\
+             WARNING space:10 repeat text\n\
+             WARNING next navigation:11 repeat text (repeated 2 times)"
+        );
+
+        state.page_record_source = Some(Box::new(FixturePageRecordSource {
+            console: console_records(Vec::new()),
+            network: network_records(Vec::new()),
+        }));
+        assert_eq!(
+            state
+                .console_messages(ConsoleLevel::Info, false, None, &request)
+                .unwrap(),
+            "(no console messages)"
+        );
+    }
+
+    #[test]
+    fn treated_console_uses_first_records_attributed_location_while_legacy_stays_raw() {
+        let mut first = console_record(0, "warning", "", "repeat text");
+        let first_raw = first.location.as_mut().expect("first raw location");
+        first_raw.line_number = 169;
+        first.attributed_location = Some(rustwright::ConsoleLocation {
+            url: "file:///fixture/console.js".to_owned(),
+            line_number: 1,
+            column_number: 0,
+        });
+        let mut second = console_record(0, "warning", "", "repeat\ttext");
+        let second_raw = second.location.as_mut().expect("second raw location");
+        second_raw.line_number = 169;
+        second.attributed_location = Some(rustwright::ConsoleLocation {
+            url: "file:///fixture/console.js".to_owned(),
+            line_number: 2,
+            column_number: 0,
+        });
+        let records = console_records(vec![first, second]);
+
+        assert_eq!(
+            console_records_presentation(&records, ConsoleLevel::Info, false).text,
+            "WARNING (unknown):169 repeat text\nWARNING (unknown):169 repeat\ttext"
+        );
+        assert_eq!(
+            console_records_presentation(&records, ConsoleLevel::Info, true).text,
+            "WARNING file:///fixture/console.js:1 repeat text (repeated 2 times)"
+        );
+    }
+
+    #[test]
+    fn w4_off_modes_run_production_pipelines_with_zero_state_writes() {
+        let console = console_records(vec![
+            console_record(0, "warning", "first", "same text"),
+            console_record(0, "warning", "second", "same\ttext"),
+        ]);
+        let legacy_console = console_records_presentation(&console, ConsoleLevel::Info, false);
+        assert_eq!(
+            legacy_console.text,
+            "WARNING first:10 same text\nWARNING second:10 same\ttext"
+        );
+        assert_eq!(legacy_console.w4_state_writes, 0);
+
+        let network = network_records(vec![network_record(
+            1,
+            "https://example.invalid/asset.png",
+            "image",
+        )]);
+        for (net_note, include_static, has_filename) in [
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let legacy = network_records_presentation(
+                &network,
+                include_static,
+                None,
+                net_note,
+                has_filename,
+            );
+            assert_eq!(legacy.hidden_static, None);
+            assert_eq!(legacy.w4_state_writes, 0);
+        }
+    }
+
+    #[test]
+    fn network_requests_counts_hidden_static_after_caller_regex_filtering() {
+        let records = network_records(vec![
+            network_record(1, "https://example.invalid/keep.png", "image"),
+            network_record(2, "https://example.invalid/drop.png", "image"),
+            network_record(3, "https://example.invalid/data", "xhr"),
+        ]);
+        let mut features = FeatureConfig::default();
+        features.net_note = true;
+        let mut state = actor_with_record_source(features, console_records(Vec::new()), records);
+        let request = digest_request();
+        assert_eq!(
+            state
+                .network_requests(false, Some("keep\\.png$|data$"), None, &request)
+                .unwrap(),
+            "[3] GET 200 https://example.invalid/data (xhr)\n\
+             (1 successful static requests hidden; use static:true to include them)"
+        );
+
+        assert_eq!(
+            state
+                .network_requests(false, Some("missing$"), None, &request)
+                .unwrap(),
+            "(no matching network requests)"
+        );
+    }
+
+    #[test]
+    fn file_and_screenshot_output_provenance_bypasses_shaping() {
+        let file = Some("artifact.txt".to_owned());
+        assert!(
+            BrowserOp::ConsoleMessages {
+                level: ConsoleLevel::Info,
+                all: true,
+                filename: file.clone(),
+            }
+            .bypass_response_shaping()
+        );
+        assert!(
+            BrowserOp::NetworkRequests {
+                include_static: false,
+                filter: Some("api".to_owned()),
+                filename: file.clone(),
+            }
+            .bypass_response_shaping()
+        );
+        assert!(
+            BrowserOp::NetworkRequest {
+                index: 1,
+                part: None,
+                filename: file,
+            }
+            .bypass_response_shaping()
+        );
+        assert!(
+            BrowserOp::TakeScreenshot {
+                full_page: false,
+                image_type: ScreenshotType::Png,
+            }
+            .bypass_response_shaping()
+        );
+        assert!(
+            !BrowserOp::NetworkRequests {
+                include_static: true,
+                filter: None,
+                filename: None,
+            }
+            .bypass_response_shaping()
+        );
+    }
     use rustwright::ActionabilityError;
 
     struct WorkerGuard<T> {
@@ -4972,7 +7966,7 @@ mod tests {
 
     fn output_text(output: &BrowserOutput) -> &str {
         match output {
-            BrowserOutput::Text(text) => text,
+            BrowserOutput::Text(text) | BrowserOutput::ShapedText { text, .. } => text,
             BrowserOutput::Image { bytes, mime, .. } => {
                 panic!("expected a text output, got {} {mime} bytes", bytes.len())
             }

@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc, Mutex, MutexGuard,
@@ -704,6 +704,16 @@ impl ServerProcess {
             .env_remove("RUSTWRIGHT_MCP_CDP_TIMEOUT_MS")
             .env_remove("RUSTWRIGHT_MCP_SCREENSHOT_MAX_BYTES")
             .env_remove("RUSTWRIGHT_MCP_TOOL_TIMEOUT_MS")
+            .env_remove("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES")
+            .env_remove("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES")
+            .env_remove("RUSTWRIGHT_MCP_BUDGET")
+            .env_remove("RUSTWRIGHT_MCP_DISTILL")
+            .env_remove("RUSTWRIGHT_MCP_HEADER")
+            .env_remove("RUSTWRIGHT_MCP_CONSOLE_DEDUP")
+            .env_remove("RUSTWRIGHT_MCP_NET_NOTE")
+            .env_remove("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS")
+            .env_remove("RUSTWRIGHT_MCP_TOOLSET")
+            .env_remove("RUSTWRIGHT_MCP_ALLOW_EVAL")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -739,20 +749,34 @@ impl ServerProcess {
         input.flush().expect("flush client frame");
     }
 
-    fn receive(&mut self) -> Value {
+    fn receive_with_frame_bytes(&mut self) -> (Value, usize) {
         let mut line = String::new();
         let bytes = self.output.read_line(&mut line).expect("read server frame");
         assert!(bytes > 0, "server stdout closed before a response");
+        assert!(line.ends_with('\n'), "rmcp response must be newline framed");
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "one response per stdio frame"
+        );
         let trimmed = line.trim_end();
         self.transcript.push(format!("S> {trimmed}"));
         let message: Value = serde_json::from_str(trimmed).unwrap_or_else(|error| {
             panic!("stdout contained a non-JSON protocol line: {error}: {trimmed:?}")
         });
         assert_eq!(message["jsonrpc"], "2.0");
-        message
+        (message, bytes)
+    }
+
+    fn receive(&mut self) -> Value {
+        self.receive_with_frame_bytes().0
     }
 
     fn initialize(&mut self) -> Value {
+        self.initialize_as("stdio-e2e")
+    }
+
+    fn initialize_as(&mut self, client_name: &str) -> Value {
         self.send(json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -760,7 +784,7 @@ impl ServerProcess {
             "params": {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
-                "clientInfo": {"name": "stdio-e2e", "version": "0"}
+                "clientInfo": {"name": client_name, "version": "0"}
             }
         }));
         let initialized = self.receive();
@@ -912,6 +936,25 @@ fn result_text(message: &Value) -> &str {
     message["result"]["content"][0]["text"]
         .as_str()
         .expect("tool response text")
+}
+
+fn normalize_console_locations(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| {
+            let mut fields = line.splitn(3, ' ');
+            let severity = fields.next().unwrap_or_default();
+            let location = fields.next();
+            let message = fields.next();
+            if matches!(severity, "ERROR" | "WARNING" | "INFO" | "DEBUG")
+                && location.is_some()
+                && message.is_some()
+            {
+                format!("{severity} <location> {}", message.unwrap())
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect()
 }
 
 fn error_result_text(message: &Value) -> &str {
@@ -1537,6 +1580,497 @@ fn real_stdio_tool_profiles_and_evaluation_gate_match_contract() {
 }
 
 #[test]
+fn real_stdio_lean_description_profile_and_override_match_contract() {
+    fn listed(client_name: &str, environment: &[(&str, &str)]) -> (Value, usize) {
+        let mut server = ServerProcess::spawn_with_env(environment);
+        server.initialize_as(client_name);
+        let id = "i".repeat(254);
+        assert_eq!(
+            serde_json::to_vec(&Value::String(id.clone()))
+                .unwrap()
+                .len(),
+            256
+        );
+        server.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/list","params":{}}));
+        let (response, frame_bytes) = server.receive_with_frame_bytes();
+        server.finish();
+        (response["result"].clone(), frame_bytes)
+    }
+
+    let (codex_default, codex_default_frame_bytes) = listed("codex-mcp-client", &[]);
+    let (explicit_off, _) = listed(
+        "codex-mcp-client",
+        &[("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS", "off")],
+    );
+    let (unknown_default, _) = listed("unknown-hermetic-client", &[]);
+    let (explicit_on, _) = listed(
+        "unknown-hermetic-client",
+        &[("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS", "on")],
+    );
+    let (invalid_codex, _) = listed(
+        "codex-mcp-client",
+        &[("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS", "invalid")],
+    );
+
+    let archived_legacy: Value =
+        serde_json::from_str(include_str!("fixtures/tools-list-legacy.json"))
+            .expect("legacy tools/list fixture");
+    let archived_lean: Value = serde_json::from_str(include_str!("fixtures/tools-list-lean.json"))
+        .expect("lean tools/list fixture");
+    assert_eq!(explicit_off, archived_legacy);
+    assert_eq!(unknown_default, archived_legacy);
+    assert_eq!(codex_default, archived_lean);
+    assert_eq!(codex_default, explicit_on);
+    assert_eq!(invalid_codex, codex_default);
+    assert_ne!(codex_default, explicit_off);
+    assert!(
+        codex_default_frame_bytes <= 9 * 1024,
+        "lean tools/list response is {codex_default_frame_bytes} bytes, over 9216"
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct UnionCorpus {
+    catalog: Value,
+    catalog_frame: String,
+    navigation: String,
+    snapshot: String,
+    console: String,
+    network: String,
+    budget_probe: Option<(Value, usize)>,
+}
+
+const UNION_CONSOLE_SCRIPT_NAME: &str = "rustwright-union-console.js";
+const UNION_CONSOLE_SCRIPT: &str = include_str!("fixtures/rustwright-union-console.js");
+const UNION_PAGE_HTML: &str = "<!doctype html><title>Union matrix</title><main><h1>Network records</h1><img src=\"union-static.svg\"></main><script src=\"rustwright-union-console.js\"></script>";
+
+fn run_union_corpus(
+    page_url: &str,
+    client_name: &str,
+    environment: &[(&str, &str)],
+    include_budget_probe: bool,
+) -> UnionCorpus {
+    let mut server = ServerProcess::spawn_with_env(environment);
+    server.initialize_as(client_name);
+    server.send(json!({"jsonrpc":"2.0","id":500,"method":"tools/list","params":{}}));
+    let catalog = server.receive()["result"].clone();
+    let catalog_frame = server
+        .transcript
+        .last()
+        .expect("tools/list response frame")
+        .strip_prefix("S> ")
+        .expect("server transcript prefix")
+        .to_owned();
+
+    let navigation = call_tool(
+        &mut server,
+        501,
+        "browser_navigate",
+        json!({"url": page_url}),
+    );
+    let snapshot = call_tool(&mut server, 502, "browser_snapshot", json!({}));
+    let _ = call_tool(
+        &mut server,
+        503,
+        "browser_evaluate",
+        json!({
+            "function": "() => { emitRustwrightUnionConsole(); return true; }"
+        }),
+    );
+    let console = call_tool(
+        &mut server,
+        504,
+        "browser_console_messages",
+        json!({"level": "debug", "all": true}),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut request_id = 505;
+    loop {
+        let response = call_tool(
+            &mut server,
+            request_id,
+            "browser_network_requests",
+            json!({"static": true}),
+        );
+        request_id += 1;
+        if result_text(&response).contains("union-static.svg") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "union network records did not converge: {}",
+            result_text(&response)
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    let network = call_tool(
+        &mut server,
+        request_id,
+        "browser_network_requests",
+        json!({"filter": "union\\.html$|union-static\\.svg$"}),
+    );
+    request_id += 1;
+
+    let budget_probe = include_budget_probe.then(|| {
+        server.send(json!({
+            "jsonrpc":"2.0","id":request_id,"method":"tools/call",
+            "params":{
+                "name":"browser_evaluate",
+                "arguments":{"function":"() => { document.title = 'Union budget'; emitRustwrightUnionBudgetConsole(); return 'budget-line\\n'.repeat(5000); }"}
+            }
+        }));
+        server.receive_with_frame_bytes()
+    });
+    server.finish();
+
+    UnionCorpus {
+        catalog,
+        catalog_frame,
+        navigation: result_text(&navigation).to_owned(),
+        snapshot: result_text(&snapshot).to_owned(),
+        console: result_text(&console).to_owned(),
+        network: result_text(&network).to_owned(),
+        budget_probe,
+    }
+}
+
+fn union_fixture() -> (PathBuf, String) {
+    let workspace = std::env::temp_dir().join(format!(
+        "rustwright-mcp-union-{}-{}",
+        std::process::id(),
+        STDIO_WORKSPACE_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir(&workspace).expect("create union workspace");
+    fs::write(workspace.join("union.html"), UNION_PAGE_HTML).expect("write union page");
+    fs::write(
+        workspace.join(UNION_CONSOLE_SCRIPT_NAME),
+        UNION_CONSOLE_SCRIPT,
+    )
+    .expect("write union console script");
+    fs::write(
+        workspace.join("union-static.svg"),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\"></svg>",
+    )
+    .expect("write union static asset");
+    let url = format!("file://{}", workspace.join("union.html").display());
+    (workspace, url)
+}
+
+fn assert_union_fixture_uses_external_console_script(workspace: &Path) {
+    let page = fs::read(workspace.join("union.html")).expect("read materialized union page");
+    let script_reference = format!("<script src=\"{UNION_CONSOLE_SCRIPT_NAME}\"></script>");
+    assert!(
+        page.windows(script_reference.len())
+            .any(|window| window == script_reference.as_bytes()),
+        "materialized union page must load the frozen external console script"
+    );
+    for inline_emission in [b"console.warn(".as_slice(), b"console.error(".as_slice()] {
+        assert!(
+            !page
+                .windows(inline_emission.len())
+                .any(|window| window == inline_emission),
+            "materialized union page must not contain inline console emissions"
+        );
+    }
+    assert_eq!(
+        fs::read(workspace.join(UNION_CONSOLE_SCRIPT_NAME))
+            .expect("read materialized union console script"),
+        UNION_CONSOLE_SCRIPT.as_bytes(),
+        "materialized union console script must match the frozen fixture bytes"
+    );
+}
+
+fn remove_union_fixture(workspace: &Path) {
+    fs::remove_file(workspace.join("union.html")).expect("remove union page");
+    fs::remove_file(workspace.join("union-static.svg")).expect("remove union static asset");
+    fs::remove_file(workspace.join(UNION_CONSOLE_SCRIPT_NAME))
+        .expect("remove union console script");
+    fs::remove_dir(workspace).expect("remove union workspace");
+}
+
+#[test]
+fn union_fixture_materializes_external_console_script_without_inline_emissions() {
+    let (workspace, page_url) = union_fixture();
+    assert_union_fixture_uses_external_console_script(&workspace);
+    let script_url = format!(
+        "{}{}",
+        page_url
+            .strip_suffix("union.html")
+            .expect("union page URL suffix"),
+        UNION_CONSOLE_SCRIPT_NAME
+    );
+    assert_eq!(
+        attributed_union_console(&page_url),
+        format!(
+            "WARNING {}:1 union duplicate\nWARNING {}:2 union duplicate",
+            script_url, script_url
+        )
+    );
+    remove_union_fixture(&workspace);
+}
+
+fn frozen_union_legacy_surfaces() -> Value {
+    serde_json::from_str(include_str!("fixtures/union-legacy-surfaces.json"))
+        .expect("frozen legacy union surfaces fixture")
+}
+
+fn frozen_union_surface<'a>(fixture: &'a Value, name: &str) -> &'a str {
+    fixture[name]
+        .as_str()
+        .unwrap_or_else(|| panic!("legacy union fixture field {name:?} must be a string"))
+}
+
+fn attributed_union_console(page_url: &str) -> String {
+    let warning_lines = UNION_CONSOLE_SCRIPT
+        .lines()
+        .enumerate()
+        .filter_map(|(line_number, line)| {
+            line.trim_start()
+                .starts_with("console.warn(")
+                .then_some(line_number)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(warning_lines.len(), 2, "union console warning fixture");
+    // CDP Runtime.CallFrame.lineNumber is zero-based. Treated W4 presentation
+    // selects the first URL-bearing page frame and keeps the first record's
+    // location when it collapses the adjacent run.
+    let attributed_template = warning_lines
+        .iter()
+        .map(|line_number| format!("WARNING {{CONSOLE_URL}}:{line_number} union duplicate"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let script_url = format!(
+        "{}{}",
+        page_url
+            .strip_suffix("union.html")
+            .expect("union page URL suffix"),
+        UNION_CONSOLE_SCRIPT_NAME
+    );
+    attributed_template.replace("{CONSOLE_URL}", &script_url)
+}
+
+fn split_page_digest(text: &str) -> (Option<&str>, &str) {
+    if text.starts_with("### Page\n") {
+        let (page, body) = text
+            .split_once("\n\n")
+            .unwrap_or_else(|| panic!("page digest has no body separator: {text}"));
+        (Some(page), body)
+    } else {
+        (None, text)
+    }
+}
+
+fn assert_page_digest<'a>(
+    text: &'a str,
+    page_url: &str,
+    title: &str,
+    errors: usize,
+    warnings: usize,
+) -> &'a str {
+    let expected = format!(
+        "### Page\nURL: {page_url}\nTitle: {title}\nStatus: 200\nConsole: {errors} errors, {warnings} warnings"
+    );
+    let (page, body) = split_page_digest(text);
+    assert_eq!(page, Some(expected.as_str()), "unexpected W3 page digest");
+    body
+}
+
+fn assert_legacy_union_expectations(corpus: &UnionCorpus, page_url: &str) {
+    let frozen = frozen_union_legacy_surfaces();
+    assert_eq!(frozen["schema_version"], 1);
+    assert_eq!(
+        frozen["baseline_commit"],
+        "815a6616b227c3a6373180c0528d19a96296a62b"
+    );
+    let archived_legacy: Value =
+        serde_json::from_str(include_str!("fixtures/tools-list-legacy.json"))
+            .expect("legacy tools/list fixture");
+    // Decoded union output is compared semantically here. Raw-byte archive identity
+    // remains pinned by the archive unit tests, with stdio frame bytes checked below.
+    assert_eq!(
+        corpus.catalog, archived_legacy,
+        "decoded tools/list result semantically diverged from the legacy archive"
+    );
+    let archived_legacy_bytes = include_str!("fixtures/tools-list-legacy.json").trim_end();
+    assert!(
+        corpus
+            .catalog_frame
+            .contains(&format!("\"result\":{archived_legacy_bytes}")),
+        "tools/list result bytes diverged from the legacy archive"
+    );
+    assert_eq!(
+        corpus.navigation,
+        frozen_union_surface(&frozen, "navigation")
+    );
+    assert_eq!(corpus.snapshot, frozen_union_surface(&frozen, "snapshot"));
+    // The injected console Proxy is the raw top CDP frame for both calls, so
+    // legacy/all-off intentionally reproduces its anonymous line-169 artifact.
+    assert_eq!(
+        corpus.console,
+        frozen_union_surface(&frozen, "console_template")
+    );
+    assert_eq!(
+        corpus.network,
+        frozen_union_surface(&frozen, "network_template").replace("{PAGE_URL}", page_url)
+    );
+    assert!(corpus.budget_probe.is_none());
+}
+
+#[test]
+fn union_matrix_unknown_client_with_unset_environment_is_legacy_compatible() {
+    let (workspace, page_url) = union_fixture();
+    assert_union_fixture_uses_external_console_script(&workspace);
+    if chromium().executable_path().is_none() {
+        eprintln!("skipping union legacy matrix: Chromium executable unavailable");
+        remove_union_fixture(&workspace);
+        return;
+    }
+    let corpus = run_union_corpus(&page_url, "unknown-hermetic-client", &[], false);
+    assert_legacy_union_expectations(&corpus, &page_url);
+    remove_union_fixture(&workspace);
+}
+
+#[test]
+fn canonical_all_off_transcript_matches_pre_treatment_union_expectations() {
+    let (workspace, page_url) = union_fixture();
+    assert_union_fixture_uses_external_console_script(&workspace);
+    if chromium().executable_path().is_none() {
+        eprintln!("skipping all-off union corpus: Chromium executable unavailable");
+        remove_union_fixture(&workspace);
+        return;
+    }
+    let treatment_all_off = run_union_corpus(
+        &page_url,
+        "unknown-hermetic-client",
+        &[
+            ("RUSTWRIGHT_MCP_BUDGET", "off"),
+            ("RUSTWRIGHT_MCP_DISTILL", "off"),
+            ("RUSTWRIGHT_MCP_HEADER", "off"),
+            ("RUSTWRIGHT_MCP_CONSOLE_DEDUP", "off"),
+            ("RUSTWRIGHT_MCP_NET_NOTE", "off"),
+            ("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS", "off"),
+            ("RUSTWRIGHT_MCP_TOOLSET", "mirror"),
+        ],
+        false,
+    );
+    assert_legacy_union_expectations(&treatment_all_off, &page_url);
+    remove_union_fixture(&workspace);
+}
+
+#[test]
+fn union_matrix_exact_codex_peer_with_all_on_deployment_activates_every_wave() {
+    let (workspace, page_url) = union_fixture();
+    assert_union_fixture_uses_external_console_script(&workspace);
+    if chromium().executable_path().is_none() {
+        eprintln!("skipping union Codex matrix: Chromium executable unavailable");
+        remove_union_fixture(&workspace);
+        return;
+    }
+    let treatment = run_union_corpus(
+        &page_url,
+        "codex-mcp-client",
+        &[
+            ("RUSTWRIGHT_MCP_BUDGET", "on"),
+            ("RUSTWRIGHT_MCP_DISTILL", "on"),
+            ("RUSTWRIGHT_MCP_HEADER", "on"),
+            ("RUSTWRIGHT_MCP_CONSOLE_DEDUP", "on"),
+            ("RUSTWRIGHT_MCP_NET_NOTE", "on"),
+            ("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS", "on"),
+            ("RUSTWRIGHT_MCP_TOOLSET", "mirror"),
+        ],
+        true,
+    );
+
+    let archived_lean: Value = serde_json::from_str(include_str!("fixtures/tools-list-lean.json"))
+        .expect("lean tools/list fixture");
+    // Decoded union output is compared semantically here. Raw-byte archive identity
+    // remains pinned by the archive unit tests, with stdio frame bytes checked below.
+    assert_eq!(
+        treatment.catalog, archived_lean,
+        "decoded tools/list result semantically diverged from the W5 lean archive"
+    );
+    let archived_lean_bytes = include_str!("fixtures/tools-list-lean.json").trim_end();
+    assert!(
+        treatment
+            .catalog_frame
+            .contains(&format!("\"result\":{archived_lean_bytes}")),
+        "tools/list result bytes diverged from the lean archive"
+    );
+    let distilled_snapshot = "- main\n  - heading [level=1]\n    - text: Network records";
+    assert_eq!(
+        assert_page_digest(&treatment.navigation, &page_url, "Union matrix", 0, 0),
+        distilled_snapshot,
+        "W3 navigation must compose with the certified W2 distilled structure"
+    );
+    let (_, snapshot_without_digest) = split_page_digest(&treatment.snapshot);
+    assert_eq!(snapshot_without_digest, distilled_snapshot);
+    let frozen = frozen_union_legacy_surfaces();
+    assert!(
+        !frozen_union_surface(&frozen, "snapshot").contains("    - text: Network records"),
+        "the precise W2-only text-node marker must be absent from the frozen legacy snapshot"
+    );
+
+    let attributed_console = attributed_union_console(&page_url);
+    let attributed_first_console = attributed_console
+        .lines()
+        .next()
+        .expect("attributed console line");
+    assert_eq!(
+        treatment.console,
+        format!("{attributed_first_console} (repeated 2 times)"),
+        "W4 must collapse exactly the adjacent duplicate run after its producing call consumed the W3 warning-count digest"
+    );
+    assert_eq!(
+        treatment.network,
+        format!(
+            "{}\n(1 successful static requests hidden; use static:true to include them)",
+            frozen_union_surface(&frozen, "network_template").replace("{PAGE_URL}", &page_url)
+        ),
+        "W4 must append its certified hidden-static count to the frozen legacy list"
+    );
+
+    let (budgeted, frame_bytes) = treatment.budget_probe.expect("all-on budget probe");
+    assert_eq!(
+        frame_bytes,
+        serde_json::to_vec(&budgeted).unwrap().len() + 1,
+        "wire accounting must include the stdio newline"
+    );
+    assert!(
+        frame_bytes <= 9 * 1024,
+        "budgeted frame was {frame_bytes} bytes"
+    );
+    let text = result_text(&budgeted);
+    let budget_body = assert_page_digest(text, &page_url, "Union budget", 1, 2);
+    assert!(text.lines().count() <= 200);
+    let (envelope, snapshot) = budget_body
+        .split_once("\n\n### Snapshot\n")
+        .unwrap_or_else(|| panic!("W1 evaluate envelope lost its W2 snapshot composition: {text}"));
+    let envelope: Value = serde_json::from_str(envelope)
+        .unwrap_or_else(|error| panic!("W1 evaluate envelope is not JSON: {error}: {text}"));
+    let oversized_value = serde_json::to_string(&"budget-line\n".repeat(5000))
+        .expect("serialize deterministic oversized evaluate value");
+    assert_eq!(oversized_value.len(), 65_002);
+    assert_eq!(envelope["truncated"], true);
+    assert_eq!(envelope["bytes"], oversized_value.len());
+    let preview = envelope["preview"]
+        .as_str()
+        .expect("W1 evaluate preview must be a string");
+    assert!(
+        !preview.is_empty()
+            && preview.len() < oversized_value.len()
+            && oversized_value.starts_with(preview),
+        "W1 preview must be an exact proper prefix of the 65,002-byte serialized value"
+    );
+    assert_eq!(
+        snapshot,
+        "- main\n[2 snapshot lines omitted. Possible narrower observations: browser_find, browser_get_text with a unique CSS selector, or a targeted browser_snapshot.]",
+        "budgeting runs last and retains the mandatory W2 snapshot head"
+    );
+    remove_union_fixture(&workspace);
+}
+
+#[test]
 fn real_stdio_type_press_enter_and_select_option_round_trip() {
     if chromium().executable_path().is_none() {
         eprintln!("skipping input tools MCP test: Chromium executable unavailable");
@@ -2140,10 +2674,279 @@ fn real_stdio_console_messages_filter_and_file_output_converge() {
         result_text(&written)
     );
     let artifact = fs::read_to_string(workspace.join("console.txt")).expect("read console output");
-    assert!(artifact.contains("Parity console error"), "{artifact}");
+    assert_eq!(
+        normalize_console_locations(&artifact),
+        normalize_console_locations(result_text(&all_visible)),
+        "console export must preserve the independently captured legacy rendering"
+    );
     server.finish();
     fs::remove_file(workspace.join("console.txt")).expect("remove console output");
     fs::remove_dir(workspace).expect("remove console workspace");
+}
+
+#[test]
+fn real_stdio_w4_console_and_network_presentation_round_trips() {
+    if chromium().executable_path().is_none() {
+        eprintln!("skipping W4 presentation test: Chromium executable unavailable");
+        return;
+    }
+
+    let workspace = std::env::temp_dir().join(format!(
+        "rustwright-mcp-w4-{}-{}",
+        std::process::id(),
+        STDIO_WORKSPACE_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir(&workspace).expect("create W4 workspace");
+    let console_page = workspace.join("w4-console.html");
+    let network_page = workspace.join("w4-network.html");
+    let static_asset = workspace.join("network-static.svg");
+    fs::write(
+        &console_page,
+        "<!doctype html><title>W4 console</title><main>console fixture</main>",
+    )
+    .expect("write W4 console page");
+    fs::write(
+        &network_page,
+        "<!doctype html><title>W4 network</title><img src=\"network-static.svg\">",
+    )
+    .expect("write W4 network page");
+    fs::write(
+        &static_asset,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\"></svg>",
+    )
+    .expect("write W4 static asset");
+    let console_url = format!("file://{}", console_page.display());
+    let network_url = format!("file://{}", network_page.display());
+    let workspace_text = workspace.to_string_lossy().to_string();
+    let mut server = ServerProcess::spawn_with_env(&[
+        ("RUSTWRIGHT_MCP_WORKSPACE", &workspace_text),
+        ("RUSTWRIGHT_MCP_CONSOLE_DEDUP", "on"),
+        ("RUSTWRIGHT_MCP_NET_NOTE", "on"),
+        ("RUSTWRIGHT_MCP_BUDGET", "on"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "4096"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "16"),
+    ]);
+    server.initialize_as("offline-w4-fixture");
+    let mut request_id = 900;
+    let _ = call_tool(
+        &mut server,
+        request_id,
+        "browser_navigate",
+        json!({"url": console_url.clone()}),
+    );
+    request_id += 1;
+    let _ = call_tool(
+        &mut server,
+        request_id,
+        "browser_evaluate",
+        json!({
+            "function": "() => { console.warn('W4 adjacent   duplicate'); console.warn('W4 adjacent duplicate'); console.error('W4 adjacent duplicate'); console.warn('W4 separator'); console.warn('W4 adjacent duplicate'); return true; }"
+        }),
+    );
+    request_id += 1;
+    let _ = call_tool(
+        &mut server,
+        request_id,
+        "browser_navigate",
+        json!({"url": network_url.clone()}),
+    );
+    request_id += 1;
+
+    let current_console = call_tool(
+        &mut server,
+        request_id,
+        "browser_console_messages",
+        json!({"level": "debug"}),
+    );
+    request_id += 1;
+    assert!(
+        !result_text(&current_console).contains("W4 adjacent"),
+        "all:false must retain the current-navigation scope: {}",
+        result_text(&current_console)
+    );
+
+    let all_console = call_tool(
+        &mut server,
+        request_id,
+        "browser_console_messages",
+        json!({"level": "debug", "all": true}),
+    );
+    request_id += 1;
+    let w4_lines = result_text(&all_console)
+        .lines()
+        .filter(|line| line.contains("W4 "))
+        .collect::<Vec<_>>();
+    assert_eq!(w4_lines.len(), 4, "{}", result_text(&all_console));
+    assert!(
+        w4_lines[0].contains("WARNING")
+            && w4_lines[0].contains("W4 adjacent   duplicate (repeated 2 times)"),
+        "{}",
+        result_text(&all_console)
+    );
+    assert!(w4_lines[1].contains("ERROR"), "{w4_lines:?}");
+    assert!(w4_lines[2].contains("W4 separator"), "{w4_lines:?}");
+    assert!(
+        w4_lines[3].contains("WARNING")
+            && w4_lines[3].contains("W4 adjacent duplicate")
+            && !w4_lines[3].contains("repeated"),
+        "non-adjacent duplicate collapsed: {w4_lines:?}"
+    );
+
+    let console_written = call_tool(
+        &mut server,
+        request_id,
+        "browser_console_messages",
+        json!({"level": "debug", "all": true, "filename": "console-w4.txt"}),
+    );
+    request_id += 1;
+    assert!(result_text(&console_written).contains("Console messages written"));
+    let console_artifact =
+        fs::read_to_string(workspace.join("console-w4.txt")).expect("read W4 console export");
+    assert_eq!(console_artifact.matches("W4 adjacent").count(), 4);
+    assert!(console_artifact.contains("W4 adjacent   duplicate"));
+    assert!(
+        !console_artifact.contains("(repeated"),
+        "{console_artifact}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let all_network = loop {
+        let response = call_tool(
+            &mut server,
+            request_id,
+            "browser_network_requests",
+            json!({"static": true}),
+        );
+        request_id += 1;
+        if result_text(&response).contains("network-static.svg") {
+            break response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "W4 network records did not converge: {}",
+            result_text(&response)
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert!(result_text(&all_network).contains("network-static.svg"));
+    assert!(!result_text(&all_network).contains("static requests hidden"));
+
+    let without_static = call_tool(
+        &mut server,
+        request_id,
+        "browser_network_requests",
+        json!({}),
+    );
+    request_id += 1;
+    assert!(!result_text(&without_static).contains("network-static.svg"));
+    assert!(
+        result_text(&without_static)
+            .contains("(1 successful static requests hidden; use static:true to include them)"),
+        "{}",
+        result_text(&without_static)
+    );
+
+    let post_filter_zero = call_tool(
+        &mut server,
+        request_id,
+        "browser_network_requests",
+        json!({"filter": "w4-network\\.html$"}),
+    );
+    request_id += 1;
+    assert!(result_text(&post_filter_zero).contains("w4-network.html"));
+    assert!(!result_text(&post_filter_zero).contains("static requests hidden"));
+
+    let post_filter_one = call_tool(
+        &mut server,
+        request_id,
+        "browser_network_requests",
+        json!({"filter": "network-static\\.svg$"}),
+    );
+    request_id += 1;
+    assert!(
+        result_text(&post_filter_one).starts_with("(no matching network requests)\n")
+            && result_text(&post_filter_one).contains("1 successful static requests hidden"),
+        "{}",
+        result_text(&post_filter_one)
+    );
+
+    let network_written = call_tool(
+        &mut server,
+        request_id,
+        "browser_network_requests",
+        json!({"filename": "network-w4.txt"}),
+    );
+    request_id += 1;
+    assert!(result_text(&network_written).contains("Network requests written"));
+    let network_artifact =
+        fs::read_to_string(workspace.join("network-w4.txt")).expect("read W4 network export");
+    assert!(!network_artifact.contains("network-static.svg"));
+    assert!(!network_artifact.contains("static requests hidden"));
+
+    let all_network_written = call_tool(
+        &mut server,
+        request_id,
+        "browser_network_requests",
+        json!({"static": true, "filename": "network-all-w4.txt"}),
+    );
+    assert!(result_text(&all_network_written).contains("Network requests written"));
+    let all_network_artifact = fs::read_to_string(workspace.join("network-all-w4.txt"))
+        .expect("read W4 all-network export");
+    assert!(all_network_artifact.contains("network-static.svg"));
+    assert!(!all_network_artifact.contains("static requests hidden"));
+
+    let (transcript, _) = server.finish();
+    assert!(transcript.iter().any(|line| {
+        line.starts_with("S> ") && line.contains("successful static requests hidden")
+    }));
+
+    let mut legacy =
+        ServerProcess::spawn_with_env(&[("RUSTWRIGHT_MCP_WORKSPACE", &workspace_text)]);
+    legacy.initialize_as("offline-w4-legacy-fixture");
+    let _ = call_tool(
+        &mut legacy,
+        950,
+        "browser_navigate",
+        json!({"url": console_url}),
+    );
+    let _ = call_tool(
+        &mut legacy,
+        951,
+        "browser_evaluate",
+        json!({
+            "function": "() => { console.warn('W4 adjacent   duplicate'); console.warn('W4 adjacent duplicate'); console.error('W4 adjacent duplicate'); console.warn('W4 separator'); console.warn('W4 adjacent duplicate'); return true; }"
+        }),
+    );
+    let _ = call_tool(
+        &mut legacy,
+        952,
+        "browser_navigate",
+        json!({"url": network_url}),
+    );
+    let legacy_console = call_tool(
+        &mut legacy,
+        953,
+        "browser_console_messages",
+        json!({"level": "debug", "all": true}),
+    );
+    assert_eq!(
+        normalize_console_locations(&console_artifact),
+        normalize_console_locations(result_text(&legacy_console)),
+        "active-W4 export must exactly match an independently captured legacy rendering"
+    );
+    legacy.finish();
+
+    for filename in [
+        "console-w4.txt",
+        "network-w4.txt",
+        "network-all-w4.txt",
+        "w4-console.html",
+        "w4-network.html",
+        "network-static.svg",
+    ] {
+        fs::remove_file(workspace.join(filename)).expect("remove W4 artifact");
+    }
+    fs::remove_dir(workspace).expect("remove W4 workspace");
 }
 
 #[test]
@@ -3434,6 +4237,443 @@ fn malformed_json_and_unknown_method_return_errors_and_server_recovers() {
     assert_eq!(pong["id"], 43);
     assert!(pong["result"].is_object());
     server.finish();
+}
+
+#[test]
+fn budgeted_stdio_preserves_validation_and_unknown_tool_error_envelopes() {
+    let canary = "opaque-request-id-value".repeat(300);
+    let mut server = ServerProcess::spawn_with_env(&[
+        ("RUSTWRIGHT_MCP_BUDGET", "on"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "4096"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "16"),
+    ]);
+    server.initialize_as("codex-neutral-fixture");
+    server.send(json!({
+        "jsonrpc":"2.0","id":canary.clone(),"method":"tools/call",
+        "params":{"name":"browser_snapshot","arguments":{"depth":"invalid"}}
+    }));
+    let validation = server.receive();
+    assert_eq!(validation["error"]["code"], -32602);
+    assert_eq!(validation["error"]["message"], "");
+
+    server.send(json!({
+        "jsonrpc":"2.0","id":256,"method":"tools/call",
+        "params":{"name":"unknown_tool_name".repeat(1000),"arguments":{}}
+    }));
+    let unknown = server.receive();
+    assert_eq!(unknown["error"]["code"], -32602);
+    assert!(
+        unknown["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("bytes omitted")
+    );
+
+    let (transcript, diagnostics) = server.finish();
+    assert!(
+        transcript
+            .iter()
+            .all(|line| line.ends_with('}') || line.starts_with("C> "))
+    );
+    assert!(diagnostics.contains("wire_ceiling_unavoidable"));
+    assert!(!diagnostics.contains("opaque-request-id-value"));
+}
+
+#[test]
+fn no_browser_actor_handler_rmcp_frames_preserve_ids_and_result_classes() {
+    let mut server = ServerProcess::spawn_with_env(&[("RUSTWRIGHT_MCP_BUDGET", "on")]);
+    // This is the production initialize/peer_info path; the profile is selected by the
+    // name rmcp stores from this frame, not by calling the matcher in the test.
+    server.initialize_as("codex-mcp-client");
+    server.send(json!({
+        "jsonrpc":"2.0","id":"actor-success","method":"tools/call",
+        "params":{"name":"browser_close","arguments":{}}
+    }));
+    let success = server.receive();
+    assert_eq!(success["id"], "actor-success");
+    assert_eq!(success["result"]["isError"], false);
+    assert_eq!(result_text(&success), "No browser session was open.");
+
+    server.send(json!({
+        "jsonrpc":"2.0","id":"actor-error","method":"tools/call",
+        "params":{"name":"browser_file_upload","arguments":{"paths":["fixture.txt"]}}
+    }));
+    let error = server.receive();
+    assert_eq!(error["id"], "actor-error");
+    assert_eq!(error["result"]["isError"], true);
+    assert!(
+        error["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("file chooser"))
+    );
+
+    let (transcript, diagnostics) = server.finish();
+    let server_frames = transcript
+        .iter()
+        .filter(|line| line.starts_with("S> "))
+        .collect::<Vec<_>>();
+    assert_eq!(server_frames.len(), 3);
+    assert!(diagnostics.contains("browser actor: ready"));
+    assert!(diagnostics.contains("browser actor: stopped"));
+    assert!(!diagnostics.contains("actor-success"));
+    assert!(!diagnostics.contains("actor-error"));
+}
+
+#[test]
+fn absent_and_explicit_off_are_raw_transcript_equivalent_for_generic_config_path() {
+    fn run(environment: &[(&str, &str)]) -> Vec<String> {
+        let mut server = ServerProcess::spawn_with_env(environment);
+        server.initialize_as("unknown-hermetic-client");
+        server.send(json!({
+            "jsonrpc":"2.0","id":81,"method":"tools/call",
+            "params":{"name":"browser_close","arguments":{}}
+        }));
+        assert_eq!(server.receive()["result"]["isError"], false);
+        server.finish().0
+    }
+    assert_eq!(
+        run(&[]),
+        run(&[
+            ("RUSTWRIGHT_MCP_BUDGET", "off"),
+            ("RUSTWRIGHT_MCP_CONSOLE_DEDUP", "off"),
+            ("RUSTWRIGHT_MCP_NET_NOTE", "off"),
+        ])
+    );
+}
+
+#[test]
+fn absent_and_explicit_off_are_byte_exact_for_console_and_network_production_paths() {
+    if chromium().executable_path().is_none() {
+        eprintln!("skipping W4 off-switch test: Chromium executable unavailable");
+        return;
+    }
+
+    let workspace = std::env::temp_dir().join(format!(
+        "rustwright-mcp-w4-off-{}-{}",
+        std::process::id(),
+        STDIO_WORKSPACE_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir(&workspace).expect("create W4 off-switch workspace");
+    let console_page = workspace.join("off-console.html");
+    let network_page = workspace.join("off-network.html");
+    let static_asset = workspace.join("off-static.svg");
+    fs::write(
+        &console_page,
+        "<!doctype html><title>off console</title><main>console</main>",
+    )
+    .expect("write off console fixture");
+    fs::write(
+        &network_page,
+        "<!doctype html><title>off network</title><img src=\"off-static.svg\">",
+    )
+    .expect("write off network fixture");
+    fs::write(
+        &static_asset,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\"></svg>",
+    )
+    .expect("write off static fixture");
+    let console_url = format!("file://{}", console_page.display());
+    let network_url = format!("file://{}", network_page.display());
+
+    fn environment<'a>(workspace: &'a str, explicit_off: bool) -> Vec<(&'a str, &'a str)> {
+        if explicit_off {
+            vec![
+                ("RUSTWRIGHT_MCP_WORKSPACE", workspace),
+                ("RUSTWRIGHT_MCP_CONSOLE_DEDUP", "off"),
+                ("RUSTWRIGHT_MCP_NET_NOTE", "off"),
+            ]
+        } else {
+            vec![("RUSTWRIGHT_MCP_WORKSPACE", workspace)]
+        }
+    }
+
+    fn run_console(
+        workspace: &Path,
+        console_url: &str,
+        filename: &str,
+        explicit_off: bool,
+    ) -> (String, String) {
+        let workspace_text = workspace.to_string_lossy();
+        let environment = environment(&workspace_text, explicit_off);
+        let artifact_path = workspace.join(filename);
+        assert!(
+            !artifact_path.exists(),
+            "console export path must be unused before the production write"
+        );
+        let mut server = ServerProcess::spawn_with_env(&environment);
+        server.initialize_as("offline-w4-off-fixture");
+        let _ = call_tool(
+            &mut server,
+            970,
+            "browser_navigate",
+            json!({"url": console_url}),
+        );
+        let _ = call_tool(
+            &mut server,
+            971,
+            "browser_evaluate",
+            json!({
+                "function": "() => { console.warn('W4 off duplicate'); console.warn('W4 off duplicate'); return true; }"
+            }),
+        );
+        let console = call_tool(
+            &mut server,
+            973,
+            "browser_console_messages",
+            json!({"level": "debug", "all": true}),
+        );
+        let console_written = call_tool(
+            &mut server,
+            974,
+            "browser_console_messages",
+            json!({"level": "debug", "all": true, "filename": filename}),
+        );
+        assert!(result_text(&console_written).contains("Console messages written"));
+        let console_artifact = fs::read_to_string(&artifact_path).unwrap();
+        server.finish();
+        (result_text(&console).to_owned(), console_artifact)
+    }
+
+    fn run_network(
+        workspace: &Path,
+        network_url: &str,
+        filename: &str,
+        explicit_off: bool,
+    ) -> (String, String) {
+        let workspace_text = workspace.to_string_lossy();
+        let environment = environment(&workspace_text, explicit_off);
+        let artifact_path = workspace.join(filename);
+        assert!(
+            !artifact_path.exists(),
+            "network export path must be unused before the production write"
+        );
+        let mut server = ServerProcess::spawn_with_env(&environment);
+        server.initialize_as("offline-w4-off-fixture");
+        let _ = call_tool(
+            &mut server,
+            972,
+            "browser_navigate",
+            json!({"url": network_url}),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let network = loop {
+            let response = call_tool(&mut server, 975, "browser_network_requests", json!({}));
+            if result_text(&response).contains("off-network.html") {
+                break response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "network records did not converge"
+            );
+            thread::sleep(Duration::from_millis(25));
+        };
+        let network_written = call_tool(
+            &mut server,
+            976,
+            "browser_network_requests",
+            json!({"filename": filename}),
+        );
+        assert!(result_text(&network_written).contains("Network requests written"));
+        let network_artifact = fs::read_to_string(&artifact_path).unwrap();
+        server.finish();
+        (result_text(&network).to_owned(), network_artifact)
+    }
+
+    let mut export_workspaces = HashSet::new();
+    let mut reserve_workspace = |configuration: &str, phase: &str| {
+        let path = workspace.join(format!("export-{configuration}-{phase}"));
+        assert!(
+            export_workspaces.insert(path.clone()),
+            "each configuration/phase pair must reserve a unique workspace"
+        );
+        assert!(
+            !path.exists(),
+            "reserved export workspace must not pre-exist"
+        );
+        fs::create_dir(&path).expect("create isolated W4 export workspace");
+        path
+    };
+    let absent_console_workspace = reserve_workspace("absent", "console");
+    let absent_network_workspace = reserve_workspace("absent", "network");
+    let off_console_workspace = reserve_workspace("explicit-off", "console");
+    let off_network_workspace = reserve_workspace("explicit-off", "network");
+    assert_eq!(export_workspaces.len(), 4);
+
+    let absent_console = run_console(
+        &absent_console_workspace,
+        &console_url,
+        "absent-console-export.txt",
+        false,
+    );
+    let absent_network = run_network(
+        &absent_network_workspace,
+        &network_url,
+        "absent-network-export.txt",
+        false,
+    );
+    let explicit_off_console = run_console(
+        &off_console_workspace,
+        &console_url,
+        "explicit-off-console-export.txt",
+        true,
+    );
+    let explicit_off_network = run_network(
+        &off_network_workspace,
+        &network_url,
+        "explicit-off-network-export.txt",
+        true,
+    );
+    let absent = (
+        absent_console.0,
+        absent_network.0,
+        absent_console.1,
+        absent_network.1,
+    );
+    let explicit_off = (
+        explicit_off_console.0,
+        explicit_off_network.0,
+        explicit_off_console.1,
+        explicit_off_network.1,
+    );
+    assert_eq!(absent, explicit_off);
+    assert_eq!(absent.0.matches("W4 off duplicate").count(), 2);
+    assert!(!absent.0.contains("(repeated"));
+    assert!(!absent.1.contains("static requests hidden"));
+
+    for export_workspace in export_workspaces {
+        let entries = fs::read_dir(&export_workspace)
+            .expect("read isolated W4 export workspace")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect isolated W4 export artifacts");
+        assert_eq!(entries.len(), 1, "each phase writes exactly one artifact");
+        fs::remove_file(entries[0].path()).expect("remove isolated W4 export artifact");
+        fs::remove_dir(export_workspace).expect("remove isolated W4 export workspace");
+    }
+    for filename in ["off-console.html", "off-network.html", "off-static.svg"] {
+        fs::remove_file(workspace.join(filename)).expect("remove W4 off-switch artifact");
+    }
+    fs::remove_dir(workspace).expect("remove W4 off-switch workspace");
+}
+
+#[test]
+fn isolated_process_parses_config_environment_and_warns_once_per_invalid_value() {
+    let mut server = ServerProcess::spawn_with_env(&[
+        ("RUSTWRIGHT_MCP_BUDGET", "invalid"),
+        ("RUSTWRIGHT_MCP_DISTILL", "ON"),
+        ("RUSTWRIGHT_MCP_CONSOLE_DEDUP", "invalid"),
+        ("RUSTWRIGHT_MCP_NET_NOTE", "yes"),
+        ("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS", "invalid"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "4095"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "15"),
+    ]);
+    server.initialize_as("unknown-hermetic-client");
+    server.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}));
+    let listed = server.receive();
+    assert_eq!(
+        listed["result"]["tools"][0]["description"],
+        "Navigate the browser and return a compact page snapshot."
+    );
+    let (_, diagnostics) = server.finish();
+    for variable in [
+        "RUSTWRIGHT_MCP_BUDGET",
+        "RUSTWRIGHT_MCP_CONSOLE_DEDUP",
+        "RUSTWRIGHT_MCP_NET_NOTE",
+        "RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS",
+        "RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES",
+        "RUSTWRIGHT_MCP_MAX_RESPONSE_LINES",
+    ] {
+        assert_eq!(
+            diagnostics
+                .matches(&format!("variable={variable} "))
+                .count(),
+            1
+        );
+    }
+    assert!(!diagnostics.contains("variable=RUSTWRIGHT_MCP_DISTILL"));
+
+    fn config_diagnostics(environment: &[(&str, &str)]) -> String {
+        let mut server = ServerProcess::spawn_with_env(environment);
+        server.initialize_as("unknown-hermetic-client");
+        server.finish().1
+    }
+
+    for (variable, value) in [
+        ("RUSTWRIGHT_MCP_HEADER", "on"),
+        ("RUSTWRIGHT_MCP_DISTILL", "off"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "0"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "4096"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "0"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "16"),
+    ] {
+        let diagnostics = config_diagnostics(&[(variable, value)]);
+        assert!(
+            !diagnostics.contains(&format!("variable={variable} ")),
+            "valid subprocess value {variable}={value} warned: {diagnostics}"
+        );
+    }
+    for (variable, value) in [
+        ("RUSTWRIGHT_MCP_HEADER", "invalid"),
+        ("RUSTWRIGHT_MCP_DISTILL", "invalid"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "invalid"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "invalid"),
+    ] {
+        let diagnostics = config_diagnostics(&[(variable, value)]);
+        assert_eq!(
+            diagnostics
+                .matches(&format!("variable={variable} "))
+                .count(),
+            1,
+            "invalid subprocess value {variable}={value}: {diagnostics}"
+        );
+    }
+
+    fn oversized_error_frame(environment: &[(&str, &str)], client_name: &str) -> (usize, String) {
+        let mut server = ServerProcess::spawn_with_env(environment);
+        server.initialize_as(client_name);
+        server.send(json!({
+            "jsonrpc":"2.0","id":77,"method":"tools/call",
+            "params":{"name":"unknown_tool".repeat(3000),"arguments":{}}
+        }));
+        let (_, frame_bytes) = server.receive_with_frame_bytes();
+        let diagnostics = server.finish().1;
+        (frame_bytes, diagnostics)
+    }
+
+    let (disabled_bytes, disabled_diagnostics) = oversized_error_frame(
+        &[
+            ("RUSTWRIGHT_MCP_BUDGET", "on"),
+            ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "0"),
+            ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "0"),
+        ],
+        "unknown-hermetic-client",
+    );
+    assert!(disabled_bytes > 9 * 1024);
+    assert!(!disabled_diagnostics.contains("invalid_or_too_small"));
+
+    let (minimum_bytes, minimum_diagnostics) = oversized_error_frame(
+        &[
+            ("RUSTWRIGHT_MCP_BUDGET", "on"),
+            ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "4096"),
+            ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "16"),
+        ],
+        "unknown-hermetic-client",
+    );
+    assert!(minimum_bytes <= 4096);
+    assert!(!minimum_diagnostics.contains("invalid_or_too_small"));
+
+    let (fallback_bytes, fallback_diagnostics) = oversized_error_frame(
+        &[
+            ("RUSTWRIGHT_MCP_BUDGET", "on"),
+            ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "4095"),
+            ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "15"),
+        ],
+        "codex-mcp-client",
+    );
+    assert!(fallback_bytes <= 9 * 1024);
+    assert_eq!(
+        fallback_diagnostics.matches("invalid_or_too_small").count(),
+        2
+    );
 }
 
 #[test]
