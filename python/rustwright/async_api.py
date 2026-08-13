@@ -126,17 +126,8 @@ from ._async_generated import (
 )
 
 
-if hasattr(asyncio, "to_thread"):
-    _DEFAULT_ASYNCIO_TO_THREAD = asyncio.to_thread
-else:
-    # asyncio.to_thread was added in Python 3.9. Preserve the same behavior on
-    # Python 3.8 by running the call in the loop's default executor with the
-    # current context copied, exactly as asyncio.to_thread does.
-    async def _DEFAULT_ASYNCIO_TO_THREAD(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        loop = asyncio.get_running_loop()
-        ctx = contextvars.copy_context()
-        call = functools.partial(ctx.run, func, *args, **kwargs)
-        return await loop.run_in_executor(None, call)
+_DEFAULT_ASYNCIO_TO_THREAD = asyncio.to_thread
+
 _ASYNC_EXECUTOR_LOCK = threading.Lock()
 _ASYNC_EXECUTOR: Optional[concurrent.futures.Executor] = None
 _ASYNC_EXECUTOR_OWNS = False
@@ -178,8 +169,6 @@ def configure_async_executor(
         _ASYNC_EXECUTOR = new_executor
         _ASYNC_EXECUTOR_OWNS = owns_new_executor
     if old_executor is not None:
-        # cancel_futures was added in Python 3.9; the default is False, so omit
-        # it to keep this call working on Python 3.8.
         old_executor.shutdown(wait=False)
 
 

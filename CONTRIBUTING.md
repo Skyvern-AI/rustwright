@@ -13,7 +13,7 @@ Use a virtual environment and build the native extension with maturin:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -U pip maturin pytest pytest-benchmark
+python -m pip install -U pip maturin pytest
 maturin develop --release
 python -m rustwright install chromium
 ```

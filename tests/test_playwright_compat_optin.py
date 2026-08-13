@@ -23,8 +23,13 @@ def _plugin_args() -> list[str]:
     # entry point does not exist and -p is required.
     from importlib.metadata import entry_points
 
-    eps = entry_points(group="pytest11")
-    if any(ep.value == "rustwright.pytest_plugin" for ep in eps):
+    eps = entry_points()
+    group = (
+        eps.select(group="pytest11")
+        if hasattr(eps, "select")
+        else eps.get("pytest11", ())
+    )
+    if any(ep.value == "rustwright.pytest_plugin" for ep in group):
         return []
     return ["-p", "rustwright.pytest_plugin"]
 
