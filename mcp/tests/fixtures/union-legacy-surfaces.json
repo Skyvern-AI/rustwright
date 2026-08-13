@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "815a6616b227c3a6373180c0528d19a96296a62b",
+  "navigation": "- main \"Network records\"\n  - heading \"Network records\" [level=1]\n  - img",
+  "snapshot": "- main \"Network records\"\n  - heading \"Network records\" [level=1]\n  - img",
+  "console_template": "WARNING (unknown):169 union duplicate\nWARNING (unknown):169 union duplicate",
+  "network_template": "[1] GET 200 {PAGE_URL} (document)"
+}
