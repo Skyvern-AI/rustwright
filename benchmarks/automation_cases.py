@@ -62,6 +62,8 @@ def remote_debugging_chromium(browser_type):
                 "--disable-background-networking",
                 "--no-first-run",
                 "--no-default-browser-check",
+                "--password-store=basic",
+                "--use-mock-keychain",
                 "about:blank",
             ],
             stdout=subprocess.PIPE,

@@ -1147,7 +1147,14 @@ def typescript_puppeteer_code(
           return await puppeteer.launch({{
             headless: true,
             executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
-            args: ['--no-sandbox', '--disable-dev-shm-usage', '--no-first-run', '--no-default-browser-check'],
+            args: [
+              '--no-sandbox',
+              '--disable-dev-shm-usage',
+              '--no-first-run',
+              '--no-default-browser-check',
+              '--password-store=basic',
+              '--use-mock-keychain',
+            ],
           }});
         }}
 
