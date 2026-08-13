@@ -50,7 +50,7 @@ COPY pyproject.toml Cargo.toml Cargo.lock ./
 RUN touch README.md
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip setuptools wheel "maturin>=1.5,<2" \
-    && python -m pip install "pytest>=8" "pytest-benchmark>=4"
+    && python -m pip install "pytest>=8"
 
 COPY src ./src
 COPY python ./python
