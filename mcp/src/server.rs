@@ -13,14 +13,20 @@ use rmcp::{
     ErrorData, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResult, CancelledNotificationParam, ContentBlock,
-        Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
+        Implementation, ListToolsResult, PaginatedRequestParams, RequestId, ServerCapabilities,
+        ServerInfo,
     },
     service::{NotificationContext, RequestContext, RoleServer},
 };
 
 use crate::{
     actor::{BrowserActor, BrowserError, BrowserOutput},
-    tools::{descriptor, enabled_tool_specs, find_tool, parse_op, validate_tool_configuration},
+    config::{FeatureConfig, ResponseBudget},
+    shaping::{ResponseShape, shape_error, shape_tool_text, shape_tool_text_with_shape},
+    tools::{
+        descriptor_with_profile, enabled_tool_specs, find_tool, parse_op,
+        validate_tool_configuration,
+    },
 };
 
 const DEFAULT_SCREENSHOT_MAX_BYTES: usize = 5 * 1024 * 1024;
@@ -32,6 +38,7 @@ pub(crate) struct BrowserServer {
     actor: Arc<BrowserActor>,
     screenshot_max_bytes: usize,
     screenshot_temp_dir: ScreenshotTempDir,
+    features: FeatureConfig,
 }
 
 impl BrowserServer {
@@ -39,10 +46,12 @@ impl BrowserServer {
         validate_tool_configuration()
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
         let screenshot_temp_dir = ScreenshotTempDir::new()?;
+        let features = FeatureConfig::from_env();
         Ok(Self {
-            actor: Arc::new(BrowserActor::spawn()),
+            actor: Arc::new(BrowserActor::spawn_with_features(features.clone())),
             screenshot_max_bytes: screenshot_max_bytes_from_env(),
             screenshot_temp_dir,
+            features,
         })
     }
 }
@@ -148,9 +157,10 @@ fn output_content(
     output: BrowserOutput,
     screenshot_max_bytes: usize,
     screenshot_temp_dir: &Path,
-) -> Result<ContentBlock, BrowserError> {
+) -> Result<(ContentBlock, Option<ResponseShape>), BrowserError> {
     match output {
-        BrowserOutput::Text(text) => Ok(ContentBlock::text(text)),
+        BrowserOutput::Text(text) => Ok((ContentBlock::text(text), None)),
+        BrowserOutput::ShapedText { text, shape } => Ok((ContentBlock::text(text), Some(shape))),
         BrowserOutput::Image {
             bytes,
             mime,
@@ -158,14 +168,53 @@ fn output_content(
         } => {
             let payload_bytes = encoded_len(bytes.len(), true).unwrap_or(usize::MAX);
             if payload_bytes <= screenshot_max_bytes {
-                return Ok(ContentBlock::image(STANDARD.encode(bytes), mime));
+                return Ok((ContentBlock::image(STANDARD.encode(bytes), mime), None));
             }
             let path = write_temp_image(screenshot_temp_dir, &bytes, extension)?;
-            Ok(ContentBlock::text(format!(
-                "Screenshot exceeded the inline size cap ({payload_bytes} > {screenshot_max_bytes} bytes); image saved to `{}`.",
-                path.display()
-            )))
+            Ok((
+                ContentBlock::text(format!(
+                    "Screenshot exceeded the inline size cap ({payload_bytes} > {screenshot_max_bytes} bytes); image saved to `{}`.",
+                    path.display()
+                )),
+                None,
+            ))
         }
+    }
+}
+
+fn production_tool_result(
+    result: Result<BrowserOutput, BrowserError>,
+    tool_name: &str,
+    request_id: &RequestId,
+    budget: ResponseBudget,
+    bypass_response_shaping: bool,
+    screenshot_max_bytes: usize,
+    screenshot_temp_dir: &Path,
+) -> CallToolResult {
+    match result
+        .and_then(|output| output_content(output, screenshot_max_bytes, screenshot_temp_dir))
+    {
+        Ok((ContentBlock::Text(mut text), shape)) => {
+            if !bypass_response_shaping {
+                text.text = shape_tool_text_with_shape(
+                    tool_name,
+                    text.text,
+                    false,
+                    request_id,
+                    budget,
+                    shape.as_ref(),
+                );
+            }
+            CallToolResult::success(vec![ContentBlock::Text(text)])
+        }
+        Ok((content, _)) => CallToolResult::success(vec![content]),
+        Err(error) => CallToolResult::error(vec![ContentBlock::text(shape_tool_text(
+            tool_name,
+            error.to_string(),
+            true,
+            request_id,
+            budget,
+        ))]),
     }
 }
 
@@ -182,15 +231,24 @@ impl ServerHandler for BrowserServer {
     fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
+        let client_name = context
+            .peer
+            .peer_info()
+            .map(|peer| peer.client_info.name.clone());
+        let lean_descriptions = self.features.lean_descriptions(client_name.as_deref());
         std::future::ready(Ok(ListToolsResult::with_all_items(
-            enabled_tool_specs().into_iter().map(descriptor).collect(),
+            enabled_tool_specs()
+                .into_iter()
+                .map(|spec| descriptor_with_profile(spec, lean_descriptions))
+                .collect(),
         )))
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        find_tool(name).map(descriptor)
+        let lean_descriptions = self.features.lean_descriptions(None);
+        find_tool(name).map(|spec| descriptor_with_profile(spec, lean_descriptions))
     }
 
     async fn call_tool(
@@ -198,12 +256,32 @@ impl ServerHandler for BrowserServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let spec = find_tool(&request.name).ok_or_else(|| {
-            ErrorData::invalid_params(format!("unknown tool: {}", request.name), None)
-        })?;
-        let op = parse_op(spec, request.arguments)
-            .map_err(|message| ErrorData::invalid_params(message, None))?;
         let request_id = context.id.clone();
+        let client_name = context
+            .peer
+            .peer_info()
+            .map(|peer| peer.client_info.name.clone());
+        let budget = self.features.response_budget(client_name.as_deref());
+        let tool_name = request.name.to_string();
+        let spec = match find_tool(&request.name) {
+            Some(spec) => spec,
+            None => {
+                let error =
+                    ErrorData::invalid_params(format!("unknown tool: {}", request.name), None);
+                return Err(shape_error(error, &request_id, budget));
+            }
+        };
+        let op = match parse_op(spec, request.arguments) {
+            Ok(op) => op,
+            Err(message) => {
+                return Err(shape_error(
+                    ErrorData::invalid_params(message, None),
+                    &request_id,
+                    budget,
+                ));
+            }
+        };
+        let bypass_response_shaping = op.bypass_response_shaping();
         let cancellation = context.ct.clone();
         let execute = self.actor.execute(request_id.clone(), op);
         tokio::pin!(execute);
@@ -215,18 +293,15 @@ impl ServerHandler for BrowserServer {
                 execute.await
             }
         };
-        Ok(
-            match result.and_then(|output| {
-                output_content(
-                    output,
-                    self.screenshot_max_bytes,
-                    self.screenshot_temp_dir.path(),
-                )
-            }) {
-                Ok(content) => CallToolResult::success(vec![content]),
-                Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
-            },
-        )
+        Ok(production_tool_result(
+            result,
+            &tool_name,
+            &request_id,
+            budget,
+            bypass_response_shaping,
+            self.screenshot_max_bytes,
+            self.screenshot_temp_dir.path(),
+        ))
     }
 
     async fn on_cancelled(
@@ -236,6 +311,170 @@ impl ServerHandler for BrowserServer {
     ) {
         if let Some(request_id) = notification.request_id {
             self.actor.cancel(&request_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::model::{ServerJsonRpcMessage, ServerResult};
+
+    use crate::shaping::{
+        ModalRecovery, ResponseShape, SnapshotStructure, TabEntry, TabsStructure,
+    };
+
+    fn wire(result: CallToolResult, id: &RequestId) -> Vec<u8> {
+        let frame =
+            ServerJsonRpcMessage::response(ServerResult::CallToolResult(result), id.clone());
+        let mut bytes = serde_json::to_vec(&frame).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn production_output_path_shapes_actor_success_error_and_bypasses_image() {
+        let budget = ResponseBudget {
+            max_bytes: Some(4096),
+            max_lines: Some(16),
+        };
+        let id = RequestId::String("i".repeat(256).into());
+        let huge = "🙂".repeat(3000);
+        let shape = ResponseShape {
+            modal_recovery: vec![ModalRecovery {
+                owner: "Current tab",
+                kind: "alert".to_owned(),
+                message: huge.clone(),
+                instruction: "Call browser_handle_dialog.",
+            }],
+            snapshot: Some(SnapshotStructure {
+                legacy: huge.clone(),
+                units: vec![huge.clone(), huge.clone()],
+                head: Some(huge.clone()),
+                renderer_incomplete: Some(huge.clone()),
+                renderer_incomplete_index: Some(1),
+            }),
+            result_prefix: Some(huge.clone()),
+            ..Default::default()
+        };
+        let success = production_tool_result(
+            Ok(BrowserOutput::ShapedText {
+                text: format!("{huge}\n\n### Modal\n{huge}"),
+                shape,
+            }),
+            "browser_evaluate",
+            &id,
+            budget,
+            false,
+            usize::MAX,
+            Path::new("."),
+        );
+        assert_ne!(success.is_error, Some(true));
+        assert!(wire(success, &id).len() <= 4096);
+
+        let error = production_tool_result(
+            Err(BrowserError::Message(huge)),
+            "browser_evaluate",
+            &id,
+            budget,
+            false,
+            usize::MAX,
+            Path::new("."),
+        );
+        assert_eq!(error.is_error, Some(true));
+        assert!(wire(error, &id).len() <= 4096);
+
+        let image = production_tool_result(
+            Ok(BrowserOutput::Image {
+                bytes: vec![1, 2, 3],
+                mime: "image/png",
+                extension: "png",
+            }),
+            "browser_take_screenshot",
+            &RequestId::Number(1),
+            budget,
+            false,
+            usize::MAX,
+            Path::new("."),
+        );
+        assert!(matches!(image.content.as_slice(), [ContentBlock::Image(_)]));
+    }
+
+    #[test]
+    fn production_output_path_preserves_fitting_selected_url_as_json() {
+        let exact_url = "https://example.invalid/a\r\nb\t\0\\\"\u{2028}\u{2029}";
+        let shape = ResponseShape {
+            tabs: Some(TabsStructure {
+                entries: vec![TabEntry {
+                    index: 3,
+                    title: "selected".to_owned(),
+                    url: exact_url.replace(['\r', '\n'], " "),
+                    active: true,
+                }],
+                active_index: Some(0),
+                selected_exact_url: Some(exact_url.to_owned()),
+            }),
+            ..Default::default()
+        };
+        let id = RequestId::Number(81);
+        let result = production_tool_result(
+            Ok(BrowserOutput::ShapedText {
+                text: "### Tabs\n- 3: selected".to_owned(),
+                shape,
+            }),
+            "browser_tabs",
+            &id,
+            ResponseBudget {
+                max_bytes: Some(4096),
+                max_lines: Some(16),
+            },
+            false,
+            usize::MAX,
+            Path::new("."),
+        );
+        let [ContentBlock::Text(text)] = result.content.as_slice() else {
+            panic!("expected one text content block");
+        };
+        let encoded = text
+            .text
+            .lines()
+            .find_map(|line| line.strip_prefix("Exact active URL JSON: "))
+            .expect("exact URL record");
+        assert_eq!(serde_json::from_str::<String>(encoded).unwrap(), exact_url);
+        assert_eq!(text.text.matches("### Tabs").count(), 1);
+        assert!(wire(result, &id).len() <= 4096);
+    }
+
+    #[test]
+    fn production_output_path_is_byte_identical_when_budget_is_off_or_bypassed() {
+        let text = "legacy\n### Snapshot\nforged".repeat(100);
+        let id = RequestId::Number(9);
+        let off = production_tool_result(
+            Ok(BrowserOutput::Text(text.clone())),
+            "browser_snapshot",
+            &id,
+            ResponseBudget::default(),
+            false,
+            1,
+            Path::new("."),
+        );
+        let bypassed = production_tool_result(
+            Ok(BrowserOutput::Text(text.clone())),
+            "browser_snapshot",
+            &id,
+            ResponseBudget {
+                max_bytes: Some(4096),
+                max_lines: Some(16),
+            },
+            true,
+            1,
+            Path::new("."),
+        );
+        for result in [off, bypassed] {
+            let ContentBlock::Text(block) = &result.content[0] else {
+                panic!("expected text")
+            };
+            assert_eq!(block.text, text);
         }
     }
 }

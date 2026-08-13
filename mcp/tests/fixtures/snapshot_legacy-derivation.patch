@@ -1,0 +1,22 @@
+diff --git a/mcp/src/snapshot_legacy.js b/mcp/src/snapshot_legacy.js
+--- a/mcp/src/snapshot_legacy.js
++++ b/mcp/src/snapshot_legacy.js
+@@ -203,11 +203,16 @@ function snapshot(input = {}) {
+       outline: target === null
+         ? '- (page has no body yet)'
+         : '- (snapshot target is no longer available)',
++      units: [target === null
++        ? '- (page has no body yet)'
++        : '- (snapshot target is no longer available)'],
++      rendererIncomplete: null,
+       nextRef: refCounter,
+       refs,
+     };
+   }
+   walk(root, 0);
+-  if (lines.length >= MAX_LINES) lines.push('- … (snapshot truncated)');
+-  return { outline: lines.join('\n'), nextRef: refCounter, refs };
++  const rendererIncomplete = lines.length >= MAX_LINES ? '- … (snapshot truncated)' : null;
++  if (rendererIncomplete !== null) lines.push(rendererIncomplete);
++  return { outline: lines.join('\n'), units: lines, rendererIncomplete, nextRef: refCounter, refs };
+ }
