@@ -315,6 +315,8 @@ async function launch(options = {}) {
     "--disable-dev-shm-usage",
     "--no-first-run",
     "--no-default-browser-check",
+    "--password-store=basic",
+    "--use-mock-keychain",
     "about:blank",
   ], { stdio: "ignore" });
   const version = await waitForJson("http://127.0.0.1:" + port + "/json/version", options.timeout || 10000);
