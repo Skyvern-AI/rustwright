@@ -4,6 +4,10 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Verified support for standard CPython 3.9 through 3.14 and CPython 3.15.0rc1. Python 3.15 support remains pre-release, and CI tracks 3.15-dev until GA.
+
 ## [0.2.0] - 2026-08-03
 
 ### Added
