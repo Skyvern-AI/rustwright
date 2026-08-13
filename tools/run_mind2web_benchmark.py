@@ -665,7 +665,7 @@ def node_adapter_code(kind: str) -> str:
         launch = "const browser = await chromium.launch({ executablePath: executable });"
     else:
         launcher = "const puppeteer = require(process.env.PUPPETEER_PACKAGE_PATH);"
-        launch = "const browser = await puppeteer.launch({ headless: true, executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, args: ['--no-sandbox', '--disable-dev-shm-usage', '--no-first-run', '--no-default-browser-check'] });"
+        launch = "const browser = await puppeteer.launch({ headless: true, executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, args: ['--no-sandbox', '--disable-dev-shm-usage', '--no-first-run', '--no-default-browser-check', '--password-store=basic', '--use-mock-keychain'] });"
     set_content = (
         "await page.setContent(fixture.html, { waitUntil: 'domcontentloaded', timeout: 5000 });"
         if kind == "puppeteer"
@@ -999,6 +999,8 @@ def node_raw_cdp_adapter_code() -> str:
             '--disable-dev-shm-usage',
             '--no-first-run',
             '--no-default-browser-check',
+            '--password-store=basic',
+            '--use-mock-keychain',
             'about:blank',
           ], {{ stdio: 'ignore' }});
           const taskRuns = Object.fromEntries(payload.tasks.map(task => [String(task.task_id), []]));

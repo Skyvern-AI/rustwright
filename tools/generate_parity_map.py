@@ -25,8 +25,7 @@ from typing import Any
 
 
 if sys.version_info < (3, 9):
-    # The analyzer relies on ast.unparse (3.9+). The library itself supports
-    # 3.8+; only this maintainer tool needs the newer interpreter.
+    # The analyzer relies on ast.unparse, which matches the package's Python 3.9 floor.
     sys.exit("tools/generate_parity_map.py requires Python 3.9+ (ast.unparse)")
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,8 +37,8 @@ NODE_README_PATH = ROOT / "node" / "README.md"
 THROWAWAY_VENV = ROOT / ".venv-parity"
 PINNED_PLAYWRIGHT = "1.61.0"
 
-# ast.TryStar (PEP 654 `except*`) only exists on Python 3.11+. The repo supports
-# 3.8+, so guard the reference to keep the analyzer importable on older versions.
+# ast.TryStar (PEP 654 `except*`) only exists on Python 3.11+. Guard the
+# reference so the analyzer remains importable on Python 3.9 and 3.10.
 _TRY_NODES = (ast.Try, ast.TryStar) if hasattr(ast, "TryStar") else (ast.Try,)
 
 

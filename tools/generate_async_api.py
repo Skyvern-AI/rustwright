@@ -119,7 +119,6 @@ HAND_METHODS = {
 # The duplicate alias entry represents the two branch-local definitions in
 # _install_async_expectation_negated_aliases.make_alias.
 HAND_ASYNC_HELPERS = (
-    "_DEFAULT_ASYNCIO_TO_THREAD",
     "_run_sync_call",
     "_await_native",
     "_await_native_method",
