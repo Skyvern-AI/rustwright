@@ -9,7 +9,7 @@ build from source, as shown below. Review the known
 
 Paste this into Claude Code or Codex:
 
-> Set up Rustwright for Python from https://github.com/Skyvern-AI/rustwright. If the repository already exists, use the current checkout; otherwise clone it. Read `QUICKSTART.md` and `LIMITATIONS.md` first. Use a repository-local `.venv` and do not change global Python packages or shell configuration. Verify Python 3.8+ and Rust 1.85+, build with maturin, install Chromium, run `python examples/quickstart.py`, and report the exact output or blocker. Do not modify or commit source files.
+> Set up Rustwright for Python from https://github.com/Skyvern-AI/rustwright. If the repository already exists, use the current checkout; otherwise clone it. Read `QUICKSTART.md` and `LIMITATIONS.md` first. Use a repository-local `.venv` and do not change global Python packages or shell configuration. Verify Python 3.9–3.14 and CPython 3.15.0rc1 (pre-release; CI tracks 3.15-dev until GA) and Rust 1.85+, build with maturin, install Chromium, run `python examples/quickstart.py`, and report the exact output or blocker. Do not modify or commit source files.
 
 ## Manual Python setup
 
@@ -18,7 +18,8 @@ Paste this into Claude Code or Codex:
 You need:
 
 - [Git](https://git-scm.com/)
-- Python 3.8 or newer
+- Python 3.9 through 3.14, or CPython 3.15.0rc1; Python 3.15 support remains
+  pre-release, and CI tracks 3.15-dev until GA
 - A [Rust toolchain](https://rustup.rs/) 1.85 or newer, including the platform
   build tools recommended by `rustup`
 
