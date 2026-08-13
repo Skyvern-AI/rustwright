@@ -5,6 +5,65 @@ Testboxes using capped, sharded Docker workloads. Do not use the developer
 machine's main Chrome profile, a long-lived host Chrome process, or a purely
 local Docker run for durable benchmark claims.
 
+## Synchronous trace-stack protocol
+
+Do not run this protocol on a developer host. Reserve and identify one Testbox,
+then run the microbenchmark from the synced checkout:
+
+```bash
+python tools/check_testbox_visibility.py --json
+tools/run_benchmark_testbox.sh
+blacksmith testbox run --id <ID> "cd <source-checkout> && python benchmarks/trace_stack_capture.py --mode steady-state --depths 8,16,24 --captures 2000 --repeats 8"
+```
+
+Collect cold samples separately. Each command measures its selected lane's
+first helper operation in a fresh process as the CPU-timed sample; tracemalloc
+sampling and fail-closed equivalence validation run afterward in that same
+process. This is not a cold-import measurement. Do not combine these artifacts
+with the warmed samples above:
+
+```bash
+blacksmith testbox run --id <ID> 'cd <source-checkout> && for case in acquisition_only/old_eager_reference/8 acquisition_only/optimized_production/8 full_production_helper/old_eager_reference/8 full_production_helper/optimized_production/8 no_capture_control/control/8; do python benchmarks/trace_stack_capture.py --mode cold-process --depths 8 --captures 1 --repeats 1 --cold-case "$case"; done'
+```
+
+Repeat that command with depths `16` and `24` and matching final path
+components. Each loop iteration starts a new Python process and emits one
+fresh-process-first-helper-operation sample artifact; preserve the artifacts
+separately.
+
+System evidence requires a purpose-built collector in the reserved Testbox; the
+microbenchmark is not a substitute. Run paired A/B trials from the same source
+revision and native build, changing only the synchronous Python stack
+acquisition implementation. Alternate order by pair and retain the explicit
+order. Every trial must record the source revision, native artifact identity,
+Python and browser versions, command, start time, and raw samples.
+
+The system matrix has these controls and one treatment:
+
+- tracing off;
+- tracing on with `sources=False`;
+- tracing on with `sources=True`, using only APIs that do not capture a source
+  stack;
+- the microbenchmark `no_capture_control` lane;
+- the old eager reference acquisition lane;
+- tracing on with `sources=True`, invoking exactly one each of the synchronous
+  `goto`, `set_content`, `evaluate`, `fill`, and `click` hooked actions per
+  iteration. Assert exactly five captured stacks per completed iteration and
+  report `captured stacks / (5 * completed iterations)`; retries and partial
+  iterations remain visible and are never removed from the denominator.
+
+Use a fixed page and action payload for both A and B. Report per-action and
+per-iteration latency, every failure with action and pair, and all raw paired
+values and confidence intervals. Identify every measured process by PID plus
+process start time. Sample user+system CPU for the complete process tree over
+the same interval. Read `/proc/<pid>/smaps_rollup` at recorded timestamps and
+report time-weighted mean and peak PSS; RSS is not PSS. Retain the raw CPU/PSS
+intervals so the aggregates are reproducible.
+
+This protocol does not authorize claims about leaks, end-to-end impact, or PSS
+from microbenchmark tracemalloc fields. Do not import percentages from another
+machine, implementation, workload, or unpublished run.
+
 ## Default Path
 
 Use a Blacksmith Testbox warmed from
