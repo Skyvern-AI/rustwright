@@ -188,6 +188,41 @@ pub struct Browser {
     inner: rustwright_core::RustwrightBrowser,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TargetLifecycleEvent {
+    Upsert { target_id: String, url: String },
+    Destroyed { target_id: String },
+}
+
+pub struct TargetLifecycleReceiver {
+    inner: rustwright_core::RustwrightTargetLifecycleReceiver,
+}
+
+impl TargetLifecycleReceiver {
+    fn map_event(event: rustwright_core::RustwrightTargetLifecycleEvent) -> TargetLifecycleEvent {
+        match event {
+            rustwright_core::RustwrightTargetLifecycleEvent::Upsert { target_id, url } => {
+                TargetLifecycleEvent::Upsert { target_id, url }
+            }
+            rustwright_core::RustwrightTargetLifecycleEvent::Destroyed { target_id } => {
+                TargetLifecycleEvent::Destroyed { target_id }
+            }
+        }
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<TargetLifecycleEvent> {
+        self.inner.recv_timeout(timeout).map(Self::map_event)
+    }
+
+    pub fn try_recv(
+        &self,
+    ) -> std::result::Result<Option<TargetLifecycleEvent>, std::sync::mpsc::TryRecvError> {
+        self.inner
+            .try_recv()
+            .map(|event| event.map(Self::map_event))
+    }
+}
+
 impl Browser {
     /// Open a fresh page in the browser's default context.
     pub fn new_page(&self) -> Result<Page> {
@@ -204,6 +239,12 @@ impl Browser {
     /// List and adopt the existing pages in the browser's default context.
     pub fn pages(&self) -> Result<Vec<Page>> {
         self.pages_with_cancel(Duration::from_secs(30), None)
+    }
+
+    pub fn target_lifecycle(&self) -> TargetLifecycleReceiver {
+        TargetLifecycleReceiver {
+            inner: self.inner.target_lifecycle(),
+        }
     }
 
     /// List and adopt existing pages with a bounded timeout and optional cancellation signal.
@@ -428,6 +469,9 @@ pub struct ConsoleRecord {
     pub text: String,
     pub args: Vec<Value>,
     pub location: Option<ConsoleLocation>,
+    /// First stack frame with a Chromium-attributed URL, falling back to the
+    /// raw top frame when every frame is anonymous.
+    pub attributed_location: Option<ConsoleLocation>,
     pub navigation_epoch: u64,
 }
 
@@ -477,6 +521,28 @@ pub enum NetworkBody {
     },
 }
 
+/// Metadata observed while waiting for a top-level navigation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NavigationObservation {
+    pub response_json: Value,
+    pub main_status: Option<u16>,
+    pub same_document: bool,
+}
+
+/// A history-navigation result that distinguishes a missing entry from navigation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryNavigationObservation {
+    pub had_entry: bool,
+    pub navigation: NavigationObservation,
+}
+
+/// Additive detail emitted for main-frame navigation events.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NavigationDetail {
+    pub url: String,
+    pub same_document: bool,
+}
+
 /// Typed page events emitted by [`Page::events`].
 #[derive(Clone, Debug)]
 pub enum PageEvent {
@@ -509,6 +575,41 @@ pub enum PageEvent {
 /// `PageCrashed` are terminal after queued events have been drained.
 pub struct EventReceiver {
     inner: rustwright_core::RustwrightPageEventReceiver,
+}
+
+/// Pull-based opt-in main-frame navigation-detail subscription.
+///
+/// Each receiver buffers at most 128 details. If producers outrun a receiver,
+/// the oldest details are discarded and [`NavigationDetailReceiver::dropped_count`]
+/// reports the cumulative loss. Dropping the receiver shuts down its subscription.
+pub struct NavigationDetailReceiver {
+    inner: rustwright_core::RustwrightNavigationDetailReceiver,
+}
+
+impl NavigationDetailReceiver {
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<NavigationDetail> {
+        self.inner.recv_timeout(timeout).map(map_navigation_detail)
+    }
+
+    pub fn dropped_count(&self) -> u64 {
+        self.inner.dropped_count()
+    }
+
+    #[doc(hidden)]
+    pub fn recv_timeout_sequenced(&self, timeout: Duration) -> Option<(u64, NavigationDetail)> {
+        self.inner
+            .recv_timeout_sequenced(timeout)
+            .map(|(sequence, detail)| (sequence, map_navigation_detail(detail)))
+    }
+
+    #[doc(hidden)]
+    pub fn latest_sequence(&self) -> u64 {
+        self.inner.latest_sequence()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
 }
 
 impl EventReceiver {
@@ -552,6 +653,13 @@ impl Page {
         }
     }
 
+    /// Subscribe to additive main-frame navigation details.
+    pub fn navigation_details(&self) -> NavigationDetailReceiver {
+        NavigationDetailReceiver {
+            inner: self.inner.navigation_details(),
+        }
+    }
+
     /// Read the page's bounded console-record ring.
     ///
     /// Pass `include_previous_navigations` to include all retained epochs and
@@ -577,12 +685,27 @@ impl Page {
                         line_number: location.line_number,
                         column_number: location.column_number,
                     }),
+                    attributed_location: record.attributed_location.map(|location| {
+                        ConsoleLocation {
+                            url: location.url,
+                            line_number: location.line_number,
+                            column_number: location.column_number,
+                        }
+                    }),
                     navigation_epoch: record.navigation_epoch,
                 })
                 .collect(),
             navigation_epoch: records.navigation_epoch,
             evicted: records.evicted,
         })
+    }
+
+    /// Arm console capture without reading or clearing retained records.
+    ///
+    /// Existing callers retain lazy first-read behavior unless they opt into
+    /// this method before a navigation boundary.
+    pub fn arm_console_capture(&self) -> Result<()> {
+        self.inner.arm_console_capture()
     }
 
     /// Read the page's oldest-first, 1,024-record request/response lifecycle ring.
@@ -647,6 +770,11 @@ impl Page {
         self.goto_with_cancel(url, options, None)
     }
 
+    /// Navigate to `url` and return response and document-transition metadata.
+    pub fn goto_observed(&self, url: &str, options: GotoOptions) -> Result<NavigationObservation> {
+        self.goto_with_cancel_observed(url, options, None)
+    }
+
     /// Navigate with an optional cancellation signal.
     pub fn goto_with_cancel(
         &self,
@@ -664,6 +792,23 @@ impl Page {
         Ok(serde_json::from_str(&json)?)
     }
 
+    /// Navigate with cancellation and return response and transition metadata.
+    pub fn goto_with_cancel_observed(
+        &self,
+        url: &str,
+        options: GotoOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<NavigationObservation> {
+        let observation = self.inner.goto_with_cancel_observed(
+            url,
+            options.wait_until.as_deref(),
+            options.timeout,
+            options.referer.as_deref(),
+            cancel,
+        )?;
+        map_navigation_observation(observation)
+    }
+
     /// Emit the failure-only navigation dump for a caller-owned timeout.
     #[doc(hidden)]
     pub fn emit_navigation_timeout_diagnostic(&self, elapsed: Duration) {
@@ -675,17 +820,36 @@ impl Page {
         self.go_back_with_cancel(options, None)
     }
 
+    pub fn go_back_observed(&self, options: GotoOptions) -> Result<HistoryNavigationObservation> {
+        self.go_back_with_cancel_observed(options, None)
+    }
+
     /// Navigate backward with an optional cancellation signal.
     pub fn go_back_with_cancel(
         &self,
         options: GotoOptions,
         cancel: Option<&CancelToken>,
     ) -> Result<Value> {
-        let timeout = duration_from_timeout_ms(options.timeout);
-        let json =
-            self.inner
-                .go_back_with_cancel(options.wait_until.as_deref(), timeout, cancel)?;
+        let json = self.inner.go_back_with_cancel(
+            options.wait_until.as_deref(),
+            duration_from_timeout_ms(options.timeout),
+            cancel,
+        )?;
         Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn go_back_with_cancel_observed(
+        &self,
+        options: GotoOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<HistoryNavigationObservation> {
+        let timeout = duration_from_timeout_ms(options.timeout);
+        let observation = self.inner.go_back_with_cancel_observed(
+            options.wait_until.as_deref(),
+            timeout,
+            cancel,
+        )?;
+        map_history_navigation_observation(observation)
     }
 
     /// Navigate backward and report whether a history entry existed.
@@ -694,10 +858,9 @@ impl Page {
         options: GotoOptions,
         cancel: Option<&CancelToken>,
     ) -> Result<(bool, Value)> {
-        let timeout = duration_from_timeout_ms(options.timeout);
         let (had_entry, json) = self.inner.go_back_with_cancel_status(
             options.wait_until.as_deref(),
-            timeout,
+            duration_from_timeout_ms(options.timeout),
             cancel,
         )?;
         Ok((had_entry, serde_json::from_str(&json)?))
@@ -708,17 +871,39 @@ impl Page {
         self.go_forward_with_cancel(options, None)
     }
 
+    pub fn go_forward_observed(
+        &self,
+        options: GotoOptions,
+    ) -> Result<HistoryNavigationObservation> {
+        self.go_forward_with_cancel_observed(options, None)
+    }
+
     /// Navigate forward with an optional cancellation signal.
     pub fn go_forward_with_cancel(
         &self,
         options: GotoOptions,
         cancel: Option<&CancelToken>,
     ) -> Result<Value> {
-        let timeout = duration_from_timeout_ms(options.timeout);
-        let json =
-            self.inner
-                .go_forward_with_cancel(options.wait_until.as_deref(), timeout, cancel)?;
+        let json = self.inner.go_forward_with_cancel(
+            options.wait_until.as_deref(),
+            duration_from_timeout_ms(options.timeout),
+            cancel,
+        )?;
         Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn go_forward_with_cancel_observed(
+        &self,
+        options: GotoOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<HistoryNavigationObservation> {
+        let timeout = duration_from_timeout_ms(options.timeout);
+        let observation = self.inner.go_forward_with_cancel_observed(
+            options.wait_until.as_deref(),
+            timeout,
+            cancel,
+        )?;
+        map_history_navigation_observation(observation)
     }
 
     /// Navigate forward and report whether a history entry existed.
@@ -727,10 +912,9 @@ impl Page {
         options: GotoOptions,
         cancel: Option<&CancelToken>,
     ) -> Result<(bool, Value)> {
-        let timeout = duration_from_timeout_ms(options.timeout);
         let (had_entry, json) = self.inner.go_forward_with_cancel_status(
             options.wait_until.as_deref(),
-            timeout,
+            duration_from_timeout_ms(options.timeout),
             cancel,
         )?;
         Ok((had_entry, serde_json::from_str(&json)?))
@@ -741,17 +925,36 @@ impl Page {
         self.reload_with_cancel(options, None)
     }
 
+    pub fn reload_observed(&self, options: GotoOptions) -> Result<NavigationObservation> {
+        self.reload_with_cancel_observed(options, None)
+    }
+
     /// Reload with an optional cancellation signal.
     pub fn reload_with_cancel(
         &self,
         options: GotoOptions,
         cancel: Option<&CancelToken>,
     ) -> Result<Value> {
-        let timeout = duration_from_timeout_ms(options.timeout);
-        let json = self
-            .inner
-            .reload_with_cancel(options.wait_until.as_deref(), timeout, cancel)?;
+        let json = self.inner.reload_with_cancel(
+            options.wait_until.as_deref(),
+            duration_from_timeout_ms(options.timeout),
+            cancel,
+        )?;
         Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn reload_with_cancel_observed(
+        &self,
+        options: GotoOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<NavigationObservation> {
+        let timeout = duration_from_timeout_ms(options.timeout);
+        let observation = self.inner.reload_with_cancel_observed(
+            options.wait_until.as_deref(),
+            timeout,
+            cancel,
+        )?;
+        map_navigation_observation(observation)
     }
 
     /// Wait until the page reaches a load lifecycle state.
@@ -1291,6 +1494,32 @@ fn map_page_event(event: rustwright_core::RustwrightPageEvent) -> PageEvent {
     }
 }
 
+fn map_navigation_detail(detail: rustwright_core::RustwrightNavigationDetail) -> NavigationDetail {
+    NavigationDetail {
+        url: detail.url,
+        same_document: detail.same_document,
+    }
+}
+
+fn map_navigation_observation(
+    observation: rustwright_core::NavigationObservation,
+) -> Result<NavigationObservation> {
+    Ok(NavigationObservation {
+        response_json: serde_json::from_str(&observation.response_json)?,
+        main_status: observation.main_status,
+        same_document: observation.same_document,
+    })
+}
+
+fn map_history_navigation_observation(
+    observation: rustwright_core::HistoryNavigationObservation,
+) -> Result<HistoryNavigationObservation> {
+    Ok(HistoryNavigationObservation {
+        had_entry: observation.had_entry,
+        navigation: map_navigation_observation(observation.navigation)?,
+    })
+}
+
 fn duration_from_timeout_ms(timeout_ms: Option<f64>) -> Duration {
     match timeout_ms {
         Some(ms) if ms <= 0.0 => Duration::from_secs(24 * 60 * 60),
@@ -1379,6 +1608,271 @@ mod tests {
         let _: fn(&Page, &str, &str, ActionOptions) -> Result<()> = Page::drag_and_drop;
         let _: fn(&Page, &str, &str, ActionOptions, Option<&CancelToken>) -> Result<()> =
             Page::drag_and_drop_with_cancel;
+    }
+
+    #[test]
+    fn public_page_event_enum_remains_exhaustively_matchable() {
+        fn event_name(event: PageEvent) -> &'static str {
+            match event {
+                PageEvent::Dialog { .. } => "dialog",
+                PageEvent::FileChooser { .. } => "filechooser",
+                PageEvent::Download { .. } => "download",
+                PageEvent::PageCrashed => "crashed",
+                PageEvent::Closed => "closed",
+                PageEvent::Navigated { url: _ } => "navigated",
+            }
+        }
+
+        assert_eq!(
+            event_name(PageEvent::Navigated {
+                url: "https://example.test/".to_owned(),
+            }),
+            "navigated"
+        );
+    }
+
+    #[test]
+    fn navigation_observation_and_detail_conversion_preserve_additive_fields() {
+        let observation = map_navigation_observation(rustwright_core::NavigationObservation {
+            response_json: r#"{"status":201}"#.to_owned(),
+            main_status: Some(201),
+            same_document: false,
+        })
+        .unwrap();
+        assert_eq!(observation.response_json, json!({"status": 201}));
+        assert_eq!(observation.main_status, Some(201));
+        assert!(!observation.same_document);
+
+        assert_eq!(
+            map_navigation_detail(rustwright_core::RustwrightNavigationDetail {
+                url: "https://example.test/#same".to_owned(),
+                same_document: true,
+            }),
+            NavigationDetail {
+                url: "https://example.test/#same".to_owned(),
+                same_document: true,
+            }
+        );
+    }
+
+    #[test]
+    fn deterministic_legacy_public_navigation_methods_preserve_exact_values() {
+        #[derive(Clone, Copy)]
+        enum Call {
+            Goto,
+            GotoWithCancel,
+            Back,
+            BackWithCancel,
+            BackStatus,
+            Forward,
+            ForwardWithCancel,
+            ForwardStatus,
+            Reload,
+            ReloadWithCancel,
+        }
+
+        enum CallResult {
+            Value(Value),
+            Status(bool, Value),
+        }
+
+        fn exact_response(request_id: &str, url: &str, status: u16) -> Value {
+            json!({
+                "request_id": request_id,
+                "loader_id": format!("{request_id}-loader"),
+                "frame_id": null,
+                "resource_type": "Document",
+                "url": url,
+                "status": status,
+                "status_text": null,
+                "headers": {},
+                "encoded_data_length": null,
+                "protocol": null,
+                "remote_ip_address": null,
+                "remote_port": null,
+                "security_details": null,
+                "from_disk_cache": false,
+                "from_service_worker": false
+            })
+        }
+
+        fn run(call: Call) -> CallResult {
+            let mut harness = rustwright_core::RustwrightNavigationHarness::new(16);
+            let page = Page {
+                inner: harness.page(),
+            };
+            let responder = thread::spawn(move || match call {
+                Call::Goto | Call::GotoWithCancel => {
+                    harness.reply_next(
+                        "Page.navigate",
+                        json!({ "frameId": "frame-main", "loaderId": "goto-loader" }),
+                    );
+                    harness.emit(json!({
+                        "sessionId": "page-session",
+                        "method": "Network.responseReceived",
+                        "params": {
+                            "requestId": "goto",
+                            "loaderId": "goto-loader",
+                            "type": "Document",
+                            "response": {
+                                "url": "https://example.test/goto",
+                                "status": 200,
+                                "headers": {}
+                            }
+                        }
+                    }));
+                }
+                Call::Back | Call::BackWithCancel | Call::BackStatus => {
+                    harness.reply_next(
+                        "Page.getNavigationHistory",
+                        json!({
+                            "currentIndex": 1,
+                            "entries": [
+                                { "id": 1, "url": "https://example.test/back" },
+                                { "id": 2, "url": "https://example.test/current" }
+                            ]
+                        }),
+                    );
+                    harness.reply_next("Page.navigateToHistoryEntry", json!({}));
+                    harness.emit(json!({
+                        "sessionId": "page-session",
+                        "method": "Network.responseReceived",
+                        "params": {
+                            "requestId": "back",
+                            "loaderId": "back-loader",
+                            "type": "Document",
+                            "response": {
+                                "url": "https://example.test/back",
+                                "status": 201,
+                                "headers": {}
+                            }
+                        }
+                    }));
+                }
+                Call::Forward | Call::ForwardWithCancel | Call::ForwardStatus => {
+                    harness.reply_next(
+                        "Page.getNavigationHistory",
+                        json!({
+                            "currentIndex": 0,
+                            "entries": [
+                                { "id": 1, "url": "https://example.test/current" },
+                                { "id": 2, "url": "https://example.test/forward" }
+                            ]
+                        }),
+                    );
+                    harness.reply_next("Page.navigateToHistoryEntry", json!({}));
+                    harness.emit(json!({
+                        "sessionId": "page-session",
+                        "method": "Network.responseReceived",
+                        "params": {
+                            "requestId": "forward",
+                            "loaderId": "forward-loader",
+                            "type": "Document",
+                            "response": {
+                                "url": "https://example.test/forward",
+                                "status": 202,
+                                "headers": {}
+                            }
+                        }
+                    }));
+                }
+                Call::Reload | Call::ReloadWithCancel => {
+                    harness.reply_next("Page.reload", json!({}));
+                }
+            });
+            let options = GotoOptions::default().wait_until("commit").timeout(1_000.0);
+            let result = match call {
+                Call::Goto => {
+                    CallResult::Value(page.goto("https://example.test/goto", options).unwrap())
+                }
+                Call::GotoWithCancel => CallResult::Value(
+                    page.goto_with_cancel("https://example.test/goto", options, None)
+                        .unwrap(),
+                ),
+                Call::Back => CallResult::Value(page.go_back(options).unwrap()),
+                Call::BackWithCancel => {
+                    CallResult::Value(page.go_back_with_cancel(options, None).unwrap())
+                }
+                Call::BackStatus => {
+                    let (had_entry, value) =
+                        page.go_back_with_cancel_status(options, None).unwrap();
+                    CallResult::Status(had_entry, value)
+                }
+                Call::Forward => CallResult::Value(page.go_forward(options).unwrap()),
+                Call::ForwardWithCancel => {
+                    CallResult::Value(page.go_forward_with_cancel(options, None).unwrap())
+                }
+                Call::ForwardStatus => {
+                    let (had_entry, value) =
+                        page.go_forward_with_cancel_status(options, None).unwrap();
+                    CallResult::Status(had_entry, value)
+                }
+                Call::Reload => CallResult::Value(page.reload(options).unwrap()),
+                Call::ReloadWithCancel => {
+                    CallResult::Value(page.reload_with_cancel(options, None).unwrap())
+                }
+            };
+            responder.join().unwrap();
+            result
+        }
+
+        let expected = [
+            (
+                [Call::Goto, Call::GotoWithCancel].as_slice(),
+                exact_response("goto", "https://example.test/goto", 200),
+            ),
+            (
+                [Call::Back, Call::BackWithCancel].as_slice(),
+                exact_response("back", "https://example.test/back", 201),
+            ),
+            (
+                [Call::Forward, Call::ForwardWithCancel].as_slice(),
+                exact_response("forward", "https://example.test/forward", 202),
+            ),
+            (
+                [Call::Reload, Call::ReloadWithCancel].as_slice(),
+                Value::Null,
+            ),
+        ];
+        for (calls, expected) in expected {
+            for call in calls {
+                let CallResult::Value(actual) = run(*call) else {
+                    panic!("expected a value result")
+                };
+                assert_eq!(actual, expected);
+            }
+        }
+        for (call, expected) in [
+            (
+                Call::BackStatus,
+                exact_response("back", "https://example.test/back", 201),
+            ),
+            (
+                Call::ForwardStatus,
+                exact_response("forward", "https://example.test/forward", 202),
+            ),
+        ] {
+            let CallResult::Status(had_entry, actual) = run(call) else {
+                panic!("expected a status result")
+            };
+            assert!(had_entry);
+            assert_eq!(actual, expected);
+        }
+
+        for forward in [false, true] {
+            let harness = rustwright_core::RustwrightNavigationHarness::new(4);
+            let page = Page {
+                inner: harness.page(),
+            };
+            let cancel = CancelToken::new();
+            cancel.cancel();
+            let result = if forward {
+                page.go_forward_with_cancel(GotoOptions::default(), Some(&cancel))
+            } else {
+                page.go_back_with_cancel(GotoOptions::default(), Some(&cancel))
+            };
+            assert!(matches!(result, Err(Error::Cancelled)));
+        }
     }
 
     #[test]
