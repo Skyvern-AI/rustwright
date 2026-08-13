@@ -98,7 +98,7 @@ pending dialog details and defer further page work until
 `browser_handle_dialog` resolves it.
 
 Set `RUSTWRIGHT_MCP_TOOLSET=lean` to expose the smaller interaction-oriented
-profile. The default `mirror` profile exposes all 22 native tools.
+profile. The default `mirror` profile exposes all 27 native tools.
 `browser_evaluate` can be removed from either profile by setting
 `RUSTWRIGHT_MCP_ALLOW_EVAL=false`.
 
@@ -107,10 +107,58 @@ profile. The default `mirror` profile exposes all 22 native tools.
 | Variable | Effect |
 |---|---|
 | `RUSTWRIGHT_CHROMIUM` / `CHROME` / `CHROMIUM` | Path to the browser executable to launch. |
+| `RUSTWRIGHT_MCP_CDP_ENDPOINT` | Connect to an existing browser through its HTTP CDP endpoint instead of launching locally. |
+| `RUSTWRIGHT_MCP_CDP_HEADERS` | JSON object containing headers for the remote CDP connection. |
+| `RUSTWRIGHT_MCP_CDP_TIMEOUT_MS` | Positive remote connection timeout in milliseconds. |
+| `RUSTWRIGHT_MCP_TOOL_TIMEOUT_MS` | Browser tool timeout in milliseconds. |
 | `RUSTWRIGHT_MCP_TOOLSET` | Tool profile: `mirror` (default) or `lean`. |
 | `RUSTWRIGHT_MCP_ALLOW_EVAL` | Enable or disable `browser_evaluate`; defaults to enabled. |
 | `RUSTWRIGHT_MCP_WORKSPACE` | Absolute directory that confines file paths supplied to `browser_drop`. |
 | `RUSTWRIGHT_MCP_SCREENSHOT_MAX_BYTES` | Largest screenshot returned inline. Oversized captures are written to a private (0600) temp file and the path is returned instead. |
+| `RUSTWRIGHT_MCP_BUDGET` | `on` enables client-aware text response shaping; defaults to `off`. Codex product ids (`codex`, `codex-mcp-client`, and `codex-*`) use exact 9 KiB/200-line JSON-RPC limits. Unknown clients remain unbounded unless an explicit nonzero limit is set. |
+| `RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES` | Overrides the profile byte limit. `0` disables this dimension; nonzero values below 4096 or invalid values warn and use the profile default. |
+| `RUSTWRIGHT_MCP_MAX_RESPONSE_LINES` | Overrides the decoded text line limit. `0` disables this dimension; nonzero values below 16 or invalid values warn and use the profile default. |
+| `RUSTWRIGHT_MCP_CONSOLE_DEDUP` | `on` collapses adjacent inline console duplicates by severity and normalized text. File exports remain verbatim. Defaults to `off`. |
+| `RUSTWRIGHT_MCP_NET_NOTE` | `on` reports successful static requests hidden after regex filtering. `static:true` still returns them. Defaults to `off`. |
+| `RUSTWRIGHT_MCP_DISTILL` | `on` enables bounded full-tree construction, full-subset refs/find, and render-only snapshot distillation. `off` selects the retained legacy traversal before page-side ref mutation. Defaults to `off`. |
+| `RUSTWRIGHT_MCP_HEADER` | `on` prepends a change-triggered `### Page` digest with the active URL, title when available, navigation status, and console error/warning counts. Unchanged page state is not repeated. Defaults to `off`. |
+| `RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS` | `on` serves shorter descriptions with narrowing guidance; `off` serves the byte-compatible legacy catalog. When unset or invalid, recognized Codex clients default to `on` and other clients to `off`; invalid values warn. |
+
+Budgeting is applied to text success results, browser errors, and validation or
+unknown-tool JSON-RPC errors. Image blocks and explicit file-output contracts are
+unchanged. Explicit response dimensions take precedence over the matched client
+profile; `RUSTWRIGHT_MCP_BUDGET=off` bypasses all response shaping.
+
+The Codex treatment deployment is an explicit all-on configuration; peer
+identification alone defaults only lean descriptions to `on`:
+
+```text
+RUSTWRIGHT_MCP_BUDGET=on
+RUSTWRIGHT_MCP_DISTILL=on
+RUSTWRIGHT_MCP_HEADER=on
+RUSTWRIGHT_MCP_CONSOLE_DEDUP=on
+RUSTWRIGHT_MCP_NET_NOTE=on
+RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS=on
+RUSTWRIGHT_MCP_TOOLSET=mirror
+```
+
+Treated console presentation attributes messages to the first page frame;
+legacy presentation preserves Chromium's raw top-frame attribution.
+
+The hermetic configuration regression fixture records the initialize frame and
+capture metadata observed from Codex CLI 0.146.0. CI parses that static fixture;
+it does not execute Codex or require network access, authentication, or a
+browser. Live recapture is a manual release compatibility check when updating
+supported client metadata. The fixture verifies profile selection only and does
+not establish or quantify token savings.
+
+Snapshot traversal executes in the page's main JavaScript world. This preserves
+the existing trust boundary: page scripts can observe or patch the traversal.
+With distillation enabled, construction stops after 50,000 visited elements or
+250 ms in-page and reports incomplete coverage. Refs cover only the constructed
+subset. Semantic and explicit click markers are detected, followed by the
+nearest `cursor:pointer` boundary; targets discoverable only through
+`addEventListener` remain a known miss. Render distillation never shortens hrefs.
 
 ## Development
 

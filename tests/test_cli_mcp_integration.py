@@ -63,6 +63,17 @@ def _read_response(process, messages, request_id, timeout):
 def test_mcp_cli_real_stdio_initialize_and_tools_list():
     binary = _native_server_binary()
     environment = os.environ.copy()
+    for variable in (
+        "RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES",
+        "RUSTWRIGHT_MCP_MAX_RESPONSE_LINES",
+        "RUSTWRIGHT_MCP_BUDGET",
+        "RUSTWRIGHT_MCP_DISTILL",
+        "RUSTWRIGHT_MCP_HEADER",
+        "RUSTWRIGHT_MCP_CONSOLE_DEDUP",
+        "RUSTWRIGHT_MCP_NET_NOTE",
+        "RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS",
+    ):
+        environment.pop(variable, None)
     python_path = str(REPOSITORY / "python")
     if environment.get("PYTHONPATH"):
         python_path += os.pathsep + environment["PYTHONPATH"]

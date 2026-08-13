@@ -1,0 +1,26 @@
+{
+  "captured_at_utc": "2026-08-06",
+  "codex_cli_version": "0.146.0",
+  "codex_js_launcher_sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477",
+  "codex_native_binary_sha256": "ae1d3ffe6d48aec6a4dc3f50e7eb8e0d11962485a6a9406c5a7012139383da02",
+  "initialize_frame": {
+    "id": 0,
+    "jsonrpc": "2.0",
+    "method": "initialize",
+    "params": {
+      "capabilities": {
+        "elicitation": {
+          "form": {},
+          "url": {}
+        }
+      },
+      "clientInfo": {
+        "name": "codex-mcp-client",
+        "title": "Codex",
+        "version": "0.146.0"
+      },
+      "protocolVersion": "2025-06-18"
+    }
+  },
+  "schema_version": 1
+}
