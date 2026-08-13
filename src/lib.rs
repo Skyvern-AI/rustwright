@@ -3265,6 +3265,8 @@ multiline-compatible = """4.5.6"""
                 close_target_on_drop: AtomicBool::new(false),
                 console_records: Mutex::new(ConsoleRecordStore::default()),
                 console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                console_replay_until_event_cursor: Mutex::new(HashMap::new()),
+                observation_event_cursor: AtomicU64::new(0),
                 native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
             }),
         };
@@ -3394,6 +3396,8 @@ multiline-compatible = """4.5.6"""
                 close_target_on_drop: AtomicBool::new(false),
                 console_records: Mutex::new(ConsoleRecordStore::default()),
                 console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                console_replay_until_event_cursor: Mutex::new(HashMap::new()),
+                observation_event_cursor: AtomicU64::new(0),
                 native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
             }),
         };
@@ -4003,6 +4007,8 @@ multiline-compatible = """4.5.6"""
                 network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
                 console_records: Mutex::new(ConsoleRecordStore::default()),
                 console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                console_replay_until_event_cursor: Mutex::new(HashMap::new()),
+                observation_event_cursor: AtomicU64::new(0),
                 native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
                 event_stream_start_cursor: 0,
                 background_override_active: Arc::new(AtomicBool::new(false)),
@@ -4023,33 +4029,28 @@ multiline-compatible = """4.5.6"""
         helper: &str,
         operation: impl FnOnce(&RustwrightPage, &CancelToken) -> RwResult<Vec<String>>,
     ) {
-        const MAX_EXPECTED_ELAPSED: Duration = Duration::from_millis(250);
-        const MUTATION_GUARD: Duration = Duration::from_millis(500);
-
-        let (page, _unanswered_commands) = page_with_unanswered_cdp();
+        let (page, mut unanswered_commands) = page_with_unanswered_cdp();
         let cancel = CancelToken::new();
-        let guard_cancel = cancel.clone();
-        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
-        let guard = std::thread::spawn(move || {
-            if completed_rx.recv_timeout(MUTATION_GUARD).is_err() {
-                let _ = guard_cancel.try_cancel();
-            }
-        });
-
-        let started = Instant::now();
         let result = operation(&page, &cancel);
-        let elapsed = started.elapsed();
-        let _ = completed_tx.send(());
-        guard.join().unwrap();
 
+        // Timeout(N) is produced from the exact budget passed to the unanswered
+        // CDP command. Unlike wall time, it is unaffected by scheduler stalls.
         assert!(
             matches!(result, Err(RwError::Timeout(25))),
             "{helper} should surface the 25 ms caller timeout, got {result:?}"
         );
-        assert!(
-            elapsed < MAX_EXPECTED_ELAPSED,
-            "{helper} should honor the caller timeout well before the 30 s default; elapsed {elapsed:?}"
+        let command: Value = match unanswered_commands
+            .try_recv()
+            .expect("selection should reach an unanswered CDP command")
+        {
+            CdpOutgoing::Text { payload, .. } => serde_json::from_str(&payload).unwrap(),
+            CdpOutgoing::Close => panic!("selection unexpectedly closed the CDP transport"),
+        };
+        assert_eq!(
+            command["method"], "Page.getFrameTree",
+            "{helper} should reach selection session resolution"
         );
+        assert_eq!(command["sessionId"], "test-session");
     }
 
     #[test]
@@ -4659,6 +4660,14 @@ multiline-compatible = """4.5.6"""
             .to_string();
 
         assert_eq!(error, "Unknown permission: unknown-permission");
+    }
+
+    #[test]
+    fn chromium_default_launch_args_disable_system_keychains() {
+        let args = chromium_default_launch_args(&LaunchOptions::default());
+
+        assert!(args.iter().any(|arg| arg == "--password-store=basic"));
+        assert!(args.iter().any(|arg| arg == "--use-mock-keychain"));
     }
 
     #[test]
@@ -5825,6 +5834,8 @@ multiline-compatible = """4.5.6"""
             network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
             console_records: Mutex::new(ConsoleRecordStore::default()),
             console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+            console_replay_until_event_cursor: Mutex::new(HashMap::new()),
+            observation_event_cursor: AtomicU64::new(0),
             native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
             event_stream_start_cursor: 0,
             background_override_active: Arc::new(AtomicBool::new(false)),
@@ -6311,6 +6322,8 @@ multiline-compatible = """4.5.6"""
                 network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
                 console_records: Mutex::new(ConsoleRecordStore::default()),
                 console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                console_replay_until_event_cursor: Mutex::new(HashMap::new()),
+                observation_event_cursor: AtomicU64::new(0),
                 native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
                 event_stream_start_cursor: 0,
                 background_override_active: Arc::new(AtomicBool::new(false)),
@@ -6990,6 +7003,19 @@ multiline-compatible = """4.5.6"""
     }
 
     impl NavigationTestHarness {
+        fn try_next_command_any(&mut self) -> Option<Value> {
+            match self.write_rx.try_recv() {
+                Ok(CdpOutgoing::Text { payload, .. }) => {
+                    Some(serde_json::from_str(&payload).unwrap())
+                }
+                Ok(CdpOutgoing::Close) => panic!("unexpected transport close"),
+                Err(mpsc::error::TryRecvError::Empty) => None,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("CDP test transport closed")
+                }
+            }
+        }
+
         async fn next_command_any(&mut self) -> Value {
             let command: Value = match self.write_rx.recv().await.expect("CDP test command") {
                 CdpOutgoing::Text { payload, .. } => serde_json::from_str(&payload).unwrap(),
@@ -7049,7 +7075,7 @@ multiline-compatible = """4.5.6"""
             alive_tx,
         });
         let browser = Arc::new(BrowserInner {
-            runtime: OwnedRuntime(None),
+            runtime: OwnedRuntime::new(tokio::runtime::Runtime::new().unwrap()),
             client,
             process: Mutex::new(None),
             profile_dir: Mutex::new(None),
@@ -7072,6 +7098,8 @@ multiline-compatible = """4.5.6"""
             network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
             console_records: Mutex::new(ConsoleRecordStore::default()),
             console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+            console_replay_until_event_cursor: Mutex::new(HashMap::new()),
+            observation_event_cursor: AtomicU64::new(0),
             native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
             event_stream_start_cursor: 0,
             background_override_active: Arc::new(AtomicBool::new(false)),
@@ -7090,6 +7118,1613 @@ multiline-compatible = """4.5.6"""
             pending,
             events,
             event_log,
+        }
+    }
+
+    #[test]
+    fn public_page_event_enum_remains_exhaustively_matchable() {
+        fn event_name(event: RustwrightPageEvent) -> &'static str {
+            match event {
+                RustwrightPageEvent::Dialog { .. } => "dialog",
+                RustwrightPageEvent::FileChooser { .. } => "filechooser",
+                RustwrightPageEvent::Download { .. } => "download",
+                RustwrightPageEvent::PageCrashed => "crashed",
+                RustwrightPageEvent::Closed => "closed",
+                RustwrightPageEvent::Navigated { url: _ } => "navigated",
+            }
+        }
+
+        assert_eq!(
+            event_name(RustwrightPageEvent::Navigated {
+                url: "https://example.test/".to_owned(),
+            }),
+            "navigated"
+        );
+    }
+
+    #[test]
+    fn legacy_navigation_events_and_opt_in_details_report_both_navigation_classes() {
+        let harness = navigation_test_harness(4);
+        *harness.page.main_frame_id.lock().unwrap() = Some("frame-1".to_owned());
+        let frame = json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": { "frame": { "id": "frame-1", "url": "https://example.test/a" } }
+        });
+        let within = json!({
+            "sessionId": "page-session",
+            "method": "Page.navigatedWithinDocument",
+            "params": { "frameId": "frame-1", "url": "https://example.test/a#b" }
+        });
+
+        for (event, same_document) in [(&frame, false), (&within, true)] {
+            let (legacy, terminal) = native_page_event_from_cdp(&harness.page, event).unwrap();
+            assert!(!terminal);
+            assert!(matches!(legacy, RustwrightPageEvent::Navigated { url: _ }));
+            let detail = native_navigation_detail_from_cdp(&harness.page, event).unwrap();
+            assert_eq!(detail.same_document, same_document);
+        }
+    }
+
+    #[test]
+    fn navigation_detail_stream_is_opt_in_and_delivers_beside_legacy_events() {
+        let harness = navigation_test_harness(32);
+        *harness.page.main_frame_id.lock().unwrap() = Some("frame-1".to_owned());
+        assert_eq!(harness.events.receiver_count(), 0);
+
+        let page = RustwrightPage {
+            inner: Arc::clone(&harness.page),
+        };
+        let legacy = page.events();
+        let details_a = page.navigation_details();
+        let details_b = page.navigation_details();
+        assert_eq!(harness.events.receiver_count(), 3);
+
+        for event in [
+            json!({
+                "sessionId": "page-session",
+                "method": "Page.frameNavigated",
+                "params": { "frame": { "id": "frame-1", "url": "https://example.test/a" } }
+            }),
+            json!({
+                "sessionId": "page-session",
+                "method": "Page.navigatedWithinDocument",
+                "params": { "frameId": "frame-1", "url": "https://example.test/a#same" }
+            }),
+        ] {
+            harness.emit(event);
+        }
+
+        assert!(matches!(
+            legacy.recv_timeout(Duration::from_secs(1)),
+            Some(RustwrightPageEvent::Navigated { url }) if url == "https://example.test/a"
+        ));
+        assert!(matches!(
+            legacy.recv_timeout(Duration::from_secs(1)),
+            Some(RustwrightPageEvent::Navigated { url }) if url == "https://example.test/a#same"
+        ));
+        for details in [&details_a, &details_b] {
+            assert_eq!(
+                details.recv_timeout(Duration::from_secs(1)),
+                Some(RustwrightNavigationDetail {
+                    url: "https://example.test/a".to_owned(),
+                    same_document: false,
+                })
+            );
+            assert_eq!(
+                details.recv_timeout(Duration::from_secs(1)),
+                Some(RustwrightNavigationDetail {
+                    url: "https://example.test/a#same".to_owned(),
+                    same_document: true,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn navigation_detail_queue_drops_oldest_at_capacity() {
+        let harness = navigation_test_harness(256);
+        *harness.page.main_frame_id.lock().unwrap() = Some("frame-main".to_owned());
+        let page = RustwrightPage {
+            inner: Arc::clone(&harness.page),
+        };
+        let receiver = page.navigation_details();
+        assert_eq!(receiver.capacity(), 128);
+        for index in 0..130 {
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.frameNavigated",
+                "params": {
+                    "frame": {
+                        "id": "frame-main",
+                        "url": format!("https://example.test/{index}")
+                    }
+                }
+            }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while receiver.dropped_count() < 2 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let retained = (0..128)
+            .map(|_| receiver.recv_timeout(Duration::from_secs(1)).unwrap().url)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained,
+            (2..130)
+                .map(|index| format!("https://example.test/{index}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(receiver.dropped_count(), 2);
+    }
+
+    #[test]
+    fn navigation_detail_boundary_uses_ingress_sequence_before_forwarding() {
+        let harness = navigation_test_harness(8);
+        *harness.page.main_frame_id.lock().unwrap() = Some("frame-main".to_owned());
+        let page = RustwrightPage {
+            inner: Arc::clone(&harness.page),
+        };
+        let receiver = page.navigation_details();
+
+        // Hold the production queue lock so the real receiver task cannot
+        // forward the detail even though CDP ingress and its event-log sequence
+        // have completed.
+        let queue_guard = receiver.queue.state.lock().unwrap();
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "frame-main",
+                    "url": "https://example.test/pre-boundary"
+                }
+            }
+        }));
+        let boundary = receiver.latest_sequence();
+        assert!(boundary > 0, "ingress must advance the producer watermark");
+        drop(queue_guard);
+
+        let (sequence, detail) = receiver
+            .recv_timeout_sequenced(Duration::from_secs(1))
+            .expect("the delayed production receiver should forward the detail");
+        assert_eq!(detail.url, "https://example.test/pre-boundary");
+        assert!(
+            sequence <= boundary,
+            "an event published before the boundary must remain pre-boundary after delayed delivery"
+        );
+    }
+
+    #[test]
+    fn dropping_navigation_detail_receiver_stops_its_subscription() {
+        let harness = navigation_test_harness(8);
+        let page = RustwrightPage {
+            inner: Arc::clone(&harness.page),
+        };
+        let details = page.navigation_details();
+        assert_eq!(harness.events.receiver_count(), 1);
+        drop(details);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while harness.events.receiver_count() != 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(harness.events.receiver_count(), 0);
+    }
+
+    #[test]
+    fn no_entry_history_observation_has_unambiguous_null_shape() {
+        assert_eq!(
+            no_history_navigation_observation(),
+            HistoryNavigationObservation {
+                had_entry: false,
+                navigation: NavigationObservation {
+                    response_json: "null".to_owned(),
+                    main_status: None,
+                    same_document: false,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn observed_main_status_rejects_non_integer_non_numeric_and_out_of_range_values() {
+        assert_eq!(
+            main_response_status(Some(&json!({ "status": 200 }))),
+            Some(200)
+        );
+        for response in [
+            json!({ "status": -1 }),
+            json!({ "status": 200.5 }),
+            json!({ "status": 65_536 }),
+            json!({ "status": "200" }),
+            json!({ "status": null }),
+        ] {
+            assert_eq!(main_response_status(Some(&response)), None, "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_goto_extracts_valid_main_status_and_marks_no_loader_as_same_document() {
+        let mut harness = navigation_test_harness(8);
+        let navigation = page_goto_observed_async(
+            Arc::clone(&harness.page),
+            "https://example.test/observed".to_owned(),
+            "load".to_owned(),
+            Duration::from_secs(1),
+            None,
+        );
+        let responder = async move {
+            harness
+                .reply_next(
+                    "Page.navigate",
+                    json!({ "frameId": "frame-1", "loaderId": "loader-1" }),
+                )
+                .await;
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "request-1",
+                    "loaderId": "loader-1",
+                    "type": "Document",
+                    "response": {
+                        "url": "https://example.test/observed",
+                        "status": 204,
+                        "headers": {}
+                    }
+                }
+            }));
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.loadEventFired",
+                "params": {}
+            }));
+        };
+        let (observation, ()) = tokio::join!(navigation, responder);
+        let observation = observation.unwrap();
+        assert_eq!(observation.main_status, Some(204));
+        assert!(!observation.same_document);
+        assert_eq!(
+            serde_json::from_str::<Value>(&observation.response_json).unwrap()["status"],
+            json!(204)
+        );
+
+        let mut harness = navigation_test_harness(4);
+        let navigation = page_goto_observed_async(
+            Arc::clone(&harness.page),
+            "https://example.test/observed#same".to_owned(),
+            "load".to_owned(),
+            Duration::from_secs(1),
+            None,
+        );
+        let responder = async move {
+            harness
+                .reply_next("Page.navigate", json!({ "frameId": "frame-1" }))
+                .await;
+        };
+        let (observation, ()) = tokio::join!(navigation, responder);
+        assert_eq!(
+            observation.unwrap(),
+            NavigationObservation {
+                response_json: "null".to_owned(),
+                main_status: None,
+                same_document: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_goto_recognizes_loader_present_within_document_event() {
+        let mut harness = navigation_test_harness(8);
+        let navigation = page_goto_observed_async(
+            Arc::clone(&harness.page),
+            "https://example.test/app#next".to_owned(),
+            "load".to_owned(),
+            Duration::from_secs(1),
+            None,
+        );
+        let responder = async move {
+            harness
+                .reply_next(
+                    "Page.navigate",
+                    json!({ "frameId": "frame-1", "loaderId": "loader-1" }),
+                )
+                .await;
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.navigatedWithinDocument",
+                "params": {
+                    "frameId": "frame-1",
+                    "url": "https://example.test/app#next"
+                }
+            }));
+        };
+        let (observation, ()) = tokio::join!(navigation, responder);
+        assert_eq!(
+            observation.unwrap(),
+            NavigationObservation {
+                response_json: "null".to_owned(),
+                main_status: None,
+                same_document: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_goto_holds_followup_snapshot_until_legacy_load_completion() {
+        let mut harness = navigation_test_harness(16);
+        let page = Arc::clone(&harness.page);
+        let operation = async move {
+            let observation = page_goto_observed_async(
+                Arc::clone(&page),
+                "https://example.test/goto".to_owned(),
+                "load".to_owned(),
+                Duration::from_secs(1),
+                None,
+            )
+            .await?;
+            let snapshot = evaluate_expression_for_page_async(
+                page,
+                "document.body.textContent".to_owned(),
+                Duration::from_secs(1),
+            )
+            .await?;
+            Ok::<_, RwError>((observation, snapshot))
+        };
+        tokio::pin!(operation);
+
+        assert!(matches!(
+            futures_util::poll!(&mut operation),
+            std::task::Poll::Pending
+        ));
+        harness
+            .reply_next(
+                "Page.navigate",
+                json!({ "frameId": "frame-main", "loaderId": "loader-goto" }),
+            )
+            .await;
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.responseReceived",
+            "params": {
+                "requestId": "request-goto",
+                "loaderId": "loader-goto",
+                "frameId": "frame-main",
+                "type": "Document",
+                "response": {
+                    "url": "https://example.test/goto",
+                    "status": 201,
+                    "headers": {}
+                }
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "frame-main",
+                    "url": "https://example.test/goto"
+                }
+            }
+        }));
+
+        assert!(matches!(
+            futures_util::poll!(&mut operation),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            harness.try_next_command_any().is_none(),
+            "the post-action snapshot evaluation must not be issued at frameNavigated"
+        );
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.loadEventFired",
+            "params": {}
+        }));
+        assert!(matches!(
+            futures_util::poll!(&mut operation),
+            std::task::Poll::Pending
+        ));
+        let snapshot = harness.next_command("Runtime.evaluate").await;
+        assert_eq!(
+            snapshot
+                .pointer("/params/expression")
+                .and_then(Value::as_str),
+            Some("document.body.textContent")
+        );
+        harness.reply(
+            &snapshot,
+            json!({ "result": { "type": "string", "value": "Goto complete" } }),
+        );
+
+        let std::task::Poll::Ready(result) = futures_util::poll!(&mut operation) else {
+            panic!("snapshot evaluation should complete after the load event")
+        };
+        let (observation, snapshot) = result.unwrap();
+        assert_eq!(observation.main_status, Some(201));
+        assert_eq!(snapshot, r#""Goto complete""#);
+    }
+
+    #[tokio::test]
+    async fn observed_reload_captures_status_while_legacy_projection_stays_null() {
+        let mut harness = navigation_test_harness(8);
+        let navigation = page_reload_observed_async(
+            Arc::clone(&harness.page),
+            Arc::clone(&harness.page.browser.client),
+            "page-session".to_owned(),
+            "load".to_owned(),
+            Duration::from_secs(1),
+        );
+        let responder = async move {
+            harness
+                .reply_next(
+                    "Page.getFrameTree",
+                    json!({ "frameTree": { "frame": { "id": "frame-main", "url": "https://example.test/reload" } } }),
+                )
+                .await;
+            harness.reply_next("Page.reload", json!({})).await;
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "request-reload",
+                    "loaderId": "loader-reload",
+                    "frameId": "frame-main",
+                    "type": "Document",
+                    "response": {
+                        "url": "https://example.test/reload",
+                        "status": 304,
+                        "headers": {}
+                    }
+                }
+            }));
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "request-iframe",
+                    "loaderId": "loader-iframe",
+                    "frameId": "frame-child",
+                    "type": "Document",
+                    "response": {
+                        "url": "https://example.test/frame",
+                        "status": 404,
+                        "headers": {}
+                    }
+                }
+            }));
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.loadEventFired",
+                "params": {}
+            }));
+        };
+        let (observation, ()) = tokio::join!(navigation, responder);
+        let observation = observation.unwrap();
+        assert_eq!(observation.main_status, Some(304), "{observation:?}");
+    }
+
+    #[tokio::test]
+    async fn observed_reload_holds_followup_snapshot_until_legacy_load_completion() {
+        let mut harness = navigation_test_harness(16);
+        let page = Arc::clone(&harness.page);
+        let client = Arc::clone(&page.browser.client);
+        let operation = async move {
+            let observation = page_reload_observed_async(
+                Arc::clone(&page),
+                client,
+                "page-session".to_owned(),
+                "load".to_owned(),
+                Duration::from_secs(1),
+            )
+            .await?;
+            let snapshot = evaluate_expression_for_page_async(
+                page,
+                "document.body.textContent".to_owned(),
+                Duration::from_secs(1),
+            )
+            .await?;
+            Ok::<_, RwError>((observation, snapshot))
+        };
+        tokio::pin!(operation);
+
+        assert!(matches!(
+            futures_util::poll!(&mut operation),
+            std::task::Poll::Pending
+        ));
+        harness
+            .reply_next(
+                "Page.getFrameTree",
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "frame-main",
+                            "url": "https://example.test/reload"
+                        }
+                    }
+                }),
+            )
+            .await;
+        assert!(matches!(
+            futures_util::poll!(&mut operation),
+            std::task::Poll::Pending
+        ));
+        harness.reply_next("Page.reload", json!({})).await;
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.responseReceived",
+            "params": {
+                "requestId": "request-reload",
+                "loaderId": "loader-reload",
+                "frameId": "frame-main",
+                "type": "Document",
+                "response": {
+                    "url": "https://example.test/reload",
+                    "status": 200,
+                    "headers": {}
+                }
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "frame-main",
+                    "url": "https://example.test/reload"
+                }
+            }
+        }));
+
+        assert!(matches!(
+            futures_util::poll!(&mut operation),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            harness.try_next_command_any().is_none(),
+            "the post-action snapshot evaluation must not be issued at frameNavigated"
+        );
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.loadEventFired",
+            "params": {}
+        }));
+        assert!(matches!(
+            futures_util::poll!(&mut operation),
+            std::task::Poll::Pending
+        ));
+        let snapshot = harness.next_command("Runtime.evaluate").await;
+        assert_eq!(
+            snapshot
+                .pointer("/params/expression")
+                .and_then(Value::as_str),
+            Some("document.body.textContent")
+        );
+        harness.reply(
+            &snapshot,
+            json!({ "result": { "type": "string", "value": "Status waiting" } }),
+        );
+
+        let std::task::Poll::Ready(result) = futures_util::poll!(&mut operation) else {
+            panic!("snapshot evaluation should complete after the load event")
+        };
+        let (observation, snapshot) = result.unwrap();
+        assert_eq!(observation.main_status, Some(200));
+        assert_eq!(snapshot, r#""Status waiting""#);
+    }
+
+    #[tokio::test]
+    async fn observed_reload_and_history_require_resolved_main_frame() {
+        let mut reload_harness = navigation_test_harness(4);
+        let reload = page_reload_observed_async(
+            Arc::clone(&reload_harness.page),
+            Arc::clone(&reload_harness.page.browser.client),
+            "page-session".to_owned(),
+            "commit".to_owned(),
+            Duration::from_secs(1),
+        );
+        let reload_responder = async move {
+            reload_harness
+                .reply_next("Page.getFrameTree", json!({ "frameTree": {} }))
+                .await;
+        };
+        let (reload, ()) = tokio::join!(reload, reload_responder);
+        assert!(
+            matches!(reload, Err(RwError::Message(message)) if message.contains("main frame id"))
+        );
+
+        let mut history_harness = navigation_test_harness(4);
+        let history = page_history_observed_async(
+            Arc::clone(&history_harness.page),
+            Arc::clone(&history_harness.page.browser.client),
+            "page-session".to_owned(),
+            -1,
+            "commit".to_owned(),
+            Duration::from_secs(1),
+        );
+        let history_responder = async move {
+            history_harness
+                .reply_next(
+                    "Page.getNavigationHistory",
+                    json!({
+                        "currentIndex": 1,
+                        "entries": [
+                            { "id": 1, "url": "https://example.test/same" },
+                            { "id": 2, "url": "https://example.test/current" }
+                        ]
+                    }),
+                )
+                .await;
+            history_harness
+                .reply_next("Page.getFrameTree", json!({ "frameTree": {} }))
+                .await;
+        };
+        let (history, ()) = tokio::join!(history, history_responder);
+        assert!(
+            matches!(history, Err(RwError::Message(message)) if message.contains("main frame id"))
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_reload_and_history_reject_same_url_iframe_without_seeded_frame_ids() {
+        let mut reload_harness = navigation_test_harness(12);
+        let reload = page_reload_observed_async(
+            Arc::clone(&reload_harness.page),
+            Arc::clone(&reload_harness.page.browser.client),
+            "page-session".to_owned(),
+            "commit".to_owned(),
+            Duration::from_secs(1),
+        );
+        let reload_responder = async move {
+            reload_harness
+                .reply_next(
+                    "Page.getFrameTree",
+                    json!({ "frameTree": { "frame": { "id": "main" } } }),
+                )
+                .await;
+            reload_harness.reply_next("Page.reload", json!({})).await;
+            for (request_id, frame_id, status) in [("iframe", "child", 418), ("main", "main", 205)]
+            {
+                reload_harness.emit(json!({
+                    "sessionId": "page-session",
+                    "method": "Network.responseReceived",
+                    "params": {
+                        "requestId": request_id,
+                        "loaderId": request_id,
+                        "frameId": frame_id,
+                        "type": "Document",
+                        "response": {
+                            "url": "https://example.test/same",
+                            "status": status,
+                            "headers": {}
+                        }
+                    }
+                }));
+            }
+        };
+        let (reload, ()) = tokio::join!(reload, reload_responder);
+        assert_eq!(reload.unwrap().main_status, Some(205));
+
+        let mut history_harness = navigation_test_harness(12);
+        let history = page_history_observed_async(
+            Arc::clone(&history_harness.page),
+            Arc::clone(&history_harness.page.browser.client),
+            "page-session".to_owned(),
+            -1,
+            "commit".to_owned(),
+            Duration::from_secs(1),
+        );
+        let history_responder = async move {
+            history_harness
+                .reply_next(
+                    "Page.getNavigationHistory",
+                    json!({
+                        "currentIndex": 1,
+                        "entries": [
+                            { "id": 1, "url": "https://example.test/same" },
+                            { "id": 2, "url": "https://example.test/current" }
+                        ]
+                    }),
+                )
+                .await;
+            history_harness
+                .reply_next(
+                    "Page.getFrameTree",
+                    json!({ "frameTree": { "frame": { "id": "main" } } }),
+                )
+                .await;
+            history_harness
+                .reply_next("Page.navigateToHistoryEntry", json!({}))
+                .await;
+            for (request_id, frame_id, status) in [("iframe", "child", 419), ("main", "main", 206)]
+            {
+                history_harness.emit(json!({
+                    "sessionId": "page-session",
+                    "method": "Network.responseReceived",
+                    "params": {
+                        "requestId": request_id,
+                        "loaderId": request_id,
+                        "frameId": frame_id,
+                        "type": "Document",
+                        "response": {
+                            "url": "https://example.test/same",
+                            "status": status,
+                            "headers": {}
+                        }
+                    }
+                }));
+            }
+        };
+        let (history, ()) = tokio::join!(history, history_responder);
+        assert_eq!(history.unwrap().navigation.main_status, Some(206));
+    }
+
+    #[tokio::test]
+    async fn observed_back_and_forward_preserve_entry_and_wait_metadata() {
+        let mut harness = navigation_test_harness(8);
+        let navigation = page_history_observed_async(
+            Arc::clone(&harness.page),
+            Arc::clone(&harness.page.browser.client),
+            "page-session".to_owned(),
+            -1,
+            "commit".to_owned(),
+            Duration::from_secs(1),
+        );
+        let responder = async move {
+            harness
+                .reply_next(
+                    "Page.getNavigationHistory",
+                    json!({
+                        "currentIndex": 1,
+                        "entries": [
+                            { "id": 1, "url": "https://example.test/a" },
+                            { "id": 2, "url": "https://example.test/b" }
+                        ]
+                    }),
+                )
+                .await;
+            harness
+                .reply_next(
+                    "Page.getFrameTree",
+                    json!({ "frameTree": { "frame": { "id": "frame-1" } } }),
+                )
+                .await;
+            harness
+                .reply_next("Page.navigateToHistoryEntry", json!({}))
+                .await;
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.navigatedWithinDocument",
+                "params": { "frameId": "frame-1", "url": "https://example.test/a" }
+            }));
+        };
+        let (back, ()) = tokio::join!(navigation, responder);
+        let back = back.unwrap();
+        assert!(back.had_entry);
+        assert!(back.navigation.same_document);
+        assert_eq!(back.navigation.main_status, None);
+
+        let mut harness = navigation_test_harness(16);
+        let navigation = page_history_observed_async(
+            Arc::clone(&harness.page),
+            Arc::clone(&harness.page.browser.client),
+            "page-session".to_owned(),
+            1,
+            "load".to_owned(),
+            Duration::from_secs(1),
+        );
+        let responder = async move {
+            harness
+                .reply_next(
+                    "Page.getNavigationHistory",
+                    json!({
+                        "currentIndex": 0,
+                        "entries": [
+                            { "id": 1, "url": "https://example.test/a" },
+                            { "id": 2, "url": "https://example.test/b" }
+                        ]
+                    }),
+                )
+                .await;
+            harness
+                .reply_next(
+                    "Page.getFrameTree",
+                    json!({ "frameTree": { "frame": { "id": "frame-main" } } }),
+                )
+                .await;
+            harness
+                .reply_next("Page.navigateToHistoryEntry", json!({}))
+                .await;
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "request-forward",
+                    "loaderId": "loader-forward",
+                    "frameId": "frame-main",
+                    "type": "Document",
+                    "response": {
+                        "url": "https://example.test/b",
+                        "status": 201,
+                        "headers": {}
+                    }
+                }
+            }));
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "request-frame",
+                    "loaderId": "loader-frame",
+                    "frameId": "frame-child",
+                    "type": "Document",
+                    "response": {
+                        "url": "https://example.test/frame",
+                        "status": 404,
+                        "headers": {}
+                    }
+                }
+            }));
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.loadEventFired",
+                "params": {}
+            }));
+            harness
+                .reply_next(
+                    "Runtime.evaluate",
+                    json!({ "result": { "type": "string", "value": "complete" } }),
+                )
+                .await;
+            harness
+                .reply_next(
+                    "Page.getFrameTree",
+                    json!({ "frameTree": { "frame": { "id": "frame-main" } } }),
+                )
+                .await;
+        };
+        let (forward, ()) = tokio::join!(navigation, responder);
+        let forward = forward.unwrap();
+        assert!(forward.had_entry);
+        assert!(!forward.navigation.same_document);
+        assert_eq!(forward.navigation.main_status, Some(201));
+    }
+
+    #[test]
+    fn legacy_public_navigation_methods_preserve_pre_observation_results() {
+        let mut harness = navigation_test_harness(16);
+        let page = RustwrightPage {
+            inner: Arc::clone(&harness.page),
+        };
+        let handle = harness.page.browser.runtime.handle().clone();
+        handle.spawn(async move {
+            harness
+                .reply_next(
+                    "Page.navigate",
+                    json!({ "frameId": "frame-main", "loaderId": "loader-main" }),
+                )
+                .await;
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "request-main",
+                    "loaderId": "loader-main",
+                    "frameId": "frame-main",
+                    "type": "Document",
+                    "response": {
+                        "url": "https://example.test/legacy",
+                        "status": 200,
+                        "statusText": "OK",
+                        "headers": {}
+                    }
+                }
+            }));
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.loadEventFired",
+                "params": {}
+            }));
+        });
+        let goto = page
+            .goto(
+                "https://example.test/legacy",
+                Some("load"),
+                Some(1_000.0),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            goto,
+            json!({
+                "request_id": "request-main",
+                "loader_id": "loader-main",
+                "frame_id": "frame-main",
+                "resource_type": "Document",
+                "url": "https://example.test/legacy",
+                "status": 200,
+                "status_text": "OK",
+                "headers": {},
+                "encoded_data_length": null,
+                "protocol": null,
+                "remote_ip_address": null,
+                "remote_port": null,
+                "security_details": null,
+                "from_disk_cache": false,
+                "from_service_worker": false
+            })
+            .to_string()
+        );
+
+        for offset in [-1_i64, 1] {
+            let mut harness = navigation_test_harness(4);
+            let page = RustwrightPage {
+                inner: Arc::clone(&harness.page),
+            };
+            let handle = harness.page.browser.runtime.handle().clone();
+            handle.spawn(async move {
+                harness
+                    .reply_next(
+                        "Page.getNavigationHistory",
+                        json!({ "currentIndex": 0, "entries": [{ "id": 1, "url": "about:blank" }] }),
+                    )
+                    .await;
+            });
+            let result = if offset < 0 {
+                page.go_back_with_cancel_status(Some("load"), Duration::from_secs(1), None)
+            } else {
+                page.go_forward_with_cancel_status(Some("load"), Duration::from_secs(1), None)
+            }
+            .unwrap();
+            assert_eq!(result, (false, "null".to_owned()));
+        }
+
+        let mut harness = navigation_test_harness(4);
+        let page = RustwrightPage {
+            inner: Arc::clone(&harness.page),
+        };
+        let handle = harness.page.browser.runtime.handle().clone();
+        handle.spawn(async move {
+            harness.reply_next("Page.reload", json!({})).await;
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.loadEventFired",
+                "params": {}
+            }));
+        });
+        assert_eq!(
+            page.reload(Some("load"), Duration::from_secs(1)).unwrap(),
+            "null"
+        );
+    }
+
+    #[test]
+    fn legacy_history_accepts_base_event_ordering_with_stale_or_absent_frame_ids() {
+        let mut harness = navigation_test_harness(16);
+        *harness.page.main_frame_id.lock().unwrap() = Some("stale-frame".to_owned());
+        let page = RustwrightPage {
+            inner: Arc::clone(&harness.page),
+        };
+        let handle = harness.page.browser.runtime.handle().clone();
+        handle.spawn(async move {
+            harness
+                .reply_next(
+                    "Page.getNavigationHistory",
+                    json!({
+                        "currentIndex": 1,
+                        "entries": [
+                            { "id": 1, "url": "https://example.test/a" },
+                            { "id": 2, "url": "https://example.test/b" }
+                        ]
+                    }),
+                )
+                .await;
+            harness
+                .reply_next("Page.navigateToHistoryEntry", json!({}))
+                .await;
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "legacy-main",
+                    "loaderId": "legacy-loader",
+                    "type": "Document",
+                    "response": {
+                        "url": "https://example.test/a",
+                        "status": 203,
+                        "headers": {}
+                    }
+                }
+            }));
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.navigatedWithinDocument",
+                "params": {
+                    "frameId": "fresh-frame",
+                    "url": "https://example.test/a"
+                }
+            }));
+        });
+        let response = page
+            .go_back_with_cancel(Some("commit"), Duration::from_secs(1), None)
+            .unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["status"], 203);
+        assert_eq!(response["url"], "https://example.test/a");
+    }
+
+    #[test]
+    fn legacy_history_accepts_first_document_even_when_url_differs() {
+        let mut harness = navigation_test_harness(8);
+        let page = RustwrightPage {
+            inner: Arc::clone(&harness.page),
+        };
+        let handle = harness.page.browser.runtime.handle().clone();
+        handle.spawn(async move {
+            harness
+                .reply_next(
+                    "Page.getNavigationHistory",
+                    json!({
+                        "currentIndex": 1,
+                        "entries": [
+                            { "id": 1, "url": "https://example.test/a" },
+                            { "id": 2, "url": "https://example.test/b" }
+                        ]
+                    }),
+                )
+                .await;
+            harness
+                .reply_next("Page.navigateToHistoryEntry", json!({}))
+                .await;
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "first-document",
+                    "type": "Document",
+                    "response": {
+                        "url": "https://example.test/b",
+                        "status": 218,
+                        "headers": {}
+                    }
+                }
+            }));
+        });
+        let response = page
+            .go_back_with_cancel(Some("commit"), Duration::from_secs(1), None)
+            .unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["url"], "https://example.test/b");
+        assert_eq!(response["status"], 218);
+    }
+
+    #[test]
+    fn legacy_history_accepts_matching_non_document_response() {
+        let mut harness = navigation_test_harness(8);
+        let page = RustwrightPage {
+            inner: Arc::clone(&harness.page),
+        };
+        let handle = harness.page.browser.runtime.handle().clone();
+        handle.spawn(async move {
+            harness
+                .reply_next(
+                    "Page.getNavigationHistory",
+                    json!({
+                        "currentIndex": 1,
+                        "entries": [
+                            { "id": 1, "url": "https://example.test/a" },
+                            { "id": 2, "url": "https://example.test/b" }
+                        ]
+                    }),
+                )
+                .await;
+            harness
+                .reply_next("Page.navigateToHistoryEntry", json!({}))
+                .await;
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "matching-script",
+                    "type": "Script",
+                    "response": {
+                        "url": "https://example.test/a",
+                        "status": 219,
+                        "headers": {}
+                    }
+                }
+            }));
+        });
+        let response = page
+            .go_back_with_cancel(Some("commit"), Duration::from_secs(1), None)
+            .unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["resource_type"], "Script");
+        assert_eq!(response["status"], 219);
+    }
+
+    #[test]
+    fn legacy_back_entry_present_returns_exact_pre_observation_json() {
+        let mut harness = navigation_test_harness(8);
+        let page = RustwrightPage {
+            inner: Arc::clone(&harness.page),
+        };
+        let handle = harness.page.browser.runtime.handle().clone();
+        handle.spawn(async move {
+            harness
+                .reply_next(
+                    "Page.getNavigationHistory",
+                    json!({
+                        "currentIndex": 1,
+                        "entries": [
+                            { "id": 1, "url": "https://example.test/a" },
+                            { "id": 2, "url": "https://example.test/b" }
+                        ]
+                    }),
+                )
+                .await;
+            harness
+                .reply_next("Page.navigateToHistoryEntry", json!({}))
+                .await;
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "back-main",
+                    "loaderId": "back-loader",
+                    "type": "Document",
+                    "response": {
+                        "url": "https://example.test/a",
+                        "status": 207,
+                        "headers": {}
+                    }
+                }
+            }));
+        });
+        let response = page
+            .go_back_with_cancel(Some("commit"), Duration::from_secs(1), None)
+            .unwrap();
+        assert_eq!(
+            response,
+            json!({
+                "request_id": "back-main",
+                "loader_id": "back-loader",
+                "frame_id": null,
+                "resource_type": "Document",
+                "url": "https://example.test/a",
+                "status": 207,
+                "status_text": null,
+                "headers": {},
+                "encoded_data_length": null,
+                "protocol": null,
+                "remote_ip_address": null,
+                "remote_port": null,
+                "security_details": null,
+                "from_disk_cache": false,
+                "from_service_worker": false
+            })
+            .to_string()
+        );
+    }
+
+    #[test]
+    fn legacy_forward_entry_present_returns_exact_pre_observation_json() {
+        let mut harness = navigation_test_harness(8);
+        let page = RustwrightPage {
+            inner: Arc::clone(&harness.page),
+        };
+        let handle = harness.page.browser.runtime.handle().clone();
+        handle.spawn(async move {
+            harness
+                .reply_next(
+                    "Page.getNavigationHistory",
+                    json!({
+                        "currentIndex": 0,
+                        "entries": [
+                            { "id": 1, "url": "https://example.test/a" },
+                            { "id": 2, "url": "https://example.test/b" }
+                        ]
+                    }),
+                )
+                .await;
+            harness
+                .reply_next("Page.navigateToHistoryEntry", json!({}))
+                .await;
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "forward-main",
+                    "loaderId": "forward-loader",
+                    "type": "Document",
+                    "response": {
+                        "url": "https://example.test/b",
+                        "status": 208,
+                        "headers": {}
+                    }
+                }
+            }));
+        });
+        let response = page
+            .go_forward_with_cancel(Some("commit"), Duration::from_secs(1), None)
+            .unwrap();
+        assert_eq!(
+            response,
+            json!({
+                "request_id": "forward-main",
+                "loader_id": "forward-loader",
+                "frame_id": null,
+                "resource_type": "Document",
+                "url": "https://example.test/b",
+                "status": 208,
+                "status_text": null,
+                "headers": {},
+                "encoded_data_length": null,
+                "protocol": null,
+                "remote_ip_address": null,
+                "remote_port": null,
+                "security_details": null,
+                "from_disk_cache": false,
+                "from_service_worker": false
+            })
+            .to_string()
+        );
+    }
+
+    #[test]
+    fn legacy_history_cancellation_variants_remain_cancelled() {
+        let harness = navigation_test_harness(4);
+        let page = RustwrightPage {
+            inner: Arc::clone(&harness.page),
+        };
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            page.go_back_with_cancel(Some("load"), Duration::from_secs(1), Some(&cancel)),
+            Err(RwError::Cancelled)
+        ));
+        assert!(matches!(
+            page.go_forward_with_cancel(Some("load"), Duration::from_secs(1), Some(&cancel)),
+            Err(RwError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn public_click_delivers_dialog_then_accepts_or_dismisses_to_completion() {
+        for accept in [true, false] {
+            let mut harness = navigation_test_harness(32);
+            let page = RustwrightPage {
+                inner: Arc::clone(&harness.page),
+            };
+            let events = page.events();
+            let (dialog_command_tx, dialog_command_rx) = std::sync::mpsc::channel();
+            let (responder_done_tx, responder_done_rx) = std::sync::mpsc::channel();
+            let handle = harness.page.browser.runtime.handle().clone();
+            handle.spawn(async move {
+                harness
+                    .reply_next(
+                        "Page.navigate",
+                        json!({ "frameId": "frame-main", "loaderId": "loader-main" }),
+                    )
+                    .await;
+                harness.emit(json!({
+                    "sessionId": "page-session",
+                    "method": "Page.loadEventFired",
+                    "params": {}
+                }));
+                harness
+                    .reply_next(
+                        "Page.getFrameTree",
+                        json!({ "frameTree": { "frame": { "id": "frame-main", "url": "https://example.test/dialog" } } }),
+                    )
+                    .await;
+                harness
+                    .reply_next(
+                        "Runtime.evaluate",
+                        json!({
+                            "result": {
+                                "type": "object",
+                                "value": {
+                                    "count": 1,
+                                    "strict_violation": false,
+                                    "attached": true,
+                                    "visible": true,
+                                    "enabled": true,
+                                    "stable": true,
+                                    "receives_events": true,
+                                    "point_x": 5.0,
+                                    "point_y": 6.0,
+                                    "rect_x": 0.0,
+                                    "rect_y": 0.0
+                                }
+                            }
+                        }),
+                    )
+                    .await;
+                harness
+                    .reply_next(
+                        "Page.getFrameTree",
+                        json!({ "frameTree": { "frame": { "id": "frame-main", "url": "https://example.test/dialog" } } }),
+                    )
+                    .await;
+                harness
+                    .reply_next(
+                        "Runtime.evaluate",
+                        json!({ "result": { "type": "object", "objectId": "node-dialog" } }),
+                    )
+                    .await;
+                harness
+                    .reply_next(
+                        "DOM.getBoxModel",
+                        json!({ "model": { "border": [0, 0, 10, 0, 10, 12, 0, 12] } }),
+                    )
+                    .await;
+                harness.reply_next("Runtime.releaseObject", json!({})).await;
+                let mut ordering_barrier = None;
+                let mut dialog_handled = false;
+                let mut mouse_released = false;
+                while !mouse_released || !dialog_handled || ordering_barrier.is_none() {
+                    let command = harness.next_command_any().await;
+                    match command["method"].as_str() {
+                        Some("Input.dispatchMouseEvent") => {
+                            let event_type = command.pointer("/params/type").and_then(Value::as_str);
+                            assert!(
+                                harness.events.receiver_count() >= 2,
+                                "public dialog and settlement receivers must exist before click dispatch"
+                            );
+                            if event_type == Some("mousePressed") {
+                                harness.emit(json!({
+                                    "sessionId": "page-session",
+                                    "method": "Page.javascriptDialogOpening",
+                                    "params": { "type": "confirm", "message": "continue?" }
+                                }));
+                            }
+                            harness.reply(&command, json!({}));
+                            if event_type == Some("mouseReleased") {
+                                assert!(!mouse_released, "mouseReleased must be sent exactly once");
+                                mouse_released = true;
+                            }
+                        }
+                        Some("Runtime.evaluate") => {
+                            assert!(ordering_barrier.is_none(), "duplicate ordering barrier");
+                            ordering_barrier = Some(command);
+                        }
+                        Some("Page.handleJavaScriptDialog") => {
+                            assert!(!dialog_handled, "dialog must be handled exactly once");
+                            assert_eq!(command["params"]["accept"], accept);
+                            harness.reply(&command, json!({}));
+                            dialog_command_tx.send(()).unwrap();
+                            dialog_handled = true;
+                        }
+                        method => {
+                            panic!("unexpected command while click or dialog is pending: {method:?}")
+                        }
+                    }
+                }
+                let barrier = ordering_barrier.expect("pointer ordering barrier");
+                harness.reply(
+                    &barrier,
+                    json!({ "result": { "type": "undefined" } }),
+                );
+                responder_done_tx.send(()).unwrap();
+            });
+
+            page.goto(
+                "https://example.test/dialog",
+                Some("load"),
+                Some(1_000.0),
+                None,
+            )
+            .expect("public goto prerequisite");
+            let (click_tx, click_rx) = std::sync::mpsc::channel();
+            let click_page = page.clone();
+            let click = std::thread::spawn(move || {
+                click_tx
+                    .send(click_page.click("#dialog", Some(1_000.0)))
+                    .unwrap();
+            });
+            let RustwrightPageEvent::Dialog { dialog, .. } = events
+                .recv_timeout(Duration::from_secs(1))
+                .expect("public click must deliver its dialog")
+            else {
+                panic!("expected dialog event")
+            };
+            assert!(
+                matches!(
+                    click_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "click must remain pending until the dialog is resolved"
+            );
+            if accept {
+                dialog.accept(None).unwrap();
+            } else {
+                dialog.dismiss().unwrap();
+            }
+            dialog_command_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("dialog command must complete");
+            click_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("click completion must arrive")
+                .expect("public click should complete");
+            responder_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("CDP responder must complete");
+            click.join().expect("join public click");
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum PublicSettledAction {
+        Scroll,
+        Hover,
+        Check,
+    }
+
+    fn run_public_settled_action(action: PublicSettledAction) {
+        let mut harness = navigation_test_harness(32);
+        let page = RustwrightPage {
+            inner: Arc::clone(&harness.page),
+        };
+        let handle = harness.page.browser.runtime.handle().clone();
+        handle.spawn(async move {
+            harness
+                .reply_next(
+                    "Page.navigate",
+                    json!({ "frameId": "frame-main", "loaderId": "loader-main" }),
+                )
+                .await;
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.loadEventFired",
+                "params": {}
+            }));
+            harness
+                .reply_next(
+                    "Page.getFrameTree",
+                    json!({ "frameTree": { "frame": { "id": "frame-main", "url": "https://example.test/action" } } }),
+                )
+                .await;
+
+            if matches!(action, PublicSettledAction::Scroll) {
+                let dispatch = harness.next_command("Runtime.evaluate").await;
+                assert!(
+                    harness.events.receiver_count() >= 1,
+                    "scroll settlement must subscribe before its dispatch"
+                );
+                harness.reply(
+                    &dispatch,
+                    json!({ "result": { "type": "boolean", "value": true } }),
+                );
+                harness
+                    .reply_next(
+                        "Runtime.evaluate",
+                        json!({ "result": { "type": "undefined" } }),
+                    )
+                    .await;
+                return;
+            }
+
+            harness
+                .reply_next(
+                    "Runtime.evaluate",
+                    json!({
+                        "result": {
+                            "type": "object",
+                            "value": {
+                                "count": 1,
+                                "strict_violation": false,
+                                "attached": true,
+                                "visible": true,
+                                "enabled": true,
+                                "stable": true,
+                                "receives_events": true,
+                                "point_x": 5.0,
+                                "point_y": 6.0,
+                                "rect_x": 0.0,
+                                "rect_y": 0.0
+                            }
+                        }
+                    }),
+                )
+                .await;
+            harness
+                .reply_next(
+                    "Page.getFrameTree",
+                    json!({ "frameTree": { "frame": { "id": "frame-main", "url": "https://example.test/action" } } }),
+                )
+                .await;
+            harness
+                .reply_next(
+                    "Runtime.evaluate",
+                    json!({ "result": { "type": "object", "objectId": "node-1" } }),
+                )
+                .await;
+            harness
+                .reply_next(
+                    "DOM.getBoxModel",
+                    json!({ "model": { "border": [0, 0, 10, 0, 10, 12, 0, 12] } }),
+                )
+                .await;
+            harness.reply_next("Runtime.releaseObject", json!({})).await;
+
+            if matches!(action, PublicSettledAction::Check) {
+                harness
+                    .reply_next(
+                        "Runtime.evaluate",
+                        json!({
+                            "result": {
+                                "type": "string",
+                                "value": "{\"valid\":true,\"checked\":false,\"native_radio\":false}"
+                            }
+                        }),
+                    )
+                    .await;
+            }
+
+            loop {
+                let command = harness.next_command_any().await;
+                let method = command["method"].as_str().unwrap();
+                if method == "Input.dispatchMouseEvent" {
+                    assert!(
+                        harness.events.receiver_count() >= 1,
+                        "pointer settlement must subscribe before input dispatch"
+                    );
+                    let event_type = command.pointer("/params/type").and_then(Value::as_str);
+                    harness.reply(&command, json!({}));
+                    if matches!(action, PublicSettledAction::Hover)
+                        || event_type == Some("mouseReleased")
+                    {
+                        break;
+                    }
+                } else {
+                    panic!("unexpected action command: {command}");
+                }
+            }
+            harness
+                .reply_next(
+                    "Runtime.evaluate",
+                    json!({ "result": { "type": "undefined" } }),
+                )
+                .await;
+            if matches!(action, PublicSettledAction::Check) {
+                harness
+                    .reply_next(
+                        "Runtime.evaluate",
+                        json!({ "result": { "type": "boolean", "value": true } }),
+                    )
+                    .await;
+            }
+        });
+
+        page.goto(
+            "https://example.test/action",
+            Some("load"),
+            Some(1_000.0),
+            None,
+        )
+        .expect("public goto prerequisite");
+        match action {
+            PublicSettledAction::Scroll => page.scroll_into_view("#target"),
+            PublicSettledAction::Hover => page.hover("#target"),
+            PublicSettledAction::Check => page.check("#target"),
+        }
+        .expect("public settled action");
+    }
+
+    #[test]
+    fn public_goto_then_scroll_hover_and_check_subscribe_before_dispatch() {
+        for action in [
+            PublicSettledAction::Scroll,
+            PublicSettledAction::Hover,
+            PublicSettledAction::Check,
+        ] {
+            run_public_settled_action(action);
         }
     }
 
@@ -7118,6 +8753,9 @@ multiline-compatible = """4.5.6"""
             "load",
             None,
             Some("https://example.test/app#second"),
+            Some("frame-1"),
+            Some("https://example.test/app#second"),
+            false,
             "Page.go_forward",
             OperationDeadline::new(Duration::from_millis(100)),
         )
@@ -7159,7 +8797,7 @@ multiline-compatible = """4.5.6"""
                 .await;
         };
 
-        let (result, ()) = tokio::time::timeout(Duration::from_millis(500), async {
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(navigation, responder)
         })
         .await
@@ -7192,7 +8830,7 @@ multiline-compatible = """4.5.6"""
             harness.next_command("Runtime.evaluate").await;
         };
 
-        let (result, ()) = tokio::time::timeout(Duration::from_millis(210), async {
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(navigation, responder)
         })
         .await
@@ -7242,7 +8880,7 @@ multiline-compatible = """4.5.6"""
                 .await;
         };
 
-        let (result, ()) = tokio::time::timeout(Duration::from_millis(300), async {
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(navigation, responder)
         })
         .await
@@ -7300,7 +8938,7 @@ multiline-compatible = """4.5.6"""
             evaluate_count
         };
 
-        let (result, evaluate_count) = tokio::time::timeout(Duration::from_millis(300), async {
+        let (result, evaluate_count) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(navigation, responder)
         })
         .await
@@ -8239,7 +9877,6 @@ fn dispatch_cdp_payload_with_diagnostics(
     }
 }
 
-#[cfg(test)]
 fn dispatch_cdp_payload(
     payload: Value,
     pending: CdpPendingMap,
@@ -9497,7 +11134,7 @@ async fn query_browser_targets_for_diagnostic(
     {
         Ok(response) => response,
         Err(error) => {
-            return BrowserTargetQueryDiagnostic::Unavailable(diagnostic_error_kind(&error))
+            return BrowserTargetQueryDiagnostic::Unavailable(diagnostic_error_kind(&error));
         }
     };
     let Some(target_infos) = response.get("targetInfos").and_then(Value::as_array) else {
@@ -9831,6 +11468,8 @@ struct PageInner {
     network_requests: Arc<Mutex<NetworkRequestStore>>,
     console_records: Mutex<ConsoleRecordStore>,
     console_capture: tokio::sync::Mutex<ConsoleCaptureState>,
+    console_replay_until_event_cursor: Mutex<HashMap<String, u64>>,
+    observation_event_cursor: AtomicU64,
     native_network_records: Mutex<NativeNetworkRecordStore>,
     event_stream_start_cursor: u64,
     background_override_active: Arc<AtomicBool>,
@@ -10232,8 +11871,16 @@ impl ConsoleRecordStore {
         self.navigation_epoch = self.navigation_epoch.saturating_add(1);
     }
 
-    fn push(&mut self, mut record: RustwrightConsoleRecord) {
-        record.navigation_epoch = self.navigation_epoch;
+    fn push(&mut self, record: RustwrightConsoleRecord) {
+        self.push_at_epoch(record, self.navigation_epoch);
+    }
+
+    fn push_capture_baseline(&mut self, record: RustwrightConsoleRecord) {
+        self.push_at_epoch(record, 0);
+    }
+
+    fn push_at_epoch(&mut self, mut record: RustwrightConsoleRecord, navigation_epoch: u64) {
+        record.navigation_epoch = navigation_epoch;
         if self.records.len() == NATIVE_CONSOLE_RECORD_CAPACITY {
             if let Some(evicted) = self.records.pop_front() {
                 *self
@@ -14677,6 +16324,9 @@ async fn page_goto_async(
         &wait_until,
         loader_id.as_deref(),
         None,
+        None,
+        None,
+        false,
         "Page.goto",
         deadline,
     )
@@ -14710,6 +16360,302 @@ async fn page_goto_async(
             })
         })
         .to_string())
+}
+
+async fn page_goto_observed_async(
+    page: Arc<PageInner>,
+    url: String,
+    wait_until: String,
+    timeout: Duration,
+    referer: Option<String>,
+) -> RwResult<NavigationObservation> {
+    page_goto_observed_impl(page, url, wait_until, timeout, referer).await
+}
+
+async fn page_goto_observed_impl(
+    page: Arc<PageInner>,
+    url: String,
+    wait_until: String,
+    timeout: Duration,
+    referer: Option<String>,
+) -> RwResult<NavigationObservation> {
+    let deadline = OperationDeadline::new(timeout);
+    let started_at = Instant::now();
+    let client = Arc::clone(&page.browser.client);
+    let session_id = page.session_id.clone();
+    let (mut events, event_cursor) = client.subscribe_with_cursor();
+    // Observation may finish at the matching main-frame navigation so it can
+    // retain the response status. Keep a second, pre-dispatch subscription for
+    // the legacy goto completion point: with no expected URL, Page.frameNavigated
+    // cannot stand in for the requested load state.
+    let (mut completion_events, completion_event_cursor) = client.subscribe_with_cursor();
+    let target_url = url.clone();
+    let mut params = json!({ "url": url });
+    if let Some(referer) = referer {
+        params["referrer"] = Value::String(referer);
+        params["referrerPolicy"] = Value::String("unsafeUrl".to_string());
+    }
+    let result = match client
+        .send(
+            "Page.navigate",
+            params,
+            Some(&session_id),
+            deadline.remaining()?,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(error @ RwError::Timeout(_)) => {
+            emit_browser_timeout_diagnostic(
+                Arc::clone(&page.browser),
+                "Page.goto",
+                "CDP command Page.navigate response".to_string(),
+                started_at,
+            )
+            .await;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(error_text) = result.get("errorText").and_then(Value::as_str) {
+        let failed_url = result
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or(target_url.as_str());
+        return Err(RwError::Message(format!(
+            "Page.goto: {error_text} at {failed_url}"
+        )));
+    }
+    let loader_id = result
+        .get("loaderId")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let frame_id = result
+        .get("frameId")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    if loader_id.is_none() {
+        if let Some(frame_id) = result.get("frameId").and_then(Value::as_str) {
+            page.record_main_frame_navigation_url(frame_id, &target_url);
+        }
+        return Ok(NavigationObservation {
+            response_json: Value::Null.to_string(),
+            main_status: None,
+            same_document: true,
+        });
+    }
+    let response = match wait_for_navigation(
+        &client,
+        &mut events,
+        event_cursor,
+        &session_id,
+        &wait_until,
+        loader_id.as_deref(),
+        None,
+        frame_id.as_deref(),
+        Some(target_url.as_str()),
+        false,
+        "Page.goto",
+        deadline,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error @ RwError::Timeout(_)) => {
+            let lifecycle = match wait_until.as_str() {
+                "commit" => "commit",
+                "domcontentloaded" => "domcontentloaded",
+                "networkidle" => "networkidle",
+                _ => "load",
+            };
+            emit_browser_timeout_diagnostic(
+                Arc::clone(&page.browser),
+                "Page.goto",
+                format!("CDP navigation lifecycle event {lifecycle}"),
+                started_at,
+            )
+            .await;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    if !response.same_document {
+        wait_for_navigation(
+            &client,
+            &mut completion_events,
+            completion_event_cursor,
+            &session_id,
+            &wait_until,
+            loader_id.as_deref(),
+            None,
+            None,
+            None,
+            false,
+            "Page.goto",
+            deadline,
+        )
+        .await?;
+    }
+    let fallback = || {
+        json!({
+            "url": result.get("url").cloned().unwrap_or(Value::Null),
+            "loader_id": loader_id,
+        })
+    };
+    Ok(observation_from_wait(response, fallback))
+}
+
+async fn page_reload_observed_async(
+    page: Arc<PageInner>,
+    client: Arc<CdpClient>,
+    session_id: String,
+    wait_until: String,
+    timeout: Duration,
+) -> RwResult<NavigationObservation> {
+    let deadline = OperationDeadline::new(timeout);
+    let expected_frame_id = page
+        .main_frame_id(&client, &session_id, deadline.remaining()?)
+        .await?;
+    let expected_url = page.cached_main_frame_url();
+    let (mut events, event_cursor) = client.subscribe_with_cursor();
+    // The observed waiter can capture the main response and finish on the
+    // matching Page.frameNavigated event. The legacy reload contract instead
+    // completes only after its requested load-state event, so subscribe before
+    // Page.reload for that independent completion wait as well.
+    let mut completion_events = client.subscribe();
+    loop {
+        match client
+            .send(
+                "Page.reload",
+                json!({}),
+                Some(&session_id),
+                deadline.remaining()?,
+            )
+            .await
+        {
+            Ok(_) => break,
+            Err(error) if is_page_not_attached_error(&error) => {
+                wait_for_page_attachment_signal(&mut events, &session_id, deadline).await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let response = wait_for_navigation(
+        &client,
+        &mut events,
+        event_cursor,
+        &session_id,
+        &wait_until,
+        None,
+        expected_url.as_deref(),
+        Some(expected_frame_id.as_str()),
+        expected_url.as_deref(),
+        false,
+        "Page.reload",
+        deadline,
+    )
+    .await?;
+    if wait_until != "commit" {
+        wait_for_load_state(
+            &client,
+            &mut completion_events,
+            &session_id,
+            &wait_until,
+            deadline.remaining()?,
+        )
+        .await?;
+    }
+    Ok(observation_from_wait(response, || Value::Null))
+}
+
+async fn page_history_observed_async(
+    page: Arc<PageInner>,
+    client: Arc<CdpClient>,
+    session_id: String,
+    offset: i64,
+    wait_until: String,
+    timeout: Duration,
+) -> RwResult<HistoryNavigationObservation> {
+    let deadline = OperationDeadline::new(timeout);
+    let history = client
+        .send(
+            "Page.getNavigationHistory",
+            json!({}),
+            Some(&session_id),
+            deadline.remaining()?,
+        )
+        .await?;
+    let current_index = history
+        .get("currentIndex")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RwError::Cdp {
+            method: "Page.getNavigationHistory".to_string(),
+            message: "response did not include currentIndex".to_string(),
+        })?;
+    let target_index = current_index + offset;
+    let entries = history
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RwError::Cdp {
+            method: "Page.getNavigationHistory".to_string(),
+            message: "response did not include entries".to_string(),
+        })?;
+    if target_index < 0 || target_index as usize >= entries.len() {
+        return Ok(no_history_navigation_observation());
+    }
+    let entry = &entries[target_index as usize];
+    let entry_id = entry
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RwError::Cdp {
+            method: "Page.getNavigationHistory".to_string(),
+            message: "entry did not include id".to_string(),
+        })?;
+    let target_url = entry
+        .get("url")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let main_frame_id = page
+        .main_frame_id(&client, &session_id, deadline.remaining()?)
+        .await?;
+    let (mut events, event_cursor) = client.subscribe_with_cursor();
+    client
+        .send(
+            "Page.navigateToHistoryEntry",
+            json!({ "entryId": entry_id }),
+            Some(&session_id),
+            deadline.remaining()?,
+        )
+        .await?;
+    let response = wait_for_navigation(
+        &client,
+        &mut events,
+        event_cursor,
+        &session_id,
+        &wait_until,
+        None,
+        target_url.as_deref(),
+        Some(main_frame_id.as_str()),
+        target_url.as_deref(),
+        false,
+        if offset < 0 {
+            "Page.go_back"
+        } else {
+            "Page.go_forward"
+        },
+        deadline,
+    )
+    .await?;
+    if !response.same_document && wait_until != "commit" {
+        settle_history_navigation(&client, &mut events, &session_id, &wait_until, deadline).await?;
+    }
+    if let Some(target_url) = target_url.as_deref() {
+        page.record_main_frame_navigation_url(&main_frame_id, target_url);
+    }
+    Ok(HistoryNavigationObservation {
+        had_entry: true,
+        navigation: observation_from_wait(response, || Value::Null),
+    })
 }
 
 fn is_locator_wait_context_loss(error: &RwError) -> bool {
@@ -15712,12 +17658,12 @@ fn classify_fill_attempt(result: &Value, action: &str) -> RwResult<FillAttempt> 
         "not-editable" => Err(RwError::Message(format!(
             "{method}: Error: Element is not editable"
         ))),
-        "non-fillable" => Err(RwError::Message(
-            format!("{method}: Error: Element is not an <input>, <textarea>, <select> or [contenteditable] and does not have a role allowing [aria-readonly]"),
-        )),
-        "select" | "force-non-fillable" => Err(RwError::Message(
-            format!("{method}: Error: Element is not an <input>, <textarea> or [contenteditable] element"),
-        )),
+        "non-fillable" => Err(RwError::Message(format!(
+            "{method}: Error: Element is not an <input>, <textarea>, <select> or [contenteditable] and does not have a role allowing [aria-readonly]"
+        ))),
+        "select" | "force-non-fillable" => Err(RwError::Message(format!(
+            "{method}: Error: Element is not an <input>, <textarea> or [contenteditable] element"
+        ))),
         result_type => Err(RwError::Message(format!(
             "{method}: unexpected native fill result {result_type:?}"
         ))),
@@ -17300,6 +19246,9 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                     &wait_until,
                     loader_id.as_deref(),
                     None,
+                    result.get("frameId").and_then(Value::as_str),
+                    Some(target_url.as_str()),
+                    false,
                     "Frame.goto",
                     deadline,
                 )
@@ -18158,7 +20107,9 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
     ) -> PyResult<String> {
         let trimmed = expression.trim();
         let function = if arg_json.is_some() {
-            format!("function(__rw_arg) {{ const __rw_fn = ({trimmed}); return __rw_fn(this, __rw_arg); }}")
+            format!(
+                "function(__rw_arg) {{ const __rw_fn = ({trimmed}); return __rw_fn(this, __rw_arg); }}"
+            )
         } else {
             format!("function() {{ const __rw_fn = ({trimmed}); return __rw_fn(this); }}")
         };
@@ -20677,6 +22628,9 @@ impl PyPage {
                     &wait_until,
                     None,
                     target_url.as_deref(),
+                    None,
+                    target_url.as_deref(),
+                    true,
                     if offset < 0 {
                         "Page.go_back"
                     } else {
@@ -21038,6 +22992,139 @@ pub struct RustwrightPage {
     inner: Arc<PageInner>,
 }
 
+/// In-memory CDP transport for facade forwarding regressions.
+///
+/// This is intentionally below `RustwrightPage`: callers receive a normal core
+/// page, and every public facade method therefore traverses the production
+/// forwarding path before the harness observes or answers a CDP command.
+#[doc(hidden)]
+pub struct RustwrightNavigationHarness {
+    page: RustwrightPage,
+    write_rx: mpsc::UnboundedReceiver<CdpOutgoing>,
+    pending: CdpPendingMap,
+    events: broadcast::Sender<Value>,
+    event_log: Arc<Mutex<CdpEventLog>>,
+}
+
+impl RustwrightNavigationHarness {
+    pub fn new(event_capacity: usize) -> Self {
+        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(event_capacity);
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let (alive_tx, _) = watch::channel(true);
+        let client = Arc::new(CdpClient {
+            write_tx,
+            pending: Arc::clone(&pending),
+            outstanding: Arc::new(Mutex::new(HashMap::new())),
+            events: events.clone(),
+            event_log: Arc::clone(&event_log),
+            traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            next_id: AtomicU64::new(1),
+            sent_runtime_enable_count: AtomicU64::new(0),
+            sent_target_close_count: AtomicU64::new(0),
+            sent_context_dispose_count: AtomicU64::new(0),
+            alive: Arc::new(AtomicBool::new(true)),
+            alive_tx,
+        });
+        let browser = Arc::new(BrowserInner {
+            runtime: OwnedRuntime::new(tokio::runtime::Runtime::new().unwrap()),
+            client,
+            process: Mutex::new(None),
+            profile_dir: Mutex::new(None),
+            owned: false,
+            ws_endpoint: "ws://test.invalid".to_owned(),
+            stealth_user_agent_override: Mutex::new(None),
+            single_process_fallback: false,
+            lifecycle: Arc::new(CloseLifecycle::new()),
+            attached_pages: AttachedPageRegistry::default(),
+            next_native_network_index: AtomicU64::new(1),
+        });
+        let page = Arc::new(PageInner {
+            browser,
+            target_id: "test-target".to_owned(),
+            registry_generation: 0,
+            session_id: "page-session".to_owned(),
+            context_id: None,
+            main_frame_id: Mutex::new(None),
+            frame_state: Mutex::new(PageFrameState::new("page-session".to_owned())),
+            network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
+            console_records: Mutex::new(ConsoleRecordStore::default()),
+            console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+            console_replay_until_event_cursor: Mutex::new(HashMap::new()),
+            observation_event_cursor: AtomicU64::new(0),
+            native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
+            event_stream_start_cursor: 0,
+            background_override_active: Arc::new(AtomicBool::new(false)),
+            screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+            mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+            fill_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+            default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
+            lifecycle: Arc::new(CloseLifecycle::new()),
+            target_closed: AtomicBool::new(false),
+            crashed: AtomicBool::new(false),
+            close_target_on_drop: AtomicBool::new(false),
+        });
+        Self {
+            page: RustwrightPage { inner: page },
+            write_rx,
+            pending,
+            events,
+            event_log,
+        }
+    }
+
+    pub fn page(&self) -> RustwrightPage {
+        self.page.clone()
+    }
+
+    pub fn next_command(&mut self, expected_method: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let command: Value = loop {
+            match self.write_rx.try_recv() {
+                Ok(CdpOutgoing::Text { payload, .. }) => {
+                    break serde_json::from_str(&payload).unwrap();
+                }
+                Ok(CdpOutgoing::Close) => panic!("unexpected transport close"),
+                Err(mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    panic!("timed out waiting for CDP test command {expected_method}")
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("CDP test transport closed before {expected_method}")
+                }
+            }
+        };
+        assert_eq!(command["method"], expected_method);
+        command
+    }
+
+    pub fn reply(&self, command: &Value, result: Value) {
+        dispatch_cdp_payload(
+            json!({ "id": command["id"], "result": result }),
+            Arc::clone(&self.pending),
+            self.events.clone(),
+            Arc::clone(&self.event_log),
+        );
+    }
+
+    pub fn reply_next(&mut self, expected_method: &str, result: Value) {
+        let command = self.next_command(expected_method);
+        self.reply(&command, result);
+    }
+
+    pub fn emit(&self, event: Value) {
+        dispatch_cdp_payload(
+            event,
+            Arc::clone(&self.pending),
+            self.events.clone(),
+            Arc::clone(&self.event_log),
+        );
+    }
+}
+
 const NATIVE_PAGE_EVENT_QUEUE_CAPACITY: usize = 128;
 
 /// The JavaScript dialog category reported by Chromium.
@@ -21180,6 +23267,9 @@ pub struct RustwrightConsoleRecord {
     pub text: String,
     pub args: Vec<Value>,
     pub location: Option<RustwrightConsoleLocation>,
+    /// First stack frame with a Chromium-attributed URL, falling back to the
+    /// raw top frame when every frame is anonymous.
+    pub attributed_location: Option<RustwrightConsoleLocation>,
     pub navigation_epoch: u64,
 }
 
@@ -21225,6 +23315,61 @@ pub struct RustwrightNetworkRecords {
     pub navigation_epoch: u64,
     pub navigation_start_index: u64,
     pub evicted: u64,
+}
+
+/// Metadata observed while waiting for a top-level navigation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NavigationObservation {
+    pub response_json: String,
+    pub main_status: Option<u16>,
+    pub same_document: bool,
+}
+
+/// A history-navigation result that distinguishes a missing entry from navigation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryNavigationObservation {
+    pub had_entry: bool,
+    pub navigation: NavigationObservation,
+}
+
+/// Additive detail emitted for main-frame navigation events.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RustwrightNavigationDetail {
+    pub url: String,
+    pub same_document: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RustwrightTargetLifecycleEvent {
+    Upsert { target_id: String, url: String },
+    Destroyed { target_id: String },
+}
+
+pub struct RustwrightTargetLifecycleReceiver {
+    receiver: Mutex<std::sync::mpsc::Receiver<RustwrightTargetLifecycleEvent>>,
+    close_tx: watch::Sender<bool>,
+}
+
+impl RustwrightTargetLifecycleReceiver {
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<RustwrightTargetLifecycleEvent> {
+        self.receiver.lock().unwrap().recv_timeout(timeout).ok()
+    }
+
+    pub fn try_recv(
+        &self,
+    ) -> Result<Option<RustwrightTargetLifecycleEvent>, std::sync::mpsc::TryRecvError> {
+        match self.receiver.lock().unwrap().try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(error @ std::sync::mpsc::TryRecvError::Disconnected) => Err(error),
+        }
+    }
+}
+
+impl Drop for RustwrightTargetLifecycleReceiver {
+    fn drop(&mut self) {
+        self.close_tx.send_replace(true);
+    }
 }
 
 /// Lazy response-body result for a captured network request.
@@ -21314,6 +23459,117 @@ impl NativePageEventQueue {
 pub struct RustwrightPageEventReceiver {
     queue: Arc<NativePageEventQueue>,
     close_tx: watch::Sender<bool>,
+}
+
+struct NativeNavigationDetailQueueState {
+    events: VecDeque<(u64, RustwrightNavigationDetail)>,
+    latest_sequence: u64,
+    dropped: u64,
+    closed: bool,
+}
+
+struct NativeNavigationDetailQueue {
+    state: Mutex<NativeNavigationDetailQueueState>,
+    changed: Condvar,
+}
+
+impl NativeNavigationDetailQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(NativeNavigationDetailQueueState {
+                events: VecDeque::with_capacity(NATIVE_PAGE_EVENT_QUEUE_CAPACITY),
+                latest_sequence: 0,
+                dropped: 0,
+                closed: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn push_sequenced(&self, sequence: u64, event: RustwrightNavigationDetail) {
+        let mut state = self.state.lock().unwrap();
+        state.latest_sequence = state.latest_sequence.max(sequence);
+        if state.events.len() == NATIVE_PAGE_EVENT_QUEUE_CAPACITY {
+            state.events.pop_front();
+            state.dropped = state.dropped.saturating_add(1);
+        }
+        state.events.push_back((sequence, event));
+        self.changed.notify_all();
+    }
+
+    fn record_upstream_drop(&self, count: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.dropped = state.dropped.saturating_add(count);
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        self.changed.notify_all();
+    }
+}
+
+/// Pull-based receiver for opt-in main-frame navigation details.
+pub struct RustwrightNavigationDetailReceiver {
+    queue: Arc<NativeNavigationDetailQueue>,
+    event_log: Arc<Mutex<CdpEventLog>>,
+    close_tx: watch::Sender<bool>,
+}
+
+impl RustwrightNavigationDetailReceiver {
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<RustwrightNavigationDetail> {
+        self.recv_timeout_sequenced(timeout)
+            .map(|(_, detail)| detail)
+    }
+
+    #[doc(hidden)]
+    pub fn recv_timeout_sequenced(
+        &self,
+        timeout: Duration,
+    ) -> Option<(u64, RustwrightNavigationDetail)> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.queue.state.lock().unwrap();
+        loop {
+            if let Some(event) = state.events.pop_front() {
+                return Some(event);
+            }
+            if state.closed {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let (next, wait) = self.queue.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if wait.timed_out() && state.events.is_empty() {
+                return None;
+            }
+        }
+    }
+
+    pub fn dropped_count(&self) -> u64 {
+        self.queue.state.lock().unwrap().dropped
+    }
+
+    #[doc(hidden)]
+    pub fn latest_sequence(&self) -> u64 {
+        // The event-log cursor is advanced synchronously at CDP ingress, before
+        // the forwarding task is scheduled.  Using that producer watermark
+        // keeps a pre-operation event pre-boundary even when forwarding is
+        // delayed until after the operation starts.
+        self.event_log.lock().unwrap().cursor()
+    }
+
+    pub const fn capacity(&self) -> usize {
+        NATIVE_PAGE_EVENT_QUEUE_CAPACITY
+    }
+}
+
+impl Drop for RustwrightNavigationDetailReceiver {
+    fn drop(&mut self) {
+        self.close_tx.send_replace(true);
+    }
 }
 
 impl RustwrightPageEventReceiver {
@@ -21462,6 +23718,77 @@ impl RustwrightBrowser {
         })
     }
 
+    pub fn target_lifecycle(&self) -> RustwrightTargetLifecycleReceiver {
+        let mut events = self.inner.client.subscribe();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(NATIVE_PAGE_EVENT_QUEUE_CAPACITY);
+        let (close_tx, mut close_rx) = watch::channel(false);
+        self.inner.runtime.handle().spawn(async move {
+            loop {
+                let received = tokio::select! {
+                    event = events.recv() => event,
+                    changed = close_rx.changed() => {
+                        if changed.is_err() || *close_rx.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let event = match received {
+                    Ok(event) => event,
+                    // A lifecycle gap makes the inventory untrustworthy.  Drop
+                    // the forwarding sender so consumers observe disconnect and
+                    // synchronously reconcile instead of retaining "fresh" state.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let method = event.get("method").and_then(Value::as_str);
+                let lifecycle = match method {
+                    Some("Target.targetCreated")
+                    | Some("Target.targetInfoChanged")
+                    | Some("Target.attachedToTarget") => {
+                        let Some(info) = event.pointer("/params/targetInfo") else {
+                            continue;
+                        };
+                        if info.get("type").and_then(Value::as_str) != Some("page") {
+                            continue;
+                        }
+                        let Some(target_id) = info.get("targetId").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        RustwrightTargetLifecycleEvent::Upsert {
+                            target_id: target_id.to_owned(),
+                            url: info
+                                .get("url")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                        }
+                    }
+                    Some("Target.targetDestroyed") => {
+                        let Some(target_id) =
+                            event.pointer("/params/targetId").and_then(Value::as_str)
+                        else {
+                            continue;
+                        };
+                        RustwrightTargetLifecycleEvent::Destroyed {
+                            target_id: target_id.to_owned(),
+                        }
+                    }
+                    _ => continue,
+                };
+                if sender.try_send(lifecycle).is_err() {
+                    // A failed lifecycle delivery makes the actor's inventory stale;
+                    // synchronous reconciliation remains its bounded fallback.
+                    break;
+                }
+            }
+        });
+        RustwrightTargetLifecycleReceiver {
+            receiver: Mutex::new(receiver),
+            close_tx,
+        }
+    }
+
     pub fn is_connected(&self) -> bool {
         !self.inner.lifecycle.is_closed() && self.inner.client.is_connected()
     }
@@ -21597,6 +23924,64 @@ impl RustwrightPage {
         RustwrightPageEventReceiver { queue, close_tx }
     }
 
+    /// Subscribe to additive main-frame navigation details.
+    pub fn navigation_details(&self) -> RustwrightNavigationDetailReceiver {
+        let queue = Arc::new(NativeNavigationDetailQueue::new());
+        let page = Arc::downgrade(&self.inner);
+        let client = Arc::clone(&self.inner.browser.client);
+        let (mut events, mut cursor) = client.subscribe_with_cursor();
+        let event_log = Arc::clone(&client.event_log);
+        let task_queue = Arc::clone(&queue);
+        let (close_tx, mut close_rx) = watch::channel(false);
+        self.inner.browser.runtime.handle().spawn(async move {
+            loop {
+                let received = tokio::select! {
+                    event = events.recv() => event,
+                    changed = close_rx.changed() => {
+                        if changed.is_err() || *close_rx.borrow() {
+                            task_queue.close();
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                match received {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => {
+                        task_queue.close();
+                        break;
+                    }
+                }
+                let Some(page) = page.upgrade() else {
+                    task_queue.close();
+                    break;
+                };
+                let (oldest_seq, entries) = {
+                    let log = event_log.lock().unwrap();
+                    (log.oldest_seq(), log.entries_since(cursor))
+                };
+                if cursor < oldest_seq {
+                    task_queue.record_upstream_drop(oldest_seq - cursor);
+                    cursor = oldest_seq;
+                }
+                for (sequence, event) in entries {
+                    cursor = sequence.saturating_add(1);
+                    if let Some(detail) = native_navigation_detail_from_cdp(&page, &event) {
+                        // `sequence + 1` uses the same convention as the event
+                        // log cursor: all events ingressed before cursor C have
+                        // sequence <= C, while later events are > C.
+                        task_queue.push_sequenced(sequence.saturating_add(1), detail);
+                    }
+                }
+            }
+        });
+        RustwrightNavigationDetailReceiver {
+            queue,
+            event_log: Arc::clone(&client.event_log),
+            close_tx,
+        }
+    }
+
     /// Read captured console records.
     ///
     /// When `include_previous_navigations` is false, only the current
@@ -21618,6 +24003,23 @@ impl RustwrightPage {
                 .read(include_previous_navigations, clear);
             Ok(records)
         })
+    }
+
+    /// Arm console capture without reading or clearing any records.
+    ///
+    /// Capture remains lazy for existing consumers: callers that do not invoke
+    /// this method still enable it on their first [`RustwrightPage::console_records`]
+    /// call. Consumers that need navigation-accurate epochs can arm a newly
+    /// registered page before its first navigation. Chromium may replay records
+    /// when `Runtime.enable` is first sent; because CDP supplies no originating
+    /// navigation identifier for those records, they belong to that session's
+    /// capture-baseline epoch (epoch zero). Events from other sessions, and
+    /// events arriving after that session's replay window, are stamped with the
+    /// epoch current at event arrival.
+    pub fn arm_console_capture(&self) -> RwResult<()> {
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        browser.block_on(async move { enable_console_capture(&page, Duration::from_secs(5)).await })
     }
 
     /// Read the page's bounded request/response lifecycle ring.
@@ -21730,6 +24132,16 @@ impl RustwrightPage {
         self.goto_with_cancel(url, wait_until, timeout_ms, referer, None)
     }
 
+    pub fn goto_observed(
+        &self,
+        url: &str,
+        wait_until: Option<&str>,
+        timeout_ms: Option<f64>,
+        referer: Option<&str>,
+    ) -> RwResult<NavigationObservation> {
+        self.goto_with_cancel_observed(url, wait_until, timeout_ms, referer, None)
+    }
+
     pub fn goto_with_cancel(
         &self,
         url: &str,
@@ -21755,8 +24167,41 @@ impl RustwrightPage {
         ))
     }
 
+    pub fn goto_with_cancel_observed(
+        &self,
+        url: &str,
+        wait_until: Option<&str>,
+        timeout_ms: Option<f64>,
+        referer: Option<&str>,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<NavigationObservation> {
+        let timeout_ms = self.resolve_timeout(timeout_ms, true);
+        let page = Arc::clone(&self.inner);
+        let url = url.to_string();
+        let wait_until = wait_until.unwrap_or("load").to_string();
+        let referer = referer.map(ToString::to_string);
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let browser = Arc::clone(&page.browser);
+        let client = Arc::clone(&browser.client);
+        let session_id = page.session_id.clone();
+        browser.block_on_raw(cancelable_navigation(
+            client,
+            session_id,
+            cancel.cloned(),
+            page_goto_observed_async(page, url, wait_until, timeout, referer),
+        ))
+    }
+
     pub fn go_back(&self, wait_until: Option<&str>, timeout: Duration) -> RwResult<String> {
         self.go_back_with_cancel(wait_until, timeout, None)
+    }
+
+    pub fn go_back_observed(
+        &self,
+        wait_until: Option<&str>,
+        timeout: Duration,
+    ) -> RwResult<HistoryNavigationObservation> {
+        self.go_back_with_cancel_observed(wait_until, timeout, None)
     }
 
     pub fn go_back_with_cancel(
@@ -21767,6 +24212,15 @@ impl RustwrightPage {
     ) -> RwResult<String> {
         self.navigate_history(-1, wait_until, timeout, cancel)
             .map(|(_, response)| response)
+    }
+
+    pub fn go_back_with_cancel_observed(
+        &self,
+        wait_until: Option<&str>,
+        timeout: Duration,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<HistoryNavigationObservation> {
+        self.navigate_history_observed(-1, wait_until, timeout, cancel)
     }
 
     pub fn go_back_with_cancel_status(
@@ -21782,6 +24236,14 @@ impl RustwrightPage {
         self.go_forward_with_cancel(wait_until, timeout, None)
     }
 
+    pub fn go_forward_observed(
+        &self,
+        wait_until: Option<&str>,
+        timeout: Duration,
+    ) -> RwResult<HistoryNavigationObservation> {
+        self.go_forward_with_cancel_observed(wait_until, timeout, None)
+    }
+
     pub fn go_forward_with_cancel(
         &self,
         wait_until: Option<&str>,
@@ -21790,6 +24252,15 @@ impl RustwrightPage {
     ) -> RwResult<String> {
         self.navigate_history(1, wait_until, timeout, cancel)
             .map(|(_, response)| response)
+    }
+
+    pub fn go_forward_with_cancel_observed(
+        &self,
+        wait_until: Option<&str>,
+        timeout: Duration,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<HistoryNavigationObservation> {
+        self.navigate_history_observed(1, wait_until, timeout, cancel)
     }
 
     pub fn go_forward_with_cancel_status(
@@ -21803,6 +24274,14 @@ impl RustwrightPage {
 
     pub fn reload(&self, wait_until: Option<&str>, timeout: Duration) -> RwResult<String> {
         self.reload_with_cancel(wait_until, timeout, None)
+    }
+
+    pub fn reload_observed(
+        &self,
+        wait_until: Option<&str>,
+        timeout: Duration,
+    ) -> RwResult<NavigationObservation> {
+        self.reload_with_cancel_observed(wait_until, timeout, None)
     }
 
     pub fn reload_with_cancel(
@@ -21860,6 +24339,34 @@ impl RustwrightPage {
                 }
                 Ok(Value::Null.to_string())
             },
+        ))
+    }
+
+    pub fn reload_with_cancel_observed(
+        &self,
+        wait_until: Option<&str>,
+        timeout: Duration,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<NavigationObservation> {
+        let page = Arc::clone(&self.inner);
+        let wait_until = wait_until.unwrap_or("load").to_string();
+        validate_navigation_wait_state(&wait_until)?;
+        let browser = Arc::clone(&page.browser);
+        let client = Arc::clone(&browser.client);
+        let session_id = page.session_id.clone();
+        let operation_client = Arc::clone(&client);
+        let operation_session_id = session_id.clone();
+        browser.block_on_raw(cancelable_navigation(
+            client,
+            session_id,
+            cancel.cloned(),
+            page_reload_observed_async(
+                page,
+                operation_client,
+                operation_session_id,
+                wait_until,
+                timeout,
+            ),
         ))
     }
 
@@ -22586,6 +25093,36 @@ return waitForScrollSettle();
             .unwrap_or(false))
     }
 
+    fn navigate_history_observed(
+        &self,
+        offset: i64,
+        wait_until: Option<&str>,
+        timeout: Duration,
+        cancel: Option<&CancelToken>,
+    ) -> RwResult<HistoryNavigationObservation> {
+        let page = Arc::clone(&self.inner);
+        let wait_until = wait_until.unwrap_or("load").to_string();
+        validate_navigation_wait_state(&wait_until)?;
+        let browser = Arc::clone(&page.browser);
+        let client = Arc::clone(&browser.client);
+        let session_id = page.session_id.clone();
+        let operation_client = Arc::clone(&client);
+        let operation_session_id = session_id.clone();
+        browser.block_on_raw(cancelable_navigation(
+            client,
+            session_id,
+            cancel.cloned(),
+            page_history_observed_async(
+                page,
+                operation_client,
+                operation_session_id,
+                offset,
+                wait_until,
+                timeout,
+            ),
+        ))
+    }
+
     fn navigate_history(
         &self,
         offset: i64,
@@ -22663,6 +25200,9 @@ return waitForScrollSettle();
                     &wait_until,
                     None,
                     target_url.as_deref(),
+                    None,
+                    target_url.as_deref(),
+                    true,
                     if offset < 0 {
                         "Page.go_back"
                     } else {
@@ -22880,6 +25420,42 @@ fn native_page_event_from_cdp(
     }
 }
 
+fn native_navigation_detail_from_cdp(
+    page: &Arc<PageInner>,
+    event: &Value,
+) -> Option<RustwrightNavigationDetail> {
+    let method = event.get("method").and_then(Value::as_str)?;
+    if event.get("sessionId").and_then(Value::as_str) != Some(page.session_id.as_str()) {
+        return None;
+    }
+    match method {
+        "Page.frameNavigated" => {
+            let frame = event.pointer("/params/frame")?;
+            if frame.get("parentId").is_some() {
+                return None;
+            }
+            Some(RustwrightNavigationDetail {
+                url: frame.get("url").and_then(Value::as_str)?.to_string(),
+                same_document: false,
+            })
+        }
+        "Page.navigatedWithinDocument" => {
+            let frame_id = event.pointer("/params/frameId").and_then(Value::as_str)?;
+            if page.main_frame_id.lock().unwrap().as_deref() != Some(frame_id) {
+                return None;
+            }
+            Some(RustwrightNavigationDetail {
+                url: event
+                    .pointer("/params/url")
+                    .and_then(Value::as_str)?
+                    .to_string(),
+                same_document: true,
+            })
+        }
+        _ => None,
+    }
+}
+
 async fn scroll_locator_into_view(
     page: &Arc<PageInner>,
     locator_json: &str,
@@ -22893,9 +25469,12 @@ el.scrollIntoView({{ block: 'center', inline: 'center' }});
 return waitForScrollSettle();"#
     );
     let expression = locator_script(&resolution.locator_json, 0, &body);
-    evaluate_locator_resolution(page, &resolution, expression, deadline, Duration::ZERO)
-        .await
-        .map(|_| ())
+    // Subscribe before dispatching the scroll evaluation.  The evaluation may
+    // synchronously trigger navigation/lifecycle work, so subscribing after it
+    // returns can miss the only ordering signal needed by settlement.
+    let mut events = page.browser.client.subscribe();
+    evaluate_locator_resolution(page, &resolution, expression, deadline, Duration::ZERO).await?;
+    settle_after_pointer_action(page, &resolution.session_id, &mut events, deadline).await
 }
 
 async fn focus_locator_for_native_input(
@@ -23749,6 +26328,8 @@ async fn attach_existing_page_unregistered(
         ))),
         console_records: Mutex::new(ConsoleRecordStore::default()),
         console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+        console_replay_until_event_cursor: Mutex::new(HashMap::new()),
+        observation_event_cursor: AtomicU64::new(0),
         native_network_records: Mutex::new(NativeNetworkRecordStore::new(
             browser.next_native_network_index.load(Ordering::SeqCst),
         )),
@@ -23934,10 +26515,39 @@ async fn enable_console_capture_for_session_locked(
     if capture.enabled_sessions.contains(session_id) {
         return Ok(());
     }
-    page.browser
+    let started = Instant::now();
+    // CDP emits replay events before the Runtime.enable response, but the page
+    // listener may consume them after the response task wakes. Keep the event
+    // cursor window explicit so scheduler order cannot restamp replayed records.
+    page.console_replay_until_event_cursor
+        .lock()
+        .unwrap()
+        .insert(session_id.to_owned(), u64::MAX);
+    let enabled = page
+        .browser
         .client
         .send("Runtime.enable", json!({}), Some(session_id), timeout)
-        .await?;
+        .await;
+    let replay_until = page.browser.client.event_cursor();
+    page.console_replay_until_event_cursor
+        .lock()
+        .unwrap()
+        .insert(session_id.to_owned(), replay_until);
+    enabled?;
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if page.observation_event_cursor.load(Ordering::SeqCst) < replay_until {
+        tokio::time::timeout(remaining, async {
+            while page.observation_event_cursor.load(Ordering::SeqCst) < replay_until {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| RwError::Timeout(timeout.as_millis() as u64))?;
+    }
+    let mut replay_windows = page.console_replay_until_event_cursor.lock().unwrap();
+    if replay_windows.get(session_id) == Some(&replay_until) {
+        replay_windows.remove(session_id);
+    }
     capture.enabled_sessions.insert(session_id.to_string());
     Ok(())
 }
@@ -24005,13 +26615,26 @@ fn spawn_page_oopif_event_listener(page: Weak<PageInner>) {
     let Some(initial_page) = page.upgrade() else {
         return;
     };
-    let mut events = initial_page.browser.client.subscribe();
+    let (mut events, mut event_cursor) = initial_page.browser.client.subscribe_with_cursor();
+    initial_page
+        .observation_event_cursor
+        .store(event_cursor, Ordering::SeqCst);
     drop(initial_page);
     tokio::spawn(async move {
         loop {
             let event = match events.recv().await {
-                Ok(event) => event,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Ok(event) => {
+                    event_cursor = event_cursor.wrapping_add(1);
+                    event
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    event_cursor = event_cursor.wrapping_add(skipped);
+                    if let Some(page) = page.upgrade() {
+                        page.observation_event_cursor
+                            .store(event_cursor, Ordering::SeqCst);
+                    }
+                    continue;
+                }
                 Err(_) => break,
             };
             let Some(page) = page.upgrade() else {
@@ -24020,14 +26643,33 @@ fn spawn_page_oopif_event_listener(page: Weak<PageInner>) {
             if page.lifecycle.is_closed() {
                 break;
             }
-            handle_page_oopif_event(Arc::clone(&page), event).await;
+            handle_page_oopif_event(Arc::clone(&page), event, event_cursor).await;
+            page.observation_event_cursor
+                .store(event_cursor, Ordering::SeqCst);
+            page.console_replay_until_event_cursor
+                .lock()
+                .unwrap()
+                .retain(|_, replay_until| {
+                    *replay_until == u64::MAX || event_cursor < *replay_until
+                });
         }
     });
 }
 
-async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
+async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value, event_cursor: u64) {
     let method = event.get("method").and_then(Value::as_str).unwrap_or("");
-    record_page_observation_event(&page, &event);
+    let capture_baseline_replay = event
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .and_then(|session_id| {
+            page.console_replay_until_event_cursor
+                .lock()
+                .unwrap()
+                .get(session_id)
+                .copied()
+        })
+        .is_some_and(|replay_until| replay_until == u64::MAX || event_cursor <= replay_until);
+    record_page_observation_event(&page, &event, capture_baseline_replay);
     if method == "Target.targetCrashed"
         && event.pointer("/params/targetId").and_then(Value::as_str)
             == Some(page.target_id.as_str())
@@ -24203,7 +26845,7 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
     }
 }
 
-fn record_page_observation_event(page: &PageInner, event: &Value) {
+fn record_page_observation_event(page: &PageInner, event: &Value, capture_baseline_replay: bool) {
     let method = event.get("method").and_then(Value::as_str).unwrap_or("");
     let event_session_id = event.get("sessionId").and_then(Value::as_str);
     let is_main_session = event_session_id == Some(page.session_id.as_str());
@@ -24259,7 +26901,12 @@ fn record_page_observation_event(page: &PageInner, event: &Value) {
 
     if method == "Runtime.consoleAPICalled" && owned_session {
         if let Some(record) = native_console_record_from_event(event) {
-            page.console_records.lock().unwrap().push(record);
+            let mut console = page.console_records.lock().unwrap();
+            if capture_baseline_replay {
+                console.push_capture_baseline(record);
+            } else {
+                console.push(record);
+            }
         }
     }
 
@@ -24375,21 +27022,35 @@ fn native_console_record_from_event(event: &Value) -> Option<RustwrightConsoleRe
         .map(console_value_text)
         .collect::<Vec<_>>()
         .join(" ");
-    let location =
-        params
-            .pointer("/stackTrace/callFrames/0")
-            .map(|frame| RustwrightConsoleLocation {
-                url: frame
+    let call_frames = params
+        .pointer("/stackTrace/callFrames")
+        .and_then(Value::as_array);
+    let frame_location = |frame: &Value| RustwrightConsoleLocation {
+        url: frame
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        line_number: frame.get("lineNumber").and_then(Value::as_u64).unwrap_or(0),
+        column_number: frame
+            .get("columnNumber")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    };
+    let location = call_frames
+        .and_then(|frames| frames.first())
+        .map(frame_location);
+    let attributed_location = call_frames
+        .and_then(|frames| {
+            frames.iter().find(|frame| {
+                frame
                     .get("url")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                line_number: frame.get("lineNumber").and_then(Value::as_u64).unwrap_or(0),
-                column_number: frame
-                    .get("columnNumber")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            });
+                    .is_some_and(|url| !url.is_empty())
+            })
+        })
+        .map(frame_location)
+        .or_else(|| location.clone());
     Some(RustwrightConsoleRecord {
         message_type: params
             .get("type")
@@ -24399,6 +27060,7 @@ fn native_console_record_from_event(event: &Value) -> Option<RustwrightConsoleRe
         text,
         args,
         location,
+        attributed_location,
         navigation_epoch: 0,
     })
 }
@@ -24413,6 +27075,7 @@ mod native_console_record_tests {
             text: text.into(),
             args: Vec::new(),
             location: None,
+            attributed_location: None,
             navigation_epoch: u64::MAX,
         }
     }
@@ -24474,10 +27137,65 @@ mod native_console_record_tests {
                 column_number: 11,
             })
         );
+        assert_eq!(parsed.attributed_location, parsed.location);
+    }
+
+    #[test]
+    fn console_event_parser_attributes_past_anonymous_wrapper_frame() {
+        let parsed = native_console_record_from_event(&json!({
+            "params": {
+                "type": "warning",
+                "args": [{"type": "string", "value": "wrapped"}],
+                "stackTrace": {
+                    "callFrames": [
+                        {"url": "", "lineNumber": 169, "columnNumber": 20},
+                        {
+                            "url": "file:///fixture/console.js",
+                            "lineNumber": 1,
+                            "columnNumber": 3
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("console record");
+        assert_eq!(
+            parsed.location,
+            Some(RustwrightConsoleLocation {
+                url: String::new(),
+                line_number: 169,
+                column_number: 20,
+            })
+        );
+        assert_eq!(
+            parsed.attributed_location,
+            Some(RustwrightConsoleLocation {
+                url: "file:///fixture/console.js".to_owned(),
+                line_number: 1,
+                column_number: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn console_event_parser_falls_back_to_raw_top_frame_when_all_frames_are_anonymous() {
+        let parsed = native_console_record_from_event(&json!({
+            "params": {
+                "stackTrace": {
+                    "callFrames": [
+                        {"url": "", "lineNumber": 169, "columnNumber": 20},
+                        {"url": "", "lineNumber": 170, "columnNumber": 4}
+                    ]
+                }
+            }
+        }))
+        .expect("console record");
+        assert_eq!(parsed.attributed_location, parsed.location);
+        assert_eq!(parsed.location.unwrap().line_number, 169);
     }
 
     #[tokio::test]
-    async fn default_attach_is_runtime_free_and_console_capture_is_single_flight() {
+    async fn console_capture_is_single_flight_and_replay_windows_are_session_scoped() {
         assert_eq!(
             DEFAULT_ATTACHED_SESSION_DOMAINS.as_slice(),
             &["Page.enable", "DOM.enable", "Network.enable"]
@@ -24525,6 +27243,8 @@ mod native_console_record_tests {
             network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
             console_records: Mutex::new(ConsoleRecordStore::default()),
             console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+            console_replay_until_event_cursor: Mutex::new(HashMap::new()),
+            observation_event_cursor: AtomicU64::new(0),
             native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
             event_stream_start_cursor: 0,
             background_override_active: Arc::new(AtomicBool::new(false)),
@@ -24537,6 +27257,32 @@ mod native_console_record_tests {
             crashed: AtomicBool::new(false),
             close_target_on_drop: AtomicBool::new(false),
         });
+        spawn_page_oopif_event_listener(Arc::downgrade(&page));
+
+        dispatch_cdp_payload(
+            json!({
+                "method": "Page.frameNavigated",
+                "sessionId": "root-session",
+                "params": {
+                    "frame": {
+                        "id": "main-frame",
+                        "loaderId": "initial-loader",
+                        "url": "https://example.test/initial"
+                    }
+                }
+            }),
+            Arc::clone(&pending),
+            events.clone(),
+            Arc::clone(&event_log),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while page.observation_event_cursor.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener must establish a nonzero event cursor");
+        assert_eq!(page.console_records.lock().unwrap().navigation_epoch, 1);
 
         enable_console_capture_for_session_if_requested(
             &page,
@@ -24580,6 +27326,11 @@ mod native_console_record_tests {
             "concurrent first-use must not send Runtime.enable twice"
         );
 
+        page.frame_state
+            .lock()
+            .unwrap()
+            .record_session_for_frame("late-iframe-frame", "late-iframe-session");
+
         let respond_late_iframe = async {
             let outgoing = tokio::time::timeout(Duration::from_secs(1), write_rx.recv())
                 .await
@@ -24591,11 +27342,46 @@ mod native_console_record_tests {
                 }
                 CdpOutgoing::Close => panic!("unexpected transport close"),
             };
+            for event in [
+                json!({
+                    "method": "Runtime.consoleAPICalled",
+                    "sessionId": "late-iframe-session",
+                    "params": {"type": "log", "args": [{"type": "string", "value": "iframe replay before navigation"}]}
+                }),
+                json!({
+                    "method": "Page.frameNavigated",
+                    "sessionId": "root-session",
+                    "params": {
+                        "frame": {
+                            "id": "main-frame",
+                            "loaderId": "interleaved-loader",
+                            "url": "https://example.test/interleaved"
+                        }
+                    }
+                }),
+                json!({
+                    "method": "Runtime.consoleAPICalled",
+                    "sessionId": "late-iframe-session",
+                    "params": {"type": "log", "args": [{"type": "string", "value": "iframe replay after navigation"}]}
+                }),
+                json!({
+                    "method": "Runtime.consoleAPICalled",
+                    "sessionId": "root-session",
+                    "params": {"type": "log", "args": [{"type": "string", "value": "live main during iframe replay"}]}
+                }),
+            ] {
+                dispatch_cdp_payload(
+                    event,
+                    Arc::clone(&pending),
+                    events.clone(),
+                    Arc::clone(&event_log),
+                );
+            }
             dispatch_cdp_payload(
                 json!({ "id": command["id"], "result": {} }),
                 Arc::clone(&pending),
-                events,
-                event_log,
+                events.clone(),
+                Arc::clone(&event_log),
             );
             command
         };
@@ -24611,6 +27397,50 @@ mod native_console_record_tests {
         assert_eq!(command["method"], "Runtime.enable");
         assert_eq!(command["sessionId"], "late-iframe-session");
         assert!(write_rx.try_recv().is_err());
+
+        dispatch_cdp_payload(
+            json!({
+                "method": "Runtime.consoleAPICalled",
+                "sessionId": "late-iframe-session",
+                "params": {"type": "log", "args": [{"type": "string", "value": "iframe after replay window"}]}
+            }),
+            Arc::clone(&pending),
+            events,
+            event_log,
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while page.observation_event_cursor.load(Ordering::SeqCst) < 6 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener must consume the post-window record");
+
+        let all = page.console_records.lock().unwrap().read(true, false);
+        assert_eq!(
+            all.records
+                .iter()
+                .map(|record| (record.text.as_str(), record.navigation_epoch))
+                .collect::<Vec<_>>(),
+            vec![
+                ("iframe replay before navigation", 0),
+                ("iframe replay after navigation", 0),
+                ("live main during iframe replay", 2),
+                ("iframe after replay window", 2),
+            ]
+        );
+        let current = page.console_records.lock().unwrap().read(false, false);
+        assert_eq!(
+            current
+                .records
+                .iter()
+                .map(|record| record.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "live main during iframe replay",
+                "iframe after replay window"
+            ]
+        );
     }
 }
 
@@ -25773,6 +28603,32 @@ fn launch_chromium_process(
     }
 }
 
+fn chromium_default_launch_args(options: &LaunchOptions) -> Vec<String> {
+    let mut default_args = vec![
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--password-store=basic".to_string(),
+        "--use-mock-keychain".to_string(),
+        "--disable-background-networking".to_string(),
+        "--disable-background-timer-throttling".to_string(),
+        "--disable-dev-shm-usage".to_string(),
+        "--disable-blink-features=AutomationControlled".to_string(),
+        "--disable-renderer-backgrounding".to_string(),
+        "--disable-popup-blocking".to_string(),
+        "--disable-prompt-on-repost".to_string(),
+        "--enable-features=CDPScreenshotNewSurface".to_string(),
+        "--mute-audio".to_string(),
+    ];
+    if options.headless {
+        default_args.push("--headless=new".to_string());
+        default_args.push("--hide-scrollbars".to_string());
+    }
+    if !options.chromium_sandbox {
+        default_args.push("--no-sandbox".to_string());
+    }
+    default_args
+}
+
 fn launch_chromium_attempt(
     executable: &Path,
     options: &LaunchOptions,
@@ -25823,26 +28679,7 @@ fn launch_chromium_attempt(
         }
     }
 
-    let mut default_args = vec![
-        "--no-first-run".to_string(),
-        "--no-default-browser-check".to_string(),
-        "--disable-background-networking".to_string(),
-        "--disable-background-timer-throttling".to_string(),
-        "--disable-dev-shm-usage".to_string(),
-        "--disable-blink-features=AutomationControlled".to_string(),
-        "--disable-renderer-backgrounding".to_string(),
-        "--disable-popup-blocking".to_string(),
-        "--disable-prompt-on-repost".to_string(),
-        "--enable-features=CDPScreenshotNewSurface".to_string(),
-        "--mute-audio".to_string(),
-    ];
-    if options.headless {
-        default_args.push("--headless=new".to_string());
-        default_args.push("--hide-scrollbars".to_string());
-    }
-    if !options.chromium_sandbox {
-        default_args.push("--no-sandbox".to_string());
-    }
+    let default_args = chromium_default_launch_args(options);
     if !options.ignore_all_default_args {
         for arg in default_args {
             if !launch_default_arg_ignored(&arg, &options.ignore_default_args) {
@@ -27120,7 +29957,7 @@ async fn wait_for_network_event(
                             "CDP event log overflow: dropped {dropped} event(s)"
                         ))),
                         cursor,
-                    )
+                    );
                 }
             };
             if let Some((matched_seq, result)) = matched {
@@ -27157,7 +29994,7 @@ async fn wait_for_network_event(
                 return (
                     Err(RwError::Message("CDP event stream closed".to_string())),
                     cursor,
-                )
+                );
             }
             Err(_) => {
                 for (seq, response) in state.take_expired() {
@@ -28450,6 +31287,45 @@ struct NavigationWaitResult {
     same_document: bool,
 }
 
+fn main_response_status(response: Option<&Value>) -> Option<u16> {
+    let status = response?.get("status")?;
+    let value = status.as_u64().or_else(|| {
+        let value = status.as_f64()?;
+        (value.is_finite() && value.fract() == 0.0 && value >= 0.0).then_some(value as u64)
+    })?;
+    u16::try_from(value).ok()
+}
+
+fn observation_from_wait(
+    result: NavigationWaitResult,
+    fallback: impl FnOnce() -> Value,
+) -> NavigationObservation {
+    if result.same_document {
+        return NavigationObservation {
+            response_json: result.response.unwrap_or(Value::Null).to_string(),
+            main_status: None,
+            same_document: true,
+        };
+    }
+    let main_status = main_response_status(result.response.as_ref());
+    NavigationObservation {
+        response_json: result.response.unwrap_or_else(fallback).to_string(),
+        main_status,
+        same_document: false,
+    }
+}
+
+fn no_history_navigation_observation() -> HistoryNavigationObservation {
+    HistoryNavigationObservation {
+        had_entry: false,
+        navigation: NavigationObservation {
+            response_json: Value::Null.to_string(),
+            main_status: None,
+            same_document: false,
+        },
+    }
+}
+
 fn completed_navigation(response: Option<Value>, same_document: bool) -> NavigationWaitResult {
     NavigationWaitResult {
         response,
@@ -28544,18 +31420,27 @@ fn navigation_terminal_event(
     session_id: &str,
     state: &str,
     expected_url: Option<&str>,
+    expected_frame_id: Option<&str>,
+    same_document_url: Option<&str>,
 ) -> Option<NavigationTerminalEvent> {
     if event.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return None;
     }
     let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+    let frame_matches = |frame_id: Option<&str>| {
+        expected_frame_id
+            .map(|expected| frame_id == Some(expected))
+            .unwrap_or(true)
+    };
     let frame_navigated_to_expected = method == "Page.frameNavigated"
+        && frame_matches(event.pointer("/params/frame/id").and_then(Value::as_str))
         && expected_url
             .zip(event.pointer("/params/frame/url").and_then(Value::as_str))
             .map(|(expected, actual)| expected == actual)
             .unwrap_or(false);
     let navigated_within_document_to_expected = method == "Page.navigatedWithinDocument"
-        && expected_url
+        && frame_matches(event.pointer("/params/frameId").and_then(Value::as_str))
+        && same_document_url
             .zip(event.pointer("/params/url").and_then(Value::as_str))
             .map(|(expected, actual)| expected == actual)
             .unwrap_or(false);
@@ -28578,6 +31463,9 @@ async fn wait_for_navigation(
     state: &str,
     loader_id: Option<&str>,
     expected_url: Option<&str>,
+    expected_frame_id: Option<&str>,
+    same_document_url: Option<&str>,
+    legacy_loaderless_response: bool,
     method_label: &str,
     deadline: OperationDeadline,
 ) -> RwResult<NavigationWaitResult> {
@@ -28704,6 +31592,8 @@ async fn wait_for_navigation(
                         loader_id,
                         request,
                         expected_url,
+                        expected_frame_id,
+                        legacy_loaderless_response,
                         response_extra,
                     ) {
                         let waiting_for_extra = response_needs_extra_info(&event, response_extra);
@@ -28786,9 +31676,14 @@ async fn wait_for_navigation(
                     continue;
                 }
 
-                if let Some(terminal_event) =
-                    navigation_terminal_event(&event, session_id, state, expected_url)
-                {
+                if let Some(terminal_event) = navigation_terminal_event(
+                    &event,
+                    session_id,
+                    state,
+                    expected_url,
+                    expected_frame_id,
+                    same_document_url,
+                ) {
                     if terminal_event == NavigationTerminalEvent::SameDocument {
                         return Ok(completed_navigation(response, true));
                     }
@@ -28819,7 +31714,14 @@ async fn wait_for_navigation(
                         .entries_since(event_cursor)
                         .into_iter()
                         .filter_map(|(_, event)| {
-                            navigation_terminal_event(&event, session_id, state, expected_url)
+                            navigation_terminal_event(
+                                &event,
+                                session_id,
+                                state,
+                                expected_url,
+                                expected_frame_id,
+                                same_document_url,
+                            )
                         })
                         .fold(None, |replayed, terminal| {
                             if replayed == Some(NavigationTerminalEvent::SameDocument)
@@ -28955,6 +31857,8 @@ fn navigation_response_from_event(
     loader_id: Option<&str>,
     request: Option<Value>,
     expected_url: Option<&str>,
+    expected_frame_id: Option<&str>,
+    legacy_loaderless_response: bool,
     response_extra: Option<&Value>,
 ) -> Option<Value> {
     let params = event.get("params")?;
@@ -28968,12 +31872,36 @@ fn navigation_response_from_event(
         if response_type != "Document" {
             return None;
         }
-    } else if response_type != "Document" {
+    } else if legacy_loaderless_response {
+        // Preserve the original public history contract exactly: without a
+        // loader, the first Document response wins regardless of URL, while a
+        // non-Document response is accepted only when its URL is the target.
+        if response_type != "Document" {
+            let matches_expected_url = expected_url
+                .zip(response.get("url").and_then(Value::as_str))
+                .map(|(expected, actual)| expected == actual)
+                .unwrap_or(false);
+            if !matches_expected_url {
+                return None;
+            }
+        }
+    } else {
+        if response_type != "Document" {
+            return None;
+        }
+        let matches_main_frame = expected_frame_id
+            .zip(params.get("frameId").and_then(Value::as_str))
+            .map(|(expected, actual)| expected == actual)
+            .unwrap_or(false);
         let matches_expected_url = expected_url
             .zip(response.get("url").and_then(Value::as_str))
             .map(|(expected, actual)| expected == actual)
             .unwrap_or(false);
-        if !matches_expected_url {
+        if expected_frame_id.is_some() {
+            if !matches_main_frame {
+                return None;
+            }
+        } else if expected_url.is_some() && !matches_expected_url {
             return None;
         }
     }
