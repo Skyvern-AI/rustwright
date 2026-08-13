@@ -54,11 +54,13 @@ anything reaches the public mirror.
 ## Local verification
 
 Run lightweight checks locally: `cargo check --locked`, `cargo test --lib`,
-`maturin develop --release`, and targeted pytest subsets.
+`maturin develop --release`, and targeted pytest subsets that do not launch a
+browser.
 
 Do not run heavyweight verification on a developer host. This includes Docker
 verification-image builds, `tools/docker_test.sh` or `tools/docker_verify.sh`
-container modes, full pytest runs, and benchmark workloads. Run these checks in
+container modes, full pytest runs, benchmark workloads, and any test that
+launches a browser — even a single targeted test. Run these checks in
 Blacksmith test containers: preflight with
 `python tools/check_testbox_visibility.py --json`, warm a testbox with
 `tools/run_benchmark_testbox.sh` through
@@ -68,3 +70,19 @@ dispatch-only workflow on a Blacksmith runner.
 
 Follow `BENCHMARK.md` for benchmarks. Use a testbox first; never run benchmarks
 on the developer host.
+
+## Browser launches
+
+Browser-launching tests and benchmarks belong in containers (see "Local
+verification"). When a browser does start on a host, it must never touch the
+host macOS Keychain:
+
+- Every Chromium launcher in this repository — the library's own
+  `default_args` and each benchmark or tool launcher — must pass
+  `--use-mock-keychain` and `--password-store=basic`. Upstream Playwright sets
+  both by default, so this is also a compatibility requirement.
+- If a macOS Keychain prompt ("Chrome Safe Storage") appears during a run,
+  kill the browser process and fix the launch arguments. Never approve the
+  prompt, and never retry until it stops appearing.
+- Debugger-held runs (for example `pytest --pdb`) keep browser processes
+  alive. Kill them when the session ends; never leave them unattended.
