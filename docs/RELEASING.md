@@ -155,7 +155,7 @@ only in its temporary assembled package.
   (cd "$test_dir" && npm init --yes && npm install "rustwright@${VERSION}" && node -e "require('rustwright')")
   ```
 
-- [ ] Confirm PyPI shows five `cp38-abi3` wheels plus the sdist: macOS arm64/x86_64, manylinux x86_64/aarch64, and Windows x86_64.
+- [ ] Confirm PyPI shows five ABI3 wheels plus the sdist: macOS arm64/x86_64, manylinux x86_64/aarch64, and Windows x86_64.
 - [ ] Confirm npm shows version `${VERSION}` under the `latest` dist-tag and displays provenance. `release-npm.yml` publishes without an explicit `--tag`, so npm applies `latest`.
 - [ ] Confirm the remaining three registries list `${VERSION}`: NuGet
       (`Rustwright`), RubyGems (`rustwright`, including one platform gem per
