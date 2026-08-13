@@ -11528,6 +11528,41 @@ class Video(_EventEmitter):
         self._delete(allow_before_close=True)
 
 
+def _walk_source_stack(
+    frame: Any,
+    visitor: Callable[[str, Any, str], bool],
+) -> None:
+    """Walk lightweight frame fields until ``visitor`` asks to stop."""
+    next_frame = None
+    code = None
+    filename = None
+    function = None
+    lineno = None
+    try:
+        while frame is not None:
+            code = frame.f_code
+            filename = code.co_filename
+            function = code.co_name
+            lineno = frame.f_lineno
+            next_frame = frame.f_back
+            code = None
+            frame = None
+            if visitor(filename, lineno, function):
+                break
+            filename = None
+            function = None
+            lineno = None
+            frame = next_frame
+            next_frame = None
+    finally:
+        code = None
+        filename = None
+        function = None
+        lineno = None
+        frame = None
+        next_frame = None
+
+
 class Tracing(_EventEmitter):
     def __init__(self, context: "BrowserContext"):
         self._context = context
@@ -11747,13 +11782,14 @@ class Tracing(_EventEmitter):
             stack_id = int(str(call_id).rsplit("@", 1)[1])
         except (IndexError, TypeError, ValueError):
             return
+        frame = None
         frames: list[list[Any]] = []
         fallback_frames: list[list[Any]] = []
         current_file = Path(__file__).resolve()
-        for frame in inspect.stack()[2:]:
-            filename = frame.filename
+
+        def append_frame(filename: str, lineno: Any, function: str) -> bool:
             if not filename:
-                continue
+                return False
             try:
                 resolved = Path(filename).resolve()
             except OSError:
@@ -11764,20 +11800,26 @@ class Tracing(_EventEmitter):
                 file_index = len(self._source_files)
                 self._source_file_indexes[file_key] = file_index
                 self._source_files.append(filename)
-            entry = [file_index, int(frame.lineno), 0, str(frame.function or "<module>")]
-            fallback_frames.append(entry)
-            if resolved == current_file:
-                continue
-            parts = set(resolved.parts)
-            if {"concurrent", "futures"}.issubset(parts) or resolved.name in {"threading.py", "_base.py"}:
-                continue
-            frames.append(entry)
-            if len(frames) >= 8:
-                break
-        if not frames:
-            frames = fallback_frames[:8]
-        if frames:
-            self._source_stacks.append([stack_id, frames])
+            entry = [file_index, int(lineno), 0, str(function or "<module>")]
+            if len(fallback_frames) < 8:
+                fallback_frames.append(entry)
+            if resolved != current_file:
+                parts = set(resolved.parts)
+                if not ({"concurrent", "futures"}.issubset(parts) or resolved.name in {"threading.py", "_base.py"}):
+                    frames.append(entry)
+                    return len(frames) >= 8
+            return False
+
+        try:
+            frame = sys._getframe(2)
+            _walk_source_stack(frame, append_frame)
+            frame = None
+            if not frames:
+                frames = fallback_frames[:8]
+            if frames:
+                self._source_stacks.append([stack_id, frames])
+        finally:
+            frame = None
 
     def _end_action(
         self,
