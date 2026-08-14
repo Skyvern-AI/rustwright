@@ -11,7 +11,10 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub use rustwright_core::{ActionabilityError, CancelToken, RwError as Error};
+pub use rustwright_core::{
+    ActionFailureError, ActionTimeoutError, ActionabilityError, CancelToken, CommandWritten,
+    FailureKind, FailureMetadata, FailurePhase, FailureTargetKind, RwError as Error,
+};
 
 /// Result type returned by the native API.
 pub type Result<T> = std::result::Result<T, Error>;
