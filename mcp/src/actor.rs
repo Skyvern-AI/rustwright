@@ -9663,7 +9663,7 @@ mod tests {
   #moving { width: 140px; height: 44px; }
   #moving.run { animation: move 320ms linear; }
   #partially-offscreen { position: fixed; left: -1000px; top: 120px; width: 1100px; height: 44px; }
-  #detach { display: block; margin-top: 1800px; width: 140px; height: 44px; }
+  #detach { position: absolute; left: 0; top: 100000px; width: 140px; height: 44px; }
   @keyframes move { from { transform: translateX(0); } to { transform: translateX(240px); } }
 </style>
 <button id="hidden">Hidden</button>
@@ -9701,14 +9701,58 @@ mod tests {
     });
   }
   const detached = document.querySelector('#detach');
-  // Deliberately rely on the engine calling this property: synchronous removal makes
-  // its next snapshot see isConnected === false; async observer delivery races dispatch
-  // and the winner has changed between Chromium builds.
-  const nativeScrollIntoView = detached.scrollIntoView;
-  detached.scrollIntoView = function(options) {
-    nativeScrollIntoView.call(this, options);
-    this.remove();
+  globalThis.detachedPointerEvents = [];
+  globalThis.detachedScroll = null;
+  globalThis.detachArmed = false;
+  globalThis.detachStartScrollY = 0;
+  globalThis.detachMotionTick = 0;
+  for (const name of ['mousedown', 'mouseup', 'click']) {
+    detached.addEventListener(name, event => {
+      globalThis.detachedPointerEvents.push({
+        type: event.type,
+        trusted: event.isTrusted,
+      });
+    });
+  }
+  // DOM geometry is frame-discrete, so two samples in the same frame are
+  // identical for any fixture. While the element exists, this fixture guarantees
+  // any two samples at least one frame (~16ms) apart differ: motion ticks run
+  // under both rAF and timer scheduling, and every tick moves the target by one
+  // CSS pixel (above the engine's 0.5px tolerance). A stability sampler that
+  // spaces samples closer than one frame measures sub-frame stability, which
+  // cannot observe motion by construction. Removal is scheduling-independent:
+  // the synchronous scroll listener and the interval and rAF monitors all call
+  // detachAfterScroll.
+  function advanceDetachMotion() {
+    if (!globalThis.detachArmed || !detached.isConnected) return;
+    globalThis.detachMotionTick += 1;
+    detached.style.transform = `translateY(${globalThis.detachMotionTick}px)`;
+  }
+  const detachAfterScroll = () => {
+    if (!globalThis.detachArmed || !detached.isConnected) return;
+    if (scrollY === globalThis.detachStartScrollY) return;
+    globalThis.detachedScroll = {
+      from: globalThis.detachStartScrollY,
+      to: scrollY,
+    };
+    detached.remove();
   };
+  addEventListener('scroll', detachAfterScroll, { passive: true });
+  // This harness owns a --headless=new browser with no user-visible window, so
+  // another application cannot occlude it and requestAnimationFrame stays live.
+  // The interval monitor still covers throttled frames, while the scroll listener
+  // removes synchronously during event dispatch regardless of either scheduler.
+  const monitorDetach = () => {
+    advanceDetachMotion();
+    detachAfterScroll();
+    if (detached.isConnected) requestAnimationFrame(monitorDetach);
+  };
+  requestAnimationFrame(monitorDetach);
+  const detachMonitorTimer = setInterval(() => {
+    advanceDetachMotion();
+    detachAfterScroll();
+    if (!detached.isConnected) clearInterval(detachMonitorTimer);
+  }, 16);
   fetch('/capture?events=actionability-ready');
 </script>"#
             .to_owned()
@@ -10603,10 +10647,63 @@ mod tests {
                         && event["clientX"] == json!(0))
             );
 
-            assert_actionability(
-                page.click("#detach", ActionOptions::timeout(3_000.0))
-                    .expect_err("detached target must not click"),
-                ActionabilityError::Detached,
+            let detached_precondition = page
+                .evaluate(
+                    "(() => {
+                      const target = document.querySelector('#detach');
+                      const rect = target.getBoundingClientRect();
+                      globalThis.detachStartScrollY = scrollY;
+                      globalThis.detachArmed = true;
+                      advanceDetachMotion();
+                      return {
+                        top: rect.top,
+                        bottom: rect.bottom,
+                        viewportHeight: innerHeight,
+                        scrollY,
+                      };
+                    })()",
+                    None,
+                    ActionOptions::timeout(1_000.0),
+                )
+                .expect("arm detached target fixture");
+            let detached_top = detached_precondition["top"]
+                .as_f64()
+                .expect("detached fixture top");
+            let viewport_height = detached_precondition["viewportHeight"]
+                .as_f64()
+                .expect("detached fixture viewport height");
+            assert!(
+                detached_top > viewport_height * 2.0,
+                "detached fixture precondition failed: target must start far below the viewport: \
+                 {detached_precondition}"
+            );
+
+            let detached_click = page.click("#detach", ActionOptions::timeout(3_000.0));
+            let detached_evidence = page
+                .evaluate(
+                    "({
+                      scroll: globalThis.detachedScroll,
+                      pointerEvents: globalThis.detachedPointerEvents,
+                      connected: document.querySelector('#detach')?.isConnected ?? false,
+                    })",
+                    None,
+                    ActionOptions::timeout(1_000.0),
+                )
+                .expect("read detached target evidence");
+            assert!(
+                detached_evidence["scroll"].is_object(),
+                "detached fixture precondition failed: actionability never scrolled the target: \
+                 {detached_evidence}"
+            );
+            let detached_error = match detached_click {
+                Err(error) => error,
+                Ok(()) => panic!("detached target must not click: {detached_evidence}"),
+            };
+            assert_actionability(detached_error, ActionabilityError::Detached);
+            assert_eq!(
+                detached_evidence["pointerEvents"],
+                json!([]),
+                "detached target must not receive pointer events"
             );
 
             page.goto(
