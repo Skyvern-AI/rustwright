@@ -7523,6 +7523,7 @@ mod tests {
     struct InputRestoringCdpProxy {
         endpoint: String,
         restored: Arc<AtomicBool>,
+        focus_emulation_enabled: Arc<AtomicBool>,
         stop: Arc<AtomicBool>,
         thread: Option<thread::JoinHandle<()>>,
     }
@@ -7541,8 +7542,10 @@ mod tests {
                 .expect("set input CDP test proxy nonblocking");
             let addr = listener.local_addr().expect("input CDP test proxy address");
             let restored = Arc::new(AtomicBool::new(false));
+            let focus_emulation_enabled = Arc::new(AtomicBool::new(false));
             let stop = Arc::new(AtomicBool::new(false));
             let thread_restored = Arc::clone(&restored);
+            let thread_focus_emulation_enabled = Arc::clone(&focus_emulation_enabled);
             let thread_stop = Arc::clone(&stop);
             let upstream_addr = upstream_addr.to_owned();
             let upstream_endpoint = upstream_endpoint.to_owned();
@@ -7557,6 +7560,8 @@ mod tests {
                             let handler_upstream_addr = upstream_addr.clone();
                             let handler_upstream_endpoint = upstream_endpoint.clone();
                             let handler_restored = Arc::clone(&thread_restored);
+                            let handler_focus_emulation_enabled =
+                                Arc::clone(&thread_focus_emulation_enabled);
                             handlers.push(thread::spawn(move || {
                                 proxy_cdp_restoring_before_input(
                                     client,
@@ -7564,6 +7569,7 @@ mod tests {
                                     &handler_upstream_endpoint,
                                     window_id,
                                     &handler_restored,
+                                    &handler_focus_emulation_enabled,
                                 )
                             }));
                         }
@@ -7582,6 +7588,7 @@ mod tests {
             Self {
                 endpoint: format!("ws://{addr}/{path}"),
                 restored,
+                focus_emulation_enabled,
                 stop,
                 thread: Some(thread),
             }
@@ -7593,6 +7600,10 @@ mod tests {
 
         fn restored(&self) -> bool {
             self.restored.load(Ordering::SeqCst)
+        }
+
+        fn focus_emulation_enabled(&self) -> bool {
+            self.focus_emulation_enabled.load(Ordering::SeqCst)
         }
     }
 
@@ -7618,6 +7629,7 @@ mod tests {
         upstream_endpoint: &str,
         window_id: i64,
         restored: &AtomicBool,
+        focus_emulation_enabled: &AtomicBool,
     ) {
         client
             .set_nonblocking(false)
@@ -7640,26 +7652,34 @@ mod tests {
             let _ = std::io::copy(&mut upstream_reader, &mut client_writer);
         });
         while let Ok(frame) = read_websocket_frame(&mut client) {
-            if frame[0] & 0x0f == 1
-                && serde_json::from_slice::<Value>(&test_websocket_payload(&frame))
-                    .ok()
-                    .and_then(|command| command["method"].as_str().map(str::to_owned))
-                    .is_some_and(|method| method == "Input.dispatchMouseEvent")
-                && !restored.swap(true, Ordering::SeqCst)
-            {
-                // This Chromium does not route physical input to a minimized window. Keep the
-                // page hidden through actionability, then restore only when that real path emits
-                // its first input command. A stalled actionability probe never reaches this point.
-                let mut control = connect_test_websocket(upstream_endpoint);
-                send_test_cdp_command(
-                    &mut control,
-                    1,
-                    "Browser.setWindowBounds",
-                    json!({
-                        "windowId": window_id,
-                        "bounds": { "windowState": "normal" },
-                    }),
-                );
+            if frame[0] & 0x0f == 1 {
+                let command = serde_json::from_slice::<Value>(&test_websocket_payload(&frame)).ok();
+                if command.as_ref().is_some_and(|command| {
+                    command["method"] == "Emulation.setFocusEmulationEnabled"
+                        && command["params"]["enabled"] == Value::Bool(true)
+                }) {
+                    focus_emulation_enabled.store(true, Ordering::SeqCst);
+                }
+                if command
+                    .as_ref()
+                    .is_some_and(|command| command["method"] == "Input.dispatchMouseEvent")
+                    && !restored.swap(true, Ordering::SeqCst)
+                {
+                    // This Chromium does not route physical input to a minimized window. Keep the
+                    // page hidden through actionability, then restore only when that real path
+                    // emits its first input command. A stalled actionability probe never reaches
+                    // this point.
+                    let mut control = connect_test_websocket(upstream_endpoint);
+                    send_test_cdp_command(
+                        &mut control,
+                        1,
+                        "Browser.setWindowBounds",
+                        json!({
+                            "windowId": window_id,
+                            "bounds": { "windowState": "normal" },
+                        }),
+                    );
+                }
             }
             upstream
                 .write_all(&frame)
@@ -13586,7 +13606,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn physical_click_succeeds_when_background_page_pauses_animation_frames() {
+    async fn physical_click_succeeds_on_non_frontmost_focus_emulated_page() {
         let _guard = browser_test_lock().lock().await;
         if chromium().executable_path().is_none() {
             eprintln!("skipping background physical click test: Chromium executable unavailable");
@@ -13636,7 +13656,7 @@ document.visibilityState
                     ActionOptions::timeout(1_000.0),
                 )
                 .expect("start background scheduling proof"),
-                json!("hidden")
+                json!("visible")
             );
 
             let scheduling_deadline = Instant::now() + Duration::from_secs(10);
@@ -13665,15 +13685,19 @@ document.visibilityState
                     ActionOptions::timeout(1_000.0),
                 )
                 .expect("finish bounded background scheduling proof");
-            assert_eq!(scheduling["visibility"], json!("hidden"));
-            assert_eq!(scheduling["animationFrameRan"], Value::Bool(false));
+            assert_eq!(scheduling["visibility"], json!("visible"));
+            assert_eq!(scheduling["animationFrameRan"], Value::Bool(true));
+            assert!(
+                proxy.focus_emulation_enabled(),
+                "the attached page must receive Emulation.setFocusEmulationEnabled"
+            );
+            assert!(!proxy.restored(), "window must remain non-frontmost before input");
 
             let click_started = Instant::now();
-            // Generous ceiling so a slow CI runner can't time out a click that DOES
-            // complete; without the stability-probe fallback the click still hangs to
-            // this deadline and fails, which is what proves the fix.
+            // A healthy click completes well below one second. Three seconds leaves a two-second
+            // CI margin while still rejecting the historical five-second attachment stall.
             page.click("#background", ActionOptions::timeout(15_000.0))
-                .expect("physical click must complete after hidden-page actionability");
+                .expect("physical click must complete on a non-frontmost page");
             let click_elapsed = click_started.elapsed();
             let evidence = page
                 .evaluate(
@@ -13683,7 +13707,7 @@ document.visibilityState
                 )
                 .expect("read background physical click evidence");
             assert!(
-                click_elapsed < Duration::from_millis(12_000),
+                click_elapsed < Duration::from_millis(3_000),
                 "background physical click stalled for {click_elapsed:?}"
             );
             assert!(proxy.restored(), "physical input should trigger window restoration");
@@ -13704,7 +13728,7 @@ document.visibilityState
             assert_eq!(evidence["effectCount"], json!(1));
             assert_eq!(evidence["text"], json!("Background click effect 1"));
             println!(
-                "background physical click: precondition=400ms actionability_visibility=hidden timer=true rAF=false click={click_elapsed:?} trusted_events=3"
+                "background physical click: precondition=400ms focus_emulated_visibility=visible timer=true rAF=true click={click_elapsed:?} trusted_events=3"
             );
             drop(page);
             drop(browser);
