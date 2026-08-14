@@ -26,7 +26,6 @@ from .sync_api import (
     expect,
     sync_playwright,
 )
-from .async_api import async_playwright
 
 __all__ = [
     "Browser",
@@ -56,3 +55,17 @@ __all__ = [
     "async_playwright",
     "sync_playwright",
 ]
+
+
+# Import attribution showed the async facade subtree is about 20% of package import, so defer it for sync-only users.
+def __getattr__(name: str):
+    if name == "async_playwright":
+        from .async_api import async_playwright
+
+        globals()[name] = async_playwright
+        return async_playwright
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
