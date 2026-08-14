@@ -4222,26 +4222,34 @@ def test_combined_frame_events_preserve_child_frame_identity(page, http_server):
     assert detached_child.is_detached() is True
 
 
-def test_history_navigation_returns_real_responses(page, http_server):
-    initial = page.go_back(timeout=500)
-    assert initial is None
+def test_history_navigation_returns_real_responses(playwright, http_server):
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=["--disable-back-forward-cache"],
+    )
+    try:
+        page = browser.new_page()
+        initial = page.go_back(timeout=500)
+        assert initial is None
 
-    page.goto(f"{http_server}/page")
-    page.goto(f"{http_server}/json")
-    back_response = page.go_back()
-    assert back_response is not None
-    assert back_response.status == 200
-    assert back_response.url == f"{http_server}/page"
-    assert back_response.request is not None
-    assert back_response.request.frame.page is page
+        page.goto(f"{http_server}/page")
+        page.goto(f"{http_server}/json")
+        back_response = page.go_back()
+        assert back_response is not None
+        assert back_response.status == 200
+        assert back_response.url == f"{http_server}/page"
+        assert back_response.request is not None
+        assert back_response.request.frame.page is page
 
-    forward_response = page.go_forward()
-    assert forward_response is not None
-    assert forward_response.status == 201
-    assert forward_response.url == f"{http_server}/json"
-    assert forward_response.request is not None
-    assert forward_response.request.response() is forward_response
-    assert forward_response.json() == {"ok": True, "path": "/json"}
+        forward_response = page.go_forward()
+        assert forward_response is not None
+        assert forward_response.status == 201
+        assert forward_response.url == f"{http_server}/json"
+        assert forward_response.request is not None
+        assert forward_response.request.response() is forward_response
+        assert forward_response.json() == {"ok": True, "path": "/json"}
+    finally:
+        browser.close()
 
 
 def test_history_navigation_boundaries_return_none_without_waiting(page, http_server):
