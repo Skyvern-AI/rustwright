@@ -220,6 +220,74 @@ The checker is intentionally stricter than a benchmark smoke. It rejects
 one-case provenance runs, local diagnostics, missing p25/median/p75 metrics,
 and non-Testbox evidence even when the run is useful for CI or debugging.
 
+## Cold-start phase latency
+
+Use the cold-start harness to compare two Rustwright revisions. Run it on one
+reserved Testbox. The matrix builds both wheels in that Testbox and installs
+them in separate virtual environments inside one derived Docker image.
+
+Run one launcher process for one sample:
+
+```bash
+RUSTWRIGHT_STARTUP_TIMING_FILE=.benchmark-data/results/startup-core.jsonl python benchmarks/startup_latency.py
+```
+
+The launcher measures import, manager creation, API startup, first Chromium
+facade access, browser launch, first page creation, the blank-page probe, and
+close. It prints one JSON record. A failed run prints an error record and exits
+nonzero. Core JSONL is optional. The launcher still works on revisions that do
+not implement `RUSTWRIGHT_STARTUP_TIMING_FILE`.
+
+Use `--browser-path` to pass `executable_path` through the public launch API.
+Otherwise, let the library read `RUSTWRIGHT_CHROMIUM`, `CHROME`, or `CHROMIUM`.
+Set `RUSTWRIGHT_CDP_TRANSPORT` to select `websocket` or `pipe`. The public
+launch API does not accept a transport argument. Never pass custom Chromium
+arguments or `ignore_default_args` to this benchmark.
+
+Run 30 matched pairs in balanced ABBA order. Keep the default
+`per-sample-container` isolation. It starts each sample in a fresh container
+with equal memory and swap caps. The `revision-block-container` mode is a
+diagnostic fallback. It reuses container state and cannot pass the Testbox
+evidence checker.
+
+Warm one Testbox and run the full matrix there:
+
+```bash
+RUSTWRIGHT_TESTBOX_REF=<pushed-ref> \
+RUSTWRIGHT_TESTBOX_IDLE_TIMEOUT=120 \
+RUSTWRIGHT_TESTBOX_DOWNLOAD_RESULTS=1 \
+tools/run_benchmark_testbox.sh -- 'set -euo pipefail; mkdir -p .benchmark-data/results .benchmark-data/reports; timestamp="$(date -u +%Y%m%dT%H%M%SZ)"; matrix_rc=0; TEST_DOCKER_MEMORY_LIMIT=8g RUSTWRIGHT_DOCKER_IMAGE=rustwright-verify-testbox python tools/run_startup_latency_matrix.py --before-rev <base-sha> --after-rev <candidate-sha> --pairs 30 --order balanced-abba --output ".benchmark-data/results/startup-latency-${timestamp}.json" --json || matrix_rc=$?; if [ "$matrix_rc" -ne 0 ] && [ "$matrix_rc" -ne 3 ]; then exit 1; fi; python tools/check_startup_latency.py ".benchmark-data/results/startup-latency-${timestamp}.json" --source testbox --runner blacksmith-testbox --run-url "testbox:${HOSTNAME:-unknown}" --min-pairs 20 --require-balanced-order --require-matched-environment --output ".benchmark-data/reports/startup-latency-${timestamp}-validation.json" --json'
+```
+
+The matrix runs sequentially at concurrency one. It records both source SHAs,
+wheel and image identities, browser and runtime versions, resource caps, CPU
+data, the exact command, start time, sample order, sample and metadata container
+names, and the full metadata container command.
+It retains failures as raw samples. Exit 0 means all samples passed. Exit 3
+means the artifact is complete but retains sample failures. Exit 1 means setup
+or protocol failure. The command above runs the checker after exit 0 or 3. The
+checker supplies the final pipeline result.
+
+`tools/startup_latency_stats.py` is the stdlib-only statistics source for the
+matrix and checker. It reports median, p25, p75, MAD, paired median changes,
+and a 95% paired bootstrap interval for each phase. The
+`paired-delta-random-v1` protocol uses exactly 10,000 resamples. Its seed is
+`startup-latency:<phase>:<complete-pair-count>`. It draws each sample index
+from the seeded `random.Random.random()` stream. This stream is stable across
+Python versions. The protocol does not use `randrange`, whose stream is not
+guaranteed to remain stable. Do not report p95 from this protocol.
+
+The checker fails closed. It requires at least 20 complete pairs, exact ABBA
+balance, equal matched environments, contiguous phase endpoints, the derived
+first-page total, complete provenance, success rates, and recomputed
+statistics. `--source testbox` is an operator attestation. Use it only for a
+real Testbox run. Supply a nonempty runner label and Testbox run reference.
+Reviewers use the label and reference as part of the evidence.
+
+Keep raw results under `.benchmark-data/results/`. Keep summaries and checker
+reports under `.benchmark-data/reports/`. These paths are untracked. Do not
+commit the generated artifacts.
+
 ## Local Diagnostic: Trusted Input Default
 
 On 2026-07-03, after disabling untrusted DOM action fast paths by default, a

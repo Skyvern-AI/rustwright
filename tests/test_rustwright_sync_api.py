@@ -205,6 +205,19 @@ def subprocess_env(**overrides: str) -> dict[str, str]:
     return env
 
 
+def _run_rustwright_subprocess(source: str, marker: str) -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        env=subprocess_env(),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stdout
+    assert marker in result.stdout, result.stdout
+
+
 def require_reference_module(module_name: str, reason: str) -> None:
     probe = subprocess.run(
         [
@@ -33557,6 +33570,105 @@ def test_context_weberror_event_wraps_page_error(browser):
 def test_unsupported_browser_types_raise(playwright):
     with pytest.raises(Error):
         playwright.firefox.launch()
+
+
+def test_async_api_basic_flow_defers_async_import_for_sync_manager_lifecycle():
+    _run_rustwright_subprocess(
+        inspect.cleandoc(
+            """
+            import sys
+
+            import rustwright
+
+            assert "rustwright.async_api" not in sys.modules
+            assert "asyncio" not in sys.modules
+            playwright = rustwright.sync_playwright().start()
+            playwright.stop()
+            assert "rustwright.async_api" not in sys.modules
+            assert "asyncio" not in sys.modules
+            print("cold-sync-ok")
+            """
+        ),
+        "cold-sync-ok",
+    )
+
+
+def test_async_api_basic_flow_lazy_attribute_loads_and_caches_callable():
+    _run_rustwright_subprocess(
+        inspect.cleandoc(
+            """
+            import sys
+
+            import rustwright
+
+            first = rustwright.async_playwright
+            second = rustwright.async_playwright
+            assert callable(first)
+            assert first is second
+            assert rustwright.__dict__["async_playwright"] is first
+            assert "rustwright.async_api" in sys.modules
+            print("lazy-attribute-ok")
+            """
+        ),
+        "lazy-attribute-ok",
+    )
+
+
+def test_async_api_basic_flow_import_forms_remain_supported():
+    _run_rustwright_subprocess(
+        inspect.cleandoc(
+            """
+            import sys
+
+            from rustwright import async_playwright
+
+            assert callable(async_playwright)
+            assert "rustwright.async_api" in sys.modules
+            print("root-import-ok")
+            """
+        ),
+        "root-import-ok",
+    )
+    _run_rustwright_subprocess(
+        inspect.cleandoc(
+            """
+            import rustwright.async_api
+            from rustwright.async_api import async_playwright
+
+            assert callable(rustwright.async_api.async_playwright)
+            assert async_playwright is rustwright.async_api.async_playwright
+            print("direct-import-ok")
+            """
+        ),
+        "direct-import-ok",
+    )
+    _run_rustwright_subprocess(
+        inspect.cleandoc(
+            """
+            namespace = {}
+            exec("from rustwright import *", namespace)
+            assert callable(namespace["async_playwright"])
+            print("star-import-ok")
+            """
+        ),
+        "star-import-ok",
+    )
+
+
+def test_async_api_basic_flow_root_directory_and_public_exports_are_stable():
+    assert "async_playwright" in dir(rustwright)
+    assert "async_playwright" in rustwright.__all__
+    # __all__ may legitimately grow on main; defend the durable contract
+    # instead of a frozen snapshot: no duplicates, and every advertised
+    # export resolves (async_playwright through the lazy module __getattr__).
+    assert len(rustwright.__all__) == len(set(rustwright.__all__))
+    for public_name in rustwright.__all__:
+        assert getattr(rustwright, public_name) is not None
+    assert set(rustwright.__all__) <= set(dir(rustwright))
+    missing_name = "_missing_public_name_for_test"
+    with pytest.raises(AttributeError) as exc_info:
+        getattr(rustwright, missing_name)
+    assert str(exc_info.value) == f"module 'rustwright' has no attribute {missing_name!r}"
 
 
 def test_async_api_basic_flow():

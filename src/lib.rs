@@ -38,6 +38,7 @@ use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Uri};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
+mod startup_timing;
 mod telemetry;
 
 pub type RwResult<T> = Result<T, RwError>;
@@ -3419,12 +3420,13 @@ mod tests {
         let browser = Arc::new(BrowserInner {
             runtime: OwnedRuntime::new(runtime),
             client: Arc::new(client),
+            startup_probe: None,
             process: Mutex::new(None),
             profile_dir: Mutex::new(None),
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
-            keyboard_platform: BrowserKeyboardPlatform::Control,
+            keyboard_platform: BrowserKeyboardPlatformState::default(),
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -5181,12 +5183,13 @@ multiline-compatible = """4.5.6"""
         let browser = Arc::new(BrowserInner {
             runtime: OwnedRuntime::new(runtime),
             client: Arc::clone(&client),
+            startup_probe: None,
             process: Mutex::new(None),
             profile_dir: Mutex::new(None),
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
-            keyboard_platform: BrowserKeyboardPlatform::Control,
+            keyboard_platform: BrowserKeyboardPlatformState::default(),
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -5319,12 +5322,13 @@ multiline-compatible = """4.5.6"""
         let browser = Arc::new(BrowserInner {
             runtime: OwnedRuntime::new(runtime),
             client: Arc::clone(&client),
+            startup_probe: None,
             process: Mutex::new(None),
             profile_dir: Mutex::new(None),
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
-            keyboard_platform: BrowserKeyboardPlatform::Control,
+            keyboard_platform: BrowserKeyboardPlatformState::default(),
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -6000,12 +6004,13 @@ multiline-compatible = """4.5.6"""
                 alive: Arc::new(AtomicBool::new(true)),
                 alive_tx,
             }),
+            startup_probe: None,
             process: Mutex::new(None),
             profile_dir: Mutex::new(None),
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
-            keyboard_platform: BrowserKeyboardPlatform::Control,
+            keyboard_platform: BrowserKeyboardPlatformState::default(),
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -6449,6 +6454,28 @@ multiline-compatible = """4.5.6"""
             BrowserKeyboardPlatform::from_version(&json!({})),
             BrowserKeyboardPlatform::Control
         );
+    }
+
+    #[test]
+    fn browser_keyboard_platform_state_defaults_to_control_and_sets_once() {
+        let mac_first = BrowserKeyboardPlatformState::default();
+        assert_eq!(mac_first.get(), BrowserKeyboardPlatform::Control);
+        assert!(mac_first.set_once_from_version(&json!({
+            "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)"
+        })));
+        assert!(!mac_first.set_once_from_version(&json!({
+            "userAgent": "Mozilla/5.0 (X11; Linux x86_64)"
+        })));
+        assert_eq!(mac_first.get(), BrowserKeyboardPlatform::Mac);
+
+        let control_first = BrowserKeyboardPlatformState::default();
+        assert!(control_first.set_once_from_version(&json!({
+            "userAgent": "Mozilla/5.0 (X11; Linux x86_64)"
+        })));
+        assert!(!control_first.set_once_from_version(&json!({
+            "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)"
+        })));
+        assert_eq!(control_first.get(), BrowserKeyboardPlatform::Control);
     }
 
     #[test]
@@ -8647,12 +8674,13 @@ multiline-compatible = """4.5.6"""
                     alive: Arc::new(AtomicBool::new(true)),
                     alive_tx,
                 }),
+                startup_probe: None,
                 process: Mutex::new(None),
                 profile_dir: Mutex::new(None),
                 owned: false,
                 ws_endpoint: "ws://test.invalid".to_string(),
                 stealth_user_agent_override: Mutex::new(None),
-                keyboard_platform: BrowserKeyboardPlatform::Control,
+                keyboard_platform: BrowserKeyboardPlatformState::default(),
                 single_process_fallback: false,
                 lifecycle: Arc::new(CloseLifecycle::new()),
                 attached_pages: AttachedPageRegistry::default(),
@@ -8713,12 +8741,13 @@ multiline-compatible = """4.5.6"""
                 alive: Arc::new(AtomicBool::new(true)),
                 alive_tx,
             }),
+            startup_probe: None,
             process: Mutex::new(None),
             profile_dir: Mutex::new(None),
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
-            keyboard_platform: BrowserKeyboardPlatform::Control,
+            keyboard_platform: BrowserKeyboardPlatformState::default(),
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -9035,12 +9064,13 @@ multiline-compatible = """4.5.6"""
         let browser = Arc::new(BrowserInner {
             runtime: OwnedRuntime::new(runtime),
             client: Arc::clone(&client),
+            startup_probe: None,
             process: Mutex::new(None),
             profile_dir: Mutex::new(None),
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
-            keyboard_platform: BrowserKeyboardPlatform::Control,
+            keyboard_platform: BrowserKeyboardPlatformState::default(),
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -9205,12 +9235,13 @@ multiline-compatible = """4.5.6"""
                 alive: Arc::new(AtomicBool::new(true)),
                 alive_tx,
             }),
+            startup_probe: None,
             process: Mutex::new(None),
             profile_dir: Mutex::new(None),
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
-            keyboard_platform: BrowserKeyboardPlatform::Control,
+            keyboard_platform: BrowserKeyboardPlatformState::default(),
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -10011,12 +10042,13 @@ multiline-compatible = """4.5.6"""
         let browser = Arc::new(BrowserInner {
             runtime: OwnedRuntime::new(tokio::runtime::Runtime::new().unwrap()),
             client,
+            startup_probe: None,
             process: Mutex::new(None),
             profile_dir: Mutex::new(None),
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
-            keyboard_platform: BrowserKeyboardPlatform::Control,
+            keyboard_platform: BrowserKeyboardPlatformState::default(),
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -18247,12 +18279,13 @@ async fn settle_write_status(
 struct BrowserInner {
     runtime: OwnedRuntime,
     client: Arc<CdpClient>,
+    startup_probe: Option<Arc<startup_timing::StartupProbe>>,
     process: Mutex<Option<Child>>,
     profile_dir: Mutex<Option<TempDir>>,
     owned: bool,
     ws_endpoint: String,
     stealth_user_agent_override: Mutex<Option<Value>>,
-    keyboard_platform: BrowserKeyboardPlatform,
+    keyboard_platform: BrowserKeyboardPlatformState,
     single_process_fallback: bool,
     lifecycle: Arc<CloseLifecycle>,
     attached_pages: AttachedPageRegistry,
@@ -18295,20 +18328,30 @@ impl BrowserKeyboardPlatform {
     }
 }
 
-fn detect_browser_keyboard_platform(
-    runtime: &tokio::runtime::Runtime,
-    client: &CdpClient,
-    timeout: Duration,
-) -> BrowserKeyboardPlatform {
-    if timeout.is_zero() {
-        return BrowserKeyboardPlatform::Control;
+#[derive(Default)]
+struct BrowserKeyboardPlatformState(AtomicU8);
+
+impl BrowserKeyboardPlatformState {
+    const UNSET: u8 = 0;
+    const CONTROL: u8 = 1;
+    const MAC: u8 = 2;
+
+    fn get(&self) -> BrowserKeyboardPlatform {
+        match self.0.load(Ordering::SeqCst) {
+            Self::MAC => BrowserKeyboardPlatform::Mac,
+            _ => BrowserKeyboardPlatform::Control,
+        }
     }
-    runtime
-        .block_on(client.send("Browser.getVersion", json!({}), None, timeout))
-        .map(|version| BrowserKeyboardPlatform::from_version(&version))
-        // Browser keyboard semantics must never depend on the client host. If
-        // metadata is unavailable, use the cross-platform Control mapping.
-        .unwrap_or_default()
+
+    fn set_once_from_version(&self, version: &Value) -> bool {
+        let value = match BrowserKeyboardPlatform::from_version(version) {
+            BrowserKeyboardPlatform::Mac => Self::MAC,
+            BrowserKeyboardPlatform::Control => Self::CONTROL,
+        };
+        self.0
+            .compare_exchange(Self::UNSET, value, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
 }
 
 #[derive(Default)]
@@ -19033,6 +19076,41 @@ fn browser_context_create_params(options_json: Option<&str>) -> RwResult<Value> 
         }
     }
     Ok(params)
+}
+async fn create_browser_context_inner(
+    browser: Arc<BrowserInner>,
+    params: Value,
+) -> RwResult<Arc<ContextInner>> {
+    let startup_probe = browser.startup_probe.clone();
+    startup_timing::measure_phase_async(
+        startup_probe.as_deref(),
+        startup_timing::Phase::ContextCreate,
+        Some(startup_timing::ParentPhase::PageCreate),
+        async move {
+            let result = browser
+                .client
+                .send(
+                    "Target.createBrowserContext",
+                    params,
+                    None,
+                    Duration::from_secs(5),
+                )
+                .await?;
+            let context_id = result
+                .get("browserContextId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RwError::Message("CDP did not return a browserContextId".to_string())
+                })?
+                .to_string();
+            Ok(Arc::new(ContextInner {
+                browser,
+                context_id: Some(context_id),
+                lifecycle: Arc::new(CloseLifecycle::new()),
+            }))
+        },
+    )
+    .await
 }
 
 async fn close_context_cleanup(context: Arc<ContextInner>) -> RwResult<()> {
@@ -21159,31 +21237,10 @@ impl PyBrowser {
     fn new_context(&self, options_json: Option<&str>) -> PyResult<PyBrowserContext> {
         let params = browser_context_create_params(options_json).map_err(py_err)?;
         let browser = Arc::clone(&self.inner);
-        let result = browser
-            .block_on(async {
-                browser
-                    .client
-                    .send(
-                        "Target.createBrowserContext",
-                        params,
-                        None,
-                        Duration::from_secs(5),
-                    )
-                    .await
-            })
+        let inner = browser
+            .block_on(create_browser_context_inner(Arc::clone(&browser), params))
             .map_err(py_err)?;
-        let context_id = result
-            .get("browserContextId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| PyRuntimeError::new_err("CDP did not return a browserContextId"))?
-            .to_string();
-        Ok(PyBrowserContext {
-            inner: Arc::new(ContextInner {
-                browser: Arc::clone(&self.inner),
-                context_id: Some(context_id),
-                lifecycle: Arc::new(CloseLifecycle::new()),
-            }),
-        })
+        Ok(PyBrowserContext { inner })
     }
 
     #[pyo3(signature = (options_json=None))]
@@ -21191,32 +21248,7 @@ impl PyBrowser {
         let params = browser_context_create_params(options_json).map_err(py_err)?;
         let browser = Arc::clone(&self.inner);
         let runtime = browser.runtime.handle().clone();
-        let future_browser = Arc::clone(&browser);
-        let creation = runtime.spawn(async move {
-            let result = future_browser
-                .client
-                .send(
-                    "Target.createBrowserContext",
-                    params,
-                    None,
-                    Duration::from_secs(5),
-                )
-                .await?;
-            let context_id = result
-                .get("browserContextId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    RwError::Message("CDP did not return a browserContextId".to_string())
-                })?
-                .to_string();
-            Ok(PyBrowserContext {
-                inner: Arc::new(ContextInner {
-                    browser: future_browser,
-                    context_id: Some(context_id),
-                    lifecycle: Arc::new(CloseLifecycle::new()),
-                }),
-            })
-        });
+        let creation = runtime.spawn(create_browser_context_inner(browser, params));
         python_future_on(
             py,
             runtime,
@@ -21225,7 +21257,7 @@ impl PyBrowser {
                     .await
                     .map_err(|error| RwError::Message(error.to_string()))?
             },
-            |py, context| Ok(Py::new(py, context)?.into_any()),
+            |py, inner| Ok(Py::new(py, PyBrowserContext { inner })?.into_any()),
         )
     }
 
@@ -29976,7 +30008,11 @@ return { ready: true, result: true, payload: null };
     }
 
     fn keyboard_primary_modifier(&self) -> &'static str {
-        self.inner.browser.keyboard_platform.primary_modifier()
+        self.inner
+            .browser
+            .keyboard_platform
+            .get()
+            .primary_modifier()
     }
 
     #[pyo3(signature = (text, delay_ms=None, timeout_ms=None))]
@@ -29998,7 +30034,7 @@ return { ready: true, result: true, payload: null };
                 &text,
                 delay,
                 transport_timeout,
-                page.browser.keyboard_platform,
+                page.browser.keyboard_platform.get(),
             ))
             .map_err(py_err)
     }
@@ -32171,58 +32207,82 @@ impl PyPage {
 }
 
 fn launch_chromium_with_options(options: LaunchOptions) -> RwResult<Arc<BrowserInner>> {
-    launch_chromium_with_options_cancelable(options, None)
-}
-
-fn launch_chromium_with_options_cancelable(
-    options: LaunchOptions,
-    cancelled: Option<Arc<AtomicBool>>,
-) -> RwResult<Arc<BrowserInner>> {
-    launch_chromium_with_options_cancellation(options, cancelled, None)
+    launch_chromium_with_options_cancellation(
+        options,
+        None,
+        None,
+        Some(startup_timing::EntryPoint::RustNative),
+    )
 }
 
 fn launch_chromium_with_options_token(
     options: LaunchOptions,
     cancel: CancelToken,
 ) -> RwResult<Arc<BrowserInner>> {
-    launch_chromium_with_options_cancellation(options, Some(cancel.atomic_flag()), Some(cancel))
+    launch_chromium_with_options_cancellation(
+        options,
+        Some(cancel.atomic_flag()),
+        Some(cancel),
+        Some(startup_timing::EntryPoint::RustNative),
+    )
 }
 
 fn launch_chromium_with_options_cancellation(
     mut options: LaunchOptions,
     cancelled: Option<Arc<AtomicBool>>,
     cancel: Option<CancelToken>,
+    entrypoint: Option<startup_timing::EntryPoint>,
 ) -> RwResult<Arc<BrowserInner>> {
+    let startup_probe = startup_timing::StartupProbe::from_env(
+        entrypoint.unwrap_or(startup_timing::EntryPoint::Unknown),
+    );
     if options.timeout.is_none() {
         options.timeout = Some(30_000.0);
     }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(2)
-        .build()
-        .map_err(|error| RwError::Message(error.to_string()))?;
+    let runtime = startup_timing::measure_phase(
+        startup_probe.as_deref(),
+        startup_timing::Phase::RuntimeCreate,
+        Some(startup_timing::ParentPhase::BrowserLaunch),
+        || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .build()
+                .map_err(|error| RwError::Message(error.to_string()))
+        },
+    )?;
     let timeout = BrowserInner::command_timeout(options.timeout);
-    let (mut child, profile_dir, transport, single_process_fallback) =
-        launch_chromium_process(&options, &runtime, timeout, cancelled.clone())?;
+    let (mut child, profile_dir, transport, single_process_fallback) = launch_chromium_process(
+        &options,
+        &runtime,
+        timeout,
+        cancelled.clone(),
+        startup_probe.as_deref(),
+    )?;
     let ws_endpoint = transport.endpoint_label();
-    let client_result = match transport {
-        LaunchedCdpTransport::WebSocket(endpoint) => runtime.block_on(async {
-            if let Some(cancelled) = cancelled.clone() {
-                tokio::select! {
-                    result = CdpClient::connect(&endpoint) => result,
-                    () = wait_for_launch_cancellation(cancelled) => {
-                        Err(RwError::Message("browser launch was cancelled".to_string()))
+    let client_result = startup_timing::measure_phase(
+        startup_probe.as_deref(),
+        startup_timing::Phase::TransportConnect,
+        Some(startup_timing::ParentPhase::BrowserLaunch),
+        || match transport {
+            LaunchedCdpTransport::WebSocket(endpoint) => runtime.block_on(async {
+                if let Some(cancelled) = cancelled.clone() {
+                    tokio::select! {
+                        result = CdpClient::connect(&endpoint) => result,
+                        () = wait_for_launch_cancellation(cancelled) => {
+                            Err(RwError::Message("browser launch was cancelled".to_string()))
+                        }
                     }
+                } else {
+                    CdpClient::connect(&endpoint).await
                 }
-            } else {
-                CdpClient::connect(&endpoint).await
+            }),
+            #[cfg(unix)]
+            LaunchedCdpTransport::Pipe { read, write } => {
+                runtime.block_on(CdpClient::connect_pipe(read, write))
             }
-        }),
-        #[cfg(unix)]
-        LaunchedCdpTransport::Pipe { read, write } => {
-            runtime.block_on(CdpClient::connect_pipe(read, write))
-        }
-    };
+        },
+    );
     let client = match client_result {
         Ok(client) => client,
         Err(error) => {
@@ -32231,39 +32291,47 @@ fn launch_chromium_with_options_cancellation(
             return Err(error);
         }
     };
-    let keyboard_platform =
-        detect_browser_keyboard_platform(&runtime, &client, Duration::from_secs(5));
     if let Err(error) = start_service_worker_stealth_auto_attach_cancelable(
         &runtime,
         Arc::clone(&client),
         Duration::from_secs(5),
         cancel,
+        startup_probe.as_deref(),
     ) {
         client.close();
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);
     }
-    let browser = Arc::new(BrowserInner {
-        runtime: OwnedRuntime::new(runtime),
-        client,
-        process: Mutex::new(Some(child)),
-        profile_dir: Mutex::new(profile_dir),
-        owned: true,
-        ws_endpoint,
-        stealth_user_agent_override: Mutex::new(None),
-        keyboard_platform,
-        single_process_fallback,
-        lifecycle: Arc::new(CloseLifecycle::new()),
-        attached_pages: AttachedPageRegistry::default(),
-        next_native_network_index: AtomicU64::new(1),
-    });
-    if launch_was_cancelled(cancelled.as_ref()) {
-        let _ = close_browser_blocking(Arc::clone(&browser));
-        return Err(RwError::Message("browser launch was cancelled".to_string()));
-    }
-    telemetry::record_engine_launched(&browser.runtime);
-    Ok(browser)
+    let browser_probe = startup_probe.clone();
+    startup_timing::measure_phase(
+        startup_probe.as_deref(),
+        startup_timing::Phase::BrowserReturn,
+        Some(startup_timing::ParentPhase::BrowserLaunch),
+        || {
+            let browser = Arc::new(BrowserInner {
+                runtime: OwnedRuntime::new(runtime),
+                client,
+                startup_probe: browser_probe,
+                process: Mutex::new(Some(child)),
+                profile_dir: Mutex::new(profile_dir),
+                owned: true,
+                ws_endpoint,
+                stealth_user_agent_override: Mutex::new(None),
+                keyboard_platform: BrowserKeyboardPlatformState::default(),
+                single_process_fallback,
+                lifecycle: Arc::new(CloseLifecycle::new()),
+                attached_pages: AttachedPageRegistry::default(),
+                next_native_network_index: AtomicU64::new(1),
+            });
+            if launch_was_cancelled(cancelled.as_ref()) {
+                let _ = close_browser_blocking(Arc::clone(&browser));
+                return Err(RwError::Message("browser launch was cancelled".to_string()));
+            }
+            telemetry::record_engine_launched(&browser.runtime);
+            Ok(browser)
+        },
+    )
 }
 
 fn launch_was_cancelled(cancelled: Option<&Arc<AtomicBool>>) -> bool {
@@ -32284,7 +32352,14 @@ fn launch_chromium(py: Python<'_>, options_json: &str) -> PyResult<PyBrowser> {
     let options: LaunchOptions = serde_json::from_str(options_json)
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
     let inner = py
-        .detach(move || launch_chromium_with_options(options))
+        .detach(move || {
+            launch_chromium_with_options_cancellation(
+                options,
+                None,
+                None,
+                Some(startup_timing::EntryPoint::PythonSync),
+            )
+        })
         .map_err(py_err)?;
     Ok(PyBrowser { inner })
 }
@@ -32298,7 +32373,12 @@ fn launch_chromium_async(py: Python<'_>, options_json: &str) -> PyResult<Py<PyAn
         py,
         move |cancelled| {
             Ok(PyBrowser {
-                inner: launch_chromium_with_options_cancelable(options, Some(cancelled))?,
+                inner: launch_chromium_with_options_cancellation(
+                    options,
+                    Some(cancelled),
+                    None,
+                    Some(startup_timing::EntryPoint::PythonAsync),
+                )?,
             })
         },
         |py, browser| Ok(Py::new(py, browser)?.into_any()),
@@ -32358,18 +32438,12 @@ fn connect_browser_over_cdp_cancelable(
         client.close();
         return Err(RwError::Timeout(duration_millis_u64(timeout)));
     }
-    let keyboard_platform =
-        detect_browser_keyboard_platform(&runtime, &client, remaining.min(Duration::from_secs(5)));
-    let remaining = timeout.saturating_sub(started.elapsed());
-    if remaining.is_zero() {
-        client.close();
-        return Err(RwError::Timeout(duration_millis_u64(timeout)));
-    }
     if let Err(error) = start_service_worker_stealth_auto_attach_cancelable(
         &runtime,
         Arc::clone(&client),
         remaining,
         cancel,
+        None,
     ) {
         client.close();
         return Err(error);
@@ -32377,12 +32451,13 @@ fn connect_browser_over_cdp_cancelable(
     Ok(Arc::new(BrowserInner {
         runtime: OwnedRuntime::new(runtime),
         client,
+        startup_probe: None,
         process: Mutex::new(None),
         profile_dir: Mutex::new(None),
         owned: false,
         ws_endpoint,
         stealth_user_agent_override: Mutex::new(None),
-        keyboard_platform,
+        keyboard_platform: BrowserKeyboardPlatformState::default(),
         single_process_fallback: false,
         lifecycle: Arc::new(CloseLifecycle::new()),
         attached_pages: AttachedPageRegistry::default(),
@@ -32448,12 +32523,13 @@ impl RustwrightNavigationHarness {
         let browser = Arc::new(BrowserInner {
             runtime: OwnedRuntime::new(tokio::runtime::Runtime::new().unwrap()),
             client,
+            startup_probe: None,
             process: Mutex::new(None),
             profile_dir: Mutex::new(None),
             owned: false,
             ws_endpoint: "ws://test.invalid".to_owned(),
             stealth_user_agent_override: Mutex::new(None),
-            keyboard_platform: BrowserKeyboardPlatform::Control,
+            keyboard_platform: BrowserKeyboardPlatformState::default(),
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -34046,6 +34122,7 @@ impl RustwrightPage {
         let text = text.to_string();
         let timeout = native_input_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
+        let keyboard_platform = page.browser.keyboard_platform.get();
         browser.block_on_raw(async move {
             let deadline = OperationDeadline::new(timeout);
             let (resolution, fallback_focused) =
@@ -34063,7 +34140,7 @@ impl RustwrightPage {
                             delay,
                             deadline,
                             InputDispatchPolicy::ActionDeadline,
-                            page.browser.keyboard_platform,
+                            keyboard_platform,
                         )
                         .await?;
                     } else {
@@ -34074,7 +34151,7 @@ impl RustwrightPage {
                             delay,
                             deadline,
                             InputDispatchPolicy::ActionDeadline,
-                            page.browser.keyboard_platform,
+                            keyboard_platform,
                         )
                         .await?;
                     }
@@ -34118,7 +34195,8 @@ impl RustwrightPage {
         // would mutate page state on a call that then returns InvalidInput. The
         // parse is pure and cheap, and `dispatch_key_press` re-derives the same
         // chord through the same parser, so there is one definition of valid.
-        parse_key_chord(key, self.inner.browser.keyboard_platform)?;
+        let keyboard_platform = self.inner.browser.keyboard_platform.get();
+        parse_key_chord(key, keyboard_platform)?;
         let timeout_ms = self.resolve_timeout(timeout_ms, false);
         let page = Arc::clone(&self.inner);
         let key = key.to_string();
@@ -34152,7 +34230,7 @@ impl RustwrightPage {
                     deadline,
                     InputDispatchPolicy::ActionDeadline,
                     cancel,
-                    page.browser.keyboard_platform,
+                    keyboard_platform,
                 )
                 .await
             } else {
@@ -34164,7 +34242,7 @@ impl RustwrightPage {
                     deadline,
                     InputDispatchPolicy::ActionDeadline,
                     cancel,
-                    page.browser.keyboard_platform,
+                    keyboard_platform,
                 )
                 .await
             };
@@ -35516,6 +35594,7 @@ async fn type_locator_for_native_input(
     let (resolution, fallback_focused) =
         focus_locator_for_native_input(page, locator_json, index, deadline, cancel.cloned())
             .await?;
+    let keyboard_platform = page.browser.keyboard_platform.get();
     let result = async {
         ensure_not_cancelled(cancel)?;
         for character in text.chars() {
@@ -35528,7 +35607,7 @@ async fn type_locator_for_native_input(
                     delay,
                     deadline,
                     delay_policy,
-                    page.browser.keyboard_platform,
+                    keyboard_platform,
                 )
                 .await?;
             } else {
@@ -35539,7 +35618,7 @@ async fn type_locator_for_native_input(
                     delay,
                     deadline,
                     delay_policy,
-                    page.browser.keyboard_platform,
+                    keyboard_platform,
                 )
                 .await?;
             }
@@ -35599,7 +35678,8 @@ async fn press_locator_for_native_input(
     cancel: Option<&CancelToken>,
 ) -> RwResult<()> {
     // Validate before focusing so an invalid key cannot fire page focus handlers.
-    parse_key_chord(key, page.browser.keyboard_platform)?;
+    let keyboard_platform = page.browser.keyboard_platform.get();
+    parse_key_chord(key, keyboard_platform)?;
     let focus = match locator_json {
         Some(locator_json) => Some(
             focus_locator_for_native_input(page, locator_json, index, deadline, cancel.cloned())
@@ -35620,7 +35700,7 @@ async fn press_locator_for_native_input(
             deadline,
             delay_policy,
             cancel,
-            page.browser.keyboard_platform,
+            keyboard_platform,
         )
         .await
     } else {
@@ -35632,7 +35712,7 @@ async fn press_locator_for_native_input(
             deadline,
             delay_policy,
             cancel,
-            page.browser.keyboard_platform,
+            keyboard_platform,
         )
         .await
     };
@@ -36279,13 +36359,6 @@ fn create_page(browser: Arc<BrowserInner>, context_id: Option<String>) -> RwResu
         .map(|inner| PyPage { inner })
 }
 
-fn create_page_raw(
-    browser: Arc<BrowserInner>,
-    context_id: Option<String>,
-) -> RwResult<Arc<PageInner>> {
-    create_page_raw_cancelable(browser, context_id, None)
-}
-
 fn create_page_raw_cancelable(
     browser: Arc<BrowserInner>,
     context_id: Option<String>,
@@ -36305,8 +36378,20 @@ async fn create_page_async(
     let mut params = json!({ "url": "about:blank" });
     if let Some(context_id) = &context_id {
         params["browserContextId"] = Value::String(context_id.clone());
+    } else {
+        startup_timing::record_skipped(
+            browser.startup_probe.as_deref(),
+            startup_timing::Phase::ContextCreate,
+            Some(startup_timing::ParentPhase::PageCreate),
+        );
     }
-    let target_guard = create_target_cancellation_safe(Arc::clone(&browser), params).await?;
+    let target_guard = startup_timing::measure_phase_async(
+        browser.startup_probe.as_deref(),
+        startup_timing::Phase::TargetCreate,
+        Some(startup_timing::ParentPhase::PageCreate),
+        create_target_cancellation_safe(Arc::clone(&browser), params),
+    )
+    .await?;
     let target_id = target_guard
         .target_id
         .as_deref()
@@ -36434,59 +36519,94 @@ async fn attach_existing_page_unregistered(
     timeout: Duration,
     session_cleanup: Arc<AttachedSessionCleanup>,
 ) -> RwResult<UnregisteredPage> {
-    let attached = browser
-        .client
-        .send(
-            "Target.attachToTarget",
-            json!({ "targetId": target_id, "flatten": true }),
-            None,
-            timeout,
-        )
-        .await?;
-    let session_id = attached
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RwError::Message("CDP did not return a sessionId".to_string()))?
-        .to_string();
+    let session_id = startup_timing::measure_phase_async(
+        browser.startup_probe.as_deref(),
+        startup_timing::Phase::TargetAttach,
+        Some(startup_timing::ParentPhase::PageCreate),
+        async {
+            let attached = browser
+                .client
+                .send(
+                    "Target.attachToTarget",
+                    json!({ "targetId": target_id, "flatten": true }),
+                    None,
+                    timeout,
+                )
+                .await?;
+            attached
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RwError::Message("CDP did not return a sessionId".to_string()))
+                .map(ToString::to_string)
+        },
+    )
+    .await?;
     session_cleanup.set_session(session_id.clone());
     let session_guard = AttachedSessionGuard::new(session_cleanup);
     let event_stream_start_cursor = browser.client.event_cursor();
-    initialize_attached_page_session(&browser.client, &session_id, Duration::from_secs(5)).await?;
+    initialize_attached_page_session(
+        &browser.client,
+        &session_id,
+        Duration::from_secs(5),
+        browser.startup_probe.as_deref(),
+    )
+    .await?;
 
-    install_stealth_defaults(&browser, &session_id).await?;
-    enable_page_iframe_auto_attach(&browser.client, &session_id, Duration::from_secs(5)).await?;
-    let page_inner = Arc::new(PageInner {
-        browser: Arc::clone(&browser),
-        target_id,
-        registry_generation,
-        session_id: session_id.clone(),
-        context_id,
-        main_frame_id: Mutex::new(None),
-        frame_state: Mutex::new(PageFrameState::new(session_id.clone())),
-        iframe_setup_tasks: IframeSetupTaskRegistry::default(),
-        network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(
-            event_stream_start_cursor,
-        ))),
-        console_records: Mutex::new(ConsoleRecordStore::default()),
-        console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
-        console_replay_until_event_cursor: Mutex::new(HashMap::new()),
-        observation_event_cursor: AtomicU64::new(0),
-        native_network_records: Mutex::new(NativeNetworkRecordStore::new(
-            browser.next_native_network_index.load(Ordering::SeqCst),
-        )),
-        event_stream_start_cursor,
-        background_override_active: Arc::new(AtomicBool::new(false)),
-        screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
-        mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
-        fill_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
-        default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
-        lifecycle: Arc::new(CloseLifecycle::new()),
-        target_closed: AtomicBool::new(false),
-        crashed: AtomicBool::new(false),
-        close_target_on_drop: AtomicBool::new(false),
-    });
-    let _ = refresh_page_frame_tree(&page_inner, Duration::from_secs(5)).await;
-    spawn_page_oopif_event_listener(Arc::downgrade(&page_inner));
+    startup_timing::measure_phase_async(
+        browser.startup_probe.as_deref(),
+        startup_timing::Phase::PageStealth,
+        Some(startup_timing::ParentPhase::PageCreate),
+        install_stealth_defaults(&browser, &session_id),
+    )
+    .await?;
+    startup_timing::measure_phase_async(
+        browser.startup_probe.as_deref(),
+        startup_timing::Phase::PageIframeAttach,
+        Some(startup_timing::ParentPhase::PageCreate),
+        enable_page_iframe_auto_attach(&browser.client, &session_id, Duration::from_secs(5)),
+    )
+    .await?;
+    let page_inner = startup_timing::measure_phase_async(
+        browser.startup_probe.as_deref(),
+        startup_timing::Phase::PageStateAndFrameTree,
+        Some(startup_timing::ParentPhase::PageCreate),
+        async {
+            let page_inner = Arc::new(PageInner {
+                browser: Arc::clone(&browser),
+                target_id,
+                registry_generation,
+                session_id: session_id.clone(),
+                context_id,
+                main_frame_id: Mutex::new(None),
+                frame_state: Mutex::new(PageFrameState::new(session_id.clone())),
+                iframe_setup_tasks: IframeSetupTaskRegistry::default(),
+                network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(
+                    event_stream_start_cursor,
+                ))),
+                console_records: Mutex::new(ConsoleRecordStore::default()),
+                console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                console_replay_until_event_cursor: Mutex::new(HashMap::new()),
+                observation_event_cursor: AtomicU64::new(0),
+                native_network_records: Mutex::new(NativeNetworkRecordStore::new(
+                    browser.next_native_network_index.load(Ordering::SeqCst),
+                )),
+                event_stream_start_cursor,
+                background_override_active: Arc::new(AtomicBool::new(false)),
+                screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+                mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+                fill_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+                default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
+                lifecycle: Arc::new(CloseLifecycle::new()),
+                target_closed: AtomicBool::new(false),
+                crashed: AtomicBool::new(false),
+                close_target_on_drop: AtomicBool::new(false),
+            });
+            let _ = refresh_page_frame_tree(&page_inner, Duration::from_secs(5)).await;
+            spawn_page_oopif_event_listener(Arc::downgrade(&page_inner));
+            Ok::<_, RwError>(page_inner)
+        },
+    )
+    .await?;
     Ok(UnregisteredPage {
         page: page_inner,
         session_guard,
@@ -36687,10 +36807,25 @@ async fn initialize_attached_page_session(
     client: &Arc<CdpClient>,
     session_id: &str,
     timeout: Duration,
+    startup_probe: Option<&startup_timing::StartupProbe>,
 ) -> RwResult<()> {
-    enable_attached_session_domains(client, session_id, timeout).await?;
-    enable_action_dispatch_binding_for_session(client, session_id, timeout).await?;
-    finish_attached_page_session_initialization(client, session_id, timeout).await
+    startup_timing::measure_phase_async(
+        startup_probe,
+        startup_timing::Phase::PageDomains,
+        Some(startup_timing::ParentPhase::PageCreate),
+        enable_attached_session_domains(client, session_id, timeout),
+    )
+    .await?;
+    startup_timing::measure_phase_async(
+        startup_probe,
+        startup_timing::Phase::PageOptionalAttach,
+        Some(startup_timing::ParentPhase::PageCreate),
+        async {
+            enable_action_dispatch_binding_for_session(client, session_id, timeout).await?;
+            finish_attached_page_session_initialization(client, session_id, timeout).await
+        },
+    )
+    .await
 }
 
 async fn enable_attached_session_domains(
@@ -37875,12 +38010,13 @@ mod native_console_record_tests {
                 alive: Arc::new(AtomicBool::new(true)),
                 alive_tx,
             }),
+            startup_probe: None,
             process: Mutex::new(None),
             profile_dir: Mutex::new(None),
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
-            keyboard_platform: BrowserKeyboardPlatform::Control,
+            keyboard_platform: BrowserKeyboardPlatformState::default(),
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -38341,6 +38477,7 @@ async fn install_stealth_defaults(browser: &BrowserInner, session_id: &str) -> R
                 Duration::from_secs(5),
             )
             .await?;
+        browser.keyboard_platform.set_once_from_version(&version);
         let override_value = version
             .get("userAgent")
             .and_then(Value::as_str)
@@ -38407,21 +38544,15 @@ async fn install_worker_stealth_defaults(client: &CdpClient, session_id: &str) -
     Ok(())
 }
 
-fn start_service_worker_stealth_auto_attach(
-    runtime: &tokio::runtime::Runtime,
-    client: Arc<CdpClient>,
-    timeout: Duration,
-) -> RwResult<()> {
-    start_service_worker_stealth_auto_attach_cancelable(runtime, client, timeout, None)
-}
-
 fn start_service_worker_stealth_auto_attach_cancelable(
     runtime: &tokio::runtime::Runtime,
     client: Arc<CdpClient>,
     timeout: Duration,
     cancel: Option<CancelToken>,
+    startup_probe: Option<&startup_timing::StartupProbe>,
 ) -> RwResult<()> {
-    runtime.block_on(cancelable(cancel, async {
+    let phase_started = startup_probe.map(|_| Instant::now());
+    let result = runtime.block_on(cancelable(cancel, async {
         client
             .send(
                 "Target.setAutoAttach",
@@ -38443,7 +38574,20 @@ fn start_service_worker_stealth_auto_attach_cancelable(
             )
             .await
             .map(|_| ())
-    }))?;
+    }));
+    let phase_timing = phase_started.map(|started| (started, started.elapsed()));
+    if let Err(error) = result {
+        if let (Some(probe), Some((started, duration))) = (startup_probe, phase_timing) {
+            probe.record(
+                startup_timing::Phase::ServiceWorkerAutoAttach,
+                Some(startup_timing::ParentPhase::BrowserLaunch),
+                started,
+                duration,
+                startup_timing::Status::Error,
+            );
+        }
+        return Err(error);
+    }
 
     let mut events = client.subscribe();
     runtime.spawn(async move {
@@ -38483,6 +38627,15 @@ fn start_service_worker_stealth_auto_attach_cancelable(
                 .await;
         }
     });
+    if let (Some(probe), Some((started, duration))) = (startup_probe, phase_timing) {
+        probe.record(
+            startup_timing::Phase::ServiceWorkerAutoAttach,
+            Some(startup_timing::ParentPhase::BrowserLaunch),
+            started,
+            duration,
+            startup_timing::Status::Ok,
+        );
+    }
     Ok(())
 }
 
@@ -39189,7 +39342,13 @@ fn launch_chromium_process(
     runtime: &tokio::runtime::Runtime,
     timeout: Duration,
     cancelled: Option<Arc<AtomicBool>>,
+    startup_probe: Option<&startup_timing::StartupProbe>,
 ) -> RwResult<(Child, Option<TempDir>, LaunchedCdpTransport, bool)> {
+    let mut launch_phases = startup_timing::PhaseSpan::new(
+        startup_probe,
+        startup_timing::Phase::LaunchPrepare,
+        Some(startup_timing::ParentPhase::BrowserLaunch),
+    );
     let executable = find_chromium_executable(
         options.executable_path.as_deref(),
         options.channel.as_deref(),
@@ -39207,6 +39366,13 @@ fn launch_chromium_process(
         })?;
     let user_debugging_port = remote_debugging_port_from_args(&options.args)?;
     let use_pipe_transport = chromium_pipe_transport_requested()?;
+    if let Some(startup_probe) = startup_probe {
+        startup_probe.set_transport(if use_pipe_transport {
+            startup_timing::Transport::Pipe
+        } else {
+            startup_timing::Transport::Websocket
+        });
+    }
     if use_pipe_transport && user_debugging_port.is_some() {
         return Err(RwError::Message(
             "RUSTWRIGHT_CDP_TRANSPORT=pipe cannot be combined with --remote-debugging-port launch args"
@@ -39240,9 +39406,23 @@ fn launch_chromium_process(
         dynamic_debugging_port,
         use_pipe_transport,
         cancelled.clone(),
+        &mut launch_phases,
     ) {
-        Ok((child, transport)) => return Ok((child, profile_dir, transport, false)),
-        Err(error) if should_retry_chromium_single_process(options, &error) => {
+        Ok((child, transport)) => {
+            launch_phases.finish(startup_timing::Status::Ok);
+            Ok((child, profile_dir, transport, false))
+        }
+        Err(error) => {
+            launch_phases.finish(startup_timing::Status::Error);
+            if !should_retry_chromium_single_process(options, &error) {
+                return Err(error);
+            }
+
+            let mut retry_launch_phases = startup_timing::PhaseSpan::new(
+                startup_probe,
+                startup_timing::Phase::LaunchPrepare,
+                Some(startup_timing::ParentPhase::BrowserLaunch),
+            );
             match launch_chromium_attempt(
                 &executable,
                 options,
@@ -39255,16 +39435,20 @@ fn launch_chromium_process(
                 dynamic_debugging_port,
                 use_pipe_transport,
                 cancelled,
+                &mut retry_launch_phases,
             ) {
-                Ok((child, transport)) => return Ok((child, profile_dir, transport, true)),
+                Ok((child, transport)) => {
+                    retry_launch_phases.finish(startup_timing::Status::Ok);
+                    Ok((child, profile_dir, transport, true))
+                }
                 Err(retry_error) => {
-                    return Err(RwError::Message(format!(
+                    retry_launch_phases.finish(startup_timing::Status::Error);
+                    Err(RwError::Message(format!(
                         "{error}\nRetrying with --single-process also failed: {retry_error}"
-                    )));
+                    )))
                 }
             }
         }
-        Err(error) => return Err(error),
     }
 }
 
@@ -39306,6 +39490,7 @@ fn launch_chromium_attempt(
     dynamic_debugging_port: bool,
     use_pipe_transport: bool,
     cancelled: Option<Arc<AtomicBool>>,
+    launch_phases: &mut startup_timing::PhaseSpan<'_>,
 ) -> RwResult<(Child, LaunchedCdpTransport)> {
     let stderr_file = NamedTempFile::new()?;
     let mut command = Command::new(executable);
@@ -39369,6 +39554,7 @@ fn launch_chromium_attempt(
     }
     command.arg("about:blank");
 
+    launch_phases.transition(startup_timing::Phase::ProcessToEndpoint);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
