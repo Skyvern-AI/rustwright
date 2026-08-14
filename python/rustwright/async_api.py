@@ -32,6 +32,7 @@ from .sync_api import (
     Download as SyncDownload,
     ElementHandle as SyncElementHandle,
     Error,
+    UnknownOutcomeError,
     Expect,
     FileChooser as SyncFileChooser,
     FilePayload,
@@ -69,6 +70,7 @@ from .sync_api import (
     _UNSET,
     backend_marker,
     _decode_json_result,
+    _copy_wire_error_metadata,
     _default_timeout_for_method,
     _emit_event,
     _event_handler_positional_args,
@@ -214,9 +216,11 @@ async def _await_native_method(method: str, awaitable: Any) -> Any:
         if isinstance(exc, TimeoutError):
             match = re.fullmatch(r"timed out after ([0-9]+(?:\.[0-9]+)?) ms", message)
             if match:
-                raise TimeoutError(f"{method}: Timeout {match.group(1)}ms exceeded.") from None
+                error = TimeoutError(f"{method}: Timeout {match.group(1)}ms exceeded.")
+                raise _copy_wire_error_metadata(exc, error) from None
         error_type = TargetClosedError if isinstance(exc, TargetClosedError) else type(exc)
-        raise error_type(f"{method}: {message}") from None
+        error = error_type(f"{method}: {message}")
+        raise _copy_wire_error_metadata(exc, error) from None
 
 
 async def _await_native_action(method: str, awaitable: Any) -> Any:
@@ -226,28 +230,13 @@ async def _await_native_action(method: str, awaitable: Any) -> Any:
         message = str(exc)
         if getattr(exc, "_rustwright_error_kind", None) == "action_timeout":
             raise
-        marker = "__rustwright_action_timeout__:"
-        if message.startswith(marker):
-            try:
-                payload = json.loads(message[len(marker) :])
-                info = _decode_json_result(json.loads(str(payload["last_info_json"])))
-                info_key = payload.get("last_info_key")
-                if info_key is not None:
-                    info = info[info_key]
-                count = int(info.get("count") or 0) if isinstance(info, dict) else 0
-                detail = "no element matched" if count == 0 else f"last state was {info}"
-                raise TimeoutError(
-                    f"timed out waiting for locator to be {payload['state']} "
-                    f"while trying to {payload['action']}; {detail}"
-                ) from None
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                pass
         if message.startswith(("Locator.", "strict mode violation:", "Page crashed")):
             raise
         if message.startswith(f"{method}:"):
             raise
         error_type = TargetClosedError if isinstance(exc, TargetClosedError) else type(exc)
-        raise error_type(f"{method}: {message}") from None
+        error = error_type(f"{method}: {message}")
+        raise _copy_wire_error_metadata(exc, error) from None
 
 
 async def _await_cleanup_completion(awaitable: Any) -> Any:
@@ -4025,6 +4014,7 @@ __all__ = [
     "Download",
     "ElementHandle",
     "Error",
+    "UnknownOutcomeError",
     "Expect",
     "FileChooser",
     "FilePayload",
