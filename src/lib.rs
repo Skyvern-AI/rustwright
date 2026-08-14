@@ -2046,20 +2046,25 @@ pub enum RwError {
 }
 
 #[cfg(feature = "python")]
+fn ffi_error_message(error: RwError) -> String {
+    match error {
+        RwError::Timeout(ms) => FfiWireError::Timeout(TimeoutWirePayload { ms }).wire_message(),
+        RwError::TargetClosed(kind) => {
+            FfiWireError::TargetClosed(TargetClosedWirePayload { kind }).wire_message()
+        }
+        RwError::PageCrashed => FfiWireError::PageCrashed.wire_message(),
+        RwError::Disconnected => FfiWireError::Disconnected.wire_message(),
+        RwError::ActionTimeout(error) => error.wire_message(),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(feature = "python")]
 fn py_err(error: RwError) -> PyErr {
     match error {
         RwError::Message(message) => PyRuntimeError::new_err(message),
         RwError::InvalidInput(message) => PyValueError::new_err(message),
-        RwError::Timeout(ms) => {
-            PyRuntimeError::new_err(FfiWireError::Timeout(TimeoutWirePayload { ms }).wire_message())
-        }
-        RwError::TargetClosed(kind) => PyRuntimeError::new_err(
-            FfiWireError::TargetClosed(TargetClosedWirePayload { kind }).wire_message(),
-        ),
-        RwError::PageCrashed => PyRuntimeError::new_err(FfiWireError::PageCrashed.wire_message()),
-        RwError::Disconnected => PyRuntimeError::new_err(FfiWireError::Disconnected.wire_message()),
-        RwError::ActionTimeout(error) => PyRuntimeError::new_err(error.wire_message()),
-        other => PyRuntimeError::new_err(other.to_string()),
+        other => PyRuntimeError::new_err(ffi_error_message(other)),
     }
 }
 
@@ -2584,6 +2589,264 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    struct InputCdpPeer {
+        write_rx: mpsc::UnboundedReceiver<CdpOutgoing>,
+        pending: CdpPendingMap,
+        events: broadcast::Sender<Value>,
+        event_log: Arc<Mutex<CdpEventLog>>,
+        fill_value: Option<String>,
+        fill_guard_key: Option<String>,
+        focus_target: bool,
+        response_delay: Option<Duration>,
+        focus_response_error_after_execution: Option<String>,
+    }
+
+    fn action_dispatch_string_literal(expression: &str, field: &str) -> String {
+        let marker = format!("{field}: ");
+        let value = expression
+            .split_once(&marker)
+            .unwrap_or_else(|| panic!("missing {field} in action dispatch expression"))
+            .1
+            .split_once(',')
+            .unwrap_or_else(|| panic!("unterminated {field} in action dispatch expression"))
+            .0
+            .trim();
+        serde_json::from_str(value)
+            .unwrap_or_else(|error| panic!("invalid {field} action dispatch literal: {error}"))
+    }
+
+    impl InputCdpPeer {
+        async fn next_command(&mut self) -> Value {
+            let command = match self.write_rx.recv().await.expect("CDP test command") {
+                CdpOutgoing::Text {
+                    payload, tracker, ..
+                } => {
+                    if let Some(tracker) = tracker {
+                        assert!(tracker.begin_write());
+                        tracker.finish(true);
+                    }
+                    serde_json::from_str::<Value>(&payload).expect("valid CDP command")
+                }
+                CdpOutgoing::Close => panic!("unexpected transport close"),
+            };
+            let result = match command["method"].as_str() {
+                Some("Page.getFrameTree") => {
+                    json!({ "frameTree": { "frame": { "id": "test-frame" } } })
+                }
+                Some("Page.createIsolatedWorld") => json!({ "executionContextId": 1 }),
+                Some("Runtime.evaluate") => {
+                    let expression = command["params"]["expression"].as_str().unwrap_or("");
+                    let value = if expression.contains("doc.activeElement !== fallback") {
+                        Value::Bool(!self.focus_target)
+                    } else if let Some(fill_value) = &self.fill_value {
+                        if expression.contains("type: 'insert-text'") {
+                            let start = expression
+                                .find("__rustwright_fill_guard_")
+                                .expect("fill guard key in public fill expression");
+                            let guard_key = expression[start..]
+                                .chars()
+                                .take_while(|character| {
+                                    character.is_ascii_alphanumeric() || *character == '_'
+                                })
+                                .collect::<String>();
+                            self.fill_guard_key = Some(guard_key.clone());
+                            json!({
+                                "ok": false,
+                                "type": "insert-text",
+                                "value": fill_value,
+                                "info": {
+                                    "count": 1,
+                                    "attached": true,
+                                    "visible": true,
+                                    "enabled": true,
+                                    "stable": true,
+                                    "receives_events": true,
+                                    "target_focused": true,
+                                    "fill_guard_key": guard_key,
+                                },
+                            })
+                        } else if expression.contains("const ready =") {
+                            Value::Bool(true)
+                        } else if expression.contains("const dispatch = guard") {
+                            json!({
+                                "actual": fill_value,
+                                "dispatch": {
+                                    "diverted": false,
+                                    "precursorReceived": true,
+                                    "mutationReceived": true,
+                                    "untrustedInputReceived": false,
+                                    "beforeInputCanceled": false,
+                                    "targetMatches": true,
+                                    "initialValue": "before",
+                                    "maxLength": null,
+                                },
+                                "info": {},
+                            })
+                        } else {
+                            Value::Null
+                        }
+                    } else {
+                        Value::Bool(true)
+                    };
+                    json!({ "result": { "type": "object", "value": value } })
+                }
+                _ => json!({}),
+            };
+            if let Some(delay) = self.response_delay {
+                tokio::time::sleep(delay).await;
+            }
+            let response = if command["method"] == "Runtime.evaluate"
+                && command["params"]["expression"]
+                    .as_str()
+                    .is_some_and(|expression| expression.contains("fallback.focus();"))
+            {
+                self.focus_response_error_after_execution
+                    .take()
+                    .map_or_else(
+                        || json!({ "id": command["id"], "result": result }),
+                        |message| json!({ "id": command["id"], "error": { "message": message } }),
+                    )
+            } else {
+                json!({ "id": command["id"], "result": result })
+            };
+            if let Some(expression) = command["params"]["expression"]
+                .as_str()
+                .filter(|expression| expression.contains("commitment: 'commencing'"))
+            {
+                let dispatch_id = action_dispatch_string_literal(expression, "dispatchId");
+                let token = action_dispatch_string_literal(expression, "token");
+                let payload = json!({
+                    "dispatchId": dispatch_id,
+                    "token": token,
+                    "result": { "ok": true },
+                    "commitment": "commencing",
+                })
+                .to_string();
+                dispatch_cdp_payload(
+                    json!({
+                        "method": "Runtime.bindingCalled",
+                        "sessionId": "test-session",
+                        "params": {
+                            "name": ACTION_DISPATCH_BINDING_NAME,
+                            "payload": payload,
+                        },
+                    }),
+                    Arc::clone(&self.pending),
+                    self.events.clone(),
+                    Arc::clone(&self.event_log),
+                );
+            }
+            dispatch_cdp_payload(
+                response,
+                Arc::clone(&self.pending),
+                self.events.clone(),
+                Arc::clone(&self.event_log),
+            );
+            command
+        }
+
+        async fn commands(&mut self, count: usize) -> Vec<Value> {
+            let mut commands = Vec::with_capacity(count);
+            for _ in 0..count {
+                let command = tokio::time::timeout(Duration::from_secs(2), self.next_command())
+                    .await
+                    .expect("expected CDP input command within two seconds");
+                assert_eq!(command["sessionId"], "test-session");
+                commands.push(command);
+            }
+            commands
+        }
+    }
+
+    fn input_cdp_transport() -> (CdpClient, InputCdpPeer) {
+        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(4);
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let (alive_tx, _) = watch::channel(true);
+        let client = CdpClient {
+            write_tx,
+            pending: Arc::clone(&pending),
+            outstanding: Arc::new(Mutex::new(HashMap::new())),
+            events: events.clone(),
+            event_log: Arc::clone(&event_log),
+            traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            next_id: AtomicU64::new(1),
+            sent_runtime_enable_count: AtomicU64::new(0),
+            sent_target_close_count: AtomicU64::new(0),
+            sent_context_dispose_count: AtomicU64::new(0),
+            alive: Arc::new(AtomicBool::new(true)),
+            alive_tx,
+        };
+        (
+            client,
+            InputCdpPeer {
+                write_rx,
+                pending,
+                events,
+                event_log,
+                fill_value: None,
+                fill_guard_key: None,
+                focus_target: true,
+                response_delay: None,
+                focus_response_error_after_execution: None,
+            },
+        )
+    }
+
+    fn input_protocol_page(fill_value: Option<&str>) -> (RustwrightPage, InputCdpPeer) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let (client, mut peer) = input_cdp_transport();
+        peer.fill_value = fill_value.map(ToString::to_string);
+        let browser = Arc::new(BrowserInner {
+            runtime: OwnedRuntime::new(runtime),
+            client: Arc::new(client),
+            process: Mutex::new(None),
+            profile_dir: Mutex::new(None),
+            owned: false,
+            ws_endpoint: "ws://test.invalid".to_string(),
+            stealth_user_agent_override: Mutex::new(None),
+            keyboard_platform: BrowserKeyboardPlatform::Control,
+            single_process_fallback: false,
+            lifecycle: Arc::new(CloseLifecycle::new()),
+            attached_pages: AttachedPageRegistry::default(),
+            next_native_network_index: AtomicU64::new(1),
+        });
+        let page = RustwrightPage {
+            inner: Arc::new(PageInner {
+                browser,
+                target_id: "test-target".to_string(),
+                registry_generation: 0,
+                session_id: "test-session".to_string(),
+                context_id: None,
+                main_frame_id: Mutex::new(None),
+                frame_state: Mutex::new(PageFrameState::new("test-session".to_string())),
+                iframe_setup_tasks: IframeSetupTaskRegistry::default(),
+                network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
+                event_stream_start_cursor: 0,
+                background_override_active: Arc::new(AtomicBool::new(false)),
+                screenshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+                mouse_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+                fill_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+                default_timeouts: Mutex::new(DefaultTimeoutRegister::default()),
+                lifecycle: Arc::new(CloseLifecycle::new()),
+                target_closed: AtomicBool::new(false),
+                crashed: AtomicBool::new(false),
+                close_target_on_drop: AtomicBool::new(false),
+                console_records: Mutex::new(ConsoleRecordStore::default()),
+                console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                console_replay_until_event_cursor: Mutex::new(HashMap::new()),
+                observation_event_cursor: AtomicU64::new(0),
+                native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
+            }),
+        };
+        (page, peer)
+    }
 
     enum ManifestDependencySection {
         Other,
@@ -3337,6 +3600,852 @@ multiline-compatible = """4.5.6"""
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn input_protocol_type_a_dispatches_raw_character_and_release_events() {
+        let (client, mut peer) = input_cdp_transport();
+        let (result, commands) = tokio::join!(
+            dispatch_typed_character(
+                &client,
+                "test-session",
+                'a',
+                None,
+                OperationDeadline::new(Duration::from_secs(1)),
+                InputDispatchPolicy::ActionDeadline,
+                BrowserKeyboardPlatform::Control,
+            ),
+            peer.commands(3),
+        );
+        result.unwrap();
+
+        let params = commands
+            .iter()
+            .map(|command| command["params"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            params,
+            vec![
+                json!({
+                    "type": "rawKeyDown", "key": "a", "code": "KeyA",
+                    "modifiers": 0, "windowsVirtualKeyCode": 65,
+                    "nativeVirtualKeyCode": 65, "location": 0,
+                }),
+                json!({
+                    "type": "char", "key": "a", "code": "KeyA",
+                    "modifiers": 0, "windowsVirtualKeyCode": 65,
+                    "nativeVirtualKeyCode": 65, "location": 0,
+                    "text": "a", "unmodifiedText": "a",
+                }),
+                json!({
+                    "type": "keyUp", "key": "a", "code": "KeyA",
+                    "modifiers": 0, "windowsVirtualKeyCode": 65,
+                    "nativeVirtualKeyCode": 65, "location": 0,
+                }),
+            ]
+        );
+        assert!(commands
+            .iter()
+            .all(|command| command["method"] == "Input.dispatchKeyEvent"));
+    }
+
+    #[tokio::test]
+    async fn input_protocol_type_uppercase_letter_holds_shift() {
+        let (client, mut peer) = input_cdp_transport();
+        let (result, commands) = tokio::join!(
+            dispatch_typed_character(
+                &client,
+                "test-session",
+                'A',
+                None,
+                OperationDeadline::new(Duration::from_secs(1)),
+                InputDispatchPolicy::ActionDeadline,
+                BrowserKeyboardPlatform::Control,
+            ),
+            peer.commands(5),
+        );
+        result.unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command["params"].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                json!({
+                    "type": "rawKeyDown", "key": "Shift", "code": "ShiftLeft",
+                    "modifiers": 8, "windowsVirtualKeyCode": 16,
+                    "nativeVirtualKeyCode": 16, "location": 1,
+                }),
+                json!({
+                    "type": "rawKeyDown", "key": "A", "code": "KeyA",
+                    "modifiers": 8, "windowsVirtualKeyCode": 65,
+                    "nativeVirtualKeyCode": 65, "location": 0,
+                }),
+                json!({
+                    "type": "char", "key": "A", "code": "KeyA",
+                    "modifiers": 8, "windowsVirtualKeyCode": 65,
+                    "nativeVirtualKeyCode": 65, "location": 0,
+                    "text": "A", "unmodifiedText": "A",
+                }),
+                json!({
+                    "type": "keyUp", "key": "A", "code": "KeyA",
+                    "modifiers": 8, "windowsVirtualKeyCode": 65,
+                    "nativeVirtualKeyCode": 65, "location": 0,
+                }),
+                json!({
+                    "type": "keyUp", "key": "Shift", "code": "ShiftLeft",
+                    "modifiers": 0, "windowsVirtualKeyCode": 16,
+                    "nativeVirtualKeyCode": 16, "location": 1,
+                }),
+            ]
+        );
+        assert!(commands
+            .iter()
+            .all(|command| command["method"] == "Input.dispatchKeyEvent"));
+    }
+
+    #[tokio::test]
+    async fn input_protocol_press_enter_dispatches_native_character_sequence() {
+        let (client, mut peer) = input_cdp_transport();
+        let (result, commands) = tokio::join!(
+            dispatch_key_press(
+                &client,
+                "test-session",
+                "Enter",
+                None,
+                OperationDeadline::new(Duration::from_secs(1)),
+                InputDispatchPolicy::ActionDeadline,
+                None,
+                BrowserKeyboardPlatform::Control,
+            ),
+            peer.commands(3),
+        );
+        result.unwrap();
+
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command["params"]["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["rawKeyDown", "char", "keyUp"]
+        );
+        for command in &commands {
+            assert_eq!(command["params"]["key"], "Enter");
+            assert_eq!(command["params"]["code"], "Enter");
+            assert_eq!(command["params"]["windowsVirtualKeyCode"], 13);
+            assert_eq!(command["params"]["location"], 0);
+        }
+        assert_eq!(commands[1]["params"]["text"], "\r");
+        assert_eq!(commands[1]["params"]["unmodifiedText"], "\r");
+    }
+
+    #[tokio::test]
+    async fn input_protocol_browser_mac_control_or_meta_names_select_all() {
+        let (client, mut peer) = input_cdp_transport();
+        let (result, commands) = tokio::join!(
+            dispatch_key_press(
+                &client,
+                "test-session",
+                "ControlOrMeta+A",
+                None,
+                OperationDeadline::new(Duration::from_secs(1)),
+                InputDispatchPolicy::ActionDeadline,
+                None,
+                BrowserKeyboardPlatform::Mac,
+            ),
+            peer.commands(4),
+        );
+        result.unwrap();
+
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command["params"].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                json!({
+                    "type": "rawKeyDown", "key": "Meta", "code": "MetaLeft",
+                    "modifiers": 4, "windowsVirtualKeyCode": 91,
+                    "nativeVirtualKeyCode": 91, "location": 1,
+                }),
+                json!({
+                    "type": "rawKeyDown", "key": "A", "code": "KeyA",
+                    "modifiers": 4, "windowsVirtualKeyCode": 65,
+                    "nativeVirtualKeyCode": 65, "location": 0,
+                    "commands": ["selectAll"],
+                }),
+                json!({
+                    "type": "keyUp", "key": "A", "code": "KeyA",
+                    "modifiers": 4, "windowsVirtualKeyCode": 65,
+                    "nativeVirtualKeyCode": 65, "location": 0,
+                }),
+                json!({
+                    "type": "keyUp", "key": "Meta", "code": "MetaLeft",
+                    "modifiers": 0, "windowsVirtualKeyCode": 91,
+                    "nativeVirtualKeyCode": 91, "location": 1,
+                }),
+            ]
+        );
+        assert!(commands
+            .iter()
+            .all(|command| command["method"] == "Input.dispatchKeyEvent"));
+    }
+
+    #[tokio::test]
+    async fn input_protocol_browser_control_fallback_control_or_meta_names_select_all() {
+        let (client, mut peer) = input_cdp_transport();
+        let (result, commands) = tokio::join!(
+            dispatch_key_press(
+                &client,
+                "test-session",
+                "ControlOrMeta+A",
+                None,
+                OperationDeadline::new(Duration::from_secs(1)),
+                InputDispatchPolicy::ActionDeadline,
+                None,
+                BrowserKeyboardPlatform::Control,
+            ),
+            peer.commands(4),
+        );
+        result.unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command["params"].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                json!({
+                    "type": "rawKeyDown", "key": "Control", "code": "ControlLeft",
+                    "modifiers": 2, "windowsVirtualKeyCode": 17,
+                    "nativeVirtualKeyCode": 17, "location": 1,
+                }),
+                json!({
+                    "type": "rawKeyDown", "key": "A", "code": "KeyA",
+                    "modifiers": 2, "windowsVirtualKeyCode": 65,
+                    "nativeVirtualKeyCode": 65, "location": 0,
+                    "commands": ["selectAll"],
+                }),
+                json!({
+                    "type": "keyUp", "key": "A", "code": "KeyA",
+                    "modifiers": 2, "windowsVirtualKeyCode": 65,
+                    "nativeVirtualKeyCode": 65, "location": 0,
+                }),
+                json!({
+                    "type": "keyUp", "key": "Control", "code": "ControlLeft",
+                    "modifiers": 0, "windowsVirtualKeyCode": 17,
+                    "nativeVirtualKeyCode": 17, "location": 1,
+                }),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn input_protocol_shifted_punctuation_uses_us_layout_descriptor() {
+        for key in ["Shift+1", "!"] {
+            let (client, mut peer) = input_cdp_transport();
+            let (result, commands) = tokio::join!(
+                dispatch_key_press(
+                    &client,
+                    "test-session",
+                    key,
+                    None,
+                    OperationDeadline::new(Duration::from_secs(1)),
+                    InputDispatchPolicy::ActionDeadline,
+                    None,
+                    BrowserKeyboardPlatform::Control,
+                ),
+                peer.commands(5),
+            );
+            result.unwrap();
+            assert_eq!(
+                commands
+                    .iter()
+                    .map(|command| command["params"].clone())
+                    .collect::<Vec<_>>(),
+                vec![
+                    json!({
+                        "type": "rawKeyDown", "key": "Shift", "code": "ShiftLeft",
+                        "modifiers": 8, "windowsVirtualKeyCode": 16,
+                        "nativeVirtualKeyCode": 16, "location": 1,
+                    }),
+                    json!({
+                        "type": "rawKeyDown", "key": "!", "code": "Digit1",
+                        "modifiers": 8, "windowsVirtualKeyCode": 49,
+                        "nativeVirtualKeyCode": 49, "location": 0,
+                    }),
+                    json!({
+                        "type": "char", "key": "!", "code": "Digit1",
+                        "modifiers": 8, "windowsVirtualKeyCode": 49,
+                        "nativeVirtualKeyCode": 49, "location": 0,
+                        "text": "!", "unmodifiedText": "!",
+                    }),
+                    json!({
+                        "type": "keyUp", "key": "!", "code": "Digit1",
+                        "modifiers": 8, "windowsVirtualKeyCode": 49,
+                        "nativeVirtualKeyCode": 49, "location": 0,
+                    }),
+                    json!({
+                        "type": "keyUp", "key": "Shift", "code": "ShiftLeft",
+                        "modifiers": 0, "windowsVirtualKeyCode": 16,
+                        "nativeVirtualKeyCode": 16, "location": 1,
+                    }),
+                ]
+            );
+            assert!(commands
+                .iter()
+                .all(|command| command["method"] == "Input.dispatchKeyEvent"));
+        }
+    }
+
+    #[tokio::test]
+    async fn input_protocol_base_modifiers_include_then_clear_their_own_masks() {
+        for (key, expected) in [
+            (
+                "Shift",
+                vec![
+                    json!({
+                        "type": "rawKeyDown", "key": "Shift", "code": "ShiftLeft",
+                        "modifiers": 8, "windowsVirtualKeyCode": 16,
+                        "nativeVirtualKeyCode": 16, "location": 1,
+                    }),
+                    json!({
+                        "type": "keyUp", "key": "Shift", "code": "ShiftLeft",
+                        "modifiers": 0, "windowsVirtualKeyCode": 16,
+                        "nativeVirtualKeyCode": 16, "location": 1,
+                    }),
+                ],
+            ),
+            (
+                "Control",
+                vec![
+                    json!({
+                        "type": "rawKeyDown", "key": "Control", "code": "ControlLeft",
+                        "modifiers": 2, "windowsVirtualKeyCode": 17,
+                        "nativeVirtualKeyCode": 17, "location": 1,
+                    }),
+                    json!({
+                        "type": "keyUp", "key": "Control", "code": "ControlLeft",
+                        "modifiers": 0, "windowsVirtualKeyCode": 17,
+                        "nativeVirtualKeyCode": 17, "location": 1,
+                    }),
+                ],
+            ),
+            (
+                "Control+Shift",
+                vec![
+                    json!({
+                        "type": "rawKeyDown", "key": "Control", "code": "ControlLeft",
+                        "modifiers": 2, "windowsVirtualKeyCode": 17,
+                        "nativeVirtualKeyCode": 17, "location": 1,
+                    }),
+                    json!({
+                        "type": "rawKeyDown", "key": "Shift", "code": "ShiftLeft",
+                        "modifiers": 10, "windowsVirtualKeyCode": 16,
+                        "nativeVirtualKeyCode": 16, "location": 1,
+                    }),
+                    json!({
+                        "type": "keyUp", "key": "Shift", "code": "ShiftLeft",
+                        "modifiers": 2, "windowsVirtualKeyCode": 16,
+                        "nativeVirtualKeyCode": 16, "location": 1,
+                    }),
+                    json!({
+                        "type": "keyUp", "key": "Control", "code": "ControlLeft",
+                        "modifiers": 0, "windowsVirtualKeyCode": 17,
+                        "nativeVirtualKeyCode": 17, "location": 1,
+                    }),
+                ],
+            ),
+        ] {
+            let (client, mut peer) = input_cdp_transport();
+            let count = expected.len();
+            let (result, commands) = tokio::join!(
+                dispatch_key_press(
+                    &client,
+                    "test-session",
+                    key,
+                    None,
+                    OperationDeadline::new(Duration::from_secs(1)),
+                    InputDispatchPolicy::ActionDeadline,
+                    None,
+                    BrowserKeyboardPlatform::Control,
+                ),
+                peer.commands(count),
+            );
+            result.unwrap();
+            assert_eq!(
+                commands
+                    .iter()
+                    .map(|command| command["params"].clone())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{key}"
+            );
+            assert!(commands
+                .iter()
+                .all(|command| command["method"] == "Input.dispatchKeyEvent"));
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_keyboard_delays_are_unbounded_and_type_renews_transport_budget() {
+        let (client, mut peer) = input_cdp_transport();
+        peer.response_delay = Some(Duration::from_millis(20));
+        let started = tokio::time::Instant::now();
+        let (result, commands) = tokio::join!(
+            dispatch_direct_keyboard_text(
+                &client,
+                "test-session",
+                "ab",
+                Some(Duration::from_millis(50)),
+                Duration::from_millis(30),
+                BrowserKeyboardPlatform::Control,
+            ),
+            peer.commands(6),
+        );
+        result.unwrap();
+        assert_eq!(commands.len(), 6);
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "each CDP send must renew its budget and both requested delays must elapse"
+        );
+
+        let (client, mut peer) = input_cdp_transport();
+        let started = tokio::time::Instant::now();
+        let (result, commands) = tokio::join!(
+            dispatch_key_press(
+                &client,
+                "test-session",
+                "a",
+                Some(Duration::from_millis(50)),
+                OperationDeadline::new(Duration::from_millis(30)),
+                InputDispatchPolicy::Direct {
+                    transport_timeout: Duration::from_millis(30),
+                },
+                None,
+                BrowserKeyboardPlatform::Control,
+            ),
+            peer.commands(3),
+        );
+        result.unwrap();
+        assert_eq!(commands.len(), 3);
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "press must not return before its requested delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_protocol_fill_ada_focuses_selects_then_inserts_text() {
+        let script = native_fill_body("Ada", true, false).unwrap().body;
+        let focus = script
+            .find("el.focus({ preventScroll: true })")
+            .expect("fill focus preparation");
+        let select = script[focus..]
+            .find("el.select()")
+            .map(|offset| focus + offset)
+            .expect("fill whole-value selection");
+        let dispatch_handoff = script[select..]
+            .find("type: 'insert-text'")
+            .map(|offset| select + offset)
+            .expect("fill protocol dispatch handoff");
+        assert!(focus < select && select < dispatch_handoff);
+
+        let (client, mut peer) = input_cdp_transport();
+        let (result, commands) = tokio::join!(
+            commit_fill_text(
+                &client,
+                "test-session",
+                "Ada",
+                OperationDeadline::new(Duration::from_secs(1)),
+            ),
+            peer.commands(1),
+        );
+        result.unwrap();
+        assert_eq!(commands[0]["method"], "Input.insertText");
+        assert_eq!(commands[0]["params"], json!({ "text": "Ada" }));
+    }
+
+    #[tokio::test]
+    async fn input_protocol_empty_fill_selects_contents_then_clears_with_trusted_delete() {
+        let script = native_fill_body("", true, false).unwrap().body;
+        let focus = script
+            .find("el.focus({ preventScroll: true })")
+            .expect("fill focus preparation");
+        let select = script[focus..]
+            .find("el.select()")
+            .map(|offset| focus + offset)
+            .expect("fill whole-value selection");
+        assert!(focus < select);
+
+        let (client, mut peer) = input_cdp_transport();
+        let (result, commands) = tokio::join!(
+            commit_fill_text(
+                &client,
+                "test-session",
+                "",
+                OperationDeadline::new(Duration::from_secs(1)),
+            ),
+            peer.commands(2),
+        );
+        result.unwrap();
+        assert_eq!(commands[0]["method"], "Input.dispatchKeyEvent");
+        assert_eq!(commands[1]["method"], "Input.dispatchKeyEvent");
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command["params"].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                json!({
+                    "type": "rawKeyDown", "key": "Delete", "code": "Delete",
+                    "modifiers": 0, "windowsVirtualKeyCode": 46,
+                    "nativeVirtualKeyCode": 46, "location": 0,
+                }),
+                json!({
+                    "type": "keyUp", "key": "Delete", "code": "Delete",
+                    "modifiers": 0, "windowsVirtualKeyCode": 46,
+                    "nativeVirtualKeyCode": 46, "location": 0,
+                }),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn public_page_type_routes_to_native_key_protocol() {
+        let (page, mut peer) = input_protocol_page(None);
+        let operation = std::thread::spawn(move || {
+            page.type_text_with_timeout_and_cancel("#target", "a", None, Some(1_000.0), None)
+        });
+        let commands = peer.commands(6).await;
+        operation.join().unwrap().unwrap();
+        let input = commands
+            .iter()
+            .filter(|command| command["method"] == "Input.dispatchKeyEvent")
+            .collect::<Vec<_>>();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["params"]["type"], "rawKeyDown");
+        assert_eq!(input[0]["params"]["key"], "a");
+        assert_eq!(input[1]["params"]["type"], "char");
+        assert_eq!(input[1]["params"]["text"], "a");
+        assert_eq!(input[2]["params"]["type"], "keyUp");
+    }
+
+    #[tokio::test]
+    async fn public_page_type_focus_failure_uses_and_cleans_safe_fallback_before_dispatch() {
+        let (page, mut peer) = input_protocol_page(None);
+        peer.focus_target = false;
+        let operation = std::thread::spawn(move || {
+            page.type_text_with_timeout_and_cancel("#nonfocusable", "x", None, Some(1_000.0), None)
+        });
+        let commands = peer.commands(7).await;
+        operation.join().unwrap().unwrap();
+
+        let focus_index = commands
+            .iter()
+            .position(|command| {
+                command["method"] == "Runtime.evaluate"
+                    && command["params"]["expression"]
+                        .as_str()
+                        .is_some_and(|expression| expression.contains("fallback.focus();"))
+            })
+            .expect("focus failure must install and focus the safe fallback");
+        let input_indexes = commands
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| {
+                (command["method"] == "Input.dispatchKeyEvent").then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let cleanup_index = commands
+            .iter()
+            .position(|command| {
+                command["method"] == "Runtime.evaluate"
+                    && command["params"]["expression"]
+                        .as_str()
+                        .is_some_and(|expression| {
+                            expression
+                                .contains("for (const fallback of Array.from(doc.querySelectorAll")
+                        })
+            })
+            .expect("safe fallback must be cleaned up");
+
+        assert_eq!(input_indexes.len(), 2);
+        assert!(input_indexes
+            .iter()
+            .all(|index| commands[*index]["params"]["type"] != "char"));
+        assert!(input_indexes.iter().all(|index| focus_index < *index));
+        assert!(input_indexes.iter().all(|index| *index < cleanup_index));
+    }
+
+    #[tokio::test]
+    async fn cancelled_focus_preparation_sweeps_fallback_before_subsequent_input() {
+        #[derive(Clone, Copy, Debug)]
+        enum EntryPath {
+            PageType,
+            PagePress,
+        }
+
+        for entry_path in [EntryPath::PageType, EntryPath::PagePress] {
+            let (page, mut peer) = input_protocol_page(None);
+            peer.focus_target = false;
+            let token = CancelToken::new();
+            let operation_page = page.clone();
+            let operation_token = token.clone();
+            let operation = std::thread::spawn(move || match entry_path {
+                EntryPath::PageType => operation_page.type_text_with_timeout_and_cancel(
+                    "#nonfocusable",
+                    "x",
+                    None,
+                    Some(1_000.0),
+                    Some(&operation_token),
+                ),
+                EntryPath::PagePress => operation_page.press_key_with_timeout_and_cancel(
+                    Some("#nonfocusable"),
+                    "a",
+                    Some(1_000.0),
+                    Some(&operation_token),
+                ),
+            });
+
+            let frame_tree = peer.next_command().await;
+            assert_eq!(frame_tree["method"], "Page.getFrameTree", "{entry_path:?}");
+            let isolated_world = peer.next_command().await;
+            assert_eq!(
+                isolated_world["method"], "Page.createIsolatedWorld",
+                "{entry_path:?}"
+            );
+            peer.response_delay = Some(Duration::from_millis(100));
+            let cancel_token = token.clone();
+            let cancellation = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert!(cancel_token.try_cancel());
+            });
+            let focus = peer.next_command().await;
+            cancellation.await.unwrap();
+            assert_eq!(focus["method"], "Runtime.evaluate", "{entry_path:?}");
+            assert!(
+                focus["params"]["expression"]
+                    .as_str()
+                    .is_some_and(|expression| expression.contains("fallback.focus();")),
+                "{entry_path:?}"
+            );
+
+            peer.response_delay = None;
+            let sweep = tokio::time::timeout(Duration::from_secs(2), peer.commands(3))
+                .await
+                .expect("cancelled focus fallback sweep must be bounded");
+            assert_eq!(sweep[0]["method"], "Page.getFrameTree", "{entry_path:?}");
+            assert_eq!(
+                sweep[1]["method"], "Page.createIsolatedWorld",
+                "{entry_path:?}"
+            );
+            assert_eq!(sweep[2]["method"], "Runtime.evaluate", "{entry_path:?}");
+            assert!(
+                sweep[2]["params"]["expression"]
+                    .as_str()
+                    .is_some_and(|expression| expression.contains("fallback.remove();")),
+                "{entry_path:?}"
+            );
+            let result = operation.join().unwrap();
+            assert!(
+                matches!(result, Err(RwError::Cancelled)),
+                "{entry_path:?}: {result:?}"
+            );
+
+            let subsequent_page = page.clone();
+            let subsequent = std::thread::spawn(move || {
+                subsequent_page.press_key_with_timeout_and_cancel(None, "a", Some(1_000.0), None)
+            });
+            let input = peer.commands(3).await;
+            subsequent.join().unwrap().unwrap();
+            assert!(
+                input
+                    .iter()
+                    .all(|command| command["method"] == "Input.dispatchKeyEvent"),
+                "{entry_path:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn locator_focus_error_sweeps_fallback_before_subsequent_input() {
+        #[derive(Clone, Copy, Debug)]
+        enum EntryPath {
+            LocatorType,
+            LocatorPress,
+        }
+
+        const FOCUS_ERROR: &str = "injected error after fallback focus execution";
+        for entry_path in [EntryPath::LocatorType, EntryPath::LocatorPress] {
+            let (page, mut peer) = input_protocol_page(None);
+            peer.focus_target = false;
+            peer.focus_response_error_after_execution = Some(FOCUS_ERROR.to_string());
+            let operation_page = page.clone();
+            let operation = std::thread::spawn(move || {
+                let page = Arc::clone(&operation_page.inner);
+                let browser = Arc::clone(&page.browser);
+                let locator_json = selector_to_locator_json("#nonfocusable").unwrap();
+                match entry_path {
+                    EntryPath::LocatorType => browser.block_on_raw(type_locator_for_native_input(
+                        &page,
+                        &locator_json,
+                        0,
+                        "x",
+                        None,
+                        OperationDeadline::new(Duration::from_secs(1)),
+                        InputDispatchPolicy::ActionDeadline,
+                        None,
+                    )),
+                    EntryPath::LocatorPress => {
+                        browser.block_on_raw(press_locator_for_native_input(
+                            &page,
+                            Some(&locator_json),
+                            0,
+                            "a",
+                            None,
+                            OperationDeadline::new(Duration::from_secs(1)),
+                            InputDispatchPolicy::ActionDeadline,
+                            None,
+                        ))
+                    }
+                }
+            });
+
+            let frame_tree = peer.next_command().await;
+            assert_eq!(frame_tree["method"], "Page.getFrameTree", "{entry_path:?}");
+            let isolated_world = peer.next_command().await;
+            assert_eq!(
+                isolated_world["method"], "Page.createIsolatedWorld",
+                "{entry_path:?}"
+            );
+            let focus = peer.next_command().await;
+            assert_eq!(focus["method"], "Runtime.evaluate", "{entry_path:?}");
+            assert!(
+                focus["params"]["expression"]
+                    .as_str()
+                    .is_some_and(|expression| expression.contains("fallback.focus();")),
+                "{entry_path:?}"
+            );
+
+            let sweep = tokio::time::timeout(Duration::from_secs(2), peer.commands(3))
+                .await
+                .expect("failed locator focus fallback sweep must be bounded");
+            assert_eq!(sweep[0]["method"], "Page.getFrameTree", "{entry_path:?}");
+            assert_eq!(
+                sweep[1]["method"], "Page.createIsolatedWorld",
+                "{entry_path:?}"
+            );
+            assert_eq!(sweep[2]["method"], "Runtime.evaluate", "{entry_path:?}");
+            assert!(
+                sweep[2]["params"]["expression"]
+                    .as_str()
+                    .is_some_and(|expression| expression.contains("fallback.remove();")),
+                "{entry_path:?}"
+            );
+            let result = operation.join().unwrap();
+            assert!(
+                matches!(
+                    &result,
+                    Err(RwError::Cdp { method, message })
+                        if method == "Runtime.evaluate" && message == FOCUS_ERROR
+                ),
+                "{entry_path:?}: {result:?}"
+            );
+
+            let subsequent_page = page.clone();
+            let subsequent = std::thread::spawn(move || {
+                subsequent_page.press_key_with_timeout_and_cancel(None, "a", Some(1_000.0), None)
+            });
+            let input = peer.commands(3).await;
+            subsequent.join().unwrap().unwrap();
+            assert!(
+                input
+                    .iter()
+                    .all(|command| command["method"] == "Input.dispatchKeyEvent"),
+                "{entry_path:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_page_press_routes_editing_commands_to_native_key_protocol() {
+        let (page, mut peer) = input_protocol_page(None);
+        let operation = std::thread::spawn(move || {
+            page.press_key_with_timeout_and_cancel(
+                Some("#target"),
+                "Control+A",
+                Some(1_000.0),
+                None,
+            )
+        });
+        let commands = peer.commands(7).await;
+        operation.join().unwrap().unwrap();
+        let input = commands
+            .iter()
+            .filter(|command| command["method"] == "Input.dispatchKeyEvent")
+            .collect::<Vec<_>>();
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0]["params"]["key"], "Control");
+        assert_eq!(input[1]["params"]["key"], "A");
+        assert_eq!(input[1]["params"]["commands"], json!(["selectAll"]));
+        assert_eq!(input[2]["params"]["type"], "keyUp");
+        assert_eq!(input[3]["params"]["modifiers"], 0);
+    }
+
+    async fn assert_public_fill_input_protocol(value: &str, expected_input: Vec<Value>) {
+        let (page, mut peer) = input_protocol_page(Some(value));
+        let value = value.to_string();
+        let operation = std::thread::spawn(move || page.fill("#target", &value, Some(1_000.0)));
+        let commands = peer.commands(11 + expected_input.len()).await;
+        operation.join().unwrap().unwrap();
+        let input = commands
+            .iter()
+            .filter(|command| {
+                command["method"].as_str().is_some_and(|method| {
+                    method == "Input.insertText" || method == "Input.dispatchKeyEvent"
+                })
+            })
+            .map(|command| json!({ "method": command["method"], "params": command["params"] }))
+            .collect::<Vec<_>>();
+        assert_eq!(input, expected_input);
+    }
+
+    #[tokio::test]
+    async fn public_page_fill_routes_to_insert_text_protocol() {
+        assert_public_fill_input_protocol(
+            "Ada",
+            vec![json!({
+                "method": "Input.insertText",
+                "params": { "text": "Ada" },
+            })],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn public_page_empty_fill_routes_to_trusted_delete_protocol() {
+        assert_public_fill_input_protocol(
+            "",
+            vec![
+                json!({
+                    "method": "Input.dispatchKeyEvent",
+                    "params": {
+                        "type": "rawKeyDown", "key": "Delete", "code": "Delete",
+                        "modifiers": 0, "windowsVirtualKeyCode": 46,
+                        "nativeVirtualKeyCode": 46, "location": 0,
+                    },
+                }),
+                json!({
+                    "method": "Input.dispatchKeyEvent",
+                    "params": {
+                        "type": "keyUp", "key": "Delete", "code": "Delete",
+                        "modifiers": 0, "windowsVirtualKeyCode": 46,
+                        "nativeVirtualKeyCode": 46, "location": 0,
+                    },
+                }),
+            ],
+        )
+        .await;
+    }
+
     #[test]
     fn typing_cancelled_during_final_character_returns_success_without_commit() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -3371,6 +4480,7 @@ multiline-compatible = """4.5.6"""
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
+            keyboard_platform: BrowserKeyboardPlatform::Control,
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -3430,7 +4540,9 @@ multiline-compatible = """4.5.6"""
                     };
                     let key_up =
                         method == "Input.dispatchKeyEvent" && command["params"]["type"] == "keyUp";
-                    if method == "Input.dispatchKeyEvent" && command["params"]["type"] == "keyDown"
+                    if method == "Input.dispatchKeyEvent"
+                        && command["params"]["type"] == "rawKeyDown"
+                        && command["params"]["key"] == "a"
                     {
                         cancellation_won = Some(dispatch_token.try_cancel());
                     }
@@ -3506,6 +4618,7 @@ multiline-compatible = """4.5.6"""
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
+            keyboard_platform: BrowserKeyboardPlatform::Control,
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -3614,7 +4727,9 @@ multiline-compatible = """4.5.6"""
                 "Control+a",
                 None,
                 OperationDeadline::new(Duration::from_millis(500)),
+                InputDispatchPolicy::ActionDeadline,
                 None,
+                BrowserKeyboardPlatform::Control,
             ),
             async {
                 tokio::time::timeout(Duration::from_secs(5), async {
@@ -3734,7 +4849,9 @@ multiline-compatible = """4.5.6"""
             "a",
             None,
             OperationDeadline::new(Duration::from_millis(100)),
+            InputDispatchPolicy::ActionDeadline,
             None,
+            BrowserKeyboardPlatform::Control,
         )
         .await;
 
@@ -3958,7 +5075,9 @@ multiline-compatible = """4.5.6"""
                 "a",
                 Some(Duration::from_millis(250)),
                 OperationDeadline::new(Duration::from_millis(100)),
+                InputDispatchPolicy::ActionDeadline,
                 None,
+                BrowserKeyboardPlatform::Control,
             ),
             async {
                 tokio::time::timeout(Duration::from_secs(5), async {
@@ -4033,6 +5152,8 @@ multiline-compatible = """4.5.6"""
                 'é',
                 None,
                 OperationDeadline::new(Duration::from_millis(25)),
+                InputDispatchPolicy::ActionDeadline,
+                BrowserKeyboardPlatform::Control,
             ),
             async {
                 tokio::time::timeout(Duration::from_secs(5), async {
@@ -4128,6 +5249,7 @@ multiline-compatible = """4.5.6"""
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
+            keyboard_platform: BrowserKeyboardPlatform::Control,
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -4362,7 +5484,8 @@ multiline-compatible = """4.5.6"""
     }
 
     fn chord_shape(key: &str) -> (Vec<String>, i64, String) {
-        let chord = parse_key_chord(key).unwrap_or_else(|error| panic!("{key:?}: {error}"));
+        let chord = parse_key_chord(key, BrowserKeyboardPlatform::Control)
+            .unwrap_or_else(|error| panic!("{key:?}: {error}"));
         let names = chord
             .modifiers
             .iter()
@@ -4384,7 +5507,10 @@ multiline-compatible = """4.5.6"""
         );
         // `+` is the chord separator, so a bare `+` has to stay addressable as a
         // base key rather than parsing as two empty parts.
-        assert_eq!(chord_shape("+"), (Vec::new(), 0, "+".to_owned()));
+        assert_eq!(
+            chord_shape("+"),
+            (vec!["Shift".to_owned()], 8, "+".to_owned())
+        );
         assert_eq!(
             chord_shape("Control+Shift+Alt+Meta+a"),
             (
@@ -4395,8 +5521,109 @@ multiline-compatible = """4.5.6"""
                     "Meta".to_owned(),
                 ],
                 2 | 8 | 1 | 4,
-                "a".to_owned()
+                "A".to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn native_key_table_matches_parallel_held_state_descriptors_entry_for_entry() {
+        type ExpectedDescriptor = (String, String, String, u32, u8, Option<String>, bool);
+        let expected: Vec<ExpectedDescriptor> = serde_json::from_str(include_str!(
+            "../tests/input_key_descriptor_conformance.json"
+        ))
+        .unwrap();
+        for (input, key, code, virtual_key, location, text, implied_shift) in expected {
+            let actual = native_key_descriptor(&input, BrowserKeyboardPlatform::Control)
+                .unwrap_or_else(|error| panic!("{input:?}: {error}"));
+            assert_eq!(
+                (
+                    actual.key,
+                    actual.code,
+                    actual.virtual_key,
+                    actual.location,
+                    actual.text,
+                    actual.implied_shift,
+                ),
+                (key, code, virtual_key, location, text, implied_shift),
+                "{input:?}"
+            );
+        }
+
+        for number in 1..=12 {
+            let input = format!("F{number}");
+            let actual = native_key_descriptor(&input, BrowserKeyboardPlatform::Control).unwrap();
+            assert_eq!(
+                (actual.key, actual.code, actual.virtual_key, actual.location),
+                (input.clone(), input, 111 + number, 0)
+            );
+            assert_eq!(actual.text, None);
+            assert!(!actual.implied_shift);
+        }
+        for character in 'A'..='Z' {
+            let input = format!("Key{character}");
+            let actual = native_key_descriptor(&input, BrowserKeyboardPlatform::Control).unwrap();
+            assert_eq!(actual.key, character.to_ascii_lowercase().to_string());
+            assert_eq!(actual.code, input);
+            assert_eq!(actual.virtual_key, u32::from(character));
+            assert_eq!(actual.location, 0);
+            assert_eq!(
+                actual.text,
+                Some(character.to_ascii_lowercase().to_string())
+            );
+            assert!(!actual.implied_shift);
+        }
+        for character in '0'..='9' {
+            let input = format!("Digit{character}");
+            let actual = native_key_descriptor(&input, BrowserKeyboardPlatform::Control).unwrap();
+            assert_eq!(actual.key, character.to_string());
+            assert_eq!(actual.code, input);
+            assert_eq!(actual.virtual_key, u32::from(character));
+            assert_eq!(actual.location, 0);
+            assert_eq!(actual.text, Some(character.to_string()));
+            assert!(!actual.implied_shift);
+        }
+        for character in ('a'..='z').chain('A'..='Z').chain('0'..='9') {
+            let input = character.to_string();
+            let actual = native_key_descriptor(&input, BrowserKeyboardPlatform::Control).unwrap();
+            let expected_code = if character.is_ascii_digit() {
+                format!("Digit{character}")
+            } else {
+                format!("Key{}", character.to_ascii_uppercase())
+            };
+            assert_eq!(actual.key, input);
+            assert_eq!(actual.code, expected_code);
+            assert_eq!(
+                actual.virtual_key,
+                u32::from(if character.is_ascii_digit() {
+                    character
+                } else {
+                    character.to_ascii_uppercase()
+                })
+            );
+            assert_eq!(actual.location, 0);
+            assert_eq!(actual.text, Some(character.to_string()));
+            assert!(!actual.implied_shift);
+        }
+    }
+
+    #[test]
+    fn browser_keyboard_platform_uses_browser_metadata_and_control_fallback() {
+        assert_eq!(
+            BrowserKeyboardPlatform::from_version(&json!({
+                "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)"
+            })),
+            BrowserKeyboardPlatform::Mac
+        );
+        assert_eq!(
+            BrowserKeyboardPlatform::from_version(&json!({
+                "userAgent": "Mozilla/5.0 (X11; Linux x86_64)"
+            })),
+            BrowserKeyboardPlatform::Control
+        );
+        assert_eq!(
+            BrowserKeyboardPlatform::from_version(&json!({})),
+            BrowserKeyboardPlatform::Control
         );
     }
 
@@ -4408,7 +5635,7 @@ multiline-compatible = """4.5.6"""
         // dedup, a caller-supplied string scales that work linearly.
         let (names, mask, base) = chord_shape("Control+Control+Control+Shift+Shift+a");
         assert_eq!(names, vec!["Control".to_owned(), "Shift".to_owned()]);
-        assert_eq!(base, "a");
+        assert_eq!(base, "A");
         // The mask a repeated modifier produces is the mask it produces once, so
         // deduplicating cannot change what the page sees.
         assert_eq!(mask, chord_shape("Control+Shift+a").1);
@@ -4419,7 +5646,11 @@ multiline-compatible = """4.5.6"""
         // Left and right modifiers share a mask but are different keys: a page
         // reading `event.code` can tell them apart, so both key-downs still go
         // out. Deduplicating by mask instead of by code would silently drop one.
-        let paired = parse_key_chord("ControlLeft+ControlRight+a").expect("paired chord");
+        let paired = parse_key_chord(
+            "ControlLeft+ControlRight+a",
+            BrowserKeyboardPlatform::Control,
+        )
+        .expect("paired chord");
         assert_eq!(
             paired
                 .modifiers
@@ -4438,18 +5669,18 @@ multiline-compatible = """4.5.6"""
         for key in ["", "Control+", "+a", "a++b"] {
             assert!(
                 matches!(
-                    parse_key_chord(key),
+                    parse_key_chord(key, BrowserKeyboardPlatform::Control),
                     Err(RwError::InvalidInput(message)) if message.starts_with("unsupported key:")
                 ),
                 "{key:?} should be rejected as an empty chord part"
             );
         }
         assert!(matches!(
-            parse_key_chord("Hyper+a"),
+            parse_key_chord("Hyper+a", BrowserKeyboardPlatform::Control),
             Err(RwError::InvalidInput(message)) if message == "unsupported key modifier: Hyper"
         ));
         assert!(
-            parse_key_chord("Control+NoSuchKey").is_err(),
+            parse_key_chord("Control+NoSuchKey", BrowserKeyboardPlatform::Control).is_err(),
             "an unknown base key must fail before its modifier is pressed"
         );
     }
@@ -5689,7 +6920,9 @@ multiline-compatible = """4.5.6"""
         let ready = fill
             .find("fill_guard_ready_expression(&guard_key)?")
             .expect("ready expression");
-        let insert = fill.find("\"Input.insertText\"").expect("input dispatch");
+        let insert = fill
+            .find("commit_fill_text(")
+            .expect("trusted fill dispatch handoff");
 
         assert!(
             last_pin < ready,
@@ -6025,6 +7258,7 @@ multiline-compatible = """4.5.6"""
                 owned: false,
                 ws_endpoint: "ws://test.invalid".to_string(),
                 stealth_user_agent_override: Mutex::new(None),
+                keyboard_platform: BrowserKeyboardPlatform::Control,
                 single_process_fallback: false,
                 lifecycle: Arc::new(CloseLifecycle::new()),
                 attached_pages: AttachedPageRegistry::default(),
@@ -6090,6 +7324,7 @@ multiline-compatible = """4.5.6"""
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
+            keyboard_platform: BrowserKeyboardPlatform::Control,
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -6411,6 +7646,7 @@ multiline-compatible = """4.5.6"""
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
+            keyboard_platform: BrowserKeyboardPlatform::Control,
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -6580,6 +7816,7 @@ multiline-compatible = """4.5.6"""
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
+            keyboard_platform: BrowserKeyboardPlatform::Control,
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -7385,6 +8622,7 @@ multiline-compatible = """4.5.6"""
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
+            keyboard_platform: BrowserKeyboardPlatform::Control,
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -15620,10 +16858,63 @@ struct BrowserInner {
     owned: bool,
     ws_endpoint: String,
     stealth_user_agent_override: Mutex<Option<Value>>,
+    keyboard_platform: BrowserKeyboardPlatform,
     single_process_fallback: bool,
     lifecycle: Arc<CloseLifecycle>,
     attached_pages: AttachedPageRegistry,
     next_native_network_index: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BrowserKeyboardPlatform {
+    Mac,
+    /// Windows, Linux, and the documented fallback when browser metadata is unavailable.
+    #[default]
+    Control,
+}
+
+impl BrowserKeyboardPlatform {
+    fn from_version(version: &Value) -> Self {
+        let user_agent = version
+            .get("userAgent")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if user_agent.contains("Macintosh") || user_agent.contains("Mac OS X") {
+            Self::Mac
+        } else {
+            Self::Control
+        }
+    }
+
+    fn primary_modifier(self) -> &'static str {
+        match self {
+            Self::Mac => "Meta",
+            Self::Control => "Control",
+        }
+    }
+
+    fn primary_mask(self) -> i64 {
+        match self {
+            Self::Mac => 4,
+            Self::Control => 2,
+        }
+    }
+}
+
+fn detect_browser_keyboard_platform(
+    runtime: &tokio::runtime::Runtime,
+    client: &CdpClient,
+    timeout: Duration,
+) -> BrowserKeyboardPlatform {
+    if timeout.is_zero() {
+        return BrowserKeyboardPlatform::Control;
+    }
+    runtime
+        .block_on(client.send("Browser.getVersion", json!({}), None, timeout))
+        .map(|version| BrowserKeyboardPlatform::from_version(&version))
+        // Browser keyboard semantics must never depend on the client host. If
+        // metadata is unavailable, use the cross-platform Control mapping.
+        .unwrap_or_default()
 }
 
 #[derive(Default)]
@@ -19124,6 +20415,12 @@ fn native_input_timeout(timeout_ms: Option<f64>) -> Duration {
     BrowserInner::command_timeout(timeout_ms)
 }
 
+fn native_input_delay(delay_ms: Option<f64>) -> Option<Duration> {
+    delay_ms
+        .filter(|delay| delay.is_finite() && *delay > 0.0)
+        .map(|delay| Duration::from_secs_f64((delay / 1_000.0).min(24.0 * 60.0 * 60.0)))
+}
+
 impl OperationDeadline {
     fn new(timeout: Duration) -> Self {
         Self {
@@ -21678,28 +22975,13 @@ return null;
                 ));
             }
             let insert_text_dispatch = !committed_value.is_empty();
-            let input_result = if committed_value.is_empty() {
-                dispatch_key_press(
-                    &page.browser.client,
-                    &resolution.session_id,
-                    "Delete",
-                    None,
-                    deadline,
-                    None,
-                )
-                .await
-            } else {
-                page.browser
-                    .client
-                    .send(
-                        "Input.insertText",
-                        json!({ "text": &committed_value }),
-                        Some(&resolution.session_id),
-                        deadline.remaining()?,
-                    )
-                    .await
-                    .map(|_| ())
-            };
+            let input_result = commit_fill_text(
+                &page.browser.client,
+                &resolution.session_id,
+                &committed_value,
+                deadline,
+            )
+            .await;
             if let Err(error) = input_result {
                 if insert_text_dispatch
                     && action_dispatch_reply_disposition(&error)
@@ -27242,40 +28524,167 @@ return { ready: true, result: true, payload: null };
         text: &str,
         timeout_ms: Option<f64>,
     ) -> PyResult<()> {
-        let text_json = serde_json::to_string(text)
+        self.type_text_native(locator_json, index, text, None, timeout_ms)
+    }
+
+    fn keyboard_primary_modifier(&self) -> &'static str {
+        self.inner.browser.keyboard_platform.primary_modifier()
+    }
+
+    #[pyo3(signature = (text, delay_ms=None, timeout_ms=None))]
+    fn keyboard_type_native(
+        &self,
+        text: &str,
+        delay_ms: Option<f64>,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<()> {
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let text = text.to_string();
+        let transport_timeout = native_input_timeout(timeout_ms);
+        let delay = native_input_delay(delay_ms);
+        browser
+            .block_on(dispatch_direct_keyboard_text(
+                &page.browser.client,
+                &page.session_id,
+                &text,
+                delay,
+                transport_timeout,
+                page.browser.keyboard_platform,
+            ))
+            .map_err(py_err)
+    }
+
+    #[pyo3(signature = (key, delay_ms=None, timeout_ms=None))]
+    fn keyboard_press_native(
+        &self,
+        key: &str,
+        delay_ms: Option<f64>,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<()> {
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let key = key.to_string();
+        let transport_timeout = native_input_timeout(timeout_ms);
+        let deadline = OperationDeadline::new(transport_timeout);
+        let delay = native_input_delay(delay_ms);
+        browser
+            .block_on(press_locator_for_native_input(
+                &page,
+                None,
+                0,
+                &key,
+                delay,
+                deadline,
+                InputDispatchPolicy::Direct { transport_timeout },
+                None,
+            ))
+            .map_err(py_err)
+    }
+
+    #[pyo3(signature = (method, params_json, timeout_ms=None))]
+    fn keyboard_dispatch_native(
+        &self,
+        py: Python<'_>,
+        method: &str,
+        params_json: &str,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<String> {
+        let params: Value = serde_json::from_str(params_json)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let prepare_body = format!(
-            r#"
-if (!el) throw new Error('No element matches locator');
-el.scrollIntoView({{ block: 'center', inline: 'center' }});
-if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
-return {{ ready: true, result: true, payload: {{ text: {text_json} }} }};
-"#
-        );
-        let dispatch_body = r#"
-if (!el.isConnected) throw new Error('__rustwright_action_dispatch_not_started__: element detached');
-const text = prepared.text;
-if ('value' in el) {
-  el.value = `${el.value || ''}${text}`;
-} else if (el.isContentEditable) {
-  el.textContent = `${el.textContent || ''}${text}`;
-} else {
-  el.textContent = `${el.textContent || ''}${text}`;
-}
-rustwrightRecordDispatch(true);
-el.dispatchEvent(new Event('input', { bubbles: true }));
-el.dispatchEvent(new Event('change', { bubbles: true }));
-return true;
-"#;
-        self.evaluate_locator_dispatch(
-            locator_json,
-            index,
-            &prepare_body,
-            dispatch_body,
-            timeout_ms,
-        )
-        .map(|_| ())
-        .map_err(py_err)
+        let action_name = params
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or(method)
+            .to_string();
+        let method = method.to_string();
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let timeout = native_input_timeout(timeout_ms);
+        let send_outcome = py.detach(move || {
+            browser.block_on_raw(async move {
+                page.browser
+                    .client
+                    .send_with_write_status(&method, params, Some(&page.session_id), timeout)
+                    .await
+            })
+        });
+        let write_status = match send_outcome.write_status {
+            TransportWriteStatus::NotWritten => "not_written",
+            TransportWriteStatus::Written => "written",
+            TransportWriteStatus::Indeterminate => "indeterminate",
+        };
+        let resolution = resolve_input_action_send(send_outcome, &action_name);
+        let commitment = match resolution.commitment {
+            InputActionCommitment::NotCommitted => "not_committed",
+            InputActionCommitment::Confirmed => "confirmed",
+            InputActionCommitment::WrittenUnconfirmed => "written_unconfirmed",
+        };
+        let error = resolution.result.err().map(ffi_error_message);
+        Ok(json!({
+            "write_status": write_status,
+            "commitment": commitment,
+            "error": error,
+        })
+        .to_string())
+    }
+
+    #[pyo3(signature = (locator_json, index, text, delay_ms=None, timeout_ms=None))]
+    fn type_text_native(
+        &self,
+        locator_json: &str,
+        index: usize,
+        text: &str,
+        delay_ms: Option<f64>,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<()> {
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let locator_json = locator_json.to_string();
+        let text = text.to_string();
+        let deadline = OperationDeadline::new(native_input_timeout(timeout_ms));
+        let delay = native_input_delay(delay_ms);
+        browser
+            .block_on(type_locator_for_native_input(
+                &page,
+                &locator_json,
+                index,
+                &text,
+                delay,
+                deadline,
+                InputDispatchPolicy::ActionDeadline,
+                None,
+            ))
+            .map_err(py_err)
+    }
+
+    #[pyo3(signature = (locator_json, index, key, delay_ms=None, timeout_ms=None))]
+    fn press_key_native(
+        &self,
+        locator_json: &str,
+        index: usize,
+        key: &str,
+        delay_ms: Option<f64>,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<()> {
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let locator_json = locator_json.to_string();
+        let key = key.to_string();
+        let deadline = OperationDeadline::new(native_input_timeout(timeout_ms));
+        let delay = native_input_delay(delay_ms);
+        browser
+            .block_on(press_locator_for_native_input(
+                &page,
+                Some(&locator_json),
+                index,
+                &key,
+                delay,
+                deadline,
+                InputDispatchPolicy::ActionDeadline,
+                None,
+            ))
+            .map_err(py_err)
     }
 
     #[pyo3(signature = (locator_json, index, timeout_ms=None))]
@@ -29374,6 +30783,8 @@ fn launch_chromium_with_options_cancellation(
             return Err(error);
         }
     };
+    let keyboard_platform =
+        detect_browser_keyboard_platform(&runtime, &client, Duration::from_secs(5));
     if let Err(error) = start_service_worker_stealth_auto_attach_cancelable(
         &runtime,
         Arc::clone(&client),
@@ -29393,6 +30804,7 @@ fn launch_chromium_with_options_cancellation(
         owned: true,
         ws_endpoint,
         stealth_user_agent_override: Mutex::new(None),
+        keyboard_platform,
         single_process_fallback,
         lifecycle: Arc::new(CloseLifecycle::new()),
         attached_pages: AttachedPageRegistry::default(),
@@ -29498,6 +30910,13 @@ fn connect_browser_over_cdp_cancelable(
         client.close();
         return Err(RwError::Timeout(duration_millis_u64(timeout)));
     }
+    let keyboard_platform =
+        detect_browser_keyboard_platform(&runtime, &client, remaining.min(Duration::from_secs(5)));
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        client.close();
+        return Err(RwError::Timeout(duration_millis_u64(timeout)));
+    }
     if let Err(error) = start_service_worker_stealth_auto_attach_cancelable(
         &runtime,
         Arc::clone(&client),
@@ -29515,6 +30934,7 @@ fn connect_browser_over_cdp_cancelable(
         owned: false,
         ws_endpoint,
         stealth_user_agent_override: Mutex::new(None),
+        keyboard_platform,
         single_process_fallback: false,
         lifecycle: Arc::new(CloseLifecycle::new()),
         attached_pages: AttachedPageRegistry::default(),
@@ -29585,6 +31005,7 @@ impl RustwrightNavigationHarness {
             owned: false,
             ws_endpoint: "ws://test.invalid".to_owned(),
             stealth_user_agent_override: Mutex::new(None),
+            keyboard_platform: BrowserKeyboardPlatform::Control,
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
@@ -31179,24 +32600,44 @@ impl RustwrightPage {
         let browser = Arc::clone(&page.browser);
         browser.block_on_raw(async move {
             let deadline = OperationDeadline::new(timeout);
-            let resolution = cancelable(
-                cancel.cloned(),
-                focus_locator_for_native_input(&page, &locator_json, deadline),
-            )
-            .await?;
-            ensure_not_cancelled(cancel)?;
-            for character in text.chars() {
+            let (resolution, fallback_focused) =
+                focus_locator_for_native_input(&page, &locator_json, 0, deadline, cancel.cloned())
+                    .await?;
+            let result = async {
                 ensure_not_cancelled(cancel)?;
-                dispatch_typed_character(
-                    &page.browser.client,
-                    &resolution.session_id,
-                    character,
-                    delay,
-                    deadline,
-                )
-                .await?;
+                for character in text.chars() {
+                    ensure_not_cancelled(cancel)?;
+                    if fallback_focused {
+                        dispatch_typed_character_without_text(
+                            &page.browser.client,
+                            &resolution.session_id,
+                            character,
+                            delay,
+                            deadline,
+                            InputDispatchPolicy::ActionDeadline,
+                            page.browser.keyboard_platform,
+                        )
+                        .await?;
+                    } else {
+                        dispatch_typed_character(
+                            &page.browser.client,
+                            &resolution.session_id,
+                            character,
+                            delay,
+                            deadline,
+                            InputDispatchPolicy::ActionDeadline,
+                            page.browser.keyboard_platform,
+                        )
+                        .await?;
+                    }
+                }
+                Ok(())
             }
-            Ok(())
+            .await;
+            if fallback_focused {
+                cleanup_keyboard_fallback_focus(&page, &resolution, 0).await;
+            }
+            result
         })
     }
 
@@ -31229,7 +32670,7 @@ impl RustwrightPage {
         // would mutate page state on a call that then returns InvalidInput. The
         // parse is pure and cheap, and `dispatch_key_press` re-derives the same
         // chord through the same parser, so there is one definition of valid.
-        parse_key_chord(key)?;
+        parse_key_chord(key, self.inner.browser.keyboard_platform)?;
         let timeout_ms = self.resolve_timeout(timeout_ms, false);
         let page = Arc::clone(&self.inner);
         let key = key.to_string();
@@ -31237,28 +32678,52 @@ impl RustwrightPage {
         let browser = Arc::clone(&page.browser);
         browser.block_on_raw(async move {
             let deadline = OperationDeadline::new(timeout);
-            let session_id = cancelable(cancel.cloned(), async {
-                match locator_json {
-                    Some(locator_json) => {
-                        Ok(
-                            focus_locator_for_native_input(&page, &locator_json, deadline)
-                                .await?
-                                .session_id,
-                        )
-                    }
-                    None => Ok(page.session_id.clone()),
+            let (session_id, focus) = match locator_json.as_deref() {
+                Some(locator_json) => {
+                    let focus = focus_locator_for_native_input(
+                        &page,
+                        locator_json,
+                        0,
+                        deadline,
+                        cancel.cloned(),
+                    )
+                    .await?;
+                    (focus.0.session_id.clone(), Some(focus))
                 }
-            })
-            .await?;
-            dispatch_key_press(
-                &page.browser.client,
-                &session_id,
-                &key,
-                None,
-                deadline,
-                cancel,
-            )
-            .await
+                None => {
+                    ensure_not_cancelled(cancel)?;
+                    (page.session_id.clone(), None)
+                }
+            };
+            let result = if focus.as_ref().is_some_and(|(_, fallback)| *fallback) {
+                dispatch_key_press_without_text(
+                    &page.browser.client,
+                    &session_id,
+                    &key,
+                    None,
+                    deadline,
+                    InputDispatchPolicy::ActionDeadline,
+                    cancel,
+                    page.browser.keyboard_platform,
+                )
+                .await
+            } else {
+                dispatch_key_press(
+                    &page.browser.client,
+                    &session_id,
+                    &key,
+                    None,
+                    deadline,
+                    InputDispatchPolicy::ActionDeadline,
+                    cancel,
+                    page.browser.keyboard_platform,
+                )
+                .await
+            };
+            if let Some((resolution, true)) = focus {
+                cleanup_keyboard_fallback_focus(&page, &resolution, 0).await;
+            }
+            result
         })
     }
 
@@ -32044,17 +33509,118 @@ return waitForScrollSettle();"#
 async fn focus_locator_for_native_input(
     page: &Arc<PageInner>,
     locator_json: &str,
+    index: usize,
     deadline: OperationDeadline,
-) -> RwResult<LocatorSessionResolution> {
-    let (_, resolution) = evaluate_locator_action_with_deadline(
-        page,
-        locator_json,
-        0,
-        "if (!el) throw new Error('No element matches locator'); el.scrollIntoView({ block: 'center', inline: 'center' }); if (typeof el.focus === 'function') el.focus({ preventScroll: true }); return true;",
-        deadline,
+    cancel: Option<CancelToken>,
+) -> RwResult<(LocatorSessionResolution, bool)> {
+    let focus = cancelable(
+        cancel,
+        focus_locator_for_native_input_before(page, locator_json, index, deadline),
     )
-    .await?;
-    Ok(resolution)
+    .await;
+    match focus {
+        Ok(focus) => Ok(focus),
+        Err(error) => {
+            // The page-side evaluation may have focused the fallback even when its
+            // response loses a cancellation or timeout race. Sweep independently.
+            let cleanup =
+                cleanup_keyboard_fallback_focus_for_locator(page, locator_json, index).await;
+            Err(attach_keyboard_fallback_cleanup_error(error, cleanup))
+        }
+    }
+}
+
+async fn focus_locator_for_native_input_before(
+    page: &Arc<PageInner>,
+    locator_json: &str,
+    index: usize,
+    deadline: OperationDeadline,
+) -> RwResult<(LocatorSessionResolution, bool)> {
+    let focus_body = r#"if (!el) throw new Error('No element matches locator');
+el.scrollIntoView({ block: 'center', inline: 'center' });
+if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+const doc = el.ownerDocument || document;
+const deepActiveElement = () => {
+  let active = doc.activeElement;
+  while (active && active.shadowRoot && active.shadowRoot.activeElement) {
+    active = active.shadowRoot.activeElement;
+  }
+  return active;
+};
+if (deepActiveElement() === el) return false;
+let fallback = doc.querySelector('[data-rustwright-keyboard-fallback="true"]');
+if (!fallback) {
+  fallback = doc.createElement('div');
+  fallback.setAttribute('data-rustwright-keyboard-fallback', 'true');
+  fallback.setAttribute('aria-hidden', 'true');
+  fallback.tabIndex = -1;
+  fallback.style.cssText = 'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;opacity:0;pointer-events:none;';
+  (doc.body || doc.documentElement).appendChild(fallback);
+}
+fallback.focus();
+if (doc.activeElement !== fallback) throw new Error('Element could not be focused');
+return true;"#;
+    let (focus_json, resolution) =
+        evaluate_locator_action_with_deadline(page, locator_json, index, focus_body, deadline)
+            .await?;
+    let fallback_focused = serde_json::from_str::<Value>(&focus_json)?
+        .as_bool()
+        .unwrap_or(false);
+    Ok((resolution, fallback_focused))
+}
+
+async fn cleanup_keyboard_fallback_focus(
+    page: &Arc<PageInner>,
+    resolution: &LocatorSessionResolution,
+    index: usize,
+) {
+    let _ = cleanup_keyboard_fallback_focus_before(
+        page,
+        resolution,
+        index,
+        OperationDeadline::new(Duration::from_secs(1)),
+    )
+    .await;
+}
+
+async fn cleanup_keyboard_fallback_focus_for_locator(
+    page: &Arc<PageInner>,
+    locator_json: &str,
+    index: usize,
+) -> RwResult<()> {
+    let deadline = OperationDeadline::new(Duration::from_secs(1));
+    let resolution =
+        resolve_locator_action_session(Arc::clone(page), locator_json, deadline).await?;
+    cleanup_keyboard_fallback_focus_before(page, &resolution, index, deadline).await
+}
+
+async fn cleanup_keyboard_fallback_focus_before(
+    page: &Arc<PageInner>,
+    resolution: &LocatorSessionResolution,
+    index: usize,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    let expression = locator_script(
+        &resolution.locator_json,
+        index,
+        r#"const doc = (el && el.ownerDocument) || document;
+for (const fallback of Array.from(doc.querySelectorAll('[data-rustwright-keyboard-fallback="true"]'))) {
+  fallback.remove();
+}
+return true;"#,
+    );
+    evaluate_locator_resolution(page, resolution, expression, deadline, Duration::ZERO)
+        .await
+        .map(|_| ())
+}
+
+fn attach_keyboard_fallback_cleanup_error(error: RwError, cleanup: RwResult<()>) -> RwError {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup_error) => RwError::Message(format!(
+            "{error}; additionally, keyboard fallback cleanup failed: {cleanup_error}"
+        )),
+    }
 }
 
 #[derive(Clone)]
@@ -32064,13 +33630,24 @@ struct NativeKeyDescriptor {
     virtual_key: u32,
     location: u8,
     text: Option<String>,
+    implied_shift: bool,
 }
 
-fn native_key_descriptor(key: &str) -> RwResult<NativeKeyDescriptor> {
+fn native_key_descriptor(
+    key: &str,
+    platform: BrowserKeyboardPlatform,
+) -> RwResult<NativeKeyDescriptor> {
+    let key = if key == "ControlOrMeta" {
+        platform.primary_modifier()
+    } else {
+        key
+    };
     let named = match key {
         "Alt" | "AltLeft" => Some(("Alt", "AltLeft", 18, 1)),
         "AltRight" => Some(("Alt", "AltRight", 18, 2)),
         "Backspace" => Some(("Backspace", "Backspace", 8, 0)),
+        "CapsLock" => Some(("CapsLock", "CapsLock", 20, 0)),
+        "ContextMenu" => Some(("ContextMenu", "ContextMenu", 93, 0)),
         "Control" | "ControlLeft" => Some(("Control", "ControlLeft", 17, 1)),
         "ControlRight" => Some(("Control", "ControlRight", 17, 2)),
         "Delete" => Some(("Delete", "Delete", 46, 0)),
@@ -32081,8 +33658,12 @@ fn native_key_descriptor(key: &str) -> RwResult<NativeKeyDescriptor> {
         "Insert" => Some(("Insert", "Insert", 45, 0)),
         "Meta" | "MetaLeft" => Some(("Meta", "MetaLeft", 91, 1)),
         "MetaRight" => Some(("Meta", "MetaRight", 92, 2)),
+        "NumLock" => Some(("NumLock", "NumLock", 144, 0)),
+        "Pause" => Some(("Pause", "Pause", 19, 0)),
         "PageDown" => Some(("PageDown", "PageDown", 34, 0)),
         "PageUp" => Some(("PageUp", "PageUp", 33, 0)),
+        "PrintScreen" => Some(("PrintScreen", "PrintScreen", 44, 0)),
+        "ScrollLock" => Some(("ScrollLock", "ScrollLock", 145, 0)),
         "Shift" | "ShiftLeft" => Some(("Shift", "ShiftLeft", 16, 1)),
         "ShiftRight" => Some(("Shift", "ShiftRight", 16, 2)),
         "Tab" => Some(("Tab", "Tab", 9, 0)),
@@ -32090,7 +33671,23 @@ fn native_key_descriptor(key: &str) -> RwResult<NativeKeyDescriptor> {
         "ArrowLeft" => Some(("ArrowLeft", "ArrowLeft", 37, 0)),
         "ArrowRight" => Some(("ArrowRight", "ArrowRight", 39, 0)),
         "ArrowUp" => Some(("ArrowUp", "ArrowUp", 38, 0)),
-        "Space" => Some((" ", "Space", 32, 0)),
+        " " | "Space" => Some((" ", "Space", 32, 0)),
+        "Numpad0" => Some(("Insert", "Numpad0", 45, 3)),
+        "Numpad1" => Some(("End", "Numpad1", 35, 3)),
+        "Numpad2" => Some(("ArrowDown", "Numpad2", 40, 3)),
+        "Numpad3" => Some(("PageDown", "Numpad3", 34, 3)),
+        "Numpad4" => Some(("ArrowLeft", "Numpad4", 37, 3)),
+        "Numpad5" => Some(("Clear", "Numpad5", 12, 3)),
+        "Numpad6" => Some(("ArrowRight", "Numpad6", 39, 3)),
+        "Numpad7" => Some(("Home", "Numpad7", 36, 3)),
+        "Numpad8" => Some(("ArrowUp", "Numpad8", 38, 3)),
+        "Numpad9" => Some(("PageUp", "Numpad9", 33, 3)),
+        "NumpadAdd" => Some(("+", "NumpadAdd", 107, 3)),
+        "NumpadSubtract" => Some(("-", "NumpadSubtract", 109, 3)),
+        "NumpadMultiply" => Some(("*", "NumpadMultiply", 106, 3)),
+        "NumpadDivide" => Some(("/", "NumpadDivide", 111, 3)),
+        "NumpadDecimal" => Some(("\0", "NumpadDecimal", 46, 3)),
+        "NumpadEnter" => Some(("Enter", "NumpadEnter", 13, 3)),
         _ => None,
     };
     if let Some((normalized, code, virtual_key, location)) = named {
@@ -32099,7 +33696,73 @@ fn native_key_descriptor(key: &str) -> RwResult<NativeKeyDescriptor> {
             code: code.to_string(),
             virtual_key,
             location,
-            text: (key == "Space").then(|| " ".to_string()),
+            text: match key {
+                // Chromium's native Enter default action is driven by the character
+                // event, whose text payload uses a carriage return.
+                "Enter" | "NumpadEnter" => Some("\r".to_string()),
+                " " | "Space" => Some(" ".to_string()),
+                "NumpadAdd" => Some("+".to_string()),
+                "NumpadSubtract" => Some("-".to_string()),
+                "NumpadMultiply" => Some("*".to_string()),
+                "NumpadDivide" => Some("/".to_string()),
+                _ => None,
+            },
+            implied_shift: false,
+        });
+    }
+    if let Some(number) = key
+        .strip_prefix('F')
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        if (1..=12).contains(&number) {
+            return Ok(NativeKeyDescriptor {
+                key: key.to_string(),
+                code: key.to_string(),
+                virtual_key: 111 + number,
+                location: 0,
+                text: None,
+                implied_shift: false,
+            });
+        }
+    }
+    if (key.len() == 4 && key.starts_with("Key")) || (key.len() == 6 && key.starts_with("Digit")) {
+        let character = key.as_bytes()[key.len() - 1] as char;
+        if (key.starts_with("Key") && character.is_ascii_uppercase())
+            || (key.starts_with("Digit") && character.is_ascii_digit())
+        {
+            let text = character.to_ascii_lowercase().to_string();
+            return Ok(NativeKeyDescriptor {
+                key: text.clone(),
+                code: key.to_string(),
+                virtual_key: u32::from(character),
+                location: 0,
+                text: Some(text),
+                implied_shift: false,
+            });
+        }
+    }
+    let physical_punctuation = match key {
+        "Backquote" => Some(('`', '~', 192)),
+        "Minus" => Some(('-', '_', 189)),
+        "Equal" => Some(('=', '+', 187)),
+        "BracketLeft" => Some(('[', '{', 219)),
+        "BracketRight" => Some((']', '}', 221)),
+        "Backslash" => Some(('\\', '|', 220)),
+        "Semicolon" => Some((';', ':', 186)),
+        "Quote" => Some(('\'', '"', 222)),
+        "Comma" => Some((',', '<', 188)),
+        "Period" => Some(('.', '>', 190)),
+        "Slash" => Some(('/', '?', 191)),
+        _ => None,
+    };
+    if let Some((normal, _, virtual_key)) = physical_punctuation {
+        return Ok(NativeKeyDescriptor {
+            key: normal.to_string(),
+            code: key.to_string(),
+            virtual_key,
+            location: 0,
+            text: Some(normal.to_string()),
+            implied_shift: false,
         });
     }
     let mut characters = key.chars();
@@ -32109,7 +33772,34 @@ fn native_key_descriptor(key: &str) -> RwResult<NativeKeyDescriptor> {
     if characters.next().is_some() || !character.is_ascii() {
         return Err(RwError::InvalidInput(format!("unsupported key: {key}")));
     }
-    let (code, virtual_key) = if character.is_ascii_alphabetic() {
+    let punctuation = match character {
+        '`' | '~' => Some(("Backquote", 192, character == '~')),
+        '-' | '_' => Some(("Minus", 189, character == '_')),
+        '=' | '+' => Some(("Equal", 187, character == '+')),
+        '[' | '{' => Some(("BracketLeft", 219, character == '{')),
+        ']' | '}' => Some(("BracketRight", 221, character == '}')),
+        '\\' | '|' => Some(("Backslash", 220, character == '|')),
+        ';' | ':' => Some(("Semicolon", 186, character == ':')),
+        '\'' | '"' => Some(("Quote", 222, character == '"')),
+        ',' | '<' => Some(("Comma", 188, character == '<')),
+        '.' | '>' => Some(("Period", 190, character == '>')),
+        '/' | '?' => Some(("Slash", 191, character == '?')),
+        '!' => Some(("Digit1", 49, true)),
+        '@' => Some(("Digit2", 50, true)),
+        '#' => Some(("Digit3", 51, true)),
+        '$' => Some(("Digit4", 52, true)),
+        '%' => Some(("Digit5", 53, true)),
+        '^' => Some(("Digit6", 54, true)),
+        '&' => Some(("Digit7", 55, true)),
+        '*' => Some(("Digit8", 56, true)),
+        '(' => Some(("Digit9", 57, true)),
+        ')' => Some(("Digit0", 48, true)),
+        _ => None,
+    };
+    let implied_shift = punctuation.is_some_and(|(_, _, shifted)| shifted);
+    let (code, virtual_key) = if let Some((code, virtual_key, _)) = punctuation {
+        (code.to_string(), virtual_key)
+    } else if character.is_ascii_alphabetic() {
         (
             format!("Key{}", character.to_ascii_uppercase()),
             u32::from(character.to_ascii_uppercase()),
@@ -32117,7 +33807,7 @@ fn native_key_descriptor(key: &str) -> RwResult<NativeKeyDescriptor> {
     } else if character.is_ascii_digit() {
         (format!("Digit{character}"), u32::from(character))
     } else {
-        (String::new(), u32::from(character))
+        return Err(RwError::InvalidInput(format!("unsupported key: {key}")));
     };
     Ok(NativeKeyDescriptor {
         key: character.to_string(),
@@ -32125,7 +33815,50 @@ fn native_key_descriptor(key: &str) -> RwResult<NativeKeyDescriptor> {
         virtual_key,
         location: 0,
         text: Some(character.to_string()),
+        implied_shift,
     })
+}
+
+fn shift_native_key_descriptor(descriptor: &mut NativeKeyDescriptor) {
+    if descriptor.implied_shift {
+        return;
+    }
+    let shifted = if descriptor.code.starts_with("Key") {
+        descriptor
+            .key
+            .chars()
+            .next()
+            .map(|value| value.to_ascii_uppercase())
+    } else {
+        match descriptor.code.as_str() {
+            "Digit1" => Some('!'),
+            "Digit2" => Some('@'),
+            "Digit3" => Some('#'),
+            "Digit4" => Some('$'),
+            "Digit5" => Some('%'),
+            "Digit6" => Some('^'),
+            "Digit7" => Some('&'),
+            "Digit8" => Some('*'),
+            "Digit9" => Some('('),
+            "Digit0" => Some(')'),
+            "Backquote" => Some('~'),
+            "Minus" => Some('_'),
+            "Equal" => Some('+'),
+            "BracketLeft" => Some('{'),
+            "BracketRight" => Some('}'),
+            "Backslash" => Some('|'),
+            "Semicolon" => Some(':'),
+            "Quote" => Some('"'),
+            "Comma" => Some('<'),
+            "Period" => Some('>'),
+            "Slash" => Some('?'),
+            _ => None,
+        }
+    };
+    if let Some(shifted) = shifted {
+        descriptor.key = shifted.to_string();
+        descriptor.text = Some(shifted.to_string());
+    }
 }
 
 fn native_modifier_mask(key: &str) -> Option<i64> {
@@ -32165,13 +33898,52 @@ fn native_key_event_params(
     params
 }
 
-async fn wait_input_delay(delay: Option<Duration>, deadline: OperationDeadline) -> RwResult<()> {
+/// Return the Chromium editing command that accompanies a platform select-all chord.
+///
+/// macOS uses Command (`Meta+A`); Windows and Linux use `Control+A`. Modifier flags
+/// alone do not ask Chromium to perform the editing operation, so the command must be
+/// present on the base raw-key-down event.
+fn native_editing_commands(
+    descriptor: &NativeKeyDescriptor,
+    modifiers: i64,
+    platform: BrowserKeyboardPlatform,
+) -> Option<Value> {
+    (descriptor.key.eq_ignore_ascii_case("a") && modifiers == platform.primary_mask())
+        .then(|| json!(["selectAll"]))
+}
+
+#[derive(Clone, Copy)]
+enum InputDispatchPolicy {
+    ActionDeadline,
+    Direct { transport_timeout: Duration },
+}
+
+fn input_transport_timeout(
+    deadline: OperationDeadline,
+    policy: InputDispatchPolicy,
+) -> RwResult<Duration> {
+    match policy {
+        InputDispatchPolicy::ActionDeadline => deadline.remaining(),
+        InputDispatchPolicy::Direct { transport_timeout } => Ok(transport_timeout),
+    }
+}
+
+async fn wait_input_delay(
+    delay: Option<Duration>,
+    deadline: OperationDeadline,
+    policy: InputDispatchPolicy,
+) -> RwResult<()> {
     let Some(delay) = delay.filter(|value| !value.is_zero()) else {
         return Ok(());
     };
-    tokio::time::timeout(deadline.remaining()?, tokio::time::sleep(delay))
-        .await
-        .map_err(|_| RwError::Timeout(duration_millis_u64(deadline.timeout)))?;
+    match policy {
+        InputDispatchPolicy::ActionDeadline => {
+            tokio::time::timeout(deadline.remaining()?, tokio::time::sleep(delay))
+                .await
+                .map_err(|_| RwError::Timeout(duration_millis_u64(deadline.timeout)))?;
+        }
+        InputDispatchPolicy::Direct { .. } => tokio::time::sleep(delay).await,
+    }
     Ok(())
 }
 
@@ -32189,9 +33961,11 @@ async fn dispatch_typed_character(
     character: char,
     delay: Option<Duration>,
     deadline: OperationDeadline,
+    delay_policy: InputDispatchPolicy,
+    platform: BrowserKeyboardPlatform,
 ) -> RwResult<()> {
     if !character.is_ascii() || character.is_ascii_control() {
-        let dispatch_timeout = deadline.remaining()?;
+        let dispatch_timeout = input_transport_timeout(deadline, delay_policy)?;
         let action = resolve_input_action_send(
             client
                 .send_with_write_status(
@@ -32204,21 +33978,220 @@ async fn dispatch_typed_character(
             "insertText",
         );
         action.result?;
-        if let Err(error) = wait_input_delay(delay, deadline).await {
+        if let Err(error) = wait_input_delay(delay, deadline, delay_policy).await {
             debug_assert!(action.commitment.is_committed());
             eprintln!("rustwright: input delay failed after committed insertText: {error}");
         }
         return Ok(());
     }
+    let key = if character.is_ascii_uppercase() {
+        format!("Shift+{}", character.to_ascii_lowercase())
+    } else {
+        character.to_string()
+    };
     dispatch_key_press(
         client,
         session_id,
-        &character.to_string(),
+        &key,
         delay,
         deadline,
+        delay_policy,
         None,
+        platform,
     )
     .await
+}
+
+async fn dispatch_typed_character_without_text(
+    client: &CdpClient,
+    session_id: &str,
+    character: char,
+    delay: Option<Duration>,
+    deadline: OperationDeadline,
+    delay_policy: InputDispatchPolicy,
+    platform: BrowserKeyboardPlatform,
+) -> RwResult<()> {
+    if !character.is_ascii() || character.is_ascii_control() {
+        return wait_input_delay(delay, deadline, delay_policy).await;
+    }
+    let key = if character.is_ascii_uppercase() {
+        format!("Shift+{}", character.to_ascii_lowercase())
+    } else {
+        character.to_string()
+    };
+    dispatch_key_press_without_text(
+        client,
+        session_id,
+        &key,
+        delay,
+        deadline,
+        delay_policy,
+        None,
+        platform,
+    )
+    .await
+}
+
+async fn dispatch_direct_keyboard_text(
+    client: &CdpClient,
+    session_id: &str,
+    text: &str,
+    delay: Option<Duration>,
+    transport_timeout: Duration,
+    platform: BrowserKeyboardPlatform,
+) -> RwResult<()> {
+    for character in text.chars() {
+        dispatch_typed_character(
+            client,
+            session_id,
+            character,
+            delay,
+            OperationDeadline::new(transport_timeout),
+            InputDispatchPolicy::Direct { transport_timeout },
+            platform,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn type_locator_for_native_input(
+    page: &Arc<PageInner>,
+    locator_json: &str,
+    index: usize,
+    text: &str,
+    delay: Option<Duration>,
+    deadline: OperationDeadline,
+    delay_policy: InputDispatchPolicy,
+    cancel: Option<&CancelToken>,
+) -> RwResult<()> {
+    let (resolution, fallback_focused) =
+        focus_locator_for_native_input(page, locator_json, index, deadline, cancel.cloned())
+            .await?;
+    let result = async {
+        ensure_not_cancelled(cancel)?;
+        for character in text.chars() {
+            ensure_not_cancelled(cancel)?;
+            if fallback_focused {
+                dispatch_typed_character_without_text(
+                    &page.browser.client,
+                    &resolution.session_id,
+                    character,
+                    delay,
+                    deadline,
+                    delay_policy,
+                    page.browser.keyboard_platform,
+                )
+                .await?;
+            } else {
+                dispatch_typed_character(
+                    &page.browser.client,
+                    &resolution.session_id,
+                    character,
+                    delay,
+                    deadline,
+                    delay_policy,
+                    page.browser.keyboard_platform,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if fallback_focused {
+        cleanup_keyboard_fallback_focus(page, &resolution, index).await;
+    }
+    result
+}
+
+async fn commit_fill_text(
+    client: &CdpClient,
+    session_id: &str,
+    value: &str,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    if value.is_empty() {
+        // Input.insertText with an empty payload is a no-op in Chromium. The fill
+        // preparation has selected the complete editable contents, so a trusted
+        // Delete key sequence is the protocol-level clearing operation.
+        dispatch_key_press(
+            client,
+            session_id,
+            "Delete",
+            None,
+            deadline,
+            InputDispatchPolicy::ActionDeadline,
+            None,
+            BrowserKeyboardPlatform::Control,
+        )
+        .await
+    } else {
+        client
+            .send(
+                "Input.insertText",
+                json!({ "text": value }),
+                Some(session_id),
+                deadline.remaining()?,
+            )
+            .await
+            .map(|_| ())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn press_locator_for_native_input(
+    page: &Arc<PageInner>,
+    locator_json: Option<&str>,
+    index: usize,
+    key: &str,
+    delay: Option<Duration>,
+    deadline: OperationDeadline,
+    delay_policy: InputDispatchPolicy,
+    cancel: Option<&CancelToken>,
+) -> RwResult<()> {
+    // Validate before focusing so an invalid key cannot fire page focus handlers.
+    parse_key_chord(key, page.browser.keyboard_platform)?;
+    let focus = match locator_json {
+        Some(locator_json) => Some(
+            focus_locator_for_native_input(page, locator_json, index, deadline, cancel.cloned())
+                .await?,
+        ),
+        None => None,
+    };
+    let session_id = focus.as_ref().map_or_else(
+        || page.session_id.as_str(),
+        |(resolution, _)| resolution.session_id.as_str(),
+    );
+    let result = if focus.as_ref().is_some_and(|(_, fallback)| *fallback) {
+        dispatch_key_press_without_text(
+            &page.browser.client,
+            session_id,
+            key,
+            delay,
+            deadline,
+            delay_policy,
+            cancel,
+            page.browser.keyboard_platform,
+        )
+        .await
+    } else {
+        dispatch_key_press(
+            &page.browser.client,
+            session_id,
+            key,
+            delay,
+            deadline,
+            delay_policy,
+            cancel,
+            page.browser.keyboard_platform,
+        )
+        .await
+    };
+    if let Some((resolution, true)) = focus {
+        cleanup_keyboard_fallback_focus(page, &resolution, index).await;
+    }
+    result
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32302,7 +34275,7 @@ struct KeyChord {
 // focus would let `press_key(target, "Nonsense")` fire the target's focus/blur
 // handlers and only then report InvalidInput, mutating the page on a call that
 // is reported as rejected.
-fn parse_key_chord(key: &str) -> RwResult<KeyChord> {
+fn parse_key_chord(key: &str, platform: BrowserKeyboardPlatform) -> RwResult<KeyChord> {
     let parts = if key == "+" {
         vec![key]
     } else {
@@ -32318,10 +34291,15 @@ fn parse_key_chord(key: &str) -> RwResult<KeyChord> {
         .ok_or_else(|| RwError::InvalidInput("key must not be empty".to_string()))?;
     let mut modifiers: Vec<(NativeKeyDescriptor, i64)> = Vec::new();
     for modifier_name in modifier_names {
-        let mask = native_modifier_mask(modifier_name).ok_or_else(|| {
+        let resolved_name = if *modifier_name == "ControlOrMeta" {
+            platform.primary_modifier()
+        } else {
+            modifier_name
+        };
+        let mask = native_modifier_mask(resolved_name).ok_or_else(|| {
             RwError::InvalidInput(format!("unsupported key modifier: {modifier_name}"))
         })?;
-        let descriptor = native_key_descriptor(modifier_name)?;
+        let descriptor = native_key_descriptor(resolved_name, platform)?;
         // Holding a modifier that is already held is a no-op, so a repeat adds
         // nothing but another key-down to dispatch and another key-up to clean
         // up. Without this, "Control+Control+...+a" scales both the dispatch
@@ -32341,7 +34319,12 @@ fn parse_key_chord(key: &str) -> RwResult<KeyChord> {
         }
         modifiers.push((descriptor, mask));
     }
-    let base = native_key_descriptor(base_name)?;
+    let mut base = native_key_descriptor(base_name, platform)?;
+    if base.implied_shift && modifiers.iter().all(|(_, mask)| *mask != 8) {
+        modifiers.push((native_key_descriptor("Shift", platform)?, 8));
+    } else if modifiers.iter().any(|(_, mask)| *mask == 8) {
+        shift_native_key_descriptor(&mut base);
+    }
     Ok(KeyChord { modifiers, base })
 }
 
@@ -32351,13 +34334,65 @@ async fn dispatch_key_press(
     key: &str,
     delay: Option<Duration>,
     deadline: OperationDeadline,
+    delay_policy: InputDispatchPolicy,
     cancel: Option<&CancelToken>,
+    platform: BrowserKeyboardPlatform,
+) -> RwResult<()> {
+    dispatch_key_press_impl(
+        client,
+        session_id,
+        key,
+        delay,
+        deadline,
+        delay_policy,
+        cancel,
+        platform,
+        true,
+    )
+    .await
+}
+
+async fn dispatch_key_press_without_text(
+    client: &CdpClient,
+    session_id: &str,
+    key: &str,
+    delay: Option<Duration>,
+    deadline: OperationDeadline,
+    delay_policy: InputDispatchPolicy,
+    cancel: Option<&CancelToken>,
+    platform: BrowserKeyboardPlatform,
+) -> RwResult<()> {
+    dispatch_key_press_impl(
+        client,
+        session_id,
+        key,
+        delay,
+        deadline,
+        delay_policy,
+        cancel,
+        platform,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_key_press_impl(
+    client: &CdpClient,
+    session_id: &str,
+    key: &str,
+    delay: Option<Duration>,
+    deadline: OperationDeadline,
+    delay_policy: InputDispatchPolicy,
+    cancel: Option<&CancelToken>,
+    platform: BrowserKeyboardPlatform,
+    emit_text: bool,
 ) -> RwResult<()> {
     let KeyChord {
         modifiers: resolved_modifiers,
         base,
-    } = parse_key_chord(key)?;
-    let first_dispatch_timeout = deadline.remaining()?;
+    } = parse_key_chord(key, platform)?;
+    let first_dispatch_timeout = input_transport_timeout(deadline, delay_policy)?;
 
     // All validation and timeout checks that can fail without input happen
     // before this boundary. From the first key-down attempt onward, Chromium
@@ -32374,7 +34409,7 @@ async fn dispatch_key_press(
             let dispatch_timeout = if index == 0 {
                 first_dispatch_timeout
             } else {
-                match deadline.remaining() {
+                match input_transport_timeout(deadline, delay_policy) {
                     Ok(remaining) => remaining,
                     Err(error) => {
                         action_result = Err(error);
@@ -32400,30 +34435,31 @@ async fn dispatch_key_press(
             }
         }
 
+        let base_modifier_mask = native_modifier_mask(&base.key).unwrap_or(0);
+        let base_down_modifiers = modifiers | base_modifier_mask;
+        let include_text =
+            emit_text && base.text.is_some() && base_down_modifiers & (1 | 2 | 4) == 0;
         if action_result.is_ok() {
-            let include_text = base.text.is_some() && modifiers & (1 | 2 | 4) == 0;
             let dispatch_timeout = if resolved_modifiers.is_empty() {
                 Ok(first_dispatch_timeout)
             } else {
-                deadline.remaining()
+                input_transport_timeout(deadline, delay_policy)
             };
             match dispatch_timeout {
                 Ok(dispatch_timeout) => {
                     base_attempted = true;
+                    let mut key_down =
+                        native_key_event_params(&base, "rawKeyDown", base_down_modifiers, false);
+                    if let Some(commands) =
+                        native_editing_commands(&base, base_down_modifiers, platform)
+                    {
+                        key_down["commands"] = commands;
+                    }
                     let action = resolve_input_action_send(
                         client
                             .send_with_write_status(
                                 "Input.dispatchKeyEvent",
-                                native_key_event_params(
-                                    &base,
-                                    if include_text {
-                                        "keyDown"
-                                    } else {
-                                        "rawKeyDown"
-                                    },
-                                    modifiers,
-                                    include_text,
-                                ),
+                                key_down,
                                 Some(session_id),
                                 dispatch_timeout,
                             )
@@ -32437,8 +34473,38 @@ async fn dispatch_key_press(
             }
         }
 
+        if action_result.is_ok() && include_text {
+            let char_timeout = match input_transport_timeout(deadline, delay_policy) {
+                Ok(remaining) => Ok(remaining),
+                // Once rawKeyDown reached the transport, complete the character
+                // exactly once even if waiting for its reply spent the action budget.
+                Err(_) if base_commitment.is_committed() => Ok(KEY_RELEASE_CLEANUP_TIMEOUT),
+                Err(error) => Err(error),
+            };
+            match char_timeout {
+                Ok(dispatch_timeout) => {
+                    let action = resolve_input_action_send(
+                        client
+                            .send_with_write_status(
+                                "Input.dispatchKeyEvent",
+                                native_key_event_params(&base, "char", base_down_modifiers, true),
+                                Some(session_id),
+                                dispatch_timeout,
+                            )
+                            .await,
+                        "char",
+                    );
+                    if action.commitment.is_committed() {
+                        base_commitment = action.commitment;
+                    }
+                    action_result = action.result;
+                }
+                Err(error) => action_result = Err(error),
+            }
+        }
+
         if action_result.is_ok() {
-            let delay_result = wait_input_delay(delay, deadline).await;
+            let delay_result = wait_input_delay(delay, deadline, delay_policy).await;
             // A spent delay budget cannot make an already-committed chord safe to retry.
             if base_commitment.is_committed() {
                 if let Err(error) = delay_result {
@@ -32454,7 +34520,12 @@ async fn dispatch_key_press(
             if let Err(error) = client
                 .send(
                     "Input.dispatchKeyEvent",
-                    native_key_event_params(&base, "keyUp", modifiers, false),
+                    native_key_event_params(
+                        &base,
+                        "keyUp",
+                        base_down_modifiers & !base_modifier_mask,
+                        false,
+                    ),
                     Some(session_id),
                     KEY_RELEASE_CLEANUP_TIMEOUT,
                 )
@@ -34305,6 +36376,7 @@ mod native_console_record_tests {
             owned: false,
             ws_endpoint: "ws://test.invalid".to_string(),
             stealth_user_agent_override: Mutex::new(None),
+            keyboard_platform: BrowserKeyboardPlatform::Control,
             single_process_fallback: false,
             lifecycle: Arc::new(CloseLifecycle::new()),
             attached_pages: AttachedPageRegistry::default(),
