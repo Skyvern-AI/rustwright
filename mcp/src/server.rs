@@ -208,13 +208,19 @@ fn production_tool_result(
             CallToolResult::success(vec![ContentBlock::Text(text)])
         }
         Ok((content, _)) => CallToolResult::success(vec![content]),
-        Err(error) => CallToolResult::error(vec![ContentBlock::text(shape_tool_text(
-            tool_name,
-            error.to_string(),
-            true,
-            request_id,
-            budget,
-        ))]),
+        Err(error) => {
+            let metadata = error.structured_metadata();
+            let mut result = CallToolResult::error(vec![ContentBlock::text(shape_tool_text(
+                tool_name,
+                error.to_string(),
+                true,
+                request_id,
+                budget,
+            ))]);
+            result.structured_content =
+                metadata.map(|metadata| serde_json::to_value(metadata).expect("metadata is JSON"));
+            result
+        }
     }
 }
 
@@ -317,6 +323,186 @@ impl ServerHandler for BrowserServer {
 
 #[cfg(test)]
 mod tests {
+    use rustwright::{
+        CommandWritten, FailureKind, FailureMetadata, FailurePhase, FailureTargetKind,
+    };
+    use serde_json::{Value, json};
+
+    fn classified_error(metadata: FailureMetadata) -> BrowserError {
+        BrowserError::Classified {
+            message: "classified action failure".to_owned(),
+            metadata,
+        }
+    }
+
+    fn unknown_outcome_metadata() -> FailureMetadata {
+        FailureMetadata {
+            kind: Some(FailureKind::UnknownOutcome),
+            phase: Some(FailurePhase::Dispatch),
+            target_kind: Some(FailureTargetKind::Page),
+            command_written: Some(CommandWritten::Indeterminate),
+            retryable: Some(false),
+        }
+    }
+
+    fn test_error_result(error: BrowserError) -> CallToolResult {
+        production_tool_result(
+            Err(error),
+            "browser_type",
+            &RequestId::Number(1),
+            ResponseBudget {
+                max_bytes: None,
+                max_lines: None,
+            },
+            false,
+            usize::MAX,
+            Path::new("."),
+        )
+    }
+
+    #[test]
+    fn production_tool_result_exposes_unknown_outcome_structured_content() {
+        let result = test_error_result(classified_error(unknown_outcome_metadata()));
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content,
+            Some(json!({
+                "kind": "unknown_outcome",
+                "phase": "dispatch",
+                "target_kind": "page",
+                "command_written": "indeterminate",
+                "retryable": false,
+            }))
+        );
+        assert!(matches!(result.content.as_slice(), [ContentBlock::Text(_)]));
+    }
+
+    #[test]
+    fn fill_form_unknown_outcome_reaches_server_structured_content() {
+        let result = production_tool_result(
+            crate::actor::production_form_fill_unknown_outcome_result(),
+            "browser_fill_form",
+            &RequestId::Number(70_001),
+            ResponseBudget {
+                max_bytes: None,
+                max_lines: None,
+            },
+            false,
+            usize::MAX,
+            Path::new("."),
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content,
+            Some(json!({
+                "kind": "unknown_outcome",
+                "phase": "dispatch",
+                "target_kind": "page",
+                "command_written": "indeterminate",
+                "retryable": false,
+            }))
+        );
+        let [ContentBlock::Text(text)] = result.content.as_slice() else {
+            panic!("expected one shaped text content block");
+        };
+        assert_eq!(
+            text.text,
+            "Field \"empty textbox\" failed: form field dispatch failed: input command may have reached the browser, but its outcome is unknown; retrying may repeat the action"
+        );
+    }
+
+    #[test]
+    fn fill_form_safe_later_substep_is_not_composite_retryable() {
+        let result = production_tool_result(
+            crate::actor::production_form_fill_safe_later_failure_result(),
+            "browser_fill_form",
+            &RequestId::Number(70_002),
+            ResponseBudget {
+                max_bytes: None,
+                max_lines: None,
+            },
+            false,
+            usize::MAX,
+            Path::new("."),
+        );
+        assert_eq!(
+            result.structured_content,
+            Some(json!({
+                "kind": "timeout",
+                "phase": "dispatch",
+                "target_kind": "page",
+                "command_written": "no",
+                "retryable": false,
+            }))
+        );
+        let [ContentBlock::Text(text)] = result.content.as_slice() else {
+            panic!("expected one shaped text content block");
+        };
+        assert!(text.text.contains("1 of 2 form fields were written"));
+        assert!(text.text.contains("Field \"second\" failed"));
+    }
+
+    #[test]
+    fn type_submit_unknown_outcome_reaches_server_structured_content() {
+        let result = production_tool_result(
+            crate::actor::production_type_submit_unknown_outcome_result(),
+            "browser_type",
+            &RequestId::Number(70_003),
+            ResponseBudget {
+                max_bytes: None,
+                max_lines: None,
+            },
+            false,
+            usize::MAX,
+            Path::new("."),
+        );
+        assert_eq!(
+            result.structured_content,
+            Some(json!({
+                "kind": "unknown_outcome",
+                "phase": "dispatch",
+                "target_kind": "page",
+                "command_written": "indeterminate",
+                "retryable": false,
+            }))
+        );
+        let [ContentBlock::Text(text)] = result.content.as_slice() else {
+            panic!("expected one shaped text content block");
+        };
+        assert!(text.text.contains("the text write completed"));
+        assert!(text.text.contains("submit failed for e1"));
+    }
+
+    #[test]
+    fn type_submit_safe_enter_is_not_composite_retryable() {
+        let result = production_tool_result(
+            crate::actor::production_type_submit_safe_failure_result(),
+            "browser_type",
+            &RequestId::Number(70_004),
+            ResponseBudget {
+                max_bytes: None,
+                max_lines: None,
+            },
+            false,
+            usize::MAX,
+            Path::new("."),
+        );
+        assert_eq!(
+            result.structured_content,
+            Some(json!({
+                "kind": "timeout",
+                "phase": "dispatch",
+                "target_kind": "page",
+                "command_written": "no",
+                "retryable": false,
+            }))
+        );
+        let [ContentBlock::Text(text)] = result.content.as_slice() else {
+            panic!("expected one shaped text content block");
+        };
+        assert!(text.text.contains("the text write completed"));
+        assert!(text.text.contains("submit failed for e1"));
+    }
     use super::*;
     use rmcp::model::{ServerJsonRpcMessage, ServerResult};
 

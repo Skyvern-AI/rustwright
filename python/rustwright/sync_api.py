@@ -1412,6 +1412,26 @@ class Error(RuntimeError):
     def stack(self, value: Any) -> None:
         self._stack = str(value)
 
+    @property
+    def kind(self) -> Optional[str]:
+        return getattr(self, "_rustwright_failure_kind", None)
+
+    @property
+    def phase(self) -> Optional[str]:
+        return getattr(self, "_rustwright_failure_phase", None)
+
+    @property
+    def target_kind(self) -> Optional[str]:
+        return getattr(self, "_rustwright_failure_target_kind", None)
+
+    @property
+    def command_written(self) -> Optional[str]:
+        return getattr(self, "_rustwright_failure_command_written", None)
+
+    @property
+    def retryable(self) -> Optional[bool]:
+        return getattr(self, "_rustwright_failure_retryable", None)
+
 
 class TimeoutError(Error):
     """Raised when a browser operation exceeds its timeout."""
@@ -1420,10 +1440,14 @@ class TimeoutError(Error):
 class TargetClosedError(Error):
     """Raised when an operation targets a closed page, context, or browser."""
 
+class UnknownOutcomeError(Error):
+    """Raised when an input command outcome is unknown and replay may duplicate it."""
+
 
 _TARGET_CLOSED_MESSAGE = "Target page, context or browser has been closed"
 _PAGE_CRASHED_MESSAGE = "Page crashed"
 _DISCONNECTED_MESSAGE = "target or browser is closed"
+_FAILURE_WIRE_MARKER = "__rustwright_failure__:"
 _ACTION_TIMEOUT_WIRE_MARKER = "__rustwright_action_timeout__:"
 _TIMEOUT_WIRE_MARKER = "__rustwright_timeout__:"
 _TARGET_CLOSED_WIRE_MARKER = "__rustwright_target_closed__:"
@@ -1432,11 +1456,25 @@ _DISCONNECTED_WIRE_MARKER = "__rustwright_disconnected__:"
 _WIRE_ERROR_KIND_ATTRIBUTE = "_rustwright_error_kind"
 _WIRE_ERROR_PAYLOAD_ATTRIBUTE = "_rustwright_error_payload"
 _TARGET_CLOSED_KINDS = frozenset({"page", "context", "browser", "target"})
+_FAILURE_PHASES = frozenset({"resolve", "dispatch", "settle"})
+_FAILURE_TARGET_KINDS = frozenset({"element", "frame", "page", "context", "browser", "target"})
+_COMMAND_WRITTEN_VALUES = frozenset({"no", "yes", "indeterminate"})
+_COMMON_FAILURE_KEYS = frozenset({"phase", "target_kind", "command_written", "retryable"})
+_UNKNOWN_OUTCOME_MESSAGE = (
+    "input command may have reached the browser, but its outcome is unknown; "
+    "retrying may repeat the action"
+)
 
 
-def _annotate_wire_error(error: Error, kind: str, payload: dict[str, Any]) -> Error:
-    setattr(error, _WIRE_ERROR_KIND_ATTRIBUTE, kind)
+def _annotate_wire_error(error: Error, marker_kind: str, payload: dict[str, Any]) -> Error:
+    setattr(error, _WIRE_ERROR_KIND_ATTRIBUTE, marker_kind)
     setattr(error, _WIRE_ERROR_PAYLOAD_ATTRIBUTE, dict(payload))
+    failure_kind = payload.get("kind") if marker_kind == "failure" else marker_kind
+    setattr(error, "_rustwright_failure_kind", failure_kind)
+    setattr(error, "_rustwright_failure_phase", payload.get("phase"))
+    setattr(error, "_rustwright_failure_target_kind", payload.get("target_kind"))
+    setattr(error, "_rustwright_failure_command_written", payload.get("command_written"))
+    setattr(error, "_rustwright_failure_retryable", payload.get("retryable"))
     return error
 
 
@@ -1448,22 +1486,57 @@ def _copy_wire_error_metadata(source: Error, target: Error) -> Error:
     return target
 
 
+def _valid_common_failure_fields(payload: dict[str, Any]) -> bool:
+    phase = payload["phase"]
+    target_kind = payload["target_kind"]
+    command_written = payload["command_written"]
+    retryable = payload["retryable"]
+    return (
+        (phase is None or (type(phase) is str and phase in _FAILURE_PHASES))
+        and (
+            target_kind is None
+            or (type(target_kind) is str and target_kind in _FAILURE_TARGET_KINDS)
+        )
+        and (
+            command_written is None
+            or (
+                type(command_written) is str
+                and command_written in _COMMAND_WRITTEN_VALUES
+            )
+        )
+        and (type(retryable) is bool or retryable is None)
+        and not (command_written == "indeterminate" and retryable is not False)
+    )
+
+
+def _common_profile(payload: dict[str, Any]) -> tuple[Any, Any, Any, Any]:
+    return (
+        payload["phase"],
+        payload["target_kind"],
+        payload["command_written"],
+        payload["retryable"],
+    )
+
+
 def _decode_wire_error(message: str) -> Optional[Error]:
-    if message.startswith(_ACTION_TIMEOUT_WIRE_MARKER):
+    if message.startswith(_FAILURE_WIRE_MARKER):
+        marker = _FAILURE_WIRE_MARKER
+        marker_kind = "failure"
+    elif message.startswith(_ACTION_TIMEOUT_WIRE_MARKER):
         marker = _ACTION_TIMEOUT_WIRE_MARKER
-        kind = "action_timeout"
+        marker_kind = "action_timeout"
     elif message.startswith(_TIMEOUT_WIRE_MARKER):
         marker = _TIMEOUT_WIRE_MARKER
-        kind = "timeout"
+        marker_kind = "timeout"
     elif message.startswith(_TARGET_CLOSED_WIRE_MARKER):
         marker = _TARGET_CLOSED_WIRE_MARKER
-        kind = "target_closed"
+        marker_kind = "target_closed"
     elif message.startswith(_PAGE_CRASHED_WIRE_MARKER):
         marker = _PAGE_CRASHED_WIRE_MARKER
-        kind = "page_crashed"
+        marker_kind = "page_crashed"
     elif message.startswith(_DISCONNECTED_WIRE_MARKER):
         marker = _DISCONNECTED_WIRE_MARKER
-        kind = "disconnected"
+        marker_kind = "disconnected"
     else:
         return None
 
@@ -1474,14 +1547,69 @@ def _decode_wire_error(message: str) -> Optional[Error]:
     if not isinstance(payload, dict):
         return None
 
-    if kind == "action_timeout":
-        if set(payload) != {"state", "action", "last_info_json", "last_info_key"}:
+    if marker_kind == "failure":
+        if set(payload) != _COMMON_FAILURE_KEYS | {"kind", "message"}:
+            return None
+        kind = payload["kind"]
+        if (
+            (kind is not None and (type(kind) is not str or kind not in {"actionability", "unknown_outcome"}))
+            or type(payload["message"]) is not str
+            or not _valid_common_failure_fields(payload)
+        ):
+            return None
+        profile = _common_profile(payload)
+        if payload["kind"] == "actionability":
+            if profile != ("resolve", "element", "no", True) or payload["message"] not in {
+                "actionability check failed: element is not visible",
+                "actionability check failed: element did not become stable",
+                "actionability check failed: element is not receiving pointer events",
+                "actionability check failed: element is disabled",
+                "actionability check failed: element was detached while waiting for actionability",
+            }:
+                return None
+            error: Error = Error(payload["message"])
+        elif payload["kind"] == "unknown_outcome":
+            if profile != ("dispatch", "page", "indeterminate", False):
+                return None
+            if payload["message"] != _UNKNOWN_OUTCOME_MESSAGE:
+                return None
+            error = UnknownOutcomeError(payload["message"])
+        else:
+            if profile not in {
+                ("dispatch", "page", "no", True),
+                ("dispatch", "page", "no", False),
+                ("dispatch", "page", "no", None),
+                ("settle", "page", "yes", True),
+                ("settle", "page", "yes", False),
+                ("settle", "page", "yes", None),
+            }:
+                return None
+            error = (
+                TargetClosedError(payload["message"])
+                if _is_target_closed_message(payload["message"])
+                else Error(payload["message"])
+            )
+    elif marker_kind == "action_timeout":
+        if set(payload) != _COMMON_FAILURE_KEYS | {
+            "state",
+            "action",
+            "last_info_json",
+            "last_info_key",
+        }:
             return None
         if (
             type(payload["state"]) is not str
             or type(payload["action"]) is not str
             or type(payload["last_info_json"]) is not str
             or (payload["last_info_key"] is not None and type(payload["last_info_key"]) is not str)
+            or not _valid_common_failure_fields(payload)
+            or _common_profile(payload)
+            not in {
+                ("resolve", "element", "no", True),
+                ("dispatch", "element", "no", True),
+                ("dispatch", "element", None, None),
+                ("settle", "element", "yes", False),
+            }
         ):
             return None
         try:
@@ -1493,33 +1621,57 @@ def _decode_wire_error(message: str) -> Optional[Error]:
             if not isinstance(info, dict) or info_key not in info:
                 return None
             info = info[info_key]
-        count = int(info.get("count") or 0) if isinstance(info, dict) else 0
+        raw_count = info.get("count") if isinstance(info, dict) else None
+        count = raw_count if type(raw_count) is int and raw_count >= 0 else 0
         detail = "no element matched" if count == 0 else f"last state was {info}"
         error = TimeoutError(
             f"timed out waiting for locator to be {payload['state']} "
             f"while trying to {payload['action']}; {detail}"
         )
-    elif kind == "timeout":
-        if set(payload) != {"ms"} or type(payload["ms"]) is not int or payload["ms"] < 0:
+    elif marker_kind == "timeout":
+        if set(payload) != _COMMON_FAILURE_KEYS | {"ms"}:
             return None
-        error: Error = TimeoutError(f"timed out after {payload['ms']} ms")
-    elif kind == "target_closed":
         if (
-            set(payload) != {"kind"}
-            or type(payload["kind"]) is not str
-            or payload["kind"] not in _TARGET_CLOSED_KINDS
+            type(payload["ms"]) is not int
+            or payload["ms"] < 0
+            or not _valid_common_failure_fields(payload)
+            or _common_profile(payload)
+            not in {
+                (None, None, None, None),
+                ("dispatch", "page", "no", True),
+            }
+        ):
+            return None
+        error = TimeoutError(f"timed out after {payload['ms']} ms")
+    elif marker_kind == "target_closed":
+        if set(payload) != _COMMON_FAILURE_KEYS | {"kind"}:
+            return None
+        target = payload.get("kind")
+        if (
+            type(target) is not str
+            or target not in _TARGET_CLOSED_KINDS
+            or not _valid_common_failure_fields(payload)
+            or _common_profile(payload)
+            not in {
+                (None, target, None, False),
+                ("dispatch", "page", "no", False),
+                ("settle", "page", "yes", False),
+            }
         ):
             return None
         error = TargetClosedError(_TARGET_CLOSED_MESSAGE)
-    elif kind == "page_crashed":
-        if payload:
-            return None
-        error = Error(_PAGE_CRASHED_MESSAGE)
     else:
-        if payload:
+        if set(payload) != _COMMON_FAILURE_KEYS or not _valid_common_failure_fields(payload):
             return None
-        error = Error(_DISCONNECTED_MESSAGE)
-    return _annotate_wire_error(error, kind, payload)
+        static_target = "page" if marker_kind == "page_crashed" else "browser"
+        if _common_profile(payload) not in {
+            (None, static_target, None, False),
+            ("dispatch", "page", "no", False),
+            ("settle", "page", "yes", False),
+        }:
+            return None
+        error = Error(_PAGE_CRASHED_MESSAGE if marker_kind == "page_crashed" else _DISCONNECTED_MESSAGE)
+    return _annotate_wire_error(error, marker_kind, payload)
 
 
 def _is_target_closed_message(message: str) -> bool:
@@ -1582,6 +1734,8 @@ def _call_with_method_prefix(method: str, fn, *args, **kwargs):
             raise
         if isinstance(exc, TargetClosedError) or _is_target_closed_message(message):
             error_type = TargetClosedError
+        elif isinstance(exc, UnknownOutcomeError):
+            error_type = UnknownOutcomeError
         else:
             error_type = TimeoutError if isinstance(exc, TimeoutError) else Error
         raise _copy_wire_error_metadata(exc, error_type(f"{method}: {message}")) from None
@@ -27684,6 +27838,7 @@ __all__ = [
     "Download",
     "ElementHandle",
     "Error",
+    "UnknownOutcomeError",
     "Expect",
     "FileChooser",
     "FilePayload",

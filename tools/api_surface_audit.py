@@ -78,6 +78,7 @@ DEFAULT_MODULE_MEMBERS = [
     "StorageState",
     "StorageStateCookie",
     "TimeoutError",
+    "UnknownOutcomeError",
     "ViewportSize",
     "async_playwright",
     "expect",

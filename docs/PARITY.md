@@ -731,8 +731,8 @@ The package-root inventory below comes from `rustwright.__all__`; sync and async
 
 | Module | Matching Playwright exports | Playwright exports | Missing | Rustwright-only/extra |
 | --- | ---: | ---: | ---: | ---: |
-| `sync_api` | 50 | 55 | 5 | 8 |
-| `async_api` | 51 | 55 | 4 | 8 |
+| `sync_api` | 50 | 55 | 5 | 9 |
+| `async_api` | 51 | 55 | 4 | 9 |
 
 Missing sync exports: `FormData`, `ScreencastFrame`, `ScreencastSize`, `Selectors`, `VirtualCredential`.
 
@@ -760,6 +760,7 @@ Missing async exports: `FormData`, `ScreencastFrame`, `ScreencastSize`, `Virtual
 | `Response` | yes | yes |
 | `TargetClosedError` | no | no |
 | `TimeoutError` | yes | yes |
+| `UnknownOutcomeError` | yes | yes |
 | `Video` | yes | yes |
 | `async_playwright` | no | yes |
 | `backend_marker` | yes | yes |
@@ -776,6 +777,7 @@ Missing async exports: `FormData`, `ScreencastFrame`, `ScreencastSize`, `Virtual
 - OOPIF support is new. Cross-origin frame locator actions work in covered cases, but non-main-frame remote `JSHandle` follow-up operations remain a gap, and drag, screenshot, and bounding-box behavior in OOPIFs is not yet claimed as full parity.
 - Anti-bot and stealth behavior is partial. Rustwright suppresses some common automation signals, but recent public fingerprint checks were only clean on about 2 of 4 targets. Rustwright does not promise undetectability.
 - Drop-in compatibility import names are intended to be opt-in for the public alpha. The final compatibility-mode API is being finalized separately.
+- `UnknownOutcomeError` is a Rustwright safety extension. Compatibility shims intentionally do not export it.
 - The implementation still has large monolithic files. A module split is planned before beta.
 
 ## Node.js subset

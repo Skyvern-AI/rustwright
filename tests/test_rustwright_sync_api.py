@@ -2252,74 +2252,187 @@ def test_cloakbrowser_alias_launchers_for_skyvern_stealth_paths(tmp_path: Path):
     asyncio.run(run())
 
 
+def _structured_error_wire(marker: str, **payload):
+    return marker + json.dumps(payload, separators=(",", ":"))
+
+
+_UNKNOWN_OUTCOME_TEXT = (
+    "input command may have reached the browser, but its outcome is unknown; "
+    "retrying may repeat the action"
+)
+
+
 @pytest.mark.parametrize(
-    ("wire_message", "expected_type", "expected_message", "expected_kind", "expected_payload"),
+    ("wire_message", "expected_type", "expected_message", "expected_kind", "expected_fields"),
     [
         (
-            '__rustwright_timeout__:{"ms":250}',
+            _structured_error_wire(
+                "__rustwright_failure__:",
+                kind="actionability",
+                message="actionability check failed: element is not visible",
+                phase="resolve",
+                target_kind="element",
+                command_written="no",
+                retryable=True,
+            ),
+            Error,
+            "actionability check failed: element is not visible",
+            "actionability",
+            ("resolve", "element", "no", True),
+        ),
+        (
+            _structured_error_wire(
+                "__rustwright_failure__:",
+                kind="unknown_outcome",
+                message=_UNKNOWN_OUTCOME_TEXT,
+                phase="dispatch",
+                target_kind="page",
+                command_written="indeterminate",
+                retryable=False,
+            ),
+            "UnknownOutcomeError",
+            _UNKNOWN_OUTCOME_TEXT,
+            "unknown_outcome",
+            ("dispatch", "page", "indeterminate", False),
+        ),
+        *[
+            (
+                _structured_error_wire(
+                    "__rustwright_action_timeout__:",
+                    state="editable",
+                    action="fill",
+                    last_info_json='{"count":0}',
+                    last_info_key=None,
+                    phase=phase,
+                    target_kind="element",
+                    command_written=command_written,
+                    retryable=retryable,
+                ),
+                TimeoutError,
+                "timed out waiting for locator to be editable while trying to fill; no element matched",
+                "action_timeout",
+                (phase, "element", command_written, retryable),
+            )
+            for phase, command_written, retryable in [
+                ("resolve", "no", True),
+                ("dispatch", "no", True),
+                ("dispatch", None, None),
+                ("settle", "yes", False),
+            ]
+        ],
+        (
+            _structured_error_wire(
+                "__rustwright_timeout__:",
+                ms=250,
+                phase=None,
+                target_kind=None,
+                command_written=None,
+                retryable=None,
+            ),
             TimeoutError,
             "timed out after 250 ms",
             "timeout",
-            {"ms": 250},
+            (None, None, None, None),
         ),
         (
-            '__rustwright_target_closed__:{"kind":"page"}',
-            "TargetClosedError",
-            "Target page, context or browser has been closed",
-            "target_closed",
-            {"kind": "page"},
+            _structured_error_wire(
+                "__rustwright_timeout__:",
+                ms=250,
+                phase="dispatch",
+                target_kind="page",
+                command_written="no",
+                retryable=True,
+            ),
+            TimeoutError,
+            "timed out after 250 ms",
+            "timeout",
+            ("dispatch", "page", "no", True),
         ),
-        (
-            '__rustwright_target_closed__:{"kind":"context"}',
-            "TargetClosedError",
-            "Target page, context or browser has been closed",
-            "target_closed",
-            {"kind": "context"},
-        ),
-        (
-            '__rustwright_target_closed__:{"kind":"browser"}',
-            "TargetClosedError",
-            "Target page, context or browser has been closed",
-            "target_closed",
-            {"kind": "browser"},
-        ),
-        (
-            '__rustwright_target_closed__:{"kind":"target"}',
-            "TargetClosedError",
-            "Target page, context or browser has been closed",
-            "target_closed",
-            {"kind": "target"},
-        ),
-        (
-            "__rustwright_page_crashed__:{}",
-            Error,
-            "Page crashed",
-            "page_crashed",
-            {},
-        ),
-        (
-            "__rustwright_disconnected__:{}",
-            Error,
-            "target or browser is closed",
-            "disconnected",
-            {},
-        ),
+        *[
+            (
+                _structured_error_wire(
+                    "__rustwright_target_closed__:",
+                    kind="context",
+                    phase=phase,
+                    target_kind=target_kind,
+                    command_written=command_written,
+                    retryable=False,
+                ),
+                "TargetClosedError",
+                "Target page, context or browser has been closed",
+                "target_closed",
+                (phase, target_kind, command_written, False),
+            )
+            for phase, target_kind, command_written in [
+                (None, "context", None),
+                ("dispatch", "page", "no"),
+                ("settle", "page", "yes"),
+            ]
+        ],
+        *[
+            (
+                _structured_error_wire(
+                    marker,
+                    phase=phase,
+                    target_kind=target_kind,
+                    command_written=command_written,
+                    retryable=False,
+                ),
+                Error,
+                message,
+                kind,
+                (phase, target_kind, command_written, False),
+            )
+            for marker, message, kind, static_target in [
+                ("__rustwright_page_crashed__:", "Page crashed", "page_crashed", "page"),
+                (
+                    "__rustwright_disconnected__:",
+                    "target or browser is closed",
+                    "disconnected",
+                    "browser",
+                ),
+            ]
+            for phase, target_kind, command_written in [
+                (None, static_target, None),
+                ("dispatch", "page", "no"),
+                ("settle", "page", "yes"),
+            ]
+        ],
     ],
 )
 def test_structured_native_error_markers_translate_without_wire_residue(
-    wire_message, expected_type, expected_message, expected_kind, expected_payload
+    wire_message, expected_type, expected_message, expected_kind, expected_fields
 ):
     import rustwright.sync_api as sync_api
 
     if expected_type == "TargetClosedError":
         expected_type = sync_api.TargetClosedError
+    elif expected_type == "UnknownOutcomeError":
+        expected_type = sync_api.UnknownOutcomeError
     translated = sync_api._translate_error(RuntimeError(wire_message))
 
     assert type(translated) is expected_type
     assert str(translated) == expected_message
     assert "__rustwright_" not in str(translated)
-    assert translated._rustwright_error_kind == expected_kind
-    assert translated._rustwright_error_payload == expected_payload
+    assert translated.kind == expected_kind
+    assert (
+        translated.phase,
+        translated.target_kind,
+        translated.command_written,
+        translated.retryable,
+    ) == expected_fields
+    marker_kind = {
+        "__rustwright_failure__:": "failure",
+        "__rustwright_action_timeout__:": "action_timeout",
+        "__rustwright_timeout__:": "timeout",
+        "__rustwright_target_closed__:": "target_closed",
+        "__rustwright_page_crashed__:": "page_crashed",
+        "__rustwright_disconnected__:": "disconnected",
+    }[wire_message.split("{", 1)[0]]
+    assert translated._rustwright_error_kind == marker_kind
+    assert translated._rustwright_error_payload == json.loads(
+        wire_message.split(":", 1)[1]
+    )
 
 
 @pytest.mark.parametrize(
@@ -2339,20 +2452,265 @@ def test_unmarked_legacy_native_errors_still_use_prose_fallback(legacy_message, 
     assert type(translated) is expected_type
     assert str(translated) == legacy_message
     assert not hasattr(translated, "_rustwright_error_kind")
+    assert (
+        translated.kind,
+        translated.phase,
+        translated.target_kind,
+        translated.command_written,
+        translated.retryable,
+    ) == (None, None, None, None, None)
+
+
+def test_unknown_outcome_is_not_a_timeout_error():
+    import rustwright.sync_api as sync_api
+
+    translated = sync_api._translate_error(
+        RuntimeError(
+            _structured_error_wire(
+                "__rustwright_failure__:",
+                kind="unknown_outcome",
+                message=_UNKNOWN_OUTCOME_TEXT,
+                phase="dispatch",
+                target_kind="page",
+                command_written="indeterminate",
+                retryable=False,
+            )
+        )
+    )
+    caught_timeout = False
+    try:
+        raise translated
+    except TimeoutError:
+        caught_timeout = True
+    except Error:
+        pass
+    assert not caught_timeout
+    assert isinstance(translated, sync_api.UnknownOutcomeError)
 
 
 def test_structured_timeout_payload_survives_playwright_method_formatting():
     import rustwright.sync_api as sync_api
 
     def native_timeout():
-        raise RuntimeError('__rustwright_timeout__:{"ms":75}')
+        raise RuntimeError(
+            _structured_error_wire(
+                "__rustwright_timeout__:",
+                ms=75,
+                phase=None,
+                target_kind=None,
+                command_written=None,
+                retryable=None,
+            )
+        )
 
     with pytest.raises(TimeoutError) as exc_info:
         sync_api._call_wait_with_playwright_timeout("Page.goto", native_timeout)
 
     assert str(exc_info.value) == "Page.goto: Timeout 75ms exceeded."
     assert exc_info.value._rustwright_error_kind == "timeout"
-    assert exc_info.value._rustwright_error_payload == {"ms": 75}
+    assert exc_info.value._rustwright_error_payload["ms"] == 75
+    assert exc_info.value.kind == "timeout"
+
+
+def test_async_action_wrapper_rejects_malformed_structured_error_payload():
+    import rustwright.async_api as async_api
+
+    invalid = [
+        "__rustwright_action_timeout__:{",
+        _structured_error_wire(
+            "__rustwright_action_timeout__:",
+            state="editable",
+            action="fill",
+            last_info_json='{"count":0}',
+            last_info_key=None,
+            phase="resolve",
+            target_kind="element",
+            command_written="no",
+            retryable=True,
+            extra=True,
+        ),
+        _structured_error_wire(
+            "__rustwright_action_timeout__:",
+            state="editable",
+            action="fill",
+            last_info_json='{"count":0}',
+            last_info_key=None,
+            phase="resolve",
+            target_kind="element",
+            command_written="no",
+        ),
+        _structured_error_wire(
+            "__rustwright_action_timeout__:",
+            state="editable",
+            action="fill",
+            last_info_json='{"count":0}',
+            last_info_key=None,
+            phase="settle",
+            target_kind="element",
+            command_written="no",
+            retryable=True,
+        ),
+        _structured_error_wire(
+            "__rustwright_action_timeout__:",
+            state="editable",
+            action="fill",
+            last_info_json='{"count":0}',
+            last_info_key=None,
+            phase=[],
+            target_kind="element",
+            command_written="no",
+            retryable=True,
+        ),
+        _structured_error_wire(
+            "__rustwright_failure__:",
+            kind={},
+            message="malformed failure",
+            phase="dispatch",
+            target_kind="page",
+            command_written="no",
+            retryable=True,
+        ),
+    ]
+
+    async def run() -> None:
+        for wire in invalid:
+            async def fail():
+                raise RuntimeError(wire)
+
+            with pytest.raises(Error) as exc_info:
+                await async_api._await_native_action("Locator.fill", fail())
+            assert type(exc_info.value) is Error
+            assert not isinstance(exc_info.value, TimeoutError)
+            assert exc_info.value.kind is None
+
+    asyncio.run(run())
+
+
+def test_action_timeout_decoder_treats_non_numeric_count_as_no_match():
+    import rustwright.sync_api as sync_api
+
+    translated = sync_api._translate_error(
+        RuntimeError(
+            _structured_error_wire(
+                "__rustwright_action_timeout__:",
+                state="editable",
+                action="fill",
+                last_info_json='{"count":"not-a-number"}',
+                last_info_key=None,
+                phase="resolve",
+                target_kind="element",
+                command_written="no",
+                retryable=True,
+            )
+        )
+    )
+    assert type(translated) is TimeoutError
+    assert str(translated).endswith("; no element matched")
+
+
+def test_async_method_prefix_preserves_structured_failure_fields():
+    import rustwright.async_api as async_api
+    import rustwright.sync_api as sync_api
+
+    cases = [
+        (
+            _structured_error_wire(
+                "__rustwright_failure__:",
+                kind="unknown_outcome",
+                message=_UNKNOWN_OUTCOME_TEXT,
+                phase="dispatch",
+                target_kind="page",
+                command_written="indeterminate",
+                retryable=False,
+            ),
+            sync_api.UnknownOutcomeError,
+            ("unknown_outcome", "dispatch", "page", "indeterminate", False),
+        ),
+        *[
+            (
+                _structured_error_wire(
+                    "__rustwright_action_timeout__:",
+                    state="editable",
+                    action="fill",
+                    last_info_json='{"count":0}',
+                    last_info_key=None,
+                    phase=phase,
+                    target_kind="element",
+                    command_written=command_written,
+                    retryable=retryable,
+                ),
+                TimeoutError,
+                ("action_timeout", phase, "element", command_written, retryable),
+            )
+            for phase, command_written, retryable in [
+                ("resolve", "no", True),
+                ("dispatch", "no", True),
+                ("dispatch", None, None),
+                ("settle", "yes", False),
+            ]
+        ],
+    ]
+
+    async def run() -> None:
+        for wire, error_type, expected in cases:
+            async def fail():
+                raise RuntimeError(wire)
+
+            with pytest.raises(error_type) as exc_info:
+                await async_api._await_native_method("Locator.fill", fail())
+            error = exc_info.value
+            assert str(error).startswith("Locator.fill: ")
+            assert (
+                error.kind,
+                error.phase,
+                error.target_kind,
+                error.command_written,
+                error.retryable,
+            ) == expected
+
+    asyncio.run(run())
+
+
+def test_unknown_outcome_error_is_rustwright_only_across_public_alias_modules():
+    import importlib
+    import rustwright
+    import rustwright.async_api as rustwright_async
+    import rustwright.sync_api as rustwright_sync
+
+    for module in [rustwright, rustwright_sync, rustwright_async]:
+        assert hasattr(module, "UnknownOutcomeError")
+        assert "UnknownOutcomeError" in module.__all__
+
+    for name in [
+        "rustwright._compat.playwright",
+        "rustwright._compat.playwright.sync_api",
+        "rustwright._compat.playwright.async_api",
+        "rustwright._compat.patchright",
+        "rustwright._compat.patchright.sync_api",
+        "rustwright._compat.patchright.async_api",
+    ]:
+        module = importlib.import_module(name)
+        assert not hasattr(module, "UnknownOutcomeError"), name
+        assert "UnknownOutcomeError" not in module.__all__, name
+
+    for name in [
+        "playwright",
+        "playwright.sync_api",
+        "playwright.async_api",
+        "patchright",
+        "patchright.sync_api",
+        "patchright.async_api",
+    ]:
+        module = importlib.import_module(name)
+        assert not hasattr(module, "UnknownOutcomeError"), name
+        assert "UnknownOutcomeError" not in module.__all__, name
+
+    for name in [
+        "rustwright._compat.playwright._impl._errors",
+        "rustwright._compat.patchright._impl._errors",
+    ]:
+        module = importlib.import_module(name)
+        assert module.__all__ == ["Error", "TargetClosedError", "TimeoutError"]
 
 
 def test_playwright_private_errors_shim_and_target_closed_type():
@@ -10306,7 +10664,18 @@ def test_expect_native_locator_timeout_classification_requires_structured_marker
         return Locator(fake_page, {"kind": "css", "selector": "#status"})
 
     with pytest.raises(AssertionError, match="Locator expected to have count '1'"):
-        expect(locator_for('__rustwright_timeout__:{"ms":25}')).to_have_count(1, timeout=25)
+        expect(
+            locator_for(
+                _structured_error_wire(
+                    "__rustwright_timeout__:",
+                    ms=25,
+                    phase=None,
+                    target_kind=None,
+                    command_written=None,
+                    retryable=None,
+                )
+            )
+        ).to_have_count(1, timeout=25)
 
     with pytest.raises(TimeoutError, match="timed out after 25 ms"):
         expect(locator_for("timed out after 25 ms")).to_have_count(1, timeout=25)
@@ -20191,7 +20560,14 @@ def test_implied_shift_cleanup_runs_after_base_key_up_not_written(
                     {
                         "write_status": "not_written",
                         "commitment": "not_committed",
-                        "error": '__rustwright_timeout__:{"ms":25}',
+                        "error": _structured_error_wire(
+                            "__rustwright_timeout__:",
+                            ms=25,
+                            phase="dispatch",
+                            target_kind="page",
+                            command_written="no",
+                            retryable=True,
+                        ),
                     }
                 )
             return json.dumps(
@@ -20246,7 +20622,15 @@ def test_unrelated_confirmed_key_up_does_not_clear_uncertain_key_poison():
                     {
                         "write_status": "indeterminate",
                         "commitment": "written_unconfirmed",
-                        "error": '__rustwright_timeout__:{"ms":25}',
+                        "error": _structured_error_wire(
+                            "__rustwright_failure__:",
+                            kind="unknown_outcome",
+                            message=_UNKNOWN_OUTCOME_TEXT,
+                            phase="dispatch",
+                            target_kind="page",
+                            command_written="indeterminate",
+                            retryable=False,
+                        ),
                     }
                 )
             return json.dumps(
@@ -20265,8 +20649,9 @@ def test_unrelated_confirmed_key_up_does_not_clear_uncertain_key_poison():
     keyboard = Keyboard(fake_page)
     keyboard._pressed_keys.add("ArrowLeft")
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(Error) as exc_info:
         keyboard.down("a")
+    assert type(exc_info.value).__name__ == "UnknownOutcomeError"
     assert keyboard._uncertain_pressed_key == "a"
     poison = keyboard._input_state_poisoned
 
@@ -20308,7 +20693,14 @@ def test_held_keyboard_bridge_timeout_stays_timeout_error():
                 {
                     "write_status": "not_written",
                     "commitment": "not_committed",
-                    "error": '__rustwright_timeout__:{"ms":25}',
+                    "error": _structured_error_wire(
+                        "__rustwright_timeout__:",
+                        ms=25,
+                        phase="dispatch",
+                        target_kind="page",
+                        command_written="no",
+                        retryable=True,
+                    ),
                 }
             )
 
@@ -20320,8 +20712,15 @@ def test_held_keyboard_bridge_timeout_stays_timeout_error():
     keyboard = Keyboard(fake_page)
     keyboard._pressed_keys.add("ArrowLeft")
 
-    with pytest.raises(TimeoutError, match="timed out after 25 ms"):
+    with pytest.raises(TimeoutError, match="timed out after 25 ms") as exc_info:
         keyboard.press("a")
+    assert (
+        exc_info.value.phase,
+        exc_info.value.target_kind,
+        exc_info.value.command_written,
+        exc_info.value.retryable,
+    ) == ("dispatch", "page", "no", True)
+    assert keyboard._input_state_poisoned is None
 
 
 @pytest.mark.parametrize(
@@ -20408,7 +20807,15 @@ def test_held_keyboard_indeterminate_char_poisoning():
                     {
                         "write_status": "indeterminate",
                         "commitment": "written_unconfirmed",
-                        "error": "__rustwright_timeout__:{\"ms\":25}",
+                        "error": _structured_error_wire(
+                            "__rustwright_failure__:",
+                            kind="unknown_outcome",
+                            message=_UNKNOWN_OUTCOME_TEXT,
+                            phase="dispatch",
+                            target_kind="page",
+                            command_written="indeterminate",
+                            retryable=False,
+                        ),
                     }
                 )
             return json.dumps(
@@ -20427,8 +20834,12 @@ def test_held_keyboard_indeterminate_char_poisoning():
     keyboard = Keyboard(fake_page)
     keyboard._pressed_keys.add("ArrowLeft")
 
-    with pytest.raises(TimeoutError):
+    from rustwright.sync_api import UnknownOutcomeError
+
+    with pytest.raises(UnknownOutcomeError) as exc_info:
         keyboard.down("a")
+    assert exc_info.value.command_written == "indeterminate"
+    assert exc_info.value.retryable is False
 
     assert "a" in keyboard._pressed_keys
     assert keyboard._input_state_poisoned is not None
@@ -20450,7 +20861,14 @@ def test_held_keyboard_not_written_raw_down_preserves_local_state():
                 {
                     "write_status": "not_written",
                     "commitment": "not_committed",
-                    "error": "__rustwright_timeout__:{\"ms\":25}",
+                    "error": _structured_error_wire(
+                        "__rustwright_timeout__:",
+                        ms=25,
+                        phase="dispatch",
+                        target_kind="page",
+                        command_written="no",
+                        retryable=True,
+                    ),
                 }
             )
 

@@ -496,6 +496,7 @@ fn new_action_dispatch_token() -> RwResult<String> {
 // marker prefixes exactly one JSON payload schema; user-visible prose is rebuilt
 // by the Python shim and never includes these private wire markers.
 const ACTION_TIMEOUT_MARKER: &str = "__rustwright_action_timeout__:";
+const FAILURE_MARKER: &str = "__rustwright_failure__:";
 const TIMEOUT_MARKER: &str = "__rustwright_timeout__:";
 const TARGET_CLOSED_MARKER: &str = "__rustwright_target_closed__:";
 const PAGE_CRASHED_MARKER: &str = "__rustwright_page_crashed__:";
@@ -1849,6 +1850,65 @@ pub enum TargetClosedKind {
     Target,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    Actionability,
+    ActionTimeout,
+    Timeout,
+    TargetClosed,
+    PageCrashed,
+    Disconnected,
+    UnknownOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FailurePhase {
+    Resolve,
+    Dispatch,
+    Settle,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FailureTargetKind {
+    Element,
+    Frame,
+    Page,
+    Context,
+    Browser,
+    Target,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommandWritten {
+    No,
+    Yes,
+    Indeterminate,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FailureMetadata {
+    pub kind: Option<FailureKind>,
+    pub phase: Option<FailurePhase>,
+    pub target_kind: Option<FailureTargetKind>,
+    pub command_written: Option<CommandWritten>,
+    pub retryable: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GenericFailureWirePayload {
+    kind: Option<FailureKind>,
+    message: String,
+    phase: Option<FailurePhase>,
+    target_kind: Option<FailureTargetKind>,
+    command_written: Option<CommandWritten>,
+    retryable: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ActionTimeoutWirePayload {
@@ -1856,80 +1916,376 @@ struct ActionTimeoutWirePayload {
     action: String,
     last_info_json: String,
     last_info_key: Option<String>,
+    phase: Option<FailurePhase>,
+    target_kind: Option<FailureTargetKind>,
+    command_written: Option<CommandWritten>,
+    retryable: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TimeoutWirePayload {
     ms: u64,
+    phase: Option<FailurePhase>,
+    target_kind: Option<FailureTargetKind>,
+    command_written: Option<CommandWritten>,
+    retryable: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TargetClosedWirePayload {
     kind: TargetClosedKind,
+    phase: Option<FailurePhase>,
+    target_kind: Option<FailureTargetKind>,
+    command_written: Option<CommandWritten>,
+    retryable: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct EmptyWirePayload {}
+struct TerminalWirePayload {
+    phase: Option<FailurePhase>,
+    target_kind: Option<FailureTargetKind>,
+    command_written: Option<CommandWritten>,
+    retryable: Option<bool>,
+}
 
 #[derive(Debug, Eq, PartialEq)]
 enum FfiWireError {
+    Failure(GenericFailureWirePayload),
     ActionTimeout(ActionTimeoutWirePayload),
     Timeout(TimeoutWirePayload),
     TargetClosed(TargetClosedWirePayload),
-    PageCrashed,
-    Disconnected,
+    PageCrashed(TerminalWirePayload),
+    Disconnected(TerminalWirePayload),
 }
 
 impl FfiWireError {
     fn marker(&self) -> &'static str {
         match self {
+            Self::Failure(_) => FAILURE_MARKER,
             Self::ActionTimeout(_) => ACTION_TIMEOUT_MARKER,
             Self::Timeout(_) => TIMEOUT_MARKER,
             Self::TargetClosed(_) => TARGET_CLOSED_MARKER,
-            Self::PageCrashed => PAGE_CRASHED_MARKER,
-            Self::Disconnected => DISCONNECTED_MARKER,
+            Self::PageCrashed(_) => PAGE_CRASHED_MARKER,
+            Self::Disconnected(_) => DISCONNECTED_MARKER,
         }
     }
 
     fn wire_message(&self) -> String {
         let payload = match self {
+            Self::Failure(payload) => serde_json::to_string(payload),
             Self::ActionTimeout(payload) => serde_json::to_string(payload),
             Self::Timeout(payload) => serde_json::to_string(payload),
             Self::TargetClosed(payload) => serde_json::to_string(payload),
-            Self::PageCrashed | Self::Disconnected => serde_json::to_string(&EmptyWirePayload {}),
+            Self::PageCrashed(payload) | Self::Disconnected(payload) => {
+                serde_json::to_string(payload)
+            }
         }
         .expect("FFI wire error payloads are always JSON-serializable");
         format!("{}{payload}", self.marker())
     }
 
     #[cfg(test)]
+    fn is_valid(&self) -> bool {
+        let generic_tracked = |phase: Option<FailurePhase>,
+                               command_written: Option<CommandWritten>,
+                               _retryable: Option<bool>| {
+            matches!(
+                (phase, command_written),
+                (Some(FailurePhase::Dispatch), Some(CommandWritten::No))
+                    | (Some(FailurePhase::Settle), Some(CommandWritten::Yes))
+            )
+        };
+        let tracked_terminal = |phase, target_kind, command_written, retryable| {
+            matches!(
+                (phase, target_kind, command_written, retryable),
+                (
+                    Some(FailurePhase::Dispatch),
+                    Some(FailureTargetKind::Page),
+                    Some(CommandWritten::No),
+                    Some(false)
+                ) | (
+                    Some(FailurePhase::Settle),
+                    Some(FailureTargetKind::Page),
+                    Some(CommandWritten::Yes),
+                    Some(false)
+                )
+            )
+        };
+        match self {
+            Self::Failure(payload) => match payload.kind {
+                Some(FailureKind::Actionability) => {
+                    matches!(
+                        payload.message.as_str(),
+                        "actionability check failed: element is not visible"
+                            | "actionability check failed: element did not become stable"
+                            | "actionability check failed: element is not receiving pointer events"
+                            | "actionability check failed: element is disabled"
+                            | "actionability check failed: element was detached while waiting for actionability"
+                    ) && matches!(
+                        (
+                            payload.phase,
+                            payload.target_kind,
+                            payload.command_written,
+                            payload.retryable
+                        ),
+                        (
+                            Some(FailurePhase::Resolve),
+                            Some(FailureTargetKind::Element),
+                            Some(CommandWritten::No),
+                            Some(true)
+                        )
+                    )
+                }
+                Some(FailureKind::UnknownOutcome) => {
+                    payload.message
+                        == "input command may have reached the browser, but its outcome is unknown; retrying may repeat the action"
+                        && matches!(
+                            (
+                                payload.phase,
+                                payload.target_kind,
+                                payload.command_written,
+                                payload.retryable
+                            ),
+                            (
+                                Some(FailurePhase::Dispatch),
+                                Some(FailureTargetKind::Page),
+                                Some(CommandWritten::Indeterminate),
+                                Some(false)
+                            )
+                        )
+                }
+                None => {
+                    payload.target_kind == Some(FailureTargetKind::Page)
+                        && generic_tracked(
+                            payload.phase,
+                            payload.command_written,
+                            payload.retryable,
+                        )
+                }
+                _ => false,
+            },
+            Self::ActionTimeout(payload) => matches!(
+                (
+                    payload.phase,
+                    payload.target_kind,
+                    payload.command_written,
+                    payload.retryable
+                ),
+                (
+                    Some(FailurePhase::Resolve),
+                    Some(FailureTargetKind::Element),
+                    Some(CommandWritten::No),
+                    Some(true)
+                ) | (
+                    Some(FailurePhase::Dispatch),
+                    Some(FailureTargetKind::Element),
+                    Some(CommandWritten::No),
+                    Some(true)
+                ) | (
+                    Some(FailurePhase::Dispatch),
+                    Some(FailureTargetKind::Element),
+                    None,
+                    None
+                ) | (
+                    Some(FailurePhase::Settle),
+                    Some(FailureTargetKind::Element),
+                    Some(CommandWritten::Yes),
+                    Some(false)
+                )
+            ),
+            Self::Timeout(payload) => matches!(
+                (
+                    payload.phase,
+                    payload.target_kind,
+                    payload.command_written,
+                    payload.retryable
+                ),
+                (None, None, None, None)
+                    | (
+                        Some(FailurePhase::Dispatch),
+                        Some(FailureTargetKind::Page),
+                        Some(CommandWritten::No),
+                        Some(true)
+                    )
+            ),
+            Self::TargetClosed(payload) => {
+                let static_target = match payload.kind {
+                    TargetClosedKind::Page => FailureTargetKind::Page,
+                    TargetClosedKind::Context => FailureTargetKind::Context,
+                    TargetClosedKind::Browser => FailureTargetKind::Browser,
+                    TargetClosedKind::Target => FailureTargetKind::Target,
+                };
+                matches!(
+                    (
+                        payload.phase,
+                        payload.target_kind,
+                        payload.command_written,
+                        payload.retryable
+                    ),
+                    (None, Some(target), None, Some(false)) if target == static_target
+                ) || tracked_terminal(
+                    payload.phase,
+                    payload.target_kind,
+                    payload.command_written,
+                    payload.retryable,
+                )
+            }
+            Self::PageCrashed(payload) => {
+                matches!(
+                    (
+                        payload.phase,
+                        payload.target_kind,
+                        payload.command_written,
+                        payload.retryable
+                    ),
+                    (None, Some(FailureTargetKind::Page), None, Some(false))
+                ) || tracked_terminal(
+                    payload.phase,
+                    payload.target_kind,
+                    payload.command_written,
+                    payload.retryable,
+                )
+            }
+            Self::Disconnected(payload) => {
+                matches!(
+                    (
+                        payload.phase,
+                        payload.target_kind,
+                        payload.command_written,
+                        payload.retryable
+                    ),
+                    (None, Some(FailureTargetKind::Browser), None, Some(false))
+                ) || tracked_terminal(
+                    payload.phase,
+                    payload.target_kind,
+                    payload.command_written,
+                    payload.retryable,
+                )
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn parse(message: &str) -> Option<Self> {
-        if let Some(payload) = message.strip_prefix(ACTION_TIMEOUT_MARKER) {
-            return serde_json::from_str(payload).ok().map(Self::ActionTimeout);
+        fn exact_payload<T: serde::de::DeserializeOwned>(raw: &str, keys: &[&str]) -> Option<T> {
+            let value: Value = serde_json::from_str(raw).ok()?;
+            let object = value.as_object()?;
+            if object.len() != keys.len() || keys.iter().any(|key| !object.contains_key(*key)) {
+                return None;
+            }
+            serde_json::from_value(value).ok()
         }
-        if let Some(payload) = message.strip_prefix(TIMEOUT_MARKER) {
-            return serde_json::from_str(payload).ok().map(Self::Timeout);
-        }
-        if let Some(payload) = message.strip_prefix(TARGET_CLOSED_MARKER) {
-            return serde_json::from_str(payload).ok().map(Self::TargetClosed);
-        }
-        if let Some(payload) = message.strip_prefix(PAGE_CRASHED_MARKER) {
-            serde_json::from_str::<EmptyWirePayload>(payload)
-                .ok()
-                .map(|_| Self::PageCrashed)
+
+        let parsed = if let Some(payload) = message.strip_prefix(FAILURE_MARKER) {
+            exact_payload(
+                payload,
+                &[
+                    "kind",
+                    "message",
+                    "phase",
+                    "target_kind",
+                    "command_written",
+                    "retryable",
+                ],
+            )
+            .map(Self::Failure)
+        } else if let Some(payload) = message.strip_prefix(ACTION_TIMEOUT_MARKER) {
+            exact_payload(
+                payload,
+                &[
+                    "state",
+                    "action",
+                    "last_info_json",
+                    "last_info_key",
+                    "phase",
+                    "target_kind",
+                    "command_written",
+                    "retryable",
+                ],
+            )
+            .map(Self::ActionTimeout)
+        } else if let Some(payload) = message.strip_prefix(TIMEOUT_MARKER) {
+            exact_payload(
+                payload,
+                &["ms", "phase", "target_kind", "command_written", "retryable"],
+            )
+            .map(Self::Timeout)
+        } else if let Some(payload) = message.strip_prefix(TARGET_CLOSED_MARKER) {
+            exact_payload(
+                payload,
+                &[
+                    "kind",
+                    "phase",
+                    "target_kind",
+                    "command_written",
+                    "retryable",
+                ],
+            )
+            .map(Self::TargetClosed)
+        } else if let Some(payload) = message.strip_prefix(PAGE_CRASHED_MARKER) {
+            exact_payload(
+                payload,
+                &["phase", "target_kind", "command_written", "retryable"],
+            )
+            .map(Self::PageCrashed)
         } else if let Some(payload) = message.strip_prefix(DISCONNECTED_MARKER) {
-            serde_json::from_str::<EmptyWirePayload>(payload)
-                .ok()
-                .map(|_| Self::Disconnected)
+            exact_payload(
+                payload,
+                &["phase", "target_kind", "command_written", "retryable"],
+            )
+            .map(Self::Disconnected)
         } else {
             None
-        }
+        };
+        parsed.filter(Self::is_valid)
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FillAttemptEvidence {
+    Resolve,
+    DispatchNotWritten,
+    DispatchUntracked,
+    SettleWritten,
+}
+
+impl FillAttemptEvidence {
+    fn metadata(self) -> FailureMetadata {
+        match self {
+            Self::Resolve => FailureMetadata {
+                kind: Some(FailureKind::ActionTimeout),
+                phase: Some(FailurePhase::Resolve),
+                target_kind: Some(FailureTargetKind::Element),
+                command_written: Some(CommandWritten::No),
+                retryable: Some(true),
+            },
+            Self::DispatchNotWritten => FailureMetadata {
+                kind: Some(FailureKind::ActionTimeout),
+                phase: Some(FailurePhase::Dispatch),
+                target_kind: Some(FailureTargetKind::Element),
+                command_written: Some(CommandWritten::No),
+                retryable: Some(true),
+            },
+            Self::DispatchUntracked => FailureMetadata {
+                kind: Some(FailureKind::ActionTimeout),
+                phase: Some(FailurePhase::Dispatch),
+                target_kind: Some(FailureTargetKind::Element),
+                command_written: None,
+                retryable: None,
+            },
+            Self::SettleWritten => FailureMetadata {
+                kind: Some(FailureKind::ActionTimeout),
+                phase: Some(FailurePhase::Settle),
+                target_kind: Some(FailureTargetKind::Element),
+                command_written: Some(CommandWritten::Yes),
+                retryable: Some(false),
+            },
+        }
+    }
+}
 #[derive(Debug)]
 pub struct ActionTimeoutError {
     state: String,
@@ -1937,15 +2293,17 @@ pub struct ActionTimeoutError {
     count: u64,
     last_info_json: String,
     last_info_key: Option<&'static str>,
+    metadata: FailureMetadata,
 }
 
 impl ActionTimeoutError {
-    fn from_raw_json(
+    fn from_attempt_raw_json(
         state: impl Into<String>,
         action: impl Into<String>,
         raw_json: String,
         info: &Value,
         info_key: Option<&'static str>,
+        evidence: FillAttemptEvidence,
     ) -> Self {
         let count = info.get("count").and_then(Value::as_u64).unwrap_or(0);
         Self {
@@ -1954,7 +2312,12 @@ impl ActionTimeoutError {
             count,
             last_info_json: raw_json,
             last_info_key: info_key,
+            metadata: evidence.metadata(),
         }
+    }
+
+    pub fn metadata(&self) -> &FailureMetadata {
+        &self.metadata
     }
 
     fn wire_message(&self) -> String {
@@ -1963,6 +2326,10 @@ impl ActionTimeoutError {
             action: self.action.to_string(),
             last_info_json: self.last_info_json.clone(),
             last_info_key: self.last_info_key.map(ToString::to_string),
+            phase: self.metadata.phase,
+            target_kind: self.metadata.target_kind,
+            command_written: self.metadata.command_written,
+            retryable: self.metadata.retryable,
         })
         .wire_message()
     }
@@ -1986,6 +2353,42 @@ impl std::fmt::Display for ActionTimeoutError {
 }
 
 impl std::error::Error for ActionTimeoutError {}
+
+#[derive(Debug)]
+pub struct ActionFailureError {
+    cause: Box<RwError>,
+    metadata: FailureMetadata,
+}
+
+impl ActionFailureError {
+    fn new(cause: RwError, metadata: FailureMetadata) -> Self {
+        Self {
+            cause: Box::new(cause),
+            metadata,
+        }
+    }
+
+    pub fn cause(&self) -> &RwError {
+        &self.cause
+    }
+
+    pub fn metadata(&self) -> &FailureMetadata {
+        &self.metadata
+    }
+}
+
+impl std::fmt::Display for ActionFailureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.metadata.kind == Some(FailureKind::UnknownOutcome) {
+            return formatter.write_str(
+                "input command may have reached the browser, but its outcome is unknown; retrying may repeat the action",
+            );
+        }
+        self.cause.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ActionFailureError {}
 const MAX_FRAME_TREE_DEPTH: usize = 256;
 
 /// A terminal element state observed by an auto-waiting physical action.
@@ -2033,6 +2436,8 @@ pub enum RwError {
     InvalidInput(String),
     #[error("actionability check failed: {0}")]
     Actionability(#[from] ActionabilityError),
+    #[error("{0}")]
+    ActionFailure(ActionFailureError),
     #[error(transparent)]
     ActionTimeout(#[from] ActionTimeoutError),
     #[error(transparent)]
@@ -2045,18 +2450,147 @@ pub enum RwError {
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
 }
 
+impl RwError {
+    pub fn failure_metadata(&self) -> FailureMetadata {
+        match self {
+            Self::ActionFailure(error) => *error.metadata(),
+            Self::ActionTimeout(error) => *error.metadata(),
+            Self::Actionability(_) => FailureMetadata {
+                kind: Some(FailureKind::Actionability),
+                phase: Some(FailurePhase::Resolve),
+                target_kind: Some(FailureTargetKind::Element),
+                command_written: Some(CommandWritten::No),
+                retryable: Some(true),
+            },
+            Self::Timeout(_) => FailureMetadata {
+                kind: Some(FailureKind::Timeout),
+                ..FailureMetadata::default()
+            },
+            Self::TargetClosed(kind) => FailureMetadata {
+                kind: Some(FailureKind::TargetClosed),
+                target_kind: Some(match kind {
+                    TargetClosedKind::Page => FailureTargetKind::Page,
+                    TargetClosedKind::Context => FailureTargetKind::Context,
+                    TargetClosedKind::Browser => FailureTargetKind::Browser,
+                    TargetClosedKind::Target => FailureTargetKind::Target,
+                }),
+                retryable: Some(false),
+                ..FailureMetadata::default()
+            },
+            Self::PageCrashed => FailureMetadata {
+                kind: Some(FailureKind::PageCrashed),
+                target_kind: Some(FailureTargetKind::Page),
+                retryable: Some(false),
+                ..FailureMetadata::default()
+            },
+            Self::Disconnected => FailureMetadata {
+                kind: Some(FailureKind::Disconnected),
+                target_kind: Some(FailureTargetKind::Browser),
+                retryable: Some(false),
+                ..FailureMetadata::default()
+            },
+            _ => FailureMetadata::default(),
+        }
+    }
+
+    fn is_retryable_timeout(&self) -> bool {
+        matches!(self, Self::Timeout(_))
+            || matches!(
+                self,
+                Self::ActionFailure(error)
+                    if error.metadata().kind == Some(FailureKind::Timeout)
+                        && error.metadata().retryable == Some(true)
+            )
+    }
+
+    fn requires_fill_guard_retention(&self) -> bool {
+        self.is_retryable_timeout()
+            || matches!(
+                self,
+                Self::ActionFailure(error)
+                    if error.metadata().kind == Some(FailureKind::UnknownOutcome)
+            )
+    }
+}
+
 #[cfg(feature = "python")]
 fn ffi_error_message(error: RwError) -> String {
-    match error {
-        RwError::Timeout(ms) => FfiWireError::Timeout(TimeoutWirePayload { ms }).wire_message(),
-        RwError::TargetClosed(kind) => {
-            FfiWireError::TargetClosed(TargetClosedWirePayload { kind }).wire_message()
+    fn encode(error: RwError, metadata_override: Option<FailureMetadata>) -> String {
+        let metadata = metadata_override.unwrap_or_else(|| error.failure_metadata());
+        match error {
+            RwError::ActionFailure(error) => {
+                let message = error.to_string();
+                let ActionFailureError { cause, metadata } = error;
+                if metadata.kind == Some(FailureKind::UnknownOutcome) {
+                    FfiWireError::Failure(GenericFailureWirePayload {
+                        kind: metadata.kind,
+                        message,
+                        phase: metadata.phase,
+                        target_kind: metadata.target_kind,
+                        command_written: metadata.command_written,
+                        retryable: metadata.retryable,
+                    })
+                    .wire_message()
+                } else {
+                    encode(*cause, Some(metadata))
+                }
+            }
+            RwError::Actionability(error) => FfiWireError::Failure(GenericFailureWirePayload {
+                kind: metadata.kind,
+                message: RwError::Actionability(error).to_string(),
+                phase: metadata.phase,
+                target_kind: metadata.target_kind,
+                command_written: metadata.command_written,
+                retryable: metadata.retryable,
+            })
+            .wire_message(),
+            RwError::ActionTimeout(error) => error.wire_message(),
+            RwError::Timeout(ms) => FfiWireError::Timeout(TimeoutWirePayload {
+                ms,
+                phase: metadata.phase,
+                target_kind: metadata.target_kind,
+                command_written: metadata.command_written,
+                retryable: metadata.retryable,
+            })
+            .wire_message(),
+            RwError::TargetClosed(kind) => FfiWireError::TargetClosed(TargetClosedWirePayload {
+                kind,
+                phase: metadata.phase,
+                target_kind: metadata.target_kind,
+                command_written: metadata.command_written,
+                retryable: metadata.retryable,
+            })
+            .wire_message(),
+            RwError::PageCrashed => FfiWireError::PageCrashed(TerminalWirePayload {
+                phase: metadata.phase,
+                target_kind: metadata.target_kind,
+                command_written: metadata.command_written,
+                retryable: metadata.retryable,
+            })
+            .wire_message(),
+            RwError::Disconnected => FfiWireError::Disconnected(TerminalWirePayload {
+                phase: metadata.phase,
+                target_kind: metadata.target_kind,
+                command_written: metadata.command_written,
+                retryable: metadata.retryable,
+            })
+            .wire_message(),
+            other if metadata_override.is_some() => {
+                FfiWireError::Failure(GenericFailureWirePayload {
+                    kind: metadata.kind,
+                    message: other.to_string(),
+                    phase: metadata.phase,
+                    target_kind: metadata.target_kind,
+                    command_written: metadata.command_written,
+                    retryable: metadata.retryable,
+                })
+                .wire_message()
+            }
+            other => other.to_string(),
         }
-        RwError::PageCrashed => FfiWireError::PageCrashed.wire_message(),
-        RwError::Disconnected => FfiWireError::Disconnected.wire_message(),
-        RwError::ActionTimeout(error) => error.wire_message(),
-        other => other.to_string(),
     }
+
+    encode(error, None)
 }
 
 #[cfg(feature = "python")]
@@ -2600,6 +3134,15 @@ mod tests {
         focus_target: bool,
         response_delay: Option<Duration>,
         focus_response_error_after_execution: Option<String>,
+        fail_next_delete_after_begin: bool,
+        fail_delete_before_begin: bool,
+        drop_insert_text_response: bool,
+        pending_fill_confirmation: bool,
+        lose_fill_guard_after_pending: bool,
+        fill_guard_lost: bool,
+        delay_resolution_after_guard_loss: bool,
+        drop_insert_text_after_guard_loss: bool,
+        allow_close: bool,
     }
 
     fn action_dispatch_string_literal(expression: &str, field: &str) -> String {
@@ -2618,18 +3161,44 @@ mod tests {
 
     impl InputCdpPeer {
         async fn next_command(&mut self) -> Value {
-            let command = match self.write_rx.recv().await.expect("CDP test command") {
+            let outgoing = match self.write_rx.recv().await {
+                Some(outgoing) => outgoing,
+                None if self.allow_close => {
+                    return json!({ "method": "__closed__", "sessionId": "test-session" });
+                }
+                None => panic!("unexpected transport close"),
+            };
+            let (payload, tracker) = match outgoing {
                 CdpOutgoing::Text {
                     payload, tracker, ..
-                } => {
-                    if let Some(tracker) = tracker {
-                        assert!(tracker.begin_write());
-                        tracker.finish(true);
-                    }
-                    serde_json::from_str::<Value>(&payload).expect("valid CDP command")
+                } => (payload, tracker),
+                CdpOutgoing::Close if self.allow_close => {
+                    return json!({ "method": "__closed__", "sessionId": "test-session" });
                 }
                 CdpOutgoing::Close => panic!("unexpected transport close"),
             };
+            let command = serde_json::from_str::<Value>(&payload).expect("valid CDP command");
+            let delete_raw_down = command["method"] == "Input.dispatchKeyEvent"
+                && command["params"]["type"] == "rawKeyDown"
+                && command["params"]["key"] == "Delete";
+            let fail_before_begin = self.fail_delete_before_begin && delete_raw_down;
+            let fail_after_begin = self.fail_next_delete_after_begin && delete_raw_down;
+            let drop_response = command["method"] == "Input.insertText"
+                && (self.drop_insert_text_response
+                    || (self.fill_guard_lost && self.drop_insert_text_after_guard_loss));
+            if !fail_before_begin {
+                if let Some(tracker) = tracker {
+                    assert!(tracker.begin_write());
+                    tracker.finish(!fail_after_begin);
+                }
+            }
+            if fail_after_begin {
+                self.fail_next_delete_after_begin = false;
+                return command;
+            }
+            if fail_before_begin || drop_response {
+                return command;
+            }
             let result = match command["method"].as_str() {
                 Some("Page.getFrameTree") => {
                     json!({ "frameTree": { "frame": { "id": "test-frame" } } })
@@ -2640,7 +3209,30 @@ mod tests {
                     let value = if expression.contains("doc.activeElement !== fallback") {
                         Value::Bool(!self.focus_target)
                     } else if let Some(fill_value) = &self.fill_value {
-                        if expression.contains("type: 'insert-text'") {
+                        if expression
+                            .contains("if (!guard || !guard.precursorReceived) return null;")
+                        {
+                            if self.lose_fill_guard_after_pending {
+                                self.fill_guard_lost = true;
+                                Value::Null
+                            } else {
+                                json!({
+                                    "ok": false,
+                                    "type": "observe-dispatch",
+                                    "value": fill_value,
+                                    "info": {
+                                        "count": 1,
+                                        "attached": true,
+                                        "visible": true,
+                                        "enabled": true,
+                                        "stable": true,
+                                        "receives_events": true,
+                                        "target_focused": true,
+                                        "fill_guard_key": self.fill_guard_key,
+                                    },
+                                })
+                            }
+                        } else if expression.contains("type: 'insert-text'") {
                             let start = expression
                                 .find("__rustwright_fill_guard_")
                                 .expect("fill guard key in public fill expression");
@@ -2670,11 +3262,15 @@ mod tests {
                             Value::Bool(true)
                         } else if expression.contains("const dispatch = guard") {
                             json!({
-                                "actual": fill_value,
+                                "actual": if self.pending_fill_confirmation {
+                                    "before"
+                                } else {
+                                    fill_value
+                                },
                                 "dispatch": {
                                     "diverted": false,
                                     "precursorReceived": true,
-                                    "mutationReceived": true,
+                                    "mutationReceived": !self.pending_fill_confirmation,
                                     "untrustedInputReceived": false,
                                     "beforeInputCanceled": false,
                                     "targetMatches": true,
@@ -2693,7 +3289,15 @@ mod tests {
                 }
                 _ => json!({}),
             };
-            if let Some(delay) = self.response_delay {
+            let response_delay = if self.fill_guard_lost
+                && self.delay_resolution_after_guard_loss
+                && command["method"] == "Page.getFrameTree"
+            {
+                Some(Duration::from_millis(100))
+            } else {
+                self.response_delay
+            };
+            if let Some(delay) = response_delay {
                 tokio::time::sleep(delay).await;
             }
             let response = if command["method"] == "Runtime.evaluate"
@@ -2791,6 +3395,15 @@ mod tests {
                 focus_target: true,
                 response_delay: None,
                 focus_response_error_after_execution: None,
+                fail_next_delete_after_begin: false,
+                fail_delete_before_begin: false,
+                drop_insert_text_response: false,
+                pending_fill_confirmation: false,
+                lose_fill_guard_after_pending: false,
+                fill_guard_lost: false,
+                delay_resolution_after_guard_loss: false,
+                drop_insert_text_after_guard_loss: false,
+                allow_close: false,
             },
         )
     }
@@ -4446,6 +5059,99 @@ multiline-compatible = """4.5.6"""
         .await;
     }
 
+    #[tokio::test]
+    async fn indeterminate_empty_fill_surfaces_once_without_retrying_delete() {
+        let (page, mut peer) = input_protocol_page(Some(""));
+        peer.fail_next_delete_after_begin = true;
+        peer.allow_close = true;
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = result_tx.send(page.fill("#target", "", Some(300.0)));
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut commands = Vec::new();
+        let result = loop {
+            if let Ok(result) = result_rx.try_recv() {
+                break result;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "public fill did not finish after the tracked write became indeterminate"
+            );
+            if let Ok(command) =
+                tokio::time::timeout(Duration::from_millis(25), peer.next_command()).await
+            {
+                commands.push(command);
+            }
+        };
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        while let Ok(outgoing) = peer.write_rx.try_recv() {
+            match outgoing {
+                CdpOutgoing::Text {
+                    payload, tracker, ..
+                } => {
+                    if let Some(tracker) = tracker {
+                        assert!(tracker.begin_write());
+                        tracker.finish(true);
+                    }
+                    commands.push(
+                        serde_json::from_str::<Value>(&payload).expect("valid drained CDP command"),
+                    );
+                }
+                CdpOutgoing::Close => {}
+            }
+        }
+        let error = result.expect_err("indeterminate Delete delivery must surface");
+        let RwError::ActionFailure(details) = error else {
+            panic!("expected unknown-outcome action failure, got {error:?}");
+        };
+        assert_eq!(
+            details.metadata(),
+            &FailureMetadata {
+                kind: Some(FailureKind::UnknownOutcome),
+                phase: Some(FailurePhase::Dispatch),
+                target_kind: Some(FailureTargetKind::Page),
+                command_written: Some(CommandWritten::Indeterminate),
+                retryable: Some(false),
+            }
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| {
+                    command["method"] == "Input.dispatchKeyEvent"
+                        && command["params"]["type"] == "rawKeyDown"
+                        && command["params"]["key"] == "Delete"
+                })
+                .count(),
+            1,
+            "the outer fill loop must not replay an indeterminate Delete"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| {
+                    command["method"] == "Input.dispatchKeyEvent"
+                        && command["params"]["type"] == "keyUp"
+                        && command["params"]["key"] == "Delete"
+                })
+                .count(),
+            1,
+            "cleanup must release Delete exactly once"
+        );
+        assert!(
+            commands.iter().any(|command| {
+                command["method"] == "Runtime.evaluate"
+                    && command["params"]["expression"]
+                        .as_str()
+                        .is_some_and(|expression| expression.contains("g.passive = true"))
+            }),
+            "unknown outcome must passivate the fill guard for late observation"
+        );
+    }
+
     #[test]
     fn typing_cancelled_during_final_character_returns_success_without_commit() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -4855,10 +5561,25 @@ multiline-compatible = """4.5.6"""
         )
         .await;
 
-        assert!(
-            matches!(result, Err(RwError::Timeout(_) | RwError::Disconnected)),
-            "a command whose pipe write failed must remain a retryable failure: {result:?}"
+        let error = result.expect_err("a failed pipe write must surface an error");
+        let RwError::ActionFailure(details) = error else {
+            panic!("expected classified action failure, got {error:?}");
+        };
+        assert!(matches!(
+            details.cause(),
+            RwError::Timeout(_) | RwError::Disconnected
+        ));
+        assert_eq!(
+            *details.metadata(),
+            FailureMetadata {
+                kind: Some(FailureKind::UnknownOutcome),
+                phase: Some(FailurePhase::Dispatch),
+                target_kind: Some(FailureTargetKind::Page),
+                command_written: Some(CommandWritten::Indeterminate),
+                retryable: Some(false),
+            }
         );
+        assert!(std::error::Error::source(&details).is_none());
         assert!(
             !client.is_connected(),
             "the writer must observe the failed pipe I/O"
@@ -4954,6 +5675,25 @@ multiline-compatible = """4.5.6"""
             .await;
         assert!(matches!(&send_outcome.result, Err(RwError::Timeout(20))));
         assert_eq!(send_outcome.write_status, TransportWriteStatus::NotWritten);
+        let action = resolve_input_action_send(send_outcome, "key-down");
+        let error = action
+            .result
+            .expect_err("NotWritten timeout must be surfaced");
+        let RwError::ActionFailure(details) = error else {
+            panic!("expected classified action failure, got {error:?}");
+        };
+        assert!(matches!(details.cause(), RwError::Timeout(20)));
+        assert_eq!(
+            *details.metadata(),
+            FailureMetadata {
+                kind: Some(FailureKind::Timeout),
+                phase: Some(FailurePhase::Dispatch),
+                target_kind: Some(FailureTargetKind::Page),
+                command_written: Some(CommandWritten::No),
+                retryable: Some(true),
+            }
+        );
+        assert_eq!(action.commitment, InputActionCommitment::NotCommitted);
         assert!(client
             .write_tx
             .send(CdpOutgoing::Text {
@@ -5031,7 +5771,23 @@ multiline-compatible = """4.5.6"""
         );
         assert_eq!(observed_state.load(), CDP_WRITE_WRITING);
         let action = resolve_input_action_send(send_outcome, "key-down");
-        assert!(matches!(action.result, Err(RwError::Timeout(20))));
+        let error = action
+            .result
+            .expect_err("indeterminate write must surface unknown outcome");
+        let RwError::ActionFailure(details) = error else {
+            panic!("expected classified action failure, got {error:?}");
+        };
+        assert!(matches!(details.cause(), RwError::Timeout(20)));
+        assert_eq!(
+            *details.metadata(),
+            FailureMetadata {
+                kind: Some(FailureKind::UnknownOutcome),
+                phase: Some(FailurePhase::Dispatch),
+                target_kind: Some(FailureTargetKind::Page),
+                command_written: Some(CommandWritten::Indeterminate),
+                retryable: Some(false),
+            }
+        );
         assert_eq!(action.commitment, InputActionCommitment::WrittenUnconfirmed);
 
         drop(browser_output);
@@ -5388,8 +6144,17 @@ multiline-compatible = """4.5.6"""
             },
             "key-down",
         );
-        assert!(matches!(rejected.result, Err(RwError::Disconnected)));
+        let error = rejected
+            .result
+            .expect_err("disconnect must remain a failure");
+        let RwError::ActionFailure(details) = error else {
+            panic!("expected classified action failure, got {error:?}");
+        };
+        assert!(matches!(details.cause(), RwError::Disconnected));
+        assert_eq!(details.metadata().command_written, Some(CommandWritten::No));
+        assert_eq!(details.metadata().retryable, Some(false));
         assert_eq!(rejected.commitment, InputActionCommitment::NotCommitted);
+
         let written = resolve_input_action_send(
             CdpSendOutcome {
                 result: Err(RwError::Timeout(25)),
@@ -5420,12 +6185,29 @@ multiline-compatible = """4.5.6"""
             },
             "key-down",
         );
+        let error = cdp_error
+            .result
+            .expect_err("CDP rejection must remain a failure");
+        let RwError::ActionFailure(details) = error else {
+            panic!("expected classified action failure, got {error:?}");
+        };
         assert!(matches!(
-            cdp_error.result,
-            Err(RwError::Cdp { method, message })
+            details.cause(),
+            RwError::Cdp { method, message }
                 if method == "Input.dispatchKeyEvent" && message == "key event rejected"
         ));
+        assert_eq!(
+            *details.metadata(),
+            FailureMetadata {
+                kind: None,
+                phase: Some(FailurePhase::Settle),
+                target_kind: Some(FailureTargetKind::Page),
+                command_written: Some(CommandWritten::Yes),
+                retryable: Some(true),
+            }
+        );
         assert_eq!(cdp_error.commitment, InputActionCommitment::NotCommitted);
+
         let disconnected = resolve_input_action_send(
             CdpSendOutcome {
                 result: Err(RwError::Disconnected),
@@ -5433,15 +6215,24 @@ multiline-compatible = """4.5.6"""
             },
             "key-down",
         );
-        assert!(
-            matches!(disconnected.result, Err(RwError::Disconnected)),
-            "a disconnect after a transport write must remain a failure"
+        let error = disconnected
+            .result
+            .expect_err("disconnect after write must remain a failure");
+        let RwError::ActionFailure(details) = error else {
+            panic!("expected classified action failure, got {error:?}");
+        };
+        assert!(matches!(details.cause(), RwError::Disconnected));
+        assert_eq!(details.metadata().phase, Some(FailurePhase::Settle));
+        assert_eq!(
+            details.metadata().command_written,
+            Some(CommandWritten::Yes)
         );
+        assert_eq!(details.metadata().retryable, Some(false));
         assert_eq!(disconnected.commitment, InputActionCommitment::NotCommitted);
     }
 
     #[tokio::test]
-    async fn indeterminate_input_write_is_written_unconfirmed() {
+    async fn indeterminate_input_write_surfaces_unknown_outcome() {
         let state = Arc::new(CdpWriteState::new());
         let (ack_tx, ack_rx) = oneshot::channel();
         let tracker = CdpWriteTracker {
@@ -5463,7 +6254,28 @@ multiline-compatible = """4.5.6"""
             "key-down",
         );
 
-        assert!(matches!(resolution.result, Err(RwError::Timeout(250))));
+        let error = resolution
+            .result
+            .expect_err("indeterminate timeout must surface unknown outcome");
+        assert_eq!(
+            error.to_string(),
+            "input command may have reached the browser, but its outcome is unknown; retrying may repeat the action"
+        );
+        let RwError::ActionFailure(details) = error else {
+            panic!("expected classified action failure, got {error:?}");
+        };
+        assert!(matches!(details.cause(), RwError::Timeout(250)));
+        assert_eq!(
+            *details.metadata(),
+            FailureMetadata {
+                kind: Some(FailureKind::UnknownOutcome),
+                phase: Some(FailurePhase::Dispatch),
+                target_kind: Some(FailureTargetKind::Page),
+                command_written: Some(CommandWritten::Indeterminate),
+                retryable: Some(false),
+            }
+        );
+        assert!(std::error::Error::source(&details).is_none());
         assert_eq!(
             resolution.commitment,
             InputActionCommitment::WrittenUnconfirmed
@@ -5479,7 +6291,19 @@ multiline-compatible = """4.5.6"""
             },
             "key-down",
         );
-        assert!(matches!(cdp_error.result, Err(RwError::Cdp { .. })));
+        let error = cdp_error
+            .result
+            .expect_err("CDP rejection must remain surfaced");
+        let RwError::ActionFailure(details) = error else {
+            panic!("expected classified action failure, got {error:?}");
+        };
+        assert!(matches!(details.cause(), RwError::Cdp { .. }));
+        assert_eq!(details.metadata().phase, Some(FailurePhase::Settle));
+        assert_eq!(
+            details.metadata().command_written,
+            Some(CommandWritten::Yes)
+        );
+        assert_eq!(details.metadata().retryable, Some(true));
         assert_eq!(cdp_error.commitment, InputActionCommitment::NotCommitted);
     }
 
@@ -6475,12 +7299,13 @@ multiline-compatible = """4.5.6"""
     fn native_action_timeout_formats_sync_messages_and_structured_payload() {
         let missing_json = r#"{"count":0,"attached":false}"#.to_string();
         let missing_info = serde_json::from_str::<Value>(&missing_json).unwrap();
-        let missing = ActionTimeoutError::from_raw_json(
+        let missing = ActionTimeoutError::from_attempt_raw_json(
             "actionable",
             "click",
             missing_json,
             &missing_info,
             None,
+            FillAttemptEvidence::Resolve,
         );
         assert_eq!(
             missing.to_string(),
@@ -6490,12 +7315,13 @@ multiline-compatible = """4.5.6"""
 
         let pending_json = r#"{"count":1,"attached":true,"visible":false}"#.to_string();
         let pending_info = serde_json::from_str::<Value>(&pending_json).unwrap();
-        let pending = ActionTimeoutError::from_raw_json(
+        let pending = ActionTimeoutError::from_attempt_raw_json(
             "editable",
             "fill",
             pending_json.clone(),
             &pending_info,
             None,
+            FillAttemptEvidence::Resolve,
         );
         assert_eq!(
             pending.to_string(),
@@ -6504,12 +7330,13 @@ multiline-compatible = """4.5.6"""
             )
         );
 
-        let dispatch = ActionTimeoutError::from_raw_json(
+        let dispatch = ActionTimeoutError::from_attempt_raw_json(
             "confirmed as edited",
             "fill",
             pending_json.clone(),
             &pending_info,
             None,
+            FillAttemptEvidence::SettleWritten,
         );
         assert_eq!(
             dispatch.to_string(),
@@ -6519,56 +7346,385 @@ multiline-compatible = """4.5.6"""
         );
     }
 
+    #[derive(Clone, Copy)]
+    enum RealFillTimeoutMode {
+        Resolve,
+        DispatchNotWritten,
+        DispatchUntracked,
+        SettleWritten,
+    }
+
+    async fn real_fill_timeout_metadata(mode: RealFillTimeoutMode) -> FailureMetadata {
+        let value = if matches!(mode, RealFillTimeoutMode::DispatchNotWritten) {
+            ""
+        } else {
+            "Ada"
+        };
+        let (page, mut peer) = input_protocol_page(Some(value));
+        peer.allow_close = true;
+        match mode {
+            RealFillTimeoutMode::Resolve => {
+                peer.response_delay = Some(Duration::from_millis(100));
+            }
+            RealFillTimeoutMode::DispatchNotWritten => {
+                peer.fail_delete_before_begin = true;
+            }
+            RealFillTimeoutMode::DispatchUntracked => {
+                peer.drop_insert_text_response = true;
+            }
+            RealFillTimeoutMode::SettleWritten => {
+                peer.pending_fill_confirmation = true;
+            }
+        }
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let value = value.to_owned();
+        std::thread::spawn(move || {
+            let _ = result_tx.send(page.fill("#target", &value, Some(60.0)));
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let result = loop {
+            if let Ok(result) = result_rx.try_recv() {
+                break result;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "real public fill timeout did not finish"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(150), peer.next_command()).await;
+        };
+        match result.expect_err("configured public fill must time out") {
+            RwError::ActionTimeout(error) => *error.metadata(),
+            error => panic!("expected ActionTimeout from real public fill branch, got {error:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_action_timeout_has_pre_dispatch_metadata() {
+        assert_eq!(
+            real_fill_timeout_metadata(RealFillTimeoutMode::Resolve).await,
+            FailureMetadata {
+                kind: Some(FailureKind::ActionTimeout),
+                phase: Some(FailurePhase::Resolve),
+                target_kind: Some(FailureTargetKind::Element),
+                command_written: Some(CommandWritten::No),
+                retryable: Some(true),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn not_written_fill_timeout_uses_current_dispatch_attempt() {
+        assert_eq!(
+            real_fill_timeout_metadata(RealFillTimeoutMode::DispatchNotWritten).await,
+            FailureMetadata {
+                kind: Some(FailureKind::ActionTimeout),
+                phase: Some(FailurePhase::Dispatch),
+                target_kind: Some(FailureTargetKind::Element),
+                command_written: Some(CommandWritten::No),
+                retryable: Some(true),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn untracked_fill_timeout_does_not_claim_delivery() {
+        assert_eq!(
+            real_fill_timeout_metadata(RealFillTimeoutMode::DispatchUntracked).await,
+            FailureMetadata {
+                kind: Some(FailureKind::ActionTimeout),
+                phase: Some(FailurePhase::Dispatch),
+                target_kind: Some(FailureTargetKind::Element),
+                command_written: None,
+                retryable: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn post_dispatch_fill_action_timeout_has_settle_metadata() {
+        assert_eq!(
+            real_fill_timeout_metadata(RealFillTimeoutMode::SettleWritten).await,
+            FailureMetadata {
+                kind: Some(FailureKind::ActionTimeout),
+                phase: Some(FailurePhase::Settle),
+                target_kind: Some(FailureTargetKind::Element),
+                command_written: Some(CommandWritten::Yes),
+                retryable: Some(false),
+            }
+        );
+    }
+
+    async fn fill_timeout_after_prior_settle(dispatch_untracked: bool) -> FailureMetadata {
+        let (page, mut peer) = input_protocol_page(Some("Ada"));
+        peer.allow_close = true;
+        peer.pending_fill_confirmation = true;
+        peer.lose_fill_guard_after_pending = true;
+        peer.delay_resolution_after_guard_loss = !dispatch_untracked;
+        peer.drop_insert_text_after_guard_loss = dispatch_untracked;
+        let operation =
+            tokio::task::spawn_blocking(move || page.fill("#target", "Ada", Some(70.0)));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if operation.is_finished() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "transitioned fill timeout did not finish"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(150), peer.next_command()).await;
+        }
+        let error = operation
+            .await
+            .expect("fill operation join")
+            .expect_err("configured transitioned fill must time out");
+        let RwError::ActionTimeout(timeout) = error else {
+            panic!("expected ActionTimeout after prior settle, got {error:?}");
+        };
+        timeout.metadata
+    }
+
+    #[tokio::test]
+    async fn prior_settle_then_resolve_timeout_resets_current_attempt() {
+        assert_eq!(
+            fill_timeout_after_prior_settle(false).await,
+            FillAttemptEvidence::Resolve.metadata()
+        );
+    }
+
+    #[tokio::test]
+    async fn prior_settle_then_untracked_timeout_resets_current_attempt() {
+        assert_eq!(
+            fill_timeout_after_prior_settle(true).await,
+            FillAttemptEvidence::DispatchUntracked.metadata()
+        );
+    }
+
+    async fn real_click_timeout_metadata(delayed_response: bool) -> FailureMetadata {
+        let (page, mut peer) = input_protocol_page(None);
+        peer.allow_close = true;
+        if delayed_response {
+            peer.response_delay = Some(Duration::from_millis(100));
+        }
+        let operation = tokio::spawn(page_click_actionable_wait_async(
+            Arc::clone(&page.inner),
+            selector_to_locator_json("#target").unwrap(),
+            0,
+            Some(40.0),
+            true,
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if operation.is_finished() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "real click timeout did not finish"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(150), peer.next_command()).await;
+        }
+        let error = operation
+            .await
+            .expect("click operation join")
+            .expect_err("configured click must time out");
+        let RwError::ActionTimeout(timeout) = error else {
+            panic!("expected ActionTimeout from real click branch, got {error:?}");
+        };
+        timeout.metadata
+    }
+
+    #[tokio::test]
+    async fn click_poll_timeout_has_pre_dispatch_metadata() {
+        assert_eq!(
+            real_click_timeout_metadata(true).await,
+            FillAttemptEvidence::Resolve.metadata()
+        );
+    }
+
+    #[tokio::test]
+    async fn click_pending_state_timeout_has_pre_dispatch_metadata() {
+        assert_eq!(
+            real_click_timeout_metadata(false).await,
+            FillAttemptEvidence::Resolve.metadata()
+        );
+    }
+
+    #[cfg(feature = "python")]
+    #[tokio::test]
+    async fn fast_path_post_dispatch_fill_timeout_has_settle_metadata() {
+        Python::initialize();
+        let (page, mut peer) = input_protocol_page(Some("Ada"));
+        let page = PyPage { inner: page.inner };
+        peer.allow_close = true;
+        peer.pending_fill_confirmation = true;
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = Python::attach(|py| {
+                page.locator_fast_path(
+                    py,
+                    r##"{"kind":"css","selector":"#target"}"##,
+                    0,
+                    "css_fill",
+                    r#"{"strict":true,"explicit_index":false,"has_handlers":false,"value":"Ada","forced":false}"#,
+                    Some(60.0),
+                )
+            });
+            let _ = result_tx.send(result.map_err(|error| error.to_string()));
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let error = loop {
+            if let Ok(result) = result_rx.try_recv() {
+                break result.expect_err("configured fast fill must time out");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "real fast fill timeout did not finish"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(150), peer.next_command()).await;
+        };
+        let marker = error
+            .find(ACTION_TIMEOUT_MARKER)
+            .expect("PyErr must contain the structured ActionTimeout marker");
+        let Some(FfiWireError::ActionTimeout(payload)) = FfiWireError::parse(&error[marker..])
+        else {
+            panic!("fast fill must preserve structured ActionTimeout: {error}");
+        };
+        assert_eq!(payload.phase, Some(FailurePhase::Settle));
+        assert_eq!(payload.command_written, Some(CommandWritten::Yes));
+        assert_eq!(payload.retryable, Some(false));
+    }
+
+    #[cfg(feature = "python")]
+    #[tokio::test]
+    async fn fast_path_retryable_tracked_timeout_cleans_retained_fill_guard() {
+        Python::initialize();
+        let (page, mut peer) = input_protocol_page(Some(""));
+        let page = PyPage { inner: page.inner };
+        peer.allow_close = true;
+        peer.fail_delete_before_begin = true;
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = Python::attach(|py| {
+                page.locator_fast_path(
+                    py,
+                    r##"{"kind":"css","selector":"#target"}"##,
+                    0,
+                    "css_fill",
+                    r#"{"strict":true,"explicit_index":false,"has_handlers":false,"value":"","forced":false}"#,
+                    Some(60.0),
+                )
+            });
+            let _ = result_tx.send(result.map_err(|error| error.to_string()));
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut commands = Vec::new();
+        let error = loop {
+            if let Ok(result) = result_rx.try_recv() {
+                break result.expect_err("configured fast fill dispatch must fail");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fast fill cleanup regression did not finish"
+            );
+            if let Ok(command) =
+                tokio::time::timeout(Duration::from_millis(150), peer.next_command()).await
+            {
+                commands.push(command);
+            }
+        };
+        assert!(
+            error.contains(TIMEOUT_MARKER)
+                && error.contains(r#""command_written":"no","retryable":true"#),
+            "tracked timeout must retain its structured metadata: {error}"
+        );
+        assert!(commands.iter().any(|command| {
+            command["params"]["expression"]
+                .as_str()
+                .is_some_and(|expression| expression.contains("guard.cleanup()"))
+        }));
+    }
     #[test]
     fn ffi_wire_error_markers_round_trip_with_closed_payload_schemas() {
+        let action_timeout = |evidence: FillAttemptEvidence| {
+            let metadata = evidence.metadata();
+
+            FfiWireError::ActionTimeout(ActionTimeoutWirePayload {
+                state: "editable".to_string(),
+                action: "fill".to_string(),
+                last_info_json: r#"{"count":0}"#.to_string(),
+                last_info_key: None,
+                phase: metadata.phase,
+                target_kind: metadata.target_kind,
+                command_written: metadata.command_written,
+                retryable: metadata.retryable,
+            })
+        };
         let cases = vec![
-            (
-                FfiWireError::ActionTimeout(ActionTimeoutWirePayload {
-                    state: "actionable".to_string(),
-                    action: "click".to_string(),
-                    last_info_json: r#"{"count":0}"#.to_string(),
-                    last_info_key: None,
-                }),
-                r#"__rustwright_action_timeout__:{"state":"actionable","action":"click","last_info_json":"{\"count\":0}","last_info_key":null}"#,
-            ),
-            (
-                FfiWireError::Timeout(TimeoutWirePayload { ms: 250 }),
-                r#"__rustwright_timeout__:{"ms":250}"#,
-            ),
-            (
-                FfiWireError::TargetClosed(TargetClosedWirePayload {
-                    kind: TargetClosedKind::Page,
-                }),
-                r#"__rustwright_target_closed__:{"kind":"page"}"#,
-            ),
-            (
-                FfiWireError::TargetClosed(TargetClosedWirePayload {
-                    kind: TargetClosedKind::Context,
-                }),
-                r#"__rustwright_target_closed__:{"kind":"context"}"#,
-            ),
-            (
-                FfiWireError::TargetClosed(TargetClosedWirePayload {
-                    kind: TargetClosedKind::Browser,
-                }),
-                r#"__rustwright_target_closed__:{"kind":"browser"}"#,
-            ),
-            (
-                FfiWireError::TargetClosed(TargetClosedWirePayload {
-                    kind: TargetClosedKind::Target,
-                }),
-                r#"__rustwright_target_closed__:{"kind":"target"}"#,
-            ),
-            (
-                FfiWireError::PageCrashed,
-                r#"__rustwright_page_crashed__:{}"#,
-            ),
-            (
-                FfiWireError::Disconnected,
-                r#"__rustwright_disconnected__:{}"#,
-            ),
+            FfiWireError::Failure(GenericFailureWirePayload {
+                kind: Some(FailureKind::Actionability),
+                message: "actionability check failed: element is not visible".to_string(),
+                phase: Some(FailurePhase::Resolve),
+                target_kind: Some(FailureTargetKind::Element),
+                command_written: Some(CommandWritten::No),
+                retryable: Some(true),
+            }),
+            FfiWireError::Failure(GenericFailureWirePayload {
+                kind: Some(FailureKind::UnknownOutcome),
+                message: "input command may have reached the browser, but its outcome is unknown; retrying may repeat the action".to_string(),
+                phase: Some(FailurePhase::Dispatch),
+                target_kind: Some(FailureTargetKind::Page),
+                command_written: Some(CommandWritten::Indeterminate),
+                retryable: Some(false),
+            }),
+            action_timeout(FillAttemptEvidence::Resolve),
+            action_timeout(FillAttemptEvidence::DispatchNotWritten),
+            action_timeout(FillAttemptEvidence::DispatchUntracked),
+            action_timeout(FillAttemptEvidence::SettleWritten),
+            FfiWireError::Timeout(TimeoutWirePayload {
+                ms: 250,
+                phase: None,
+                target_kind: None,
+                command_written: None,
+                retryable: None,
+            }),
+            FfiWireError::Timeout(TimeoutWirePayload {
+                ms: 250,
+                phase: Some(FailurePhase::Dispatch),
+                target_kind: Some(FailureTargetKind::Page),
+                command_written: Some(CommandWritten::No),
+                retryable: Some(true),
+            }),
+            FfiWireError::TargetClosed(TargetClosedWirePayload {
+                kind: TargetClosedKind::Context,
+                phase: None,
+                target_kind: Some(FailureTargetKind::Context),
+                command_written: None,
+                retryable: Some(false),
+            }),
+            FfiWireError::TargetClosed(TargetClosedWirePayload {
+                kind: TargetClosedKind::Page,
+                phase: Some(FailurePhase::Settle),
+                target_kind: Some(FailureTargetKind::Page),
+                command_written: Some(CommandWritten::Yes),
+                retryable: Some(false),
+            }),
+            FfiWireError::PageCrashed(TerminalWirePayload {
+                phase: None,
+                target_kind: Some(FailureTargetKind::Page),
+                command_written: None,
+                retryable: Some(false),
+            }),
+            FfiWireError::Disconnected(TerminalWirePayload {
+                phase: None,
+                target_kind: Some(FailureTargetKind::Browser),
+                command_written: None,
+                retryable: Some(false),
+            }),
         ];
         let markers = [
+            FAILURE_MARKER,
             ACTION_TIMEOUT_MARKER,
             TIMEOUT_MARKER,
             TARGET_CLOSED_MARKER,
@@ -6580,10 +7736,9 @@ multiline-compatible = """4.5.6"""
             markers.len()
         );
 
-        for (error, expected) in cases {
+        for error in cases {
             let marker = error.marker();
             let message = error.wire_message();
-            assert_eq!(message, expected);
             assert_eq!(FfiWireError::parse(&message), Some(error));
             assert!(message.starts_with(marker));
             assert_eq!(
@@ -6595,19 +7750,258 @@ multiline-compatible = """4.5.6"""
             );
         }
 
-        assert_eq!(
-            FfiWireError::parse(r#"__rustwright_timeout__:{"ms":1,"extra":true}"#),
-            None
-        );
-        assert_eq!(
-            FfiWireError::parse(r#"__rustwright_target_closed__:{"kind":"tab"}"#),
-            None
-        );
-        assert_eq!(
-            FfiWireError::parse(r#"__rustwright_page_crashed__:{"extra":true}"#),
-            None
-        );
+        for invalid in [
+            r#"__rustwright_timeout__:{"ms":1,"phase":null,"target_kind":null,"command_written":null,"retryable":null,"extra":true}"#,
+            r#"__rustwright_timeout__:{"ms":1,"phase":null,"target_kind":null,"command_written":null}"#,
+            r#"__rustwright_timeout__:{"ms":1,"phase":"dispatch","target_kind":"page","command_written":"indeterminate","retryable":true}"#,
+            r#"__rustwright_action_timeout__:{"state":"editable","action":"fill","last_info_json":"{}","last_info_key":null,"phase":"settle","target_kind":"element","command_written":"no","retryable":true}"#,
+            r#"__rustwright_failure__:{"kind":"unknown_outcome","message":"input command may have reached the browser, but its outcome is unknown; retrying may repeat the action","phase":"dispatch","target_kind":"page","command_written":"indeterminate","retryable":true}"#,
+            r#"__rustwright_target_closed__:{"kind":"tab","phase":null,"target_kind":"target","command_written":null,"retryable":false}"#,
+            r#"__rustwright_page_crashed__:{"phase":null,"target_kind":"page","command_written":null,"retryable":false,"extra":true}"#,
+        ] {
+            assert_eq!(FfiWireError::parse(invalid), None, "{invalid}");
+        }
         assert_eq!(FfiWireError::parse("plain legacy error"), None);
+
+        #[cfg(feature = "python")]
+        {
+            let resolution = resolve_input_action_send(
+                CdpSendOutcome {
+                    result: Err(RwError::Timeout(250)),
+                    write_status: TransportWriteStatus::Indeterminate,
+                },
+                "key-down",
+            );
+            let message = ffi_error_message(
+                resolution
+                    .result
+                    .expect_err("indeterminate resolver outcome must fail"),
+            );
+            assert!(message.starts_with(FAILURE_MARKER), "{message}");
+            let Some(FfiWireError::Failure(payload)) = FfiWireError::parse(&message) else {
+                panic!("resolver-produced unknown outcome must use the failure marker: {message}");
+            };
+            assert_eq!(payload.kind, Some(FailureKind::UnknownOutcome));
+            assert_eq!(payload.command_written, Some(CommandWritten::Indeterminate));
+            assert_eq!(payload.retryable, Some(false));
+        }
+    }
+
+    #[test]
+    fn public_failure_metadata_derivation_is_stable() {
+        let none = FailureMetadata::default();
+        assert_eq!(
+            RwError::Actionability(ActionabilityError::NotVisible).failure_metadata(),
+            FailureMetadata {
+                kind: Some(FailureKind::Actionability),
+                phase: Some(FailurePhase::Resolve),
+                target_kind: Some(FailureTargetKind::Element),
+                command_written: Some(CommandWritten::No),
+                retryable: Some(true),
+            }
+        );
+        for (evidence, phase, command_written, retryable) in [
+            (
+                FillAttemptEvidence::Resolve,
+                FailurePhase::Resolve,
+                Some(CommandWritten::No),
+                Some(true),
+            ),
+            (
+                FillAttemptEvidence::DispatchNotWritten,
+                FailurePhase::Dispatch,
+                Some(CommandWritten::No),
+                Some(true),
+            ),
+            (
+                FillAttemptEvidence::DispatchUntracked,
+                FailurePhase::Dispatch,
+                None,
+                None,
+            ),
+            (
+                FillAttemptEvidence::SettleWritten,
+                FailurePhase::Settle,
+                Some(CommandWritten::Yes),
+                Some(false),
+            ),
+        ] {
+            assert_eq!(
+                evidence.metadata(),
+                FailureMetadata {
+                    kind: Some(FailureKind::ActionTimeout),
+                    phase: Some(phase),
+                    target_kind: Some(FailureTargetKind::Element),
+                    command_written,
+                    retryable,
+                }
+            );
+        }
+        assert_eq!(
+            RwError::Timeout(1).failure_metadata(),
+            FailureMetadata {
+                kind: Some(FailureKind::Timeout),
+                ..none
+            }
+        );
+        for (kind, target_kind) in [
+            (TargetClosedKind::Page, FailureTargetKind::Page),
+            (TargetClosedKind::Context, FailureTargetKind::Context),
+            (TargetClosedKind::Browser, FailureTargetKind::Browser),
+            (TargetClosedKind::Target, FailureTargetKind::Target),
+        ] {
+            assert_eq!(
+                RwError::TargetClosed(kind).failure_metadata(),
+                FailureMetadata {
+                    kind: Some(FailureKind::TargetClosed),
+                    target_kind: Some(target_kind),
+                    retryable: Some(false),
+                    ..none
+                }
+            );
+        }
+        assert_eq!(
+            RwError::PageCrashed.failure_metadata(),
+            FailureMetadata {
+                kind: Some(FailureKind::PageCrashed),
+                target_kind: Some(FailureTargetKind::Page),
+                retryable: Some(false),
+                ..none
+            }
+        );
+        assert_eq!(
+            RwError::Disconnected.failure_metadata(),
+            FailureMetadata {
+                kind: Some(FailureKind::Disconnected),
+                target_kind: Some(FailureTargetKind::Browser),
+                retryable: Some(false),
+                ..none
+            }
+        );
+        for error in [
+            RwError::Cancelled,
+            RwError::InvalidInput("bad input".to_owned()),
+            RwError::Message("other".to_owned()),
+        ] {
+            assert_eq!(error.failure_metadata(), none);
+        }
+
+        let tracked_cases = [
+            (
+                TransportWriteStatus::NotWritten,
+                RwError::Timeout(25),
+                Some(FailureKind::Timeout),
+                FailurePhase::Dispatch,
+                CommandWritten::No,
+                true,
+            ),
+            (
+                TransportWriteStatus::NotWritten,
+                RwError::TargetClosed(TargetClosedKind::Page),
+                Some(FailureKind::TargetClosed),
+                FailurePhase::Dispatch,
+                CommandWritten::No,
+                false,
+            ),
+            (
+                TransportWriteStatus::NotWritten,
+                RwError::Closed,
+                None,
+                FailurePhase::Dispatch,
+                CommandWritten::No,
+                false,
+            ),
+            (
+                TransportWriteStatus::Written,
+                RwError::Cdp {
+                    method: "Input.dispatchKeyEvent".to_owned(),
+                    message: "rejected".to_owned(),
+                },
+                None,
+                FailurePhase::Settle,
+                CommandWritten::Yes,
+                true,
+            ),
+            (
+                TransportWriteStatus::Written,
+                RwError::Disconnected,
+                Some(FailureKind::Disconnected),
+                FailurePhase::Settle,
+                CommandWritten::Yes,
+                false,
+            ),
+            (
+                TransportWriteStatus::Written,
+                RwError::Closed,
+                None,
+                FailurePhase::Settle,
+                CommandWritten::Yes,
+                false,
+            ),
+            (
+                TransportWriteStatus::Indeterminate,
+                RwError::Timeout(25),
+                Some(FailureKind::UnknownOutcome),
+                FailurePhase::Dispatch,
+                CommandWritten::Indeterminate,
+                false,
+            ),
+        ];
+        for (write_status, error, kind, phase, command_written, retryable) in tracked_cases {
+            let resolution = resolve_input_action_send(
+                CdpSendOutcome {
+                    result: Err(error),
+                    write_status,
+                },
+                "key-down",
+            );
+            let details = match resolution.result.expect_err("tracked failure") {
+                RwError::ActionFailure(details) => details,
+                other => panic!("expected classified action failure, got {other:?}"),
+            };
+            assert_eq!(
+                details.metadata(),
+                &FailureMetadata {
+                    kind,
+                    phase: Some(phase),
+                    target_kind: Some(FailureTargetKind::Page),
+                    command_written: Some(command_written),
+                    retryable: Some(retryable),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_outcome_diagnostic_kind_is_not_timeout() {
+        let resolution = resolve_input_action_send(
+            CdpSendOutcome {
+                result: Err(RwError::Timeout(25)),
+                write_status: TransportWriteStatus::Indeterminate,
+            },
+            "key-down",
+        );
+        let error = resolution.result.expect_err("unknown outcome");
+        assert_eq!(diagnostic_error_kind(&error), "unknown-outcome");
+        assert_ne!(diagnostic_error_kind(&error), "timeout");
+        assert_ne!(diagnostic_error_kind(&error), "unavailable");
+    }
+
+    #[test]
+    fn cli_unknown_outcome_alternate_display_has_no_cause_suffix() {
+        let resolution = resolve_input_action_send(
+            CdpSendOutcome {
+                result: Err(RwError::Timeout(25)),
+                write_status: TransportWriteStatus::Indeterminate,
+            },
+            "key-down",
+        );
+        let error = resolution.result.expect_err("unknown outcome");
+        assert_eq!(
+            format!("{error:#}"),
+            "input command may have reached the browser, but its outcome is unknown; retrying may repeat the action"
+        );
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
@@ -17371,6 +18765,11 @@ fn browser_process_diagnostic(browser: &BrowserInner) -> BrowserProcessDiagnosti
 
 fn diagnostic_error_kind(error: &RwError) -> &'static str {
     match error {
+        RwError::ActionFailure(error)
+            if error.metadata().kind == Some(FailureKind::UnknownOutcome) =>
+        {
+            "unknown-outcome"
+        }
         RwError::Timeout(_) => "timeout",
         RwError::Disconnected | RwError::Closed | RwError::TargetClosed(_) => "disconnected",
         RwError::Cdp { .. } => "protocol-error",
@@ -22746,6 +24145,7 @@ async fn evaluate_locator_fill_for_page(
     value: String,
     timeout: Duration,
     pinned_resolution: &mut Option<LocatorSessionResolution>,
+    current_attempt_evidence: &mut FillAttemptEvidence,
     mut drop_cleanup: Option<&mut FillGuardDropCleanup>,
 ) -> RwResult<String> {
     let deadline = OperationDeadline::new(timeout);
@@ -22764,6 +24164,7 @@ async fn evaluate_locator_fill_for_page(
         let mut json = None;
         let mut action_dispatch_guard = None;
         if reentering_dispatch {
+            *current_attempt_evidence = FillAttemptEvidence::SettleWritten;
             let observation = evaluate_locator_resolution(
                 &page,
                 &resolution,
@@ -22784,6 +24185,7 @@ async fn evaluate_locator_fill_for_page(
                         json = Some(observation.to_string());
                     } else {
                         pinned_resolution.take();
+                        *current_attempt_evidence = FillAttemptEvidence::Resolve;
                         resolution = resolve_locator_fill_session(
                             Arc::clone(&page),
                             &locator_json,
@@ -22795,6 +24197,7 @@ async fn evaluate_locator_fill_for_page(
                 }
                 Err(error) if is_locator_wait_context_loss(&error) => {
                     pinned_resolution.take();
+                    *current_attempt_evidence = FillAttemptEvidence::Resolve;
                     resolution =
                         resolve_locator_fill_session(Arc::clone(&page), &locator_json, deadline)
                             .await?;
@@ -22975,6 +24378,9 @@ return null;
                 ));
             }
             let insert_text_dispatch = !committed_value.is_empty();
+            if insert_text_dispatch {
+                *current_attempt_evidence = FillAttemptEvidence::DispatchUntracked;
+            }
             let input_result = commit_fill_text(
                 &page.browser.client,
                 &resolution.session_id,
@@ -22983,6 +24389,13 @@ return null;
             )
             .await;
             if let Err(error) = input_result {
+                if matches!(
+                    &error,
+                    RwError::ActionFailure(error)
+                        if error.metadata().command_written == Some(CommandWritten::No)
+                ) {
+                    *current_attempt_evidence = FillAttemptEvidence::DispatchNotWritten;
+                }
                 if insert_text_dispatch
                     && action_dispatch_reply_disposition(&error)
                         == ActionDispatchReplyDisposition::SafeRetry
@@ -22996,6 +24409,7 @@ return null;
                 }
                 return Err(error);
             }
+            *current_attempt_evidence = FillAttemptEvidence::SettleWritten;
             native_input_commitment = Some(committed_result.to_string());
         }
 
@@ -23173,7 +24587,7 @@ return {{ actual, dispatch, info }};
                     == Some(true),
             )
         }
-        Err(RwError::Timeout(_)) => (true, false),
+        Err(error) if error.requires_fill_guard_retention() => (true, false),
         Err(_) => (false, false),
     };
     if retain_guard {
@@ -25314,12 +26728,13 @@ async fn page_click_actionable_wait_async(
             Err(RwError::Timeout(_)) => {
                 ensure_native_action_owner_available(&page, "click")?;
                 if Instant::now() >= deadline {
-                    return Err(ActionTimeoutError::from_raw_json(
+                    return Err(ActionTimeoutError::from_attempt_raw_json(
                         "actionable",
                         "click",
                         last_info_json,
                         &last_info,
                         None,
+                        FillAttemptEvidence::Resolve,
                     )
                     .into());
                 }
@@ -25341,12 +26756,13 @@ async fn page_click_actionable_wait_async(
             break info;
         }
         if Instant::now() >= deadline {
-            return Err(ActionTimeoutError::from_raw_json(
+            return Err(ActionTimeoutError::from_attempt_raw_json(
                 "actionable",
                 "click",
                 json,
                 &info,
                 None,
+                FillAttemptEvidence::Resolve,
             )
             .into());
         }
@@ -25521,7 +26937,8 @@ async fn page_fill_actionable_with_script_async(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         let command_timeout = action_poll_timeout(timeout_ms, true, remaining);
-        // Sync #106 parity: a probe timeout is transient until the outer action deadline.
+        let mut current_attempt_evidence = FillAttemptEvidence::Resolve;
+        // Sync #106 parity: a safe probe timeout is transient until the outer action deadline.
         let evaluation = evaluate_locator_fill_for_page(
             Arc::clone(&page),
             locator_json.clone(),
@@ -25531,12 +26948,13 @@ async fn page_fill_actionable_with_script_async(
             value.clone(),
             command_timeout,
             &mut pinned_resolution,
+            &mut current_attempt_evidence,
             Some(&mut drop_cleanup),
         )
         .await;
         let json = match evaluation {
             Ok(json) => json,
-            Err(RwError::Timeout(_)) => {
+            Err(error) if error.is_retryable_timeout() => {
                 if let Err(error) = ensure_native_action_owner_available(&page, &action) {
                     let _ = cleanup_retained_fill_guard(
                         Arc::clone(&page),
@@ -25559,12 +26977,13 @@ async fn page_fill_actionable_with_script_async(
                     )
                     .await;
                     drop_cleanup.disarm();
-                    return Err(ActionTimeoutError::from_raw_json(
+                    return Err(ActionTimeoutError::from_attempt_raw_json(
                         last_timeout_state,
                         action.clone(),
                         last_info_json,
                         &last_info,
                         last_info_key,
+                        current_attempt_evidence,
                     )
                     .into());
                 }
@@ -25653,22 +27072,29 @@ async fn page_fill_actionable_with_script_async(
                 )
                 .await;
                 drop_cleanup.disarm();
-                return Err(ActionTimeoutError::from_raw_json(
+                return Err(ActionTimeoutError::from_attempt_raw_json(
                     state,
                     action.clone(),
                     json,
                     &info,
                     Some("info"),
+                    current_attempt_evidence,
                 )
                 .into());
             }
             FillAttempt::PendingActionability | FillAttempt::PendingDispatch => {
-                last_timeout_state =
-                    if result.get("type").and_then(Value::as_str) == Some("pending-dispatch") {
-                        "confirmed as edited"
-                    } else {
-                        "editable"
-                    };
+                let pending_dispatch =
+                    result.get("type").and_then(Value::as_str) == Some("pending-dispatch");
+                if pending_dispatch {
+                    debug_assert_eq!(current_attempt_evidence, FillAttemptEvidence::SettleWritten);
+                } else {
+                    pinned_resolution.take();
+                }
+                last_timeout_state = if pending_dispatch {
+                    "confirmed as edited"
+                } else {
+                    "editable"
+                };
                 last_info = info;
                 last_info_json = json;
                 last_info_key = Some("info");
@@ -28151,6 +29577,7 @@ return { ready: true, result: true, payload: null };
             let browser = Arc::clone(&page.browser);
             browser.block_on(async move {
                 let mut pinned_resolution = None;
+                let mut current_attempt_evidence = FillAttemptEvidence::Resolve;
                 evaluate_locator_fill_for_page(
                     page,
                     locator_json,
@@ -28160,6 +29587,7 @@ return { ready: true, result: true, payload: null };
                     value,
                     timeout,
                     &mut pinned_resolution,
+                    &mut current_attempt_evidence,
                     None,
                 )
                 .await
@@ -28254,6 +29682,7 @@ return { ready: true, result: true, payload: null };
                 browser.block_on(async move {
                     let deadline = action_deadline(timeout);
                     let mut pinned_resolution = None;
+                    let mut current_attempt_evidence = FillAttemptEvidence::Resolve;
                     let evaluation = evaluate_locator_fill_for_page(
                         Arc::clone(&page),
                         locator_json.clone(),
@@ -28263,12 +29692,13 @@ return { ready: true, result: true, payload: null };
                         value.clone(),
                         timeout,
                         &mut pinned_resolution,
+                        &mut current_attempt_evidence,
                         None,
                     )
                     .await;
                     let mut json = match evaluation {
                         Ok(json) => json,
-                        Err(error @ RwError::Timeout(_)) => {
+                        Err(error) if error.is_retryable_timeout() => {
                             let _ = cleanup_retained_fill_guard(
                                 Arc::clone(&page),
                                 &locator_json,
@@ -28317,6 +29747,7 @@ return { ready: true, result: true, payload: null };
                     let mut last_info = first_info;
                     let mut last_info_json = json;
                     let mut last_timeout_state = "confirmed as edited";
+                    let mut last_attempt_evidence = FillAttemptEvidence::SettleWritten;
                     loop {
                         if Instant::now() >= deadline {
                             let _ = cleanup_retained_fill_guard(
@@ -28327,12 +29758,13 @@ return { ready: true, result: true, payload: null };
                                 Duration::from_millis(100),
                             )
                             .await;
-                            return Err(ActionTimeoutError::from_raw_json(
+                            return Err(ActionTimeoutError::from_attempt_raw_json(
                                 last_timeout_state,
                                 "fill".to_string(),
                                 last_info_json,
                                 &last_info,
                                 Some("info"),
+                                last_attempt_evidence,
                             )
                             .into());
                         }
@@ -28354,6 +29786,7 @@ return { ready: true, result: true, payload: null };
                             return Err(error);
                         }
                         let remaining = deadline.saturating_duration_since(Instant::now());
+                        let mut current_attempt_evidence = FillAttemptEvidence::Resolve;
                         let evaluation = evaluate_locator_fill_for_page(
                             Arc::clone(&page),
                             locator_json.clone(),
@@ -28363,12 +29796,16 @@ return { ready: true, result: true, payload: null };
                             value.clone(),
                             remaining.max(Duration::from_millis(1)),
                             &mut pinned_resolution,
+                            &mut current_attempt_evidence,
                             None,
                         )
                         .await;
                         json = match evaluation {
                             Ok(json) => json,
-                            Err(RwError::Timeout(_)) => continue,
+                            Err(error) if error.is_retryable_timeout() => {
+                                last_attempt_evidence = current_attempt_evidence;
+                                continue;
+                            }
                             Err(error) => return Err(error),
                         };
                         let result =
@@ -28395,7 +29832,18 @@ return { ready: true, result: true, payload: null };
                         match classify_fill_attempt(&result, "fill")? {
                             FillAttempt::Success => return Ok(json),
                             FillAttempt::PendingActionability | FillAttempt::PendingDispatch => {
-                                last_timeout_state = if result_type == Some("pending-dispatch") {
+                                let pending_dispatch = result_type == Some("pending-dispatch");
+                                last_attempt_evidence = if pending_dispatch {
+                                    debug_assert_eq!(
+                                        current_attempt_evidence,
+                                        FillAttemptEvidence::SettleWritten
+                                    );
+                                    FillAttemptEvidence::SettleWritten
+                                } else {
+                                    pinned_resolution.take();
+                                    FillAttemptEvidence::Resolve
+                                };
+                                last_timeout_state = if pending_dispatch {
                                     "confirmed as edited"
                                 } else {
                                     "editable"
@@ -34213,6 +35661,51 @@ struct InputActionResolution {
     commitment: InputActionCommitment,
 }
 
+fn classify_tracked_input_failure(
+    write_status: TransportWriteStatus,
+    error: &RwError,
+) -> FailureMetadata {
+    let rejection = matches!(error, RwError::Cdp { .. });
+    let terminal = matches!(
+        error,
+        RwError::Closed | RwError::TargetClosed(_) | RwError::PageCrashed | RwError::Disconnected
+    );
+    let (phase, command_written) = if rejection {
+        (FailurePhase::Settle, CommandWritten::Yes)
+    } else {
+        match write_status {
+            TransportWriteStatus::NotWritten => (FailurePhase::Dispatch, CommandWritten::No),
+            TransportWriteStatus::Written => (FailurePhase::Settle, CommandWritten::Yes),
+            TransportWriteStatus::Indeterminate => {
+                (FailurePhase::Dispatch, CommandWritten::Indeterminate)
+            }
+        }
+    };
+    let retryable = if command_written == CommandWritten::Indeterminate {
+        Some(false)
+    } else if rejection {
+        Some(true)
+    } else if terminal {
+        Some(false)
+    } else if command_written == CommandWritten::No
+        && matches!(
+            error,
+            RwError::Timeout(_) | RwError::Actionability(_) | RwError::ActionTimeout(_)
+        )
+    {
+        Some(true)
+    } else {
+        error.failure_metadata().retryable
+    };
+    FailureMetadata {
+        kind: error.failure_metadata().kind,
+        phase: Some(phase),
+        target_kind: Some(FailureTargetKind::Page),
+        command_written: Some(command_written),
+        retryable,
+    }
+}
+
 fn resolve_input_action_send(
     send_outcome: CdpSendOutcome,
     action_name: &str,
@@ -34236,32 +35729,43 @@ fn resolve_input_action_send(
                 commitment: InputActionCommitment::WrittenUnconfirmed,
             }
         }
-        // The write was already in flight, so this may still reach the browser. The
-        // caller gets an error because it may equally never land, but the commitment
-        // records that a retry is not free.
-        //
-        // A reply of any kind already classifies as written, so a rejection carrying
-        // an in-flight status is unreachable today; the guard keeps this function
-        // honest on its own terms rather than on its caller's.
-        Err(error)
-            if send_outcome.write_status == TransportWriteStatus::Indeterminate
-                && !matches!(&error, RwError::Cdp { .. }) =>
-        {
+        // A reply of any kind proves that the command was written. Treat a
+        // synthetic indeterminate rejection the same as its production Written
+        // form so this pure classifier remains honest on its own terms.
+        Err(error @ RwError::Cdp { .. }) => {
+            let metadata = classify_tracked_input_failure(send_outcome.write_status, &error);
+            InputActionResolution {
+                result: Err(RwError::ActionFailure(ActionFailureError::new(
+                    error, metadata,
+                ))),
+                commitment: InputActionCommitment::NotCommitted,
+            }
+        }
+        // Once the writer touched the socket, replay can duplicate the action.
+        // The wrapper keeps the original cause for native inspection while
+        // exposing the unsafe outcome as a separate public condition.
+        Err(error) if send_outcome.write_status == TransportWriteStatus::Indeterminate => {
             eprintln!(
                 "rustwright: {action_name} may or may not have reached the browser; retrying it may repeat the input: {error}"
             );
+            let mut metadata = classify_tracked_input_failure(send_outcome.write_status, &error);
+            metadata.kind = Some(FailureKind::UnknownOutcome);
             InputActionResolution {
-                result: Err(error),
+                result: Err(RwError::ActionFailure(ActionFailureError::new(
+                    error, metadata,
+                ))),
                 commitment: InputActionCommitment::WrittenUnconfirmed,
             }
         }
-        // A confirmed browser rejection stays a failure. Buffered bytes can
-        // outlive the browser, and a dead session cannot accept a retry, so a
-        // disconnect stays a failure too.
-        Err(error) => InputActionResolution {
-            result: Err(error),
-            commitment: InputActionCommitment::NotCommitted,
-        },
+        Err(error) => {
+            let metadata = classify_tracked_input_failure(send_outcome.write_status, &error);
+            InputActionResolution {
+                result: Err(RwError::ActionFailure(ActionFailureError::new(
+                    error, metadata,
+                ))),
+                commitment: InputActionCommitment::NotCommitted,
+            }
+        }
     }
 }
 

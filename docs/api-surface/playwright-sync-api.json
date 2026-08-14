@@ -1817,11 +1817,14 @@
       "StorageState",
       "StorageStateCookie",
       "TimeoutError",
+      "UnknownOutcomeError",
       "ViewportSize",
       "expect",
       "sync_playwright"
     ],
-    "extra": [],
+    "extra": [
+      "UnknownOutcomeError"
+    ],
     "missing": {},
     "reference": [
       "APIResponseAssertions",
@@ -1856,7 +1859,7 @@
   },
   "reference_module": "playwright.sync_api",
   "summary": {
-    "extra_members": 0,
+    "extra_members": 1,
     "missing_classes": 0,
     "missing_members": 0,
     "signature_diffs": 0,

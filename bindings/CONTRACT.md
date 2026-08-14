@@ -103,6 +103,8 @@ the same OS thread and copy the borrowed UTF-8 message into language-owned
 memory. It is NULL when no error is recorded and is valid only until the next
 Rustwright ABI call on that thread. Never free it.
 
+`rw_last_error()` is diagnostic prose, not a machine-readable taxonomy; bindings must not parse it to decide whether to retry.
+
 `rw_browser_ws_endpoint` and `rw_page_target_id` return NULL on failure and set
 the same last-error slot. All ABI entry points catch Rust panics; no unwind is
 allowed to cross the C boundary.

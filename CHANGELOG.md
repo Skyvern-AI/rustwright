@@ -7,6 +7,7 @@ All notable user-facing changes to Rustwright are documented in this file.
 ### Changed
 
 - Verified support for standard CPython 3.9 through 3.14 and CPython 3.15.0rc1. Python 3.15 support remains pre-release, and CI tracks 3.15-dev until GA.
+- Added a public failure and retry contract for browser actions. Rust, Python, and MCP callers can inspect the failure phase, target kind, command-write status, and retry safety. A tracked input command with unknown delivery now raises `UnknownOutcomeError` in Python and is never reported as safe to retry. Other bindings keep their existing error types and receive a clear diagnostic message.
 
 ## [0.2.0] - 2026-08-03
 
