@@ -400,6 +400,62 @@ const CDP_DIAGNOSTIC_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const TIMEOUT_DIAGNOSTIC_BANNER: &str = "RUSTWRIGHT TIMEOUT DIAGNOSTIC";
 const FRAME_UTILITY_WORLD_NAME: &str = "__utility_world__";
 static NEXT_FILL_GUARD_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_ACTION_DISPATCH_ID: AtomicU64 = AtomicU64::new(1);
+const ACTION_DISPATCH_BINDING_NAME: &str = "__rustwright_dispatch__";
+const ACTION_DISPATCH_TOKEN_BYTES: usize = 32;
+const ACTION_DISPATCH_OPTION_LIST_CHANGED_MARKER: &str =
+    "__rustwright_action_dispatch_not_started__: option list changed";
+#[cfg(unix)]
+fn fill_action_dispatch_random(bytes: &mut [u8]) -> RwResult<()> {
+    fs::File::open("/dev/urandom")?.read_exact(bytes)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn fill_action_dispatch_random(bytes: &mut [u8]) -> RwResult<()> {
+    #[link(name = "bcrypt")]
+    extern "system" {
+        #[link_name = "BCryptGenRandom"]
+        fn bcrypt_gen_random(
+            algorithm: *mut std::ffi::c_void,
+            buffer: *mut u8,
+            buffer_len: u32,
+            flags: u32,
+        ) -> i32;
+    }
+
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    let buffer_len = u32::try_from(bytes.len())
+        .map_err(|_| RwError::Message("action dispatch token buffer is too large".to_string()))?;
+    let status = unsafe {
+        bcrypt_gen_random(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            buffer_len,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(RwError::Message(format!(
+            "secure action dispatch token generation failed with NTSTATUS {status:#x}"
+        )))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn fill_action_dispatch_random(_bytes: &mut [u8]) -> RwResult<()> {
+    Err(RwError::Message(
+        "secure action dispatch token generation is unavailable on this platform".to_string(),
+    ))
+}
+
+fn new_action_dispatch_token() -> RwResult<String> {
+    let mut bytes = [0_u8; ACTION_DISPATCH_TOKEN_BYTES];
+    fill_action_dispatch_random(&mut bytes)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
 // Closed set of structured errors carried across the Python FFI boundary. Each
 // marker prefixes exactly one JSON payload schema; user-visible prose is rebuilt
 // by the Python shim and never includes these private wire markers.
@@ -824,28 +880,9 @@ Object.assign(info, fillObservationInfo(el));
 const tagName = info.tag_name || '';
 const inputType = info.input_type || '';
 const pendingFillGuard = globalThis[fillGuardKey];
-if (
-  pendingFillGuard &&
-  typeof pendingFillGuard.valueLikeApplied === 'string'
-) {
-  if (
-    typeof pendingFillGuard.expiresAt !== 'number' ||
-    performance.now() > pendingFillGuard.expiresAt
-  ) {
-    pendingFillGuard.cleanup();
-  } else {
-    pendingFillGuard.expiresAt = performance.now() + 5000;
-    pendingFillGuard.expiryRenewed = false;
-    info.fill_guard_key = fillGuardKey;
-    return { ok: true, info };
-  }
-}
 // Concurrent fills of the same target can vicariously confirm each other. That accepted
 // boundary still produces Playwright's two trusted dispatches with the last writer winning.
-if (
-  pendingFillGuard &&
-  (pendingFillGuard.dispatched || pendingFillGuard.precursorReceived)
-) {
+if (pendingFillGuard && pendingFillGuard.precursorReceived) {
   if (
     typeof pendingFillGuard.expiresAt !== 'number' ||
     performance.now() > pendingFillGuard.expiresAt
@@ -931,7 +968,6 @@ const installFillGuard = () => {
     precursorReceived: false,
     mutationReceived: false,
     untrustedInputReceived: false,
-    dispatched: false,
     committedValue: value,
     activePrecursor: null,
     activeBeforeInput: null,
@@ -953,7 +989,7 @@ const installFillGuard = () => {
       guard.expiresAt = performance.now() + 5000;
       return { cleanedUp: false, passivatedActive };
     }
-    guard.cleanup(guard.dispatched);
+    guard.cleanup();
     return { cleanedUp: true, passivatedActive: false };
   };
   const precursorName = value.length === 0 ? 'keydown' : 'beforeinput';
@@ -1233,22 +1269,20 @@ if ('value' in el) {
         info,
       };
     }
+    const result = { ok: true, info };
+    const binding = globalThis['__rustwright_dispatch__'];
+    if (typeof binding !== 'function') {
+      throw new Error('__rustwright_action_dispatch_binding_unavailable__');
+    }
+    binding(JSON.stringify({
+      dispatchId: __RUSTWRIGHT_FILL_DISPATCH_ID__,
+      token: __RUSTWRIGHT_FILL_DISPATCH_TOKEN__,
+      result,
+      commitment: null,
+    }));
     el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
-    const valueLikeMarker = {
-      valueLikeApplied: String(el.value ?? ''),
-      locator: el,
-      observationInfo: fillObservationInfo,
-      expiresAt: performance.now() + 5000,
-      expiryRenewed: false,
-      cleanup() {
-        if (globalThis[fillGuardKey] === valueLikeMarker) {
-          delete globalThis[fillGuardKey];
-        }
-      },
-    };
-    globalThis[fillGuardKey] = valueLikeMarker;
-    return { ok: true, info };
+    return result;
   }
   el.scrollIntoView({ block: 'center', inline: 'center' });
   if (typeof el.focus === 'function') el.focus({ preventScroll: true });
@@ -1289,7 +1323,7 @@ if (!info.target_focused) {
 return { ok: false, type: 'insert-text', value, info };
 "#;
 
-const LOCATOR_SELECT_APPLY_TEMPLATE: &str = r#"
+const LOCATOR_SELECT_PREPARE_TEMPLATE: &str = r#"
 if (!el) throw new Error('No element matches locator');
 if (!(el instanceof HTMLSelectElement)) throw new Error('Element is not a <select> element');
 const values = __VALUES__;
@@ -1330,23 +1364,77 @@ const allRequestedFound =
 const ready = !hasRequests || (el.multiple ? allRequestedFound : selectedOptions.length > 0);
 if (!ready) {
   return {
-    ok: false,
-    missing: [
-      ...values.filter(value => !foundValues.has(value)).map(value => `value=${value}`),
-      ...labels.filter(label => !foundLabels.has(label)).map(label => `label=${label}`),
-      ...indexes.filter(index => !foundIndexes.has(index)).map(index => `index=${index}`),
-    ],
+    ready: false,
+    result: {
+      ok: false,
+      missing: [
+        ...values.filter(value => !foundValues.has(value)).map(value => `value=${value}`),
+        ...labels.filter(label => !foundLabels.has(label)).map(label => `label=${label}`),
+        ...indexes.filter(index => !foundIndexes.has(index)).map(index => `index=${index}`),
+      ],
+    },
+    payload: null,
   };
 }
-for (const option of options) option.selected = false;
-if (el.multiple) {
-  for (const option of selectedOptions) option.selected = true;
-} else if (selectedOptions.length) {
-  selectedOptions[0].selected = true;
+const committedOptions = el.multiple ? selectedOptions : selectedOptions.slice(0, 1);
+return {
+  ready: true,
+  result: { ok: true, selected: committedOptions.map(option => option.value) },
+  payload: { values, labels, indexes },
+};
+"#;
+
+const LOCATOR_SELECT_DISPATCH_BODY: &str = r#"
+if (!el.isConnected) throw new Error('__rustwright_action_dispatch_not_started__: element detached');
+const values = Array.isArray(prepared.values) ? prepared.values : [];
+const labels = Array.isArray(prepared.labels) ? prepared.labels : [];
+const indexes = Array.isArray(prepared.indexes) ? prepared.indexes : [];
+const options = Array.from(el.options);
+const foundValues = new Set();
+const foundLabels = new Set();
+const foundIndexes = new Set();
+const selectedOptions = [];
+for (const option of options) {
+  let matched = false;
+  for (const value of values) {
+    if (option.value === value || option.label === value) {
+      foundValues.add(value);
+      matched = true;
+    }
+  }
+  for (const label of labels) {
+    if (option.label === label) {
+      foundLabels.add(label);
+      matched = true;
+    }
+  }
+  for (const index of indexes) {
+    if (option.index === index) {
+      foundIndexes.add(index);
+      matched = true;
+    }
+  }
+  if (matched) selectedOptions.push(option);
 }
+const hasRequests = values.length > 0 || labels.length > 0 || indexes.length > 0;
+const allRequestedFound =
+  values.every(value => foundValues.has(value)) &&
+  labels.every(label => foundLabels.has(label)) &&
+  indexes.every(index => foundIndexes.has(index));
+const ready = !hasRequests || (el.multiple ? allRequestedFound : selectedOptions.length > 0);
+if (!ready) {
+  throw new Error('__rustwright_action_dispatch_not_started__: option list changed');
+}
+const committedOptions = el.multiple ? selectedOptions : selectedOptions.slice(0, 1);
+const committedOptionSet = new Set(committedOptions);
+for (const option of options) {
+  option.selected = committedOptionSet.has(option);
+}
+const result = { ok: true, selected: Array.from(el.selectedOptions).map(option => option.value) };
+rustwrightRecordDispatch(result);
 el.dispatchEvent(new Event('input', { bubbles: true }));
 el.dispatchEvent(new Event('change', { bubbles: true }));
-return { ok: true, selected: Array.from(el.selectedOptions).map(option => option.value) };
+return new Promise(resolve => setTimeout(() => resolve(result), 0));
 "#;
 
 const LOCATOR_FAST_PATH_TEMPLATE: &str = r#"
@@ -1440,6 +1528,12 @@ struct LocatorFillScript {
 }
 
 #[derive(Debug)]
+struct LocatorDispatchScript {
+    prepare_body: String,
+    dispatch_body: String,
+}
+
+#[derive(Debug)]
 struct LocatorFastPathScript {
     body: String,
     fill_guard_key: Option<String>,
@@ -1462,11 +1556,11 @@ fn locator_fill_body(value: &str, strict: bool, forced: bool) -> RwResult<Locato
     Ok(LocatorFillScript { body, guard_key })
 }
 
-fn locator_select_apply_body(
+fn locator_select_apply_script(
     values_json: &str,
     labels_json: &str,
     indexes_json: &str,
-) -> RwResult<String> {
+) -> RwResult<LocatorDispatchScript> {
     let values: Value = serde_json::from_str(values_json)?;
     let labels: Value = serde_json::from_str(labels_json)?;
     let indexes: Value = serde_json::from_str(indexes_json)?;
@@ -1475,10 +1569,13 @@ fn locator_select_apply_body(
             "locator select arguments must be arrays".to_string(),
         ));
     }
-    Ok(LOCATOR_SELECT_APPLY_TEMPLATE
-        .replace("__VALUES__", &values.to_string())
-        .replace("__LABELS__", &labels.to_string())
-        .replace("__INDEXES__", &indexes.to_string()))
+    Ok(LocatorDispatchScript {
+        prepare_body: LOCATOR_SELECT_PREPARE_TEMPLATE
+            .replace("__VALUES__", &values.to_string())
+            .replace("__LABELS__", &labels.to_string())
+            .replace("__INDEXES__", &indexes.to_string()),
+        dispatch_body: LOCATOR_SELECT_DISPATCH_BODY.to_string(),
+    })
 }
 
 fn locator_check_state_body() -> String {
@@ -3284,7 +3381,10 @@ multiline-compatible = """4.5.6"""
                     };
                     let method = command["method"].as_str().unwrap();
                     let result = match method {
-                        "Page.getFrameTree" => json!({}),
+                        "Page.getFrameTree" => {
+                            json!({ "frameTree": { "frame": { "id": "test-frame" } } })
+                        }
+                        "Page.createIsolatedWorld" => json!({ "executionContextId": 1 }),
                         "Runtime.evaluate" => {
                             json!({ "result": { "type": "boolean", "value": true } })
                         }
@@ -4839,19 +4939,28 @@ multiline-compatible = """4.5.6"""
         assert!(fill.body.contains("value = value.toLowerCase();"));
         assert!(fill.body.contains("composed: true"));
         assert!(fill.body.contains("expiresAt: guardDeadline"));
-        assert!(fill
+        assert!(!fill.body.contains("valueLikeApplied"));
+        assert!(fill.body.contains("__RUSTWRIGHT_FILL_DISPATCH_ID__"));
+        assert!(fill.body.contains("__RUSTWRIGHT_FILL_DISPATCH_TOKEN__"));
+        let value_like_mutation = fill.body.find("valueSetter.call(el, value);").unwrap();
+        let value_like_receipt = fill.body.find("binding(JSON.stringify({").unwrap();
+        let value_like_event = fill
             .body
-            .contains("valueLikeApplied: String(el.value ?? '')"));
+            .find("el.dispatchEvent(new Event('input'")
+            .unwrap();
+        assert!(value_like_mutation < value_like_receipt);
+        assert!(value_like_receipt < value_like_event);
         assert!(fill
             .body
             .contains(&format!("const fillGuardKey = {:?};", fill.guard_key)));
 
-        let select = locator_select_apply_body(r#"["a"]"#, "[]", "[1]").unwrap();
+        let select = locator_select_apply_script(r#"["a"]"#, "[]", "[1]").unwrap();
         for placeholder in ["__VALUES__", "__LABELS__", "__INDEXES__"] {
-            assert!(!select.contains(placeholder));
+            assert!(!select.prepare_body.contains(placeholder));
         }
-        assert!(select.contains(r#"const values = ["a"];"#));
-        assert!(select.contains("const indexes = [1];"));
+        assert!(select.prepare_body.contains(r#"const values = ["a"];"#));
+        assert!(select.prepare_body.contains("const indexes = [1];"));
+        assert!(select.dispatch_body.contains("el.dispatchEvent"));
     }
 
     #[test]
@@ -5351,8 +5460,9 @@ multiline-compatible = """4.5.6"""
             expression.matches("guard.expiryRenewed = false;").count(),
             1
         );
-        assert!(expression.contains("typeof guard.valueLikeApplied === 'string'"));
-        assert!(expression.contains("ok: true,"));
+        assert!(expression.contains("if (!guard || !guard.precursorReceived) return null;"));
+        assert!(expression.contains("type: 'observe-dispatch'"));
+        assert!(!expression.contains("valueLikeApplied"));
     }
 
     #[test]
@@ -7366,6 +7476,7 @@ multiline-compatible = """4.5.6"""
                 "params": {
                     "requestId": "request-1",
                     "loaderId": "loader-1",
+                    "frameId": "frame-1",
                     "type": "Document",
                     "response": {
                         "url": "https://example.test/observed",
@@ -8422,6 +8533,12 @@ multiline-compatible = """4.5.6"""
                         json!({ "frameTree": { "frame": { "id": "frame-main", "url": "https://example.test/dialog" } } }),
                     )
                     .await;
+                let utility_world = harness.next_command("Page.createIsolatedWorld").await;
+                assert_eq!(
+                    utility_world.pointer("/params/frameId").and_then(Value::as_str),
+                    Some("frame-main")
+                );
+                harness.reply(&utility_world, json!({ "executionContextId": 1 }));
                 harness
                     .reply_next(
                         "Runtime.evaluate",
@@ -8451,6 +8568,12 @@ multiline-compatible = """4.5.6"""
                         json!({ "frameTree": { "frame": { "id": "frame-main", "url": "https://example.test/dialog" } } }),
                     )
                     .await;
+                let utility_world = harness.next_command("Page.createIsolatedWorld").await;
+                assert_eq!(
+                    utility_world.pointer("/params/frameId").and_then(Value::as_str),
+                    Some("frame-main")
+                );
+                harness.reply(&utility_world, json!({ "executionContextId": 2 }));
                 harness
                     .reply_next(
                         "Runtime.evaluate",
@@ -8591,6 +8714,13 @@ multiline-compatible = """4.5.6"""
                 )
                 .await;
 
+            let utility_world = harness.next_command("Page.createIsolatedWorld").await;
+            assert_eq!(
+                utility_world.pointer("/params/frameId").and_then(Value::as_str),
+                Some("frame-main")
+            );
+            harness.reply(&utility_world, json!({ "executionContextId": 1 }));
+
             if matches!(action, PublicSettledAction::Scroll) {
                 let dispatch = harness.next_command("Runtime.evaluate").await;
                 assert!(
@@ -8639,6 +8769,12 @@ multiline-compatible = """4.5.6"""
                     json!({ "frameTree": { "frame": { "id": "frame-main", "url": "https://example.test/action" } } }),
                 )
                 .await;
+            let utility_world = harness.next_command("Page.createIsolatedWorld").await;
+            assert_eq!(
+                utility_world.pointer("/params/frameId").and_then(Value::as_str),
+                Some("frame-main")
+            );
+            harness.reply(&utility_world, json!({ "executionContextId": 2 }));
             harness
                 .reply_next(
                     "Runtime.evaluate",
@@ -8654,6 +8790,12 @@ multiline-compatible = """4.5.6"""
             harness.reply_next("Runtime.releaseObject", json!({})).await;
 
             if matches!(action, PublicSettledAction::Check) {
+                let utility_world = harness.next_command("Page.createIsolatedWorld").await;
+                assert_eq!(
+                    utility_world.pointer("/params/frameId").and_then(Value::as_str),
+                    Some("frame-main")
+                );
+                harness.reply(&utility_world, json!({ "executionContextId": 3 }));
                 harness
                     .reply_next(
                         "Runtime.evaluate",
@@ -8693,6 +8835,12 @@ multiline-compatible = """4.5.6"""
                 )
                 .await;
             if matches!(action, PublicSettledAction::Check) {
+                let utility_world = harness.next_command("Page.createIsolatedWorld").await;
+                assert_eq!(
+                    utility_world.pointer("/params/frameId").and_then(Value::as_str),
+                    Some("frame-main")
+                );
+                harness.reply(&utility_world, json!({ "executionContextId": 4 }));
                 harness
                     .reply_next(
                         "Runtime.evaluate",
@@ -8749,11 +8897,12 @@ multiline-compatible = """4.5.6"""
             &client,
             &mut receiver,
             event_cursor,
+            None,
             "page-session",
             "load",
+            Some("frame-1"),
             None,
             Some("https://example.test/app#second"),
-            Some("frame-1"),
             Some("https://example.test/app#second"),
             false,
             "Page.go_forward",
@@ -8764,6 +8913,844 @@ multiline-compatible = """4.5.6"""
 
         assert!(response.response.is_none());
         assert!(response.same_document);
+    }
+
+    #[tokio::test]
+    async fn history_wait_completes_on_back_forward_cache_restore_without_response() {
+        let mut harness = navigation_test_harness(4);
+        let client = Arc::clone(&harness.page.browser.client);
+        let (mut receiver, event_cursor) = client.subscribe_with_cursor();
+        let navigate =
+            send_history_entry_navigation(&client, 1, "page-session", Duration::from_millis(100));
+        let reply = async {
+            harness
+                .reply_next("Page.navigateToHistoryEntry", json!({}))
+                .await;
+        };
+        let (navigate_result, ()) = tokio::join!(navigate, reply);
+        let restore_initiation_cursor = navigate_result.expect("history command should complete");
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "frame-1",
+                    "url": "https://example.test/restored"
+                },
+                "type": "BackForwardCacheRestore"
+            }
+        }));
+
+        let response = wait_for_navigation(
+            &client,
+            &mut receiver,
+            event_cursor,
+            Some(restore_initiation_cursor),
+            "page-session",
+            "load",
+            Some("frame-1"),
+            None,
+            Some("https://example.test/restored"),
+            Some("https://example.test/restored"),
+            false,
+            "Page.go_back",
+            OperationDeadline::new(Duration::from_millis(100)),
+        )
+        .await
+        .expect("back-forward cache restoration should complete without a network response");
+
+        assert!(response.response.is_none());
+        assert!(!response.same_document);
+    }
+
+    #[tokio::test]
+    async fn history_wait_accepts_back_forward_cache_restore_logged_between_send_and_response() {
+        let mut harness = navigation_test_harness(4);
+        let client = Arc::clone(&harness.page.browser.client);
+        let (mut receiver, event_cursor) = client.subscribe_with_cursor();
+        let navigate =
+            send_history_entry_navigation(&client, 1, "page-session", Duration::from_millis(100));
+        let restore_before_response = async {
+            let command = harness.next_command("Page.navigateToHistoryEntry").await;
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.frameNavigated",
+                "params": {
+                    "frame": {
+                        "id": "frame-1",
+                        "url": "https://example.test/restored"
+                    },
+                    "type": "BackForwardCacheRestore"
+                }
+            }));
+            harness.reply(&command, json!({}));
+        };
+        let (navigate_result, ()) = tokio::join!(navigate, restore_before_response);
+        let restore_initiation_cursor =
+            navigate_result.expect("history command should complete after restore");
+
+        let response = wait_for_navigation(
+            &client,
+            &mut receiver,
+            event_cursor,
+            Some(restore_initiation_cursor),
+            "page-session",
+            "load",
+            Some("frame-1"),
+            None,
+            Some("https://example.test/restored"),
+            Some("https://example.test/restored"),
+            false,
+            "Page.go_back",
+            OperationDeadline::new(Duration::from_millis(100)),
+        )
+        .await
+        .expect("restore logged before the command response should complete traversal");
+
+        assert!(response.response.is_none());
+        assert!(!response.same_document);
+    }
+
+    #[tokio::test]
+    async fn history_wait_rejects_back_forward_cache_restore_before_initiation() {
+        for replay_pre_send_event in [false, true] {
+            let mut harness = navigation_test_harness(if replay_pre_send_event { 1 } else { 4 });
+            let client = Arc::clone(&harness.page.browser.client);
+            let (mut receiver, event_cursor) = client.subscribe_with_cursor();
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.frameNavigated",
+                "params": {
+                    "frame": {
+                        "id": "frame-1",
+                        "url": "https://example.test/restored"
+                    },
+                    "type": "BackForwardCacheRestore"
+                }
+            }));
+            if replay_pre_send_event {
+                for sequence in 0..2 {
+                    harness.emit(json!({
+                        "sessionId": "other-session",
+                        "method": "Page.loadEventFired",
+                        "params": { "sequence": sequence }
+                    }));
+                }
+            }
+
+            let navigate = send_history_entry_navigation(
+                &client,
+                1,
+                "page-session",
+                Duration::from_millis(100),
+            );
+            let reply = async {
+                harness
+                    .reply_next("Page.navigateToHistoryEntry", json!({}))
+                    .await;
+            };
+            let (navigate_result, ()) = tokio::join!(navigate, reply);
+            let restore_initiation_cursor =
+                navigate_result.expect("history command should complete");
+
+            let result = wait_for_navigation(
+                &client,
+                &mut receiver,
+                event_cursor,
+                Some(restore_initiation_cursor),
+                "page-session",
+                "commit",
+                Some("frame-1"),
+                None,
+                Some("https://example.test/restored"),
+                Some("https://example.test/restored"),
+                false,
+                "Page.go_back",
+                OperationDeadline::new(Duration::from_millis(30)),
+            )
+            .await;
+            assert!(matches!(result, Err(RwError::Timeout(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn history_navigation_resolves_missing_main_frame_before_matching_events() {
+        let mut harness = navigation_test_harness(8);
+        assert!(harness.page.main_frame_id.lock().unwrap().is_none());
+        let page = Arc::clone(&harness.page);
+        let client = Arc::clone(&page.browser.client);
+        let resolve_frame = page.main_frame_id(&client, "page-session", Duration::from_millis(100));
+        let respond_to_frame_tree = async {
+            harness
+                .reply_next(
+                    "Page.getFrameTree",
+                    json!({ "frameTree": { "frame": { "id": "main" } } }),
+                )
+                .await;
+        };
+        let (frame_id, ()) = tokio::join!(resolve_frame, respond_to_frame_tree);
+        let frame_id = frame_id.expect("history navigation should resolve the main frame");
+        assert_eq!(frame_id, "main");
+
+        let (mut receiver, event_cursor) = client.subscribe_with_cursor();
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.navigatedWithinDocument",
+            "params": {
+                "frameId": "child",
+                "url": "https://example.test/saved"
+            }
+        }));
+        let navigation = wait_for_navigation(
+            &client,
+            &mut receiver,
+            event_cursor,
+            None,
+            "page-session",
+            "load",
+            Some(&frame_id),
+            None,
+            Some("https://example.test/saved"),
+            Some("https://example.test/saved"),
+            false,
+            "Page.go_back",
+            OperationDeadline::new(Duration::from_millis(200)),
+        );
+        tokio::pin!(navigation);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut navigation)
+                .await
+                .is_err(),
+            "a matching child-frame URL must not complete main-frame history traversal"
+        );
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.navigatedWithinDocument",
+            "params": {
+                "frameId": "main",
+                "url": "https://example.test/saved"
+            }
+        }));
+        let result = tokio::time::timeout(Duration::from_millis(100), &mut navigation)
+            .await
+            .expect("main-frame event should complete promptly")
+            .expect("main-frame event should complete history navigation");
+        assert!(result.same_document);
+    }
+
+    #[tokio::test]
+    async fn history_wait_ignores_concurrent_chain_with_expected_url_only_in_ancestry() {
+        let harness = navigation_test_harness(8);
+        let client = Arc::clone(&harness.page.browser.client);
+        let (mut receiver, event_cursor) = client.subscribe_with_cursor();
+        for (url, redirected) in [
+            ("https://example.test/other", false),
+            ("https://example.test/saved", true),
+            ("https://example.test/blocked", true),
+        ] {
+            let mut params = json!({
+                "requestId": "concurrent-chain",
+                "loaderId": "",
+                "frameId": "main",
+                "type": "Document",
+                "documentURL": url,
+                "request": {
+                    "url": url,
+                    "method": "GET",
+                    "headers": {},
+                },
+            });
+            if redirected {
+                params["redirectResponse"] = json!({ "status": 302 });
+            }
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Network.requestWillBeSent",
+                "params": params,
+            }));
+        }
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.loadingFailed",
+            "params": {
+                "requestId": "concurrent-chain",
+                "type": "Document",
+                "errorText": "net::ERR_FAILED",
+            },
+        }));
+
+        let navigation = wait_for_navigation(
+            &client,
+            &mut receiver,
+            event_cursor,
+            None,
+            "page-session",
+            "load",
+            Some("main"),
+            None,
+            Some("https://example.test/saved"),
+            Some("https://example.test/saved"),
+            false,
+            "Page.go_back",
+            OperationDeadline::new(Duration::from_millis(250)),
+        );
+        tokio::pin!(navigation);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut navigation)
+                .await
+                .is_err(),
+            "a concurrent chain that merely passes through the expected URL must not fail history"
+        );
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.navigatedWithinDocument",
+            "params": {
+                "frameId": "main",
+                "url": "https://example.test/saved",
+            },
+        }));
+        let result = tokio::time::timeout(Duration::from_millis(100), &mut navigation)
+            .await
+            .expect("owned main-frame event should complete promptly")
+            .expect("concurrent failure must not own history navigation");
+        assert!(result.same_document);
+    }
+
+    #[tokio::test]
+    async fn history_wait_ignores_concurrent_document_response_and_load() {
+        let harness = navigation_test_harness(16);
+        let client = Arc::clone(&harness.page.browser.client);
+        let (mut receiver, event_cursor) = client.subscribe_with_cursor();
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "child",
+                "loaderId": "",
+                "frameId": "child",
+                "type": "Document",
+                "documentURL": "https://example.test/saved",
+                "request": {
+                    "url": "https://example.test/saved",
+                    "method": "GET",
+                    "headers": {},
+                },
+            },
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.responseReceived",
+            "params": {
+                "requestId": "child",
+                "loaderId": "",
+                "frameId": "child",
+                "type": "Document",
+                "response": {
+                    "url": "https://example.test/saved",
+                    "status": 200,
+                    "statusText": "OK",
+                    "headers": {},
+                },
+            },
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.loadEventFired",
+            "params": {},
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "concurrent",
+                "loaderId": "",
+                "frameId": "main",
+                "type": "Document",
+                "documentURL": "https://example.test/other",
+                "request": {
+                    "url": "https://example.test/other",
+                    "method": "GET",
+                    "headers": {},
+                },
+            },
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.responseReceived",
+            "params": {
+                "requestId": "concurrent",
+                "loaderId": "",
+                "frameId": "main",
+                "type": "Document",
+                "response": {
+                    "url": "https://example.test/other",
+                    "status": 200,
+                    "statusText": "OK",
+                    "headers": {},
+                },
+            },
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.loadEventFired",
+            "params": {},
+        }));
+
+        let navigation = wait_for_navigation(
+            &client,
+            &mut receiver,
+            event_cursor,
+            None,
+            "page-session",
+            "load",
+            Some("main"),
+            None,
+            Some("https://example.test/saved"),
+            Some("https://example.test/saved"),
+            false,
+            "Page.go_back",
+            OperationDeadline::new(Duration::from_millis(300)),
+        );
+        tokio::pin!(navigation);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut navigation)
+                .await
+                .is_err(),
+            "child-frame and concurrent chains must not complete owned history"
+        );
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "owned",
+                "loaderId": "",
+                "frameId": "main",
+                "type": "Document",
+                "documentURL": "https://example.test/saved",
+                "request": {
+                    "url": "https://example.test/saved",
+                    "method": "GET",
+                    "headers": {},
+                },
+            },
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.responseReceived",
+            "params": {
+                "requestId": "owned",
+                "loaderId": "",
+                "frameId": "main",
+                "type": "Document",
+                "response": {
+                    "url": "https://example.test/saved",
+                    "status": 200,
+                    "statusText": "OK",
+                    "headers": {},
+                },
+            },
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.loadEventFired",
+            "params": {},
+        }));
+
+        let result = tokio::time::timeout(Duration::from_millis(100), &mut navigation)
+            .await
+            .expect("owned response and load should complete promptly")
+            .expect("owned response and load should complete history navigation");
+        assert_eq!(
+            result
+                .response
+                .as_ref()
+                .and_then(|response| response.get("url"))
+                .and_then(Value::as_str),
+            Some("https://example.test/saved")
+        );
+        assert!(!result.same_document);
+    }
+
+    #[tokio::test]
+    async fn lagged_history_replay_preserves_event_order() {
+        let harness = navigation_test_harness(2);
+        let client = Arc::clone(&harness.page.browser.client);
+        let (mut receiver, event_cursor) = client.subscribe_with_cursor();
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.loadEventFired",
+            "params": {},
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "owned",
+                "loaderId": "",
+                "frameId": "main",
+                "type": "Document",
+                "documentURL": "https://example.test/saved",
+                "request": {
+                    "url": "https://example.test/saved",
+                    "method": "GET",
+                    "headers": {},
+                },
+            },
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.responseReceived",
+            "params": {
+                "requestId": "owned",
+                "loaderId": "",
+                "frameId": "main",
+                "type": "Document",
+                "response": {
+                    "url": "https://example.test/saved",
+                    "status": 200,
+                    "statusText": "OK",
+                    "headers": {},
+                },
+            },
+        }));
+
+        let navigation = wait_for_navigation(
+            &client,
+            &mut receiver,
+            event_cursor,
+            None,
+            "page-session",
+            "load",
+            Some("main"),
+            None,
+            Some("https://example.test/saved"),
+            Some("https://example.test/saved"),
+            false,
+            "Page.go_back",
+            OperationDeadline::new(Duration::from_millis(500)),
+        );
+        tokio::pin!(navigation);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), &mut navigation)
+                .await
+                .is_err(),
+            "a replayed bare load before the owned response must stay pending"
+        );
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.loadEventFired",
+            "params": {},
+        }));
+        let result = tokio::time::timeout(Duration::from_millis(100), &mut navigation)
+            .await
+            .expect("owned response followed by load should complete promptly")
+            .expect("owned response followed by load should complete history navigation");
+        assert_eq!(
+            result
+                .response
+                .as_ref()
+                .and_then(|response| response.get("url"))
+                .and_then(Value::as_str),
+            Some("https://example.test/saved")
+        );
+    }
+
+    #[test]
+    fn action_dispatch_receipt_survives_event_log_eviction() {
+        let harness = navigation_test_harness(8);
+        let dispatch = harness
+            .page
+            .browser
+            .client
+            .begin_action_dispatch("page-session", "dispatch-1", "authentic-token")
+            .unwrap();
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.bindingCalled",
+            "params": {
+                "name": ACTION_DISPATCH_BINDING_NAME,
+                "payload": serde_json::to_string(&json!({
+                    "dispatchId": "dispatch-1",
+                    "token": "authentic-token",
+                    "result": { "ok": true, "selected": ["b"] },
+                    "commitment": null,
+                }))
+                .unwrap(),
+            },
+        }));
+        for index in 0..=CDP_EVENT_LOG_LIMIT {
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Runtime.consoleAPICalled",
+                "params": { "index": index },
+            }));
+        }
+
+        assert!(harness.event_log.lock().unwrap().oldest_seq() > 0);
+        assert_eq!(
+            dispatch.single_evaluation_receipt(),
+            Some(json!({ "ok": true, "selected": ["b"] }).to_string())
+        );
+        drop(dispatch);
+        assert!(harness
+            .event_log
+            .lock()
+            .unwrap()
+            .action_dispatch_receipts
+            .is_empty());
+    }
+
+    #[test]
+    fn commencing_receipt_is_terminal_only_for_single_evaluation_dispatch() {
+        let harness = navigation_test_harness(8);
+        let dispatch = harness
+            .page
+            .browser
+            .client
+            .begin_action_dispatch("page-session", "dispatch-1", "authentic-token")
+            .unwrap();
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.bindingCalled",
+            "params": {
+                "name": ACTION_DISPATCH_BINDING_NAME,
+                "payload": serde_json::to_string(&json!({
+                    "dispatchId": "dispatch-1",
+                    "token": "authentic-token",
+                    "result": { "ok": true },
+                    "commitment": "commencing",
+                }))
+                .unwrap(),
+            },
+        }));
+
+        assert_eq!(
+            dispatch.single_evaluation_receipt(),
+            Some(json!({ "ok": true }).to_string())
+        );
+        assert_eq!(dispatch.terminal_receipt(), None);
+        assert!(dispatch.has_commencing_receipt());
+    }
+
+    #[tokio::test]
+    async fn action_dispatch_token_failure_releases_element_after_deadline_expires() {
+        let mut harness = navigation_test_harness(8);
+        let page = Arc::clone(&harness.page);
+        let resolved = ResolvedLocatorActionElement {
+            resolution: LocatorSessionResolution {
+                session_id: "page-session".to_string(),
+                frame_id: None,
+                locator_json: r#"{"kind":"css","selector":"button"}"#.to_string(),
+            },
+            object_id: "resolved-object".to_string(),
+        };
+        let generation = action_dispatch_token_for_element(
+            &page,
+            &resolved,
+            OperationDeadline::new(Duration::ZERO),
+            || Err(RwError::Message("token generation failed".to_string())),
+        );
+        let release = async {
+            let command = harness.next_command("Runtime.releaseObject").await;
+            assert_eq!(command["sessionId"], "page-session");
+            assert_eq!(command["params"]["objectId"], "resolved-object");
+            harness.reply(&command, json!({}));
+        };
+
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(generation, release)
+        })
+        .await
+        .expect("release command after expired action deadline");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "token generation failed".to_string()
+        );
+    }
+
+    #[test]
+    fn action_dispatch_pending_proof_is_not_evicted_by_forged_receipts() {
+        let mut receipts = ActionDispatchReceiptMap::default();
+        assert!(receipts.register("real".to_string(), "authentic-token".to_string()));
+        for index in 0..2_000 {
+            assert!(!receipts.record(
+                &format!("dummy-{index}"),
+                "fake-token",
+                &json!(index),
+                ActionDispatchCommitmentKind::Terminal,
+            ));
+        }
+        assert_eq!(receipts.pending.len(), 1);
+        assert_eq!(receipts.receipt("real"), None);
+
+        let genuine = json!({ "ok": true, "selected": ["b"] });
+        assert!(receipts.record(
+            "real",
+            "authentic-token",
+            &genuine,
+            ActionDispatchCommitmentKind::Terminal,
+        ));
+        for index in 0..2_000 {
+            assert!(!receipts.record(
+                "real",
+                &format!("fake-token-{index}"),
+                &json!("forged"),
+                ActionDispatchCommitmentKind::Terminal,
+            ));
+        }
+        let stored = ActionDispatchReceipt {
+            result: genuine.to_string(),
+            kind: ActionDispatchCommitmentKind::Terminal,
+        };
+        assert_eq!(receipts.pending.len(), 1);
+        assert_eq!(receipts.receipt("real"), Some(stored.clone()));
+        assert_eq!(receipts.remove("real"), Some(stored));
+        assert!(receipts.pending.is_empty());
+    }
+
+    #[test]
+    fn action_dispatch_forged_events_do_not_grow_receipt_storage() {
+        let event = |session_id: &str, dispatch_id: String, token: &str, result: Value| {
+            json!({
+                "sessionId": session_id,
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "name": ACTION_DISPATCH_BINDING_NAME,
+                    "payload": serde_json::to_string(&json!({
+                        "dispatchId": dispatch_id,
+                        "token": token,
+                        "result": result,
+                        "commitment": null,
+                    }))
+                    .unwrap(),
+                },
+            })
+        };
+        let mut event_log = CdpEventLog::new();
+        for index in 0..2_000 {
+            event_log.record_action_dispatch_receipt(&event(
+                "forged-session",
+                format!("dummy-{index}"),
+                "fake-token",
+                json!("forged"),
+            ));
+        }
+        assert!(event_log.action_dispatch_receipts.is_empty());
+
+        assert!(event_log.register_action_dispatch(
+            "page-session",
+            "real".to_string(),
+            "authentic-token".to_string(),
+        ));
+        event_log.record_action_dispatch_receipt(&event(
+            "other-session",
+            "real".to_string(),
+            "authentic-token",
+            json!("wrong session"),
+        ));
+        event_log.record_action_dispatch_receipt(&event(
+            "page-session",
+            "real".to_string(),
+            "fake-token",
+            json!("wrong token"),
+        ));
+        event_log.record_action_dispatch_receipt(&event(
+            "page-session",
+            "unknown".to_string(),
+            "authentic-token",
+            json!("wrong id"),
+        ));
+        assert_eq!(event_log.action_dispatch_receipts.len(), 1);
+        assert_eq!(
+            event_log.action_dispatch_receipts["page-session"]
+                .pending
+                .len(),
+            1
+        );
+        assert_eq!(
+            event_log.action_dispatch_receipt("page-session", "real"),
+            None
+        );
+
+        event_log.record_action_dispatch_receipt(&event(
+            "page-session",
+            "real".to_string(),
+            "authentic-token",
+            json!("genuine"),
+        ));
+        event_log.record_action_dispatch_receipt(&event(
+            "page-session",
+            "real".to_string(),
+            "fake-token",
+            json!("forged overwrite"),
+        ));
+        assert_eq!(
+            event_log.settle_action_dispatch("page-session", "real"),
+            Some(json!("genuine").to_string())
+        );
+        assert!(event_log.action_dispatch_receipts.is_empty());
+    }
+
+    #[test]
+    fn action_dispatch_tokens_are_fresh_256_bit_os_random_values() {
+        let first = new_action_dispatch_token().unwrap();
+        let second = new_action_dispatch_token().unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(first)
+                .unwrap()
+                .len(),
+            ACTION_DISPATCH_TOKEN_BYTES
+        );
+        assert_eq!(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(second)
+                .unwrap()
+                .len(),
+            ACTION_DISPATCH_TOKEN_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn action_dispatch_binding_registration_failure_is_deterministic() {
+        let mut harness = navigation_test_harness(8);
+        let client = Arc::clone(&harness.page.browser.client);
+        let registration = enable_action_dispatch_binding_for_session(
+            &client,
+            "page-session",
+            Duration::from_millis(100),
+        );
+        let reject = async {
+            let command = harness.next_command("Runtime.addBinding").await;
+            assert_eq!(
+                command["params"]["name"],
+                json!(ACTION_DISPATCH_BINDING_NAME)
+            );
+            dispatch_cdp_payload(
+                json!({
+                    "id": command["id"],
+                    "error": { "message": "binding registration rejected" },
+                }),
+                Arc::clone(&harness.pending),
+                harness.events.clone(),
+                Arc::clone(&harness.event_log),
+            );
+        };
+        let (result, ()) = tokio::join!(registration, reject);
+        let error = result
+            .expect_err("binding registration must fail closed")
+            .to_string();
+        assert!(
+            error.contains("Rustwright action dispatch binding registration failed")
+                && error.contains("binding registration rejected"),
+            "unexpected binding failure: {error}"
+        );
     }
 
     #[tokio::test]
@@ -8797,7 +9784,7 @@ multiline-compatible = """4.5.6"""
                 .await;
         };
 
-        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+        let (result, ()) = tokio::time::timeout(Duration::from_millis(500), async {
             tokio::join!(navigation, responder)
         })
         .await
@@ -8830,7 +9817,7 @@ multiline-compatible = """4.5.6"""
             harness.next_command("Runtime.evaluate").await;
         };
 
-        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+        let (result, ()) = tokio::time::timeout(Duration::from_millis(210), async {
             tokio::join!(navigation, responder)
         })
         .await
@@ -8880,7 +9867,7 @@ multiline-compatible = """4.5.6"""
                 .await;
         };
 
-        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+        let (result, ()) = tokio::time::timeout(Duration::from_millis(300), async {
             tokio::join!(navigation, responder)
         })
         .await
@@ -8938,7 +9925,7 @@ multiline-compatible = """4.5.6"""
             evaluate_count
         };
 
-        let (result, evaluate_count) = tokio::time::timeout(Duration::from_secs(2), async {
+        let (result, evaluate_count) = tokio::time::timeout(Duration::from_millis(300), async {
             tokio::join!(navigation, responder)
         })
         .await
@@ -9035,6 +10022,7 @@ multiline-compatible = """4.5.6"""
         let mut log = CdpEventLog {
             next_seq: 10,
             events: VecDeque::with_capacity(CDP_EVENT_LOG_LIMIT),
+            action_dispatch_receipts: HashMap::new(),
         };
         let initial = json!({
             "sessionId": "page-session",
@@ -9687,6 +10675,100 @@ fn cdp_write_state_label(state: u8) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActionDispatchCommitmentKind {
+    Terminal,
+    Commencing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActionDispatchReceipt {
+    result: String,
+    kind: ActionDispatchCommitmentKind,
+}
+
+struct PendingActionDispatch {
+    token: String,
+    receipt: Option<ActionDispatchReceipt>,
+}
+
+#[derive(Default)]
+struct ActionDispatchReceiptMap {
+    pending: HashMap<String, PendingActionDispatch>,
+}
+
+impl ActionDispatchReceiptMap {
+    fn register(&mut self, dispatch_id: String, token: String) -> bool {
+        if self.pending.contains_key(&dispatch_id) {
+            return false;
+        }
+        self.pending.insert(
+            dispatch_id,
+            PendingActionDispatch {
+                token,
+                receipt: None,
+            },
+        );
+        true
+    }
+
+    fn record(
+        &mut self,
+        dispatch_id: &str,
+        token: &str,
+        result: &Value,
+        kind: ActionDispatchCommitmentKind,
+    ) -> bool {
+        let Some(pending) = self.pending.get_mut(dispatch_id) else {
+            return false;
+        };
+        if pending.token != token || pending.receipt.is_some() {
+            return false;
+        }
+        pending.receipt = Some(ActionDispatchReceipt {
+            result: result.to_string(),
+            kind,
+        });
+        true
+    }
+
+    fn receipt(&self, dispatch_id: &str) -> Option<ActionDispatchReceipt> {
+        self.pending.get(dispatch_id)?.receipt.clone()
+    }
+
+    fn remove(&mut self, dispatch_id: &str) -> Option<ActionDispatchReceipt> {
+        self.pending.remove(dispatch_id)?.receipt
+    }
+}
+
+fn action_dispatch_receipt_from_event(
+    event: &Value,
+) -> Option<(String, String, String, Value, ActionDispatchCommitmentKind)> {
+    if event.get("method").and_then(Value::as_str) != Some("Runtime.bindingCalled")
+        || event.pointer("/params/name").and_then(Value::as_str)
+            != Some(ACTION_DISPATCH_BINDING_NAME)
+    {
+        return None;
+    }
+    let session_id = event.get("sessionId").and_then(Value::as_str)?.to_string();
+    let payload: Value =
+        serde_json::from_str(event.pointer("/params/payload").and_then(Value::as_str)?).ok()?;
+    let dispatch_id = payload
+        .get("dispatchId")
+        .and_then(Value::as_str)?
+        .to_string();
+    let token = payload.get("token").and_then(Value::as_str)?.to_string();
+    let kind = match payload.get("commitment") {
+        None | Some(Value::Null) => ActionDispatchCommitmentKind::Terminal,
+        Some(Value::String(commitment)) if commitment == "commencing" => {
+            ActionDispatchCommitmentKind::Commencing
+        }
+        _ => return None,
+    };
+    let result = payload.get("result")?.clone();
+    Some((session_id, dispatch_id, token, result, kind))
+}
+
 struct CdpClient {
     write_tx: mpsc::UnboundedSender<CdpOutgoing>,
     pending: CdpPendingMap,
@@ -9700,6 +10782,49 @@ struct CdpClient {
     sent_context_dispose_count: AtomicU64,
     alive: Arc<AtomicBool>,
     alive_tx: watch::Sender<bool>,
+}
+struct PendingActionDispatchGuard<'a> {
+    client: &'a CdpClient,
+    session_id: String,
+    dispatch_id: String,
+    token: String,
+}
+
+impl PendingActionDispatchGuard<'_> {
+    fn dispatch_id(&self) -> &str {
+        &self.dispatch_id
+    }
+
+    fn token(&self) -> &str {
+        &self.token
+    }
+
+    fn receipt_with_kind(&self) -> Option<ActionDispatchReceipt> {
+        self.client
+            .action_dispatch_receipt(&self.session_id, &self.dispatch_id)
+    }
+
+    fn single_evaluation_receipt(&self) -> Option<String> {
+        self.receipt_with_kind().map(|receipt| receipt.result)
+    }
+
+    fn terminal_receipt(&self) -> Option<String> {
+        self.receipt_with_kind()
+            .filter(|receipt| receipt.kind == ActionDispatchCommitmentKind::Terminal)
+            .map(|receipt| receipt.result)
+    }
+
+    fn has_commencing_receipt(&self) -> bool {
+        self.receipt_with_kind()
+            .is_some_and(|receipt| receipt.kind == ActionDispatchCommitmentKind::Commencing)
+    }
+}
+
+impl Drop for PendingActionDispatchGuard<'_> {
+    fn drop(&mut self) {
+        self.client
+            .settle_action_dispatch(&self.session_id, &self.dispatch_id);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9722,6 +10847,7 @@ struct CdpSendOutcome {
 struct CdpEventLog {
     next_seq: u64,
     events: VecDeque<(u64, Value)>,
+    action_dispatch_receipts: HashMap<String, ActionDispatchReceiptMap>,
 }
 
 impl CdpEventLog {
@@ -9729,6 +10855,7 @@ impl CdpEventLog {
         Self {
             next_seq: 0,
             events: VecDeque::with_capacity(CDP_EVENT_LOG_LIMIT),
+            action_dispatch_receipts: HashMap::new(),
         }
     }
 
@@ -9744,6 +10871,48 @@ impl CdpEventLog {
             self.events.pop_front();
         }
     }
+    fn register_action_dispatch(
+        &mut self,
+        session_id: &str,
+        dispatch_id: String,
+        token: String,
+    ) -> bool {
+        self.action_dispatch_receipts
+            .entry(session_id.to_string())
+            .or_default()
+            .register(dispatch_id, token)
+    }
+
+    fn record_action_dispatch_receipt(&mut self, event: &Value) {
+        let Some((session_id, dispatch_id, token, result, kind)) =
+            action_dispatch_receipt_from_event(event)
+        else {
+            return;
+        };
+        let Some(receipts) = self.action_dispatch_receipts.get_mut(&session_id) else {
+            return;
+        };
+        receipts.record(&dispatch_id, &token, &result, kind);
+    }
+
+    fn action_dispatch_receipt(
+        &self,
+        session_id: &str,
+        dispatch_id: &str,
+    ) -> Option<ActionDispatchReceipt> {
+        self.action_dispatch_receipts
+            .get(session_id)?
+            .receipt(dispatch_id)
+    }
+
+    fn settle_action_dispatch(&mut self, session_id: &str, dispatch_id: &str) -> Option<String> {
+        let receipts = self.action_dispatch_receipts.get_mut(session_id)?;
+        let result = receipts.remove(dispatch_id).map(|receipt| receipt.result);
+        if receipts.pending.is_empty() {
+            self.action_dispatch_receipts.remove(session_id);
+        }
+        result
+    }
 
     fn entries_since(&self, cursor: u64) -> Vec<(u64, Value)> {
         self.events
@@ -9751,6 +10920,21 @@ impl CdpEventLog {
             .filter(|(seq, _)| *seq >= cursor)
             .map(|(seq, event)| (*seq, event.clone()))
             .collect()
+    }
+    fn entries_between(&self, start: u64, end: u64) -> Vec<(u64, Value)> {
+        self.events
+            .iter()
+            .filter(|(seq, _)| *seq >= start && *seq < end)
+            .map(|(seq, event)| (*seq, event.clone()))
+            .collect()
+    }
+
+    fn cursor_after_event(&self, cursor: u64, event: &Value) -> u64 {
+        self.events
+            .iter()
+            .find(|(seq, candidate)| *seq >= cursor && candidate == event)
+            .map(|(seq, _)| seq.wrapping_add(1))
+            .unwrap_or(cursor)
     }
 
     fn oldest_seq(&self) -> u64 {
@@ -9872,6 +11056,7 @@ fn dispatch_cdp_payload_with_diagnostics(
             .unwrap()
             .push(CdpTrafficEntry::received_event(&payload));
         let mut event_log = event_log.lock().unwrap();
+        event_log.record_action_dispatch_receipt(&payload);
         event_log.push(payload.clone());
         let _ = events.send(payload);
     }
@@ -10248,6 +11433,47 @@ impl CdpClient {
 
     fn event_cursor(&self) -> u64 {
         self.event_log.lock().unwrap().cursor()
+    }
+    fn begin_action_dispatch<'a>(
+        &'a self,
+        session_id: &str,
+        dispatch_id: &str,
+        token: &str,
+    ) -> RwResult<PendingActionDispatchGuard<'a>> {
+        let registered = self.event_log.lock().unwrap().register_action_dispatch(
+            session_id,
+            dispatch_id.to_string(),
+            token.to_string(),
+        );
+        if !registered {
+            return Err(RwError::Message(format!(
+                "duplicate in-flight action dispatch id {dispatch_id}"
+            )));
+        }
+        Ok(PendingActionDispatchGuard {
+            client: self,
+            session_id: session_id.to_string(),
+            dispatch_id: dispatch_id.to_string(),
+            token: token.to_string(),
+        })
+    }
+
+    fn action_dispatch_receipt(
+        &self,
+        session_id: &str,
+        dispatch_id: &str,
+    ) -> Option<ActionDispatchReceipt> {
+        self.event_log
+            .lock()
+            .unwrap()
+            .action_dispatch_receipt(session_id, dispatch_id)
+    }
+
+    fn settle_action_dispatch(&self, session_id: &str, dispatch_id: &str) -> Option<String> {
+        self.event_log
+            .lock()
+            .unwrap()
+            .settle_action_dispatch(session_id, dispatch_id)
     }
 
     fn is_connected(&self) -> bool {
@@ -13862,7 +15088,8 @@ async fn resolve_locator_point(
     strict: bool,
     deadline: OperationDeadline,
 ) -> RwResult<ResolvedLocatorPoint> {
-    let resolution = resolve_locator_session(Arc::clone(&page), locator_json, deadline).await?;
+    let resolution =
+        resolve_locator_action_session(Arc::clone(&page), locator_json, deadline).await?;
     let strict_guard = if strict {
         "if (matches.length > 1) throw new Error(`strict mode violation: locator resolved to ${matches.length} elements while trying to click`);"
     } else {
@@ -14017,7 +15244,8 @@ async fn evaluate_actionability_probe(
     strict: bool,
     deadline: OperationDeadline,
 ) -> RwResult<ActionabilityState> {
-    let resolution = resolve_locator_session(Arc::clone(page), locator_json, deadline).await?;
+    let resolution =
+        resolve_locator_action_session(Arc::clone(page), locator_json, deadline).await?;
     let expression = locator_script(
         &resolution.locator_json,
         index,
@@ -14031,8 +15259,26 @@ async fn evaluate_actionability_probe(
     Ok(serde_json::from_value(state)?)
 }
 
-fn is_transient_actionability_target_error(error: &RwError) -> bool {
+fn is_transient_action_resolution_error(error: &RwError) -> bool {
     if is_locator_wait_context_loss(error) {
+        return true;
+    }
+    let message = match error {
+        RwError::Message(message) => message.to_ascii_lowercase(),
+        _ => return false,
+    };
+    [
+        "cross-origin iframe did not expose a cdp frame id",
+        "iframe target attachment ended without a frame session",
+        "cross-origin iframe did not acquire an execution session",
+        "cdp did not return a main frame id",
+    ]
+    .iter()
+    .any(|fragment| message.contains(fragment))
+}
+
+fn is_transient_actionability_target_error(error: &RwError) -> bool {
+    if is_transient_action_resolution_error(error) {
         return true;
     }
     let message = match error {
@@ -14093,8 +15339,13 @@ async fn wait_for_actionable_locator_point(
                     requires_enabled,
                 ));
             }
-            Err(error) if is_locator_wait_context_loss(&error) => {
+            Err(error) if is_transient_action_resolution_error(&error) => {
                 verify_locator_wait_target_liveness(&page, deadline).await?;
+                let _ = refresh_page_frame_tree(
+                    &page,
+                    deadline.remaining_capped(Duration::from_millis(250))?,
+                )
+                .await;
                 continue;
             }
             Err(error) => return Err(error),
@@ -14931,6 +16182,503 @@ async fn evaluate_locator_for_page(
     evaluate_locator_resolution(&page, &resolution, expression, deadline, Duration::ZERO).await
 }
 
+const ACTION_RESOLUTION_RETRY_LIMIT: usize = 3;
+
+// Actions must execute in the target frame's realm. Keeping a same-origin frame in
+// the locator spec resolves its elements but leaves realm-specific DOM constructors
+// and events bound to the parent document. A navigation can replace that realm
+// between resolution and evaluation, so discard transient resolutions and retry
+// against a refreshed frame tree without extending the original action deadline.
+async fn evaluate_locator_action_with_deadline(
+    page: &Arc<PageInner>,
+    locator_json: &str,
+    index: usize,
+    body: &str,
+    deadline: OperationDeadline,
+) -> RwResult<(String, LocatorSessionResolution)> {
+    let mut retries = 0;
+    loop {
+        let evaluation = async {
+            let resolution =
+                resolve_locator_action_session(Arc::clone(page), locator_json, deadline).await?;
+            let expression = locator_script(&resolution.locator_json, index, body);
+            let value = evaluate_locator_resolution(
+                page,
+                &resolution,
+                expression,
+                deadline,
+                Duration::ZERO,
+            )
+            .await?;
+            Ok((value, resolution))
+        }
+        .await;
+        match evaluation {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if retries < ACTION_RESOLUTION_RETRY_LIMIT
+                    && is_transient_action_resolution_error(&error) =>
+            {
+                retries += 1;
+                verify_locator_wait_target_liveness(page, deadline).await?;
+                let _ = refresh_page_frame_tree(
+                    page,
+                    deadline.remaining_capped(Duration::from_millis(250))?,
+                )
+                .await;
+                wait_before_rearming_locator_wait(page, deadline).await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn evaluate_locator_action_for_page(
+    page: Arc<PageInner>,
+    locator_json: String,
+    index: usize,
+    body: String,
+    timeout: Duration,
+) -> RwResult<String> {
+    let deadline = OperationDeadline::new(timeout);
+    evaluate_locator_action_with_deadline(&page, &locator_json, index, &body, deadline)
+        .await
+        .map(|(value, _)| value)
+}
+
+struct ResolvedLocatorActionElement {
+    resolution: LocatorSessionResolution,
+    object_id: String,
+}
+
+async fn resolve_locator_action_element(
+    page: &Arc<PageInner>,
+    locator_json: &str,
+    index: usize,
+    deadline: OperationDeadline,
+) -> RwResult<ResolvedLocatorActionElement> {
+    let resolution =
+        resolve_locator_action_session(Arc::clone(page), locator_json, deadline).await?;
+    let context_id = if let Some(frame_id) = &resolution.frame_id {
+        Some(
+            create_isolated_world_for_frame(
+                &page.browser.client,
+                &resolution.session_id,
+                frame_id,
+                deadline.remaining()?,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let expression = locator_script(
+        &resolution.locator_json,
+        index,
+        "if (!el) throw new Error('No element matches locator'); return el;",
+    );
+    let mut params = json!({
+        "expression": expression,
+        "awaitPromise": true,
+        "returnByValue": false,
+        "userGesture": true,
+    });
+    if let Some(context_id) = context_id {
+        params["contextId"] = context_id;
+    }
+    let result = page
+        .browser
+        .client
+        .send(
+            "Runtime.evaluate",
+            params,
+            Some(&resolution.session_id),
+            deadline.remaining()?,
+        )
+        .await?;
+    if let Some(exception) = result.get("exceptionDetails") {
+        return Err(RwError::Message(runtime_exception_message(exception)));
+    }
+    let object_id = result
+        .pointer("/result/objectId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            RwError::Message("locator did not resolve to an element handle".to_string())
+        })?
+        .to_string();
+    Ok(ResolvedLocatorActionElement {
+        resolution,
+        object_id,
+    })
+}
+
+fn locator_action_call_params(
+    resolved: &ResolvedLocatorActionElement,
+    body: &str,
+    argument: Option<&Value>,
+) -> Value {
+    let mut params = json!({
+        "objectId": resolved.object_id,
+        "functionDeclaration": format!(
+            "function(prepared) {{ const el = this;\n\
+             const rustwrightSendDispatch = (result, commitment) => {{\n\
+               if (prepared &&
+                   typeof prepared.__rustwrightDispatchId === 'string' &&
+                   typeof prepared.__rustwrightDispatchToken === 'string') {{
+                 const binding = globalThis[{ACTION_DISPATCH_BINDING_NAME:?}];\n\
+                 if (typeof binding !== 'function') {{\n\
+                   throw new Error('__rustwright_action_dispatch_binding_unavailable__');\n\
+                 }}\n\
+                 binding(JSON.stringify({{ dispatchId: prepared.__rustwrightDispatchId, token: prepared.__rustwrightDispatchToken, result, commitment }}));\n\
+               }}\n\
+               return result;\n\
+             }};\n\
+             const rustwrightRecordDispatch = (result) => rustwrightSendDispatch(result, null);\n\
+             const rustwrightCommitDispatch = (result) => rustwrightSendDispatch(result, 'commencing');\n\
+             {body}\n}}"
+        ),
+        "awaitPromise": true,
+        "returnByValue": true,
+        "userGesture": true,
+    });
+    if let Some(argument) = argument {
+        params["arguments"] = json!([{ "value": argument }]);
+    }
+    params
+}
+
+async fn call_locator_action_element(
+    page: &PageInner,
+    resolved: &ResolvedLocatorActionElement,
+    body: &str,
+    argument: Option<&Value>,
+    deadline: OperationDeadline,
+) -> RwResult<String> {
+    let result = page
+        .browser
+        .client
+        .send(
+            "Runtime.callFunctionOn",
+            locator_action_call_params(resolved, body, argument),
+            Some(&resolved.resolution.session_id),
+            deadline.remaining()?,
+        )
+        .await?;
+    runtime_result_to_json(&result)
+}
+
+async fn call_locator_action_element_for_dispatch(
+    page: &PageInner,
+    resolved: &ResolvedLocatorActionElement,
+    body: &str,
+    argument: &Value,
+    deadline: OperationDeadline,
+) -> RwResult<String> {
+    let result = page
+        .browser
+        .client
+        .send(
+            "Runtime.callFunctionOn",
+            locator_action_call_params(resolved, body, Some(argument)),
+            Some(&resolved.resolution.session_id),
+            deadline.remaining()?,
+        )
+        .await?;
+    runtime_result_to_json(&result)
+}
+
+const LOCATOR_ACTION_RELEASE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn release_locator_action_element(
+    page: &PageInner,
+    resolved: &ResolvedLocatorActionElement,
+    deadline: OperationDeadline,
+) {
+    let timeout = deadline
+        .remaining_capped(Duration::from_millis(100))
+        .unwrap_or(LOCATOR_ACTION_RELEASE_CLEANUP_TIMEOUT);
+    let _ = page
+        .browser
+        .client
+        .send(
+            "Runtime.releaseObject",
+            json!({ "objectId": resolved.object_id }),
+            Some(&resolved.resolution.session_id),
+            timeout,
+        )
+        .await;
+}
+
+async fn action_dispatch_token_for_element<F>(
+    page: &PageInner,
+    resolved: &ResolvedLocatorActionElement,
+    deadline: OperationDeadline,
+    generate: F,
+) -> RwResult<String>
+where
+    F: FnOnce() -> RwResult<String>,
+{
+    match generate() {
+        Ok(token) => Ok(token),
+        Err(error) => {
+            release_locator_action_element(page, resolved, deadline).await;
+            Err(error)
+        }
+    }
+}
+
+// `test_cdp_action_dispatch_reply_semantics_against_chromium` verifies these
+// protocol outcomes against headless Chromium. A destroyed context that predates
+// the call replies "Cannot find context with specified id", and a detached
+// browser-routed session replies "No session with given id"; neither reaches the
+// renderer. For a single-evaluation dispatch, a commencing receipt proves that the
+// mutation was reached before a handler destroyed the context. Native fill emits
+// its commencing receipt in a separate evaluation, so only a successful Input
+// command commits that dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActionDispatchReplyDisposition {
+    SafeRetry,
+    AmbiguousContextLoss,
+    DeterministicFailure,
+}
+
+fn action_dispatch_reply_disposition(error: &RwError) -> ActionDispatchReplyDisposition {
+    let message = match error {
+        RwError::Cdp { message, .. } | RwError::Message(message) => message.to_ascii_lowercase(),
+        _ => return ActionDispatchReplyDisposition::DeterministicFailure,
+    };
+    // Retry only failures that prove dispatch did not reach the resolved element.
+    // A detached-element marker is terminal because re-resolution could target a replacement.
+    if [
+        ACTION_DISPATCH_OPTION_LIST_CHANGED_MARKER,
+        "session is detached",
+        "session with given id not found",
+        "no session with given id",
+        "cannot find context with specified id",
+        "cannot find context with id",
+        "could not find object with given id",
+        "cannot find object with id",
+    ]
+    .iter()
+    .any(|fragment| message.contains(fragment))
+    {
+        return ActionDispatchReplyDisposition::SafeRetry;
+    }
+    if [
+        "execution context was destroyed",
+        "inspected target navigated or closed",
+    ]
+    .iter()
+    .any(|fragment| message.contains(fragment))
+    {
+        return ActionDispatchReplyDisposition::AmbiguousContextLoss;
+    }
+    ActionDispatchReplyDisposition::DeterministicFailure
+}
+
+fn action_dispatch_option_list_changed(error: &RwError) -> bool {
+    match error {
+        RwError::Cdp { message, .. } | RwError::Message(message) => {
+            message.contains(ACTION_DISPATCH_OPTION_LIST_CHANGED_MARKER)
+        }
+        _ => false,
+    }
+}
+
+async fn rearm_locator_action_resolution(
+    page: &Arc<PageInner>,
+    deadline: OperationDeadline,
+) -> RwResult<()> {
+    verify_locator_wait_target_liveness(page, deadline).await?;
+    let _ =
+        refresh_page_frame_tree(page, deadline.remaining_capped(Duration::from_millis(250))?).await;
+    wait_before_rearming_locator_wait(page, deadline).await
+}
+
+async fn evaluate_locator_dispatch_with_deadline(
+    page: &Arc<PageInner>,
+    locator_json: &str,
+    index: usize,
+    prepare_body: &str,
+    dispatch_body: &str,
+    deadline: OperationDeadline,
+) -> RwResult<String> {
+    let mut retries = 0;
+    loop {
+        let resolved =
+            match resolve_locator_action_element(page, locator_json, index, deadline).await {
+                Ok(resolved) => resolved,
+                Err(error)
+                    if retries < ACTION_RESOLUTION_RETRY_LIMIT
+                        && is_transient_action_resolution_error(&error) =>
+                {
+                    retries += 1;
+                    rearm_locator_action_resolution(page, deadline).await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+        if let Err(error) = enable_action_dispatch_binding_for_session(
+            &page.browser.client,
+            &resolved.resolution.session_id,
+            deadline.remaining()?,
+        )
+        .await
+        {
+            release_locator_action_element(page, &resolved, deadline).await;
+            return Err(error);
+        }
+        let prepared_json = match call_locator_action_element(
+            page,
+            &resolved,
+            prepare_body,
+            None,
+            deadline,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error)
+                if retries < ACTION_RESOLUTION_RETRY_LIMIT
+                    && is_transient_action_resolution_error(&error) =>
+            {
+                release_locator_action_element(page, &resolved, deadline).await;
+                retries += 1;
+                rearm_locator_action_resolution(page, deadline).await?;
+                continue;
+            }
+            Err(error) => {
+                release_locator_action_element(page, &resolved, deadline).await;
+                return Err(error);
+            }
+        };
+        let preparation = (|| -> RwResult<(bool, Value, Value)> {
+            let prepared: Value = serde_json::from_str(&prepared_json)?;
+            let ready = prepared
+                .get("ready")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    RwError::Message("action preparation did not return ready".to_string())
+                })?;
+            let completion = prepared.get("result").cloned().ok_or_else(|| {
+                RwError::Message("action preparation did not return a result".to_string())
+            })?;
+            let payload = prepared.get("payload").cloned().unwrap_or(Value::Null);
+            Ok((ready, completion, payload))
+        })();
+        let (ready, completion, payload) = match preparation {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                release_locator_action_element(page, &resolved, deadline).await;
+                return Err(error);
+            }
+        };
+        if !ready {
+            release_locator_action_element(page, &resolved, deadline).await;
+            return Ok(completion.to_string());
+        }
+        let dispatch_id = NEXT_ACTION_DISPATCH_ID
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
+        let dispatch_token =
+            action_dispatch_token_for_element(page, &resolved, deadline, new_action_dispatch_token)
+                .await?;
+        let mut payload = match payload {
+            Value::Null => json!({}),
+            Value::Object(_) => payload,
+            _ => {
+                release_locator_action_element(page, &resolved, deadline).await;
+                return Err(RwError::Message(
+                    "action preparation payload must be an object or null".to_string(),
+                ));
+            }
+        };
+        payload.as_object_mut().unwrap().insert(
+            "__rustwrightDispatchId".to_string(),
+            Value::String(dispatch_id.clone()),
+        );
+        payload.as_object_mut().unwrap().insert(
+            "__rustwrightDispatchToken".to_string(),
+            Value::String(dispatch_token.clone()),
+        );
+        let dispatch_guard = match page.browser.client.begin_action_dispatch(
+            &resolved.resolution.session_id,
+            &dispatch_id,
+            &dispatch_token,
+        ) {
+            Ok(guard) => guard,
+            Err(error) => {
+                release_locator_action_element(page, &resolved, deadline).await;
+                return Err(error);
+            }
+        };
+        let dispatched = call_locator_action_element_for_dispatch(
+            page,
+            &resolved,
+            dispatch_body,
+            &payload,
+            deadline,
+        )
+        .await;
+        let receipt = dispatch_guard.single_evaluation_receipt();
+        match dispatched {
+            Ok(value) => {
+                release_locator_action_element(page, &resolved, deadline).await;
+                return Ok(value);
+            }
+            Err(error) => {
+                let disposition = action_dispatch_reply_disposition(&error);
+                release_locator_action_element(page, &resolved, deadline).await;
+                if let Some(result) = receipt {
+                    if let Some(terminal) = locator_wait_terminal_error(page) {
+                        return Err(terminal);
+                    }
+                    return Ok(result);
+                }
+                match disposition {
+                    ActionDispatchReplyDisposition::SafeRetry
+                        if retries < ACTION_RESOLUTION_RETRY_LIMIT =>
+                    {
+                        retries += 1;
+                        rearm_locator_action_resolution(page, deadline).await?;
+                    }
+                    ActionDispatchReplyDisposition::SafeRetry
+                        if action_dispatch_option_list_changed(&error) =>
+                    {
+                        return Ok(json!({ "ok": false, "missing": [] }).to_string());
+                    }
+                    ActionDispatchReplyDisposition::AmbiguousContextLoss
+                        if retries < ACTION_RESOLUTION_RETRY_LIMIT =>
+                    {
+                        retries += 1;
+                        rearm_locator_action_resolution(page, deadline).await?;
+                    }
+                    _ => return Err(error),
+                }
+            }
+        }
+    }
+}
+
+async fn evaluate_locator_dispatch_for_page(
+    page: Arc<PageInner>,
+    locator_json: String,
+    index: usize,
+    prepare_body: String,
+    dispatch_body: String,
+    timeout: Duration,
+) -> RwResult<String> {
+    evaluate_locator_dispatch_with_deadline(
+        &page,
+        &locator_json,
+        index,
+        &prepare_body,
+        &dispatch_body,
+        OperationDeadline::new(timeout),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_locator_for_element_handle(
     page: Arc<PageInner>,
@@ -15039,14 +16787,7 @@ fn fill_guard_reentry_observation_expression(guard_key: &str) -> RwResult<String
         r#"(() => {{
 const guardKey = {guard_key_json};
 const guard = globalThis[guardKey];
-if (
-  !guard ||
-  (
-    typeof guard.valueLikeApplied !== 'string' &&
-    !guard.dispatched &&
-    !guard.precursorReceived
-  )
-) return null;
+if (!guard || !guard.precursorReceived) return null;
 const now = performance.now();
 const expired =
   typeof guard.expiresAt !== 'number' ||
@@ -15066,18 +16807,6 @@ if (expired) {{
 const el = guard.locator || guard.target;
 const observationInfo =
   typeof guard.observationInfo === 'function' ? guard.observationInfo(el) : {{}};
-if (typeof guard.valueLikeApplied === 'string') {{
-  return {{
-    ok: true,
-    info: {{
-      count: el ? 1 : 0,
-      frame_strict_violation: null,
-      attached: !!el && el.isConnected,
-      ...observationInfo,
-      fill_guard_key: guardKey,
-    }},
-  }};
-}}
 return {{
   ok: false,
   type: 'observe-dispatch',
@@ -15340,6 +17069,7 @@ async fn evaluate_locator_fill_for_page(
     *pinned_resolution = Some(resolution.clone());
     let outcome = async {
         let mut json = None;
+        let mut action_dispatch_guard = None;
         if reentering_dispatch {
             let observation = evaluate_locator_resolution(
                 &page,
@@ -15357,9 +17087,7 @@ async fn evaluate_locator_fill_for_page(
                     if observation.get("ok").and_then(Value::as_bool) == Some(true) {
                         return Ok(observation.to_string());
                     }
-                    if observation.get("type").and_then(Value::as_str)
-                        == Some("observe-dispatch")
-                    {
+                    if observation.get("type").and_then(Value::as_str) == Some("observe-dispatch") {
                         json = Some(observation.to_string());
                     } else {
                         pinned_resolution.take();
@@ -15374,12 +17102,9 @@ async fn evaluate_locator_fill_for_page(
                 }
                 Err(error) if is_locator_wait_context_loss(&error) => {
                     pinned_resolution.take();
-                    resolution = resolve_locator_fill_session(
-                        Arc::clone(&page),
-                        &locator_json,
-                        deadline,
-                    )
-                    .await?;
+                    resolution =
+                        resolve_locator_fill_session(Arc::clone(&page), &locator_json, deadline)
+                            .await?;
                     *pinned_resolution = Some(resolution.clone());
                 }
                 Err(error) => return Err(error),
@@ -15388,18 +17113,67 @@ async fn evaluate_locator_fill_for_page(
         let json = match json {
             Some(json) => json,
             None => {
+                if let Some(frame_id) = resolution.frame_id.as_deref() {
+                    create_isolated_world_for_frame(
+                        &page.browser.client,
+                        &resolution.session_id,
+                        frame_id,
+                        deadline.remaining()?,
+                    )
+                    .await?;
+                }
+                enable_action_dispatch_binding_for_session(
+                    &page.browser.client,
+                    &resolution.session_id,
+                    deadline.remaining()?,
+                )
+                .await?;
+                let dispatch_id = NEXT_ACTION_DISPATCH_ID
+                    .fetch_add(1, Ordering::Relaxed)
+                    .to_string();
+                let dispatch_token = new_action_dispatch_token()?;
+                let dispatch_guard = page.browser.client.begin_action_dispatch(
+                    &resolution.session_id,
+                    &dispatch_id,
+                    &dispatch_token,
+                )?;
+                let dispatch_body = body
+                    .replace(
+                        "__RUSTWRIGHT_FILL_DISPATCH_ID__",
+                        &serde_json::to_string(dispatch_guard.dispatch_id())?,
+                    )
+                    .replace(
+                        "__RUSTWRIGHT_FILL_DISPATCH_TOKEN__",
+                        &serde_json::to_string(dispatch_guard.token())?,
+                    );
+                action_dispatch_guard = Some(dispatch_guard);
                 if let Some(drop_cleanup) = drop_cleanup.as_deref_mut() {
                     drop_cleanup.arm_for_install(&resolution);
                 }
-                let expression = locator_script(&resolution.locator_json, index, &body);
-                evaluate_locator_resolution(
+                let expression = locator_script(&resolution.locator_json, index, &dispatch_body);
+                match evaluate_locator_resolution(
                     &page,
                     &resolution,
                     expression,
                     deadline,
                     Duration::ZERO,
                 )
-                .await?
+                .await
+                {
+                    Ok(json) => json,
+                    Err(error) => {
+                        if let Some(receipt) = action_dispatch_guard
+                            .as_ref()
+                            .and_then(PendingActionDispatchGuard::terminal_receipt)
+                        {
+                            if let Some(terminal) = locator_wait_terminal_error(&page) {
+                                return Err(terminal);
+                            }
+                            return Ok(receipt);
+                        }
+                        return Err(error);
+                    }
+                }
             }
         };
         let mut result = decode_runtime_serialized_value(serde_json::from_str::<Value>(&json)?);
@@ -15408,6 +17182,7 @@ async fn evaluate_locator_fill_for_page(
             return Ok(json);
         }
         let observe_only = result_type == Some("observe-dispatch");
+        let mut native_input_commitment = None;
 
         let committed_value = result
             .get("value")
@@ -15449,7 +17224,65 @@ async fn evaluate_locator_fill_for_page(
                 result["type"] = Value::String("pending".to_string());
                 return Ok(result.to_string());
             }
-            if committed_value.is_empty() {
+            let dispatch_guard = action_dispatch_guard.as_ref().ok_or_else(|| {
+                RwError::Message("native fill dispatch was not registered".to_string())
+            })?;
+            let mut committed_result = result.clone();
+            committed_result["ok"] = Value::Bool(true);
+            if let Some(committed_result) = committed_result.as_object_mut() {
+                committed_result.remove("type");
+                committed_result.remove("value");
+            }
+            let commitment_expression = format!(
+                r#"(() => {{
+const binding = globalThis[{binding_name}];
+if (typeof binding !== 'function') {{
+  throw new Error('__rustwright_action_dispatch_binding_unavailable__');
+}}
+binding(JSON.stringify({{
+  dispatchId: {dispatch_id},
+  token: {dispatch_token},
+  result: {committed_result},
+  commitment: 'commencing',
+}}));
+return null;
+}})()"#,
+                binding_name = serde_json::to_string(ACTION_DISPATCH_BINDING_NAME)?,
+                dispatch_id = serde_json::to_string(dispatch_guard.dispatch_id())?,
+                dispatch_token = serde_json::to_string(dispatch_guard.token())?,
+            );
+            let commitment = evaluate_locator_resolution(
+                &page,
+                &resolution,
+                commitment_expression,
+                deadline,
+                Duration::ZERO,
+            )
+            .await;
+            if let Err(error) = commitment {
+                if is_locator_wait_context_loss(&error) {
+                    if let Some(receipt) = dispatch_guard.terminal_receipt() {
+                        if let Some(terminal) = locator_wait_terminal_error(&page) {
+                            return Err(terminal);
+                        }
+                        return Ok(receipt);
+                    }
+                    if let Some(terminal) = locator_wait_terminal_error(&page) {
+                        return Err(terminal);
+                    }
+                    result["ok"] = Value::Bool(false);
+                    result["type"] = Value::String("pending".to_string());
+                    return Ok(result.to_string());
+                }
+                return Err(error);
+            }
+            if !dispatch_guard.has_commencing_receipt() {
+                return Err(RwError::Message(
+                    "native fill commencing receipt was not received".to_string(),
+                ));
+            }
+            let insert_text_dispatch = !committed_value.is_empty();
+            let input_result = if committed_value.is_empty() {
                 dispatch_key_press(
                     &page.browser.client,
                     &resolution.session_id,
@@ -15458,7 +17291,7 @@ async fn evaluate_locator_fill_for_page(
                     deadline,
                     None,
                 )
-                .await?;
+                .await
             } else {
                 page.browser
                     .client
@@ -15468,19 +17301,24 @@ async fn evaluate_locator_fill_for_page(
                         Some(&resolution.session_id),
                         deadline.remaining()?,
                     )
-                    .await?;
+                    .await
+                    .map(|_| ())
+            };
+            if let Err(error) = input_result {
+                if insert_text_dispatch
+                    && action_dispatch_reply_disposition(&error)
+                        == ActionDispatchReplyDisposition::SafeRetry
+                {
+                    if let Some(terminal) = locator_wait_terminal_error(&page) {
+                        return Err(terminal);
+                    }
+                    result["ok"] = Value::Bool(false);
+                    result["type"] = Value::String("pending".to_string());
+                    return Ok(result.to_string());
+                }
+                return Err(error);
             }
-            let dispatched_expression = format!(
-                "(() => {{ const g = globalThis[{guard_key_json}]; if (g) g.dispatched = true; return null; }})()"
-            );
-            let _ = evaluate_locator_resolution(
-                &page,
-                &resolution,
-                dispatched_expression,
-                OperationDeadline::new(Duration::from_millis(100)),
-                Duration::ZERO,
-            )
-            .await;
+            native_input_commitment = Some(committed_result.to_string());
         }
 
         let actual_body = format!(
@@ -15520,14 +17358,37 @@ return {{ actual, dispatch, info }};
 }})()
 "#
         );
-        let actual_json = evaluate_locator_resolution(
+        let actual_json = match evaluate_locator_resolution(
             &page,
             &resolution,
             actual_body,
             deadline,
             Duration::ZERO,
         )
-        .await?;
+        .await
+        {
+            Ok(actual) => actual,
+            Err(error) => {
+                if is_locator_wait_context_loss(&error) {
+                    if let Some(committed) = native_input_commitment.as_ref() {
+                        if let Some(terminal) = locator_wait_terminal_error(&page) {
+                            return Err(terminal);
+                        }
+                        return Ok(committed.clone());
+                    }
+                    if let Some(receipt) = action_dispatch_guard
+                        .as_ref()
+                        .and_then(PendingActionDispatchGuard::terminal_receipt)
+                    {
+                        if let Some(terminal) = locator_wait_terminal_error(&page) {
+                            return Err(terminal);
+                        }
+                        return Ok(receipt);
+                    }
+                }
+                return Err(error);
+            }
+        };
         let observed =
             decode_runtime_serialized_value(serde_json::from_str::<Value>(&actual_json)?);
         if let (Some(result_info), Some(observed_info)) = (
@@ -15570,6 +17431,23 @@ return {{ actual, dispatch, info }};
             .pointer("/dispatch/targetMatches")
             .and_then(Value::as_bool)
             == Some(true);
+        if !target_matches {
+            if let Some(committed) = native_input_commitment.as_ref() {
+                if let Some(terminal) = locator_wait_terminal_error(&page) {
+                    return Err(terminal);
+                }
+                return Ok(committed.clone());
+            }
+            if let Some(receipt) = action_dispatch_guard
+                .as_ref()
+                .and_then(PendingActionDispatchGuard::terminal_receipt)
+            {
+                if let Some(terminal) = locator_wait_terminal_error(&page) {
+                    return Err(terminal);
+                }
+                return Ok(receipt);
+            }
+        }
         let actual_matches_commit = actual == Some(committed_value.as_str());
         let page_committed_canceled_edit = before_input_canceled
             && untrusted_input_received
@@ -15699,6 +17577,30 @@ async fn resolve_locator_session(
     deadline: OperationDeadline,
 ) -> RwResult<LocatorSessionResolution> {
     resolve_locator_session_with_frame_mode(page, locator_json, deadline, false).await
+}
+
+// Read operations keep same-origin frame paths intact for locator count and strictness
+// semantics. Action operations enter nested frames so action code uses the target realm.
+// Top-frame actions use the main frame id so evaluation occurs in the isolated utility world.
+async fn resolve_locator_action_session(
+    page: Arc<PageInner>,
+    locator_json: &str,
+    deadline: OperationDeadline,
+) -> RwResult<LocatorSessionResolution> {
+    let mut resolution =
+        resolve_locator_session_with_frame_mode(Arc::clone(&page), locator_json, deadline, true)
+            .await?;
+    if resolution.frame_id.is_none() {
+        resolution.frame_id = Some(
+            page.main_frame_id(
+                &page.browser.client,
+                &resolution.session_id,
+                deadline.remaining()?,
+            )
+            .await?,
+        );
+    }
+    Ok(resolution)
 }
 
 async fn resolve_locator_session_with_frame_mode(
@@ -16310,20 +18212,32 @@ async fn page_goto_async(
         .get("loaderId")
         .and_then(Value::as_str)
         .map(ToString::to_string);
+    let navigation_frame_id = result
+        .get("frameId")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
     if loader_id.is_none() {
         if let Some(frame_id) = result.get("frameId").and_then(Value::as_str) {
             page.record_main_frame_navigation_url(frame_id, &target_url);
         }
         return Ok(Value::Null.to_string());
     }
+    let navigation_frame_id = match navigation_frame_id {
+        Some(frame_id) => frame_id,
+        None => {
+            page.main_frame_id(&client, &session_id, deadline.remaining()?)
+                .await?
+        }
+    };
     let response = match wait_for_navigation(
         &client,
         &mut events,
         event_cursor,
+        None,
         &session_id,
         &wait_until,
+        Some(&navigation_frame_id),
         loader_id.as_deref(),
-        None,
         None,
         None,
         false,
@@ -16448,11 +18362,12 @@ async fn page_goto_observed_impl(
         &client,
         &mut events,
         event_cursor,
+        None,
         &session_id,
         &wait_until,
+        frame_id.as_deref(),
         loader_id.as_deref(),
         None,
-        frame_id.as_deref(),
         Some(target_url.as_str()),
         false,
         "Page.goto",
@@ -16484,10 +18399,11 @@ async fn page_goto_observed_impl(
             &client,
             &mut completion_events,
             completion_event_cursor,
+            None,
             &session_id,
             &wait_until,
+            frame_id.as_deref(),
             loader_id.as_deref(),
-            None,
             None,
             None,
             false,
@@ -16544,11 +18460,12 @@ async fn page_reload_observed_async(
         &client,
         &mut events,
         event_cursor,
+        None,
         &session_id,
         &wait_until,
+        Some(expected_frame_id.as_str()),
         None,
         expected_url.as_deref(),
-        Some(expected_frame_id.as_str()),
         expected_url.as_deref(),
         false,
         "Page.reload",
@@ -16619,23 +18536,19 @@ async fn page_history_observed_async(
         .main_frame_id(&client, &session_id, deadline.remaining()?)
         .await?;
     let (mut events, event_cursor) = client.subscribe_with_cursor();
-    client
-        .send(
-            "Page.navigateToHistoryEntry",
-            json!({ "entryId": entry_id }),
-            Some(&session_id),
-            deadline.remaining()?,
-        )
-        .await?;
+    let restore_initiation_cursor =
+        send_history_entry_navigation(&client, entry_id, &session_id, deadline.remaining()?)
+            .await?;
     let response = wait_for_navigation(
         &client,
         &mut events,
         event_cursor,
+        Some(restore_initiation_cursor),
         &session_id,
         &wait_until,
+        Some(main_frame_id.as_str()),
         None,
         target_url.as_deref(),
-        Some(main_frame_id.as_str()),
         target_url.as_deref(),
         false,
         if offset < 0 {
@@ -19200,6 +21113,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
             browser.block_on(async move {
                 let deadline = OperationDeadline::new(timeout);
                 let (mut events, event_cursor) = client.subscribe_with_cursor();
+                let navigation_frame_id = frame_id.clone();
                 let target_url = url.clone();
                 let mut params = json!({ "url": url, "frameId": frame_id });
                 if let Some(referer) = referer {
@@ -19242,11 +21156,12 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                     &client,
                     &mut events,
                     event_cursor,
+                    None,
                     &session_id,
                     &wait_until,
+                    Some(&navigation_frame_id),
                     loader_id.as_deref(),
                     None,
-                    result.get("frameId").and_then(Value::as_str),
                     Some(target_url.as_str()),
                     false,
                     "Frame.goto",
@@ -20295,16 +22210,24 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         index: usize,
         timeout_ms: Option<f64>,
     ) -> PyResult<()> {
-        let body = r#"
+        let prepare_body = r#"
 if (!el) throw new Error('No element matches locator');
 el.scrollIntoView({ block: 'center', inline: 'center' });
 if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-el.click();
-return true;
+return { ready: true, result: true, payload: null };
 "#;
-        py.detach(|| self.evaluate_locator(locator_json, index, body, timeout_ms))
-            .map(|_| ())
-            .map_err(py_err)
+        let dispatch_body = "if (!el.isConnected) throw new Error('__rustwright_action_dispatch_not_started__: element detached'); rustwrightCommitDispatch(true); el.click(); return true;";
+        py.detach(|| {
+            self.evaluate_locator_dispatch(
+                locator_json,
+                index,
+                prepare_body,
+                dispatch_body,
+                timeout_ms,
+            )
+        })
+        .map(|_| ())
+        .map_err(py_err)
     }
 
     #[pyo3(signature = (locator_json, index, body, timeout_ms=None))]
@@ -20363,7 +22286,7 @@ return true;
         py.detach(move || {
             let browser = Arc::clone(&page.browser);
             browser.block_on(async move {
-                evaluate_locator_for_page(page, locator_json, index, body, timeout).await
+                evaluate_locator_action_for_page(page, locator_json, index, body, timeout).await
             })
         })
         .map_err(py_err)
@@ -20419,10 +22342,18 @@ return true;
         indexes_json: &str,
         timeout_ms: Option<f64>,
     ) -> PyResult<String> {
-        let body =
-            locator_select_apply_body(values_json, labels_json, indexes_json).map_err(py_err)?;
-        py.detach(|| self.evaluate_locator(locator_json, index, &body, timeout_ms))
-            .map_err(py_err)
+        let script =
+            locator_select_apply_script(values_json, labels_json, indexes_json).map_err(py_err)?;
+        py.detach(|| {
+            self.evaluate_locator_dispatch(
+                locator_json,
+                index,
+                &script.prepare_body,
+                &script.dispatch_body,
+                timeout_ms,
+            )
+        })
+        .map_err(py_err)
     }
 
     #[pyo3(signature = (locator_json, index, timeout_ms=None))]
@@ -20434,7 +22365,7 @@ return true;
         timeout_ms: Option<f64>,
     ) -> PyResult<String> {
         let body = locator_check_state_body();
-        py.detach(|| self.evaluate_locator(locator_json, index, &body, timeout_ms))
+        py.detach(|| self.evaluate_locator_action(locator_json, index, &body, timeout_ms))
             .map_err(py_err)
     }
 
@@ -20757,27 +22688,38 @@ return true;
     ) -> PyResult<()> {
         let text_json = serde_json::to_string(text)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let body = format!(
+        let prepare_body = format!(
             r#"
 if (!el) throw new Error('No element matches locator');
 el.scrollIntoView({{ block: 'center', inline: 'center' }});
 if (typeof el.focus === 'function') el.focus({{ preventScroll: true }});
-const text = {text_json};
-if ('value' in el) {{
-  el.value = `${{el.value || ''}}${{text}}`;
-}} else if (el.isContentEditable) {{
-  el.textContent = `${{el.textContent || ''}}${{text}}`;
-}} else {{
-  el.textContent = `${{el.textContent || ''}}${{text}}`;
-}}
-el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-return true;
+return {{ ready: true, result: true, payload: {{ text: {text_json} }} }};
 "#
         );
-        self.evaluate_locator(locator_json, index, &body, timeout_ms)
-            .map(|_| ())
-            .map_err(py_err)
+        let dispatch_body = r#"
+if (!el.isConnected) throw new Error('__rustwright_action_dispatch_not_started__: element detached');
+const text = prepared.text;
+if ('value' in el) {
+  el.value = `${el.value || ''}${text}`;
+} else if (el.isContentEditable) {
+  el.textContent = `${el.textContent || ''}${text}`;
+} else {
+  el.textContent = `${el.textContent || ''}${text}`;
+}
+rustwrightRecordDispatch(true);
+el.dispatchEvent(new Event('input', { bubbles: true }));
+el.dispatchEvent(new Event('change', { bubbles: true }));
+return true;
+"#;
+        self.evaluate_locator_dispatch(
+            locator_json,
+            index,
+            &prepare_body,
+            dispatch_body,
+            timeout_ms,
+        )
+        .map(|_| ())
+        .map_err(py_err)
     }
 
     #[pyo3(signature = (locator_json, index, timeout_ms=None))]
@@ -22599,6 +24541,14 @@ impl PyPage {
                 if target_index < 0 || target_index as usize >= entries.len() {
                     return Ok(Value::Null.to_string());
                 }
+                let navigation_frame_id = if wait_until == "commit" {
+                    page.main_frame_id.lock().unwrap().clone()
+                } else {
+                    Some(
+                        page.main_frame_id(&client, &session_id, deadline.remaining()?)
+                            .await?,
+                    )
+                };
                 let entry_id = entries[target_index as usize]
                     .get("id")
                     .and_then(Value::as_i64)
@@ -22612,23 +24562,23 @@ impl PyPage {
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
                 let (mut events, event_cursor) = client.subscribe_with_cursor();
-                client
-                    .send(
-                        "Page.navigateToHistoryEntry",
-                        json!({ "entryId": entry_id }),
-                        Some(&session_id),
-                        deadline.remaining()?,
-                    )
-                    .await?;
+                let restore_initiation_cursor = send_history_entry_navigation(
+                    &client,
+                    entry_id,
+                    &session_id,
+                    deadline.remaining()?,
+                )
+                .await?;
                 let response = wait_for_navigation(
                     &client,
                     &mut events,
                     event_cursor,
+                    Some(restore_initiation_cursor),
                     &session_id,
                     &wait_until,
+                    navigation_frame_id.as_deref(),
                     None,
                     target_url.as_deref(),
-                    None,
                     target_url.as_deref(),
                     true,
                     if offset < 0 {
@@ -22731,6 +24681,50 @@ impl PyPage {
         let browser = Arc::clone(&page.browser);
         browser.block_on(async move {
             evaluate_locator_for_page(page, locator_json, index, body, timeout).await
+        })
+    }
+
+    fn evaluate_locator_action(
+        &self,
+        locator_json: &str,
+        index: usize,
+        body: &str,
+        timeout_ms: Option<f64>,
+    ) -> RwResult<String> {
+        let page = Arc::clone(&self.inner);
+        let locator_json = locator_json.to_string();
+        let body = body.to_string();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let browser = Arc::clone(&page.browser);
+        browser.block_on(async move {
+            evaluate_locator_action_for_page(page, locator_json, index, body, timeout).await
+        })
+    }
+
+    fn evaluate_locator_dispatch(
+        &self,
+        locator_json: &str,
+        index: usize,
+        prepare_body: &str,
+        dispatch_body: &str,
+        timeout_ms: Option<f64>,
+    ) -> RwResult<String> {
+        let page = Arc::clone(&self.inner);
+        let locator_json = locator_json.to_string();
+        let prepare_body = prepare_body.to_string();
+        let dispatch_body = dispatch_body.to_string();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let browser = Arc::clone(&page.browser);
+        browser.block_on(async move {
+            evaluate_locator_dispatch_for_page(
+                page,
+                locator_json,
+                index,
+                prepare_body,
+                dispatch_body,
+                timeout,
+            )
+            .await
         })
     }
 
@@ -25170,6 +27164,18 @@ return waitForScrollSettle();
                 if target_index < 0 || target_index as usize >= entries.len() {
                     return Ok((false, Value::Null.to_string()));
                 }
+                let navigation_frame_id = if wait_until == "commit" {
+                    page.main_frame_id.lock().unwrap().clone()
+                } else {
+                    Some(
+                        page.main_frame_id(
+                            &operation_client,
+                            &operation_session_id,
+                            deadline.remaining()?,
+                        )
+                        .await?,
+                    )
+                };
                 let entry = &entries[target_index as usize];
                 let entry_id =
                     entry
@@ -25184,23 +27190,23 @@ return waitForScrollSettle();
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
                 let (mut events, event_cursor) = operation_client.subscribe_with_cursor();
-                operation_client
-                    .send(
-                        "Page.navigateToHistoryEntry",
-                        json!({ "entryId": entry_id }),
-                        Some(&operation_session_id),
-                        deadline.remaining()?,
-                    )
-                    .await?;
+                let restore_initiation_cursor = send_history_entry_navigation(
+                    &operation_client,
+                    entry_id,
+                    &operation_session_id,
+                    deadline.remaining()?,
+                )
+                .await?;
                 let response = wait_for_navigation(
                     &operation_client,
                     &mut events,
                     event_cursor,
+                    Some(restore_initiation_cursor),
                     &operation_session_id,
                     &wait_until,
+                    navigation_frame_id.as_deref(),
                     None,
                     target_url.as_deref(),
-                    None,
                     target_url.as_deref(),
                     true,
                     if offset < 0 {
@@ -25221,9 +27227,10 @@ return waitForScrollSettle();
                     )
                     .await?;
                 }
-                let main_frame_id = page.main_frame_id.lock().unwrap().clone();
-                if let (Some(frame_id), Some(target_url)) = (main_frame_id, target_url.as_deref()) {
-                    page.record_main_frame_navigation_url(&frame_id, target_url);
+                if let (Some(frame_id), Some(target_url)) =
+                    (navigation_frame_id.as_deref(), target_url.as_deref())
+                {
+                    page.record_main_frame_navigation_url(frame_id, target_url);
                 }
                 Ok((true, response.response.unwrap_or(Value::Null).to_string()))
             },
@@ -25461,19 +27468,18 @@ async fn scroll_locator_into_view(
     locator_json: &str,
     deadline: OperationDeadline,
 ) -> RwResult<()> {
-    let resolution = resolve_locator_session(Arc::clone(page), locator_json, deadline).await?;
     let body = format!(
         r#"{SCROLL_SETTLE_JS}
 if (!el) throw new Error('No element matches locator');
 el.scrollIntoView({{ block: 'center', inline: 'center' }});
 return waitForScrollSettle();"#
     );
-    let expression = locator_script(&resolution.locator_json, 0, &body);
-    // Subscribe before dispatching the scroll evaluation.  The evaluation may
+    // Subscribe before dispatching the scroll evaluation. The evaluation may
     // synchronously trigger navigation/lifecycle work, so subscribing after it
     // returns can miss the only ordering signal needed by settlement.
     let mut events = page.browser.client.subscribe();
-    evaluate_locator_resolution(page, &resolution, expression, deadline, Duration::ZERO).await?;
+    let (_, resolution) =
+        evaluate_locator_action_with_deadline(page, locator_json, 0, &body, deadline).await?;
     settle_after_pointer_action(page, &resolution.session_id, &mut events, deadline).await
 }
 
@@ -25482,13 +27488,14 @@ async fn focus_locator_for_native_input(
     locator_json: &str,
     deadline: OperationDeadline,
 ) -> RwResult<LocatorSessionResolution> {
-    let resolution = resolve_locator_session(Arc::clone(page), locator_json, deadline).await?;
-    let expression = locator_script(
-        &resolution.locator_json,
+    let (_, resolution) = evaluate_locator_action_with_deadline(
+        page,
+        locator_json,
         0,
         "if (!el) throw new Error('No element matches locator'); el.scrollIntoView({ block: 'center', inline: 'center' }); if (typeof el.focus === 'function') el.focus({ preventScroll: true }); return true;",
-    );
-    evaluate_locator_resolution(page, &resolution, expression, deadline, Duration::ZERO).await?;
+        deadline,
+    )
+    .await?;
     Ok(resolution)
 }
 
@@ -26311,6 +28318,12 @@ async fn attach_existing_page_unregistered(
             .send(method, json!({}), Some(&session_id), Duration::from_secs(5))
     }))
     .await?;
+    enable_action_dispatch_binding_for_session(
+        &browser.client,
+        &session_id,
+        Duration::from_secs(5),
+    )
+    .await?;
     enable_file_chooser_intercept_for_session(&browser.client, &session_id, Duration::from_secs(5))
         .await?;
     install_stealth_defaults(&browser, &session_id).await?;
@@ -26404,6 +28417,28 @@ async fn enable_page_iframe_auto_attach(
         )
         .await?;
     Ok(())
+}
+
+async fn enable_action_dispatch_binding_for_session(
+    client: &CdpClient,
+    session_id: &str,
+    timeout: Duration,
+) -> RwResult<()> {
+    match client
+        .send(
+            "Runtime.addBinding",
+            json!({ "name": ACTION_DISPATCH_BINDING_NAME }),
+            Some(session_id),
+            timeout,
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(RwError::Cdp { message, .. }) if message.contains("already exists") => Ok(()),
+        Err(error) => Err(RwError::Message(format!(
+            "Rustwright action dispatch binding registration failed: {error}"
+        ))),
+    }
 }
 
 async fn enable_file_chooser_intercept_for_session(
@@ -26599,6 +28634,8 @@ async fn setup_attached_iframe_session(
         )
     }))
     .await?;
+    enable_action_dispatch_binding_for_session(&client, &child_session_id, Duration::from_secs(5))
+        .await?;
     enable_file_chooser_intercept_for_session(&client, &child_session_id, Duration::from_secs(5))
         .await?;
     install_stealth_defaults(&page.browser, &child_session_id).await?;
@@ -31145,6 +33182,12 @@ fn route_from_event(event: &Value) -> Option<Value> {
 fn request_from_event(event: &Value, redirected_from: Option<Value>) -> Option<Value> {
     let params = event.get("params")?;
     let request = params.get("request")?;
+    let redirect_hop = redirected_from
+        .as_ref()
+        .and_then(|previous| previous.get("redirect_hop"))
+        .and_then(Value::as_u64)
+        .map(|hop| hop.saturating_add(1))
+        .unwrap_or(0);
     let mut payload = json!({
         "request_id": params.get("requestId").cloned().unwrap_or(Value::Null),
         "loader_id": params.get("loaderId").cloned().unwrap_or(Value::Null),
@@ -31158,6 +33201,7 @@ fn request_from_event(event: &Value, redirected_from: Option<Value>) -> Option<V
         "headers": request.get("headers").cloned().unwrap_or_else(|| json!({})),
         "post_data": request.get("postData").cloned().unwrap_or(Value::Null),
         "post_data_entries": request.get("postDataEntries").cloned().unwrap_or(Value::Null),
+        "redirect_hop": redirect_hop,
         "timing": Value::Null,
     });
     if params.get("redirectResponse").is_some() {
@@ -31347,10 +33391,33 @@ fn navigation_ready_state_satisfies(state: &str, ready_state: &str) -> bool {
     }
 }
 
+fn frame_tree_matches_navigation(
+    node: &Value,
+    expected_frame_id: &str,
+    expected_url: Option<&str>,
+) -> bool {
+    let frame = node.get("frame").unwrap_or(&Value::Null);
+    if frame.get("id").and_then(Value::as_str) == Some(expected_frame_id) {
+        return expected_url
+            .map(|expected| frame.get("url").and_then(Value::as_str) == Some(expected))
+            .unwrap_or(true);
+    }
+    node.get("childFrames")
+        .and_then(Value::as_array)
+        .map(|children| {
+            children
+                .iter()
+                .any(|child| frame_tree_matches_navigation(child, expected_frame_id, expected_url))
+        })
+        .unwrap_or(false)
+}
+
 async fn reconcile_navigation_state(
     client: &CdpClient,
     session_id: &str,
     state: &str,
+    expected_frame_id: Option<&str>,
+    expected_url: Option<&str>,
     deadline: OperationDeadline,
 ) -> RwResult<bool> {
     if !matches!(state, "domcontentloaded" | "load") {
@@ -31393,7 +33460,7 @@ async fn reconcile_navigation_state(
         return Ok(false);
     }
 
-    match client
+    let frame_tree = match client
         .send(
             "Page.getFrameTree",
             json!({}),
@@ -31402,16 +33469,43 @@ async fn reconcile_navigation_state(
         )
         .await
     {
-        Ok(_) => Ok(true),
-        Err(RwError::Timeout(_)) => Err(navigation_timeout(deadline)),
-        Err(error) if is_page_not_attached_error(&error) => Ok(false),
-        Err(error) => Err(error),
-    }
+        Ok(frame_tree) => frame_tree,
+        Err(RwError::Timeout(_)) => return Err(navigation_timeout(deadline)),
+        Err(error) if is_page_not_attached_error(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(frame_tree.get("frameTree").is_some_and(|root| {
+        expected_frame_id
+            .map(|frame_id| frame_tree_matches_navigation(root, frame_id, expected_url))
+            .unwrap_or(true)
+    }))
+}
+
+async fn send_history_entry_navigation(
+    client: &CdpClient,
+    entry_id: i64,
+    session_id: &str,
+    timeout: Duration,
+) -> RwResult<u64> {
+    // Page.navigateToHistoryEntry returns no navigation id, so CDP cannot distinguish a
+    // concurrent same-session/frame/URL restore while the command is in flight. The pre-send
+    // event-log cursor is the strongest sound ownership bound available from the protocol.
+    let restore_initiation_cursor = client.event_cursor();
+    client
+        .send(
+            "Page.navigateToHistoryEntry",
+            json!({ "entryId": entry_id }),
+            Some(session_id),
+            timeout,
+        )
+        .await?;
+    Ok(restore_initiation_cursor)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NavigationTerminalEvent {
     SameDocument,
+    BackForwardCacheRestore,
     Lifecycle,
 }
 
@@ -31419,8 +33513,8 @@ fn navigation_terminal_event(
     event: &Value,
     session_id: &str,
     state: &str,
-    expected_url: Option<&str>,
     expected_frame_id: Option<&str>,
+    expected_url: Option<&str>,
     same_document_url: Option<&str>,
 ) -> Option<NavigationTerminalEvent> {
     if event.get("sessionId").and_then(Value::as_str) != Some(session_id) {
@@ -31438,12 +33532,17 @@ fn navigation_terminal_event(
             .zip(event.pointer("/params/frame/url").and_then(Value::as_str))
             .map(|(expected, actual)| expected == actual)
             .unwrap_or(false);
+    let restored_from_back_forward_cache = frame_navigated_to_expected
+        && event.pointer("/params/type").and_then(Value::as_str) == Some("BackForwardCacheRestore");
     let navigated_within_document_to_expected = method == "Page.navigatedWithinDocument"
         && frame_matches(event.pointer("/params/frameId").and_then(Value::as_str))
         && same_document_url
             .zip(event.pointer("/params/url").and_then(Value::as_str))
             .map(|(expected, actual)| expected == actual)
             .unwrap_or(false);
+    if restored_from_back_forward_cache {
+        return Some(NavigationTerminalEvent::BackForwardCacheRestore);
+    }
     if navigated_within_document_to_expected {
         return Some(NavigationTerminalEvent::SameDocument);
     }
@@ -31455,15 +33554,228 @@ fn navigation_terminal_event(
     reached_state.then_some(NavigationTerminalEvent::Lifecycle)
 }
 
+fn navigation_terminal_lacks_owned_response(
+    terminal_event: NavigationTerminalEvent,
+    loader_id: Option<&str>,
+    expected_url: Option<&str>,
+    response: Option<&Value>,
+) -> bool {
+    matches!(
+        terminal_event,
+        NavigationTerminalEvent::Lifecycle | NavigationTerminalEvent::BackForwardCacheRestore
+    ) && loader_id.is_none()
+        && expected_url.is_some()
+        && response.is_none()
+}
+
+#[derive(Default)]
+struct NavigationEventState {
+    response: Option<Value>,
+    requests: HashMap<String, Value>,
+    response_extra_infos: HashMap<String, Value>,
+    response_extra_request_id: Option<String>,
+    response_extra_deadline: Option<tokio::time::Instant>,
+    state_ready_to_return: bool,
+    active_requests: HashSet<String>,
+    load_reached: bool,
+    network_idle_deadline: Option<tokio::time::Instant>,
+    state_reached_deadline: Option<tokio::time::Instant>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_navigation_event(
+    event: &Value,
+    event_log_position: Option<u64>,
+    session_id: &str,
+    wait_until: &str,
+    expected_frame_id: Option<&str>,
+    loader_id: Option<&str>,
+    expected_url: Option<&str>,
+    same_document_url: Option<&str>,
+    legacy_loaderless_response: bool,
+    method_label: &str,
+    restore_initiation_cursor: Option<u64>,
+    matcher: &mut NavigationEventState,
+) -> RwResult<Option<NavigationWaitResult>> {
+    if event.get("sessionId").and_then(Value::as_str) != Some(session_id) {
+        return Ok(None);
+    }
+    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+    if method == "Network.requestWillBeSent" {
+        if let Some(request_id) = event.pointer("/params/requestId").and_then(Value::as_str) {
+            matcher.active_requests.insert(request_id.to_string());
+            matcher.network_idle_deadline = None;
+        }
+        let prior_request = event
+            .pointer("/params/requestId")
+            .and_then(Value::as_str)
+            .and_then(|request_id| matcher.requests.get(request_id).cloned());
+        if let Some(request) = request_from_event(event, prior_request) {
+            if let Some(request_id) = request.get("request_id").and_then(Value::as_str) {
+                matcher.requests.insert(request_id.to_string(), request);
+            }
+        }
+        return Ok(None);
+    }
+    if method == "Network.responseReceived" {
+        let request_id = event
+            .pointer("/params/requestId")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let response_extra = event
+            .pointer("/params/requestId")
+            .and_then(Value::as_str)
+            .and_then(|request_id| matcher.response_extra_infos.get(request_id));
+        let request = event
+            .pointer("/params/requestId")
+            .and_then(Value::as_str)
+            .and_then(|request_id| matcher.requests.get(request_id).cloned());
+        if let Some(candidate) = navigation_response_from_event(
+            event,
+            expected_frame_id,
+            loader_id,
+            request,
+            expected_url,
+            legacy_loaderless_response,
+            response_extra,
+        ) {
+            let waiting_for_extra = response_needs_extra_info(event, response_extra);
+            let is_non_document = candidate
+                .get("resource_type")
+                .and_then(Value::as_str)
+                .map(|resource_type| resource_type != "Document")
+                .unwrap_or(false);
+            matcher.response = Some(candidate);
+            if waiting_for_extra {
+                matcher.response_extra_request_id = request_id;
+                matcher.response_extra_deadline =
+                    Some(tokio::time::Instant::now() + Duration::from_millis(100));
+            } else {
+                matcher.response_extra_request_id = None;
+                matcher.response_extra_deadline = None;
+            }
+            if wait_until == "commit" {
+                if matcher.response_extra_deadline.is_some() {
+                    matcher.state_ready_to_return = true;
+                    return Ok(None);
+                }
+                return Ok(Some(completed_navigation(matcher.response.take(), false)));
+            }
+            if wait_until != "networkidle" && is_non_document {
+                if matcher.response_extra_deadline.is_some() {
+                    matcher.state_ready_to_return = true;
+                    return Ok(None);
+                }
+                return Ok(Some(completed_navigation(matcher.response.take(), false)));
+            }
+        }
+        return Ok(None);
+    }
+    if method == "Network.responseReceivedExtraInfo" {
+        if let (Some(request_id), Some(params)) = (
+            event.pointer("/params/requestId").and_then(Value::as_str),
+            event.get("params"),
+        ) {
+            matcher
+                .response_extra_infos
+                .insert(request_id.to_string(), params.clone());
+            if matcher.response_extra_request_id.as_deref() == Some(request_id) {
+                if let Some(existing_response) = matcher.response.as_mut() {
+                    apply_response_extra_info(existing_response, params);
+                }
+                matcher.response_extra_request_id = None;
+                matcher.response_extra_deadline = None;
+                if matcher.state_ready_to_return {
+                    return Ok(Some(completed_navigation(matcher.response.take(), false)));
+                }
+            }
+        }
+        return Ok(None);
+    }
+    if method == "Network.loadingFinished" || method == "Network.loadingFailed" {
+        if method == "Network.loadingFailed" {
+            if let Some(message) = navigation_failure_message(
+                event,
+                expected_frame_id,
+                loader_id,
+                expected_url,
+                &matcher.requests,
+                matcher.response.as_ref(),
+                method_label,
+            ) {
+                return Err(RwError::Message(message));
+            }
+        }
+        if let Some(request_id) = event.pointer("/params/requestId").and_then(Value::as_str) {
+            matcher.active_requests.remove(request_id);
+        }
+        if wait_until == "networkidle" && matcher.load_reached && matcher.active_requests.is_empty()
+        {
+            matcher.network_idle_deadline =
+                Some(tokio::time::Instant::now() + Duration::from_millis(500));
+        }
+        return Ok(None);
+    }
+
+    if let Some(terminal_event) = navigation_terminal_event(
+        event,
+        session_id,
+        wait_until,
+        expected_frame_id,
+        expected_url,
+        same_document_url,
+    ) {
+        if terminal_event == NavigationTerminalEvent::BackForwardCacheRestore
+            && expected_frame_id.is_some()
+            && matches!(method_label, "Page.go_back" | "Page.go_forward")
+            && restore_initiation_cursor
+                .zip(event_log_position)
+                .is_some_and(|(cursor, position)| position >= cursor)
+        {
+            return Ok(Some(completed_navigation(matcher.response.take(), false)));
+        }
+        if navigation_terminal_lacks_owned_response(
+            terminal_event,
+            loader_id,
+            expected_url,
+            matcher.response.as_ref(),
+        ) {
+            return Ok(None);
+        }
+        if terminal_event == NavigationTerminalEvent::SameDocument {
+            return Ok(Some(completed_navigation(matcher.response.take(), true)));
+        }
+        if wait_until == "networkidle" {
+            matcher.load_reached = true;
+            if matcher.active_requests.is_empty() {
+                matcher.network_idle_deadline =
+                    Some(tokio::time::Instant::now() + Duration::from_millis(500));
+            }
+            return Ok(None);
+        }
+        if matcher.response.is_some() {
+            if matcher.response_extra_deadline.is_some() {
+                matcher.state_ready_to_return = true;
+                return Ok(None);
+            }
+            return Ok(Some(completed_navigation(matcher.response.take(), false)));
+        }
+        matcher.state_reached_deadline =
+            Some(tokio::time::Instant::now() + Duration::from_millis(250));
+    }
+    Ok(None)
+}
+
 async fn wait_for_navigation(
     client: &CdpClient,
     events: &mut broadcast::Receiver<Value>,
     event_cursor: u64,
+    restore_initiation_cursor: Option<u64>,
     session_id: &str,
     state: &str,
+    expected_frame_id: Option<&str>,
     loader_id: Option<&str>,
     expected_url: Option<&str>,
-    expected_frame_id: Option<&str>,
     same_document_url: Option<&str>,
     legacy_loaderless_response: bool,
     method_label: &str,
@@ -31476,16 +33788,8 @@ async fn wait_for_navigation(
         .min(initial_remaining);
     let reconciliation_at = deadline.at - reconciliation_budget;
     let mut deadline_reconciliation_attempted = false;
-    let mut response = None;
-    let mut requests: HashMap<String, Value> = HashMap::new();
-    let mut response_extra_infos: HashMap<String, Value> = HashMap::new();
-    let mut response_extra_request_id: Option<String> = None;
-    let mut response_extra_deadline: Option<tokio::time::Instant> = None;
-    let mut state_ready_to_return = false;
-    let mut active_requests: HashSet<String> = HashSet::new();
-    let mut load_reached = false;
-    let mut network_idle_deadline: Option<tokio::time::Instant> = None;
-    let mut state_reached_deadline: Option<tokio::time::Instant> = None;
+    let mut matcher = NavigationEventState::default();
+    let mut replay_cursor = event_cursor;
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline.at {
@@ -31493,40 +33797,51 @@ async fn wait_for_navigation(
         }
         if !deadline_reconciliation_attempted && now >= reconciliation_at {
             deadline_reconciliation_attempted = true;
-            if reconcile_navigation_state(client, session_id, state, deadline).await? {
-                return Ok(completed_navigation(response, false));
+            if reconcile_navigation_state(
+                client,
+                session_id,
+                state,
+                expected_frame_id,
+                expected_url,
+                deadline,
+            )
+            .await?
+            {
+                return Ok(completed_navigation(matcher.response.take(), false));
             }
             continue;
         }
         if state == "networkidle"
-            && load_reached
-            && response.is_some()
-            && active_requests.is_empty()
-            && network_idle_deadline
+            && matcher.load_reached
+            && matcher.response.is_some()
+            && matcher.active_requests.is_empty()
+            && matcher
+                .network_idle_deadline
                 .map(|idle| now >= idle)
                 .unwrap_or(false)
         {
-            return Ok(completed_navigation(response, false));
+            return Ok(completed_navigation(matcher.response.take(), false));
         }
-        if let Some(grace_deadline) = state_reached_deadline {
+        if let Some(grace_deadline) = matcher.state_reached_deadline {
             if now >= grace_deadline {
-                return Ok(completed_navigation(response, false));
+                return Ok(completed_navigation(matcher.response.take(), false));
             }
         }
-        if response_extra_deadline
+        if matcher
+            .response_extra_deadline
             .map(|extra_deadline| now >= extra_deadline)
             .unwrap_or(false)
         {
-            response_extra_request_id = None;
-            response_extra_deadline = None;
+            matcher.response_extra_request_id = None;
+            matcher.response_extra_deadline = None;
         }
-        if state_ready_to_return {
-            if let Some(extra_deadline) = response_extra_deadline {
+        if matcher.state_ready_to_return {
+            if let Some(extra_deadline) = matcher.response_extra_deadline {
                 if now >= extra_deadline {
-                    return Ok(completed_navigation(response, false));
+                    return Ok(completed_navigation(matcher.response.take(), false));
                 }
             } else {
-                return Ok(completed_navigation(response, false));
+                return Ok(completed_navigation(matcher.response.take(), false));
             }
         }
         let mut remaining = deadline.at - now;
@@ -31534,232 +33849,82 @@ async fn wait_for_navigation(
             remaining = remaining.min(reconciliation_at.saturating_duration_since(now));
         }
         if state == "networkidle" {
-            if let Some(idle_deadline) = network_idle_deadline {
+            if let Some(idle_deadline) = matcher.network_idle_deadline {
                 remaining = remaining.min(idle_deadline - now);
             }
         }
-        if let Some(grace_deadline) = state_reached_deadline {
+        if let Some(grace_deadline) = matcher.state_reached_deadline {
             remaining = remaining.min(grace_deadline - now);
         }
-        if let Some(extra_deadline) = response_extra_deadline {
+        if let Some(extra_deadline) = matcher.response_extra_deadline {
             remaining = remaining.min(extra_deadline - now);
         }
         match tokio::time::timeout(remaining, events.recv()).await {
             Ok(Ok(event)) => {
-                let matches_session = event
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(|value| value == session_id)
-                    .unwrap_or(false);
-                if !matches_session {
-                    continue;
-                }
-                let method = event.get("method").and_then(Value::as_str).unwrap_or("");
-                if method == "Network.requestWillBeSent" {
-                    if let Some(request_id) =
-                        event.pointer("/params/requestId").and_then(Value::as_str)
-                    {
-                        active_requests.insert(request_id.to_string());
-                        network_idle_deadline = None;
-                    }
-                    let prior_request = event
-                        .pointer("/params/requestId")
-                        .and_then(Value::as_str)
-                        .and_then(|request_id| requests.get(request_id).cloned());
-                    if let Some(request) = request_from_event(&event, prior_request) {
-                        if let Some(request_id) = request.get("request_id").and_then(Value::as_str)
-                        {
-                            requests.insert(request_id.to_string(), request);
-                        }
-                    }
-                    continue;
-                }
-                if method == "Network.responseReceived" {
-                    let request_id = event
-                        .pointer("/params/requestId")
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string);
-                    let response_extra = event
-                        .pointer("/params/requestId")
-                        .and_then(Value::as_str)
-                        .and_then(|request_id| response_extra_infos.get(request_id));
-                    let request = event
-                        .pointer("/params/requestId")
-                        .and_then(Value::as_str)
-                        .and_then(|request_id| requests.get(request_id).cloned());
-                    if let Some(candidate) = navigation_response_from_event(
-                        &event,
-                        loader_id,
-                        request,
-                        expected_url,
-                        expected_frame_id,
-                        legacy_loaderless_response,
-                        response_extra,
-                    ) {
-                        let waiting_for_extra = response_needs_extra_info(&event, response_extra);
-                        let is_non_document = candidate
-                            .get("resource_type")
-                            .and_then(Value::as_str)
-                            .map(|resource_type| resource_type != "Document")
-                            .unwrap_or(false);
-                        response = Some(candidate);
-                        if waiting_for_extra {
-                            response_extra_request_id = request_id;
-                            response_extra_deadline =
-                                Some(tokio::time::Instant::now() + Duration::from_millis(100));
-                        } else {
-                            response_extra_request_id = None;
-                            response_extra_deadline = None;
-                        }
-                        if state == "commit" {
-                            if response_extra_deadline.is_some() {
-                                state_ready_to_return = true;
-                                continue;
-                            }
-                            return Ok(completed_navigation(response, false));
-                        }
-                        if state != "networkidle" && is_non_document {
-                            if response_extra_deadline.is_some() {
-                                state_ready_to_return = true;
-                                continue;
-                            }
-                            return Ok(completed_navigation(response, false));
-                        }
-                    }
-                    continue;
-                }
-                if method == "Network.responseReceivedExtraInfo" {
-                    if let (Some(request_id), Some(params)) = (
-                        event.pointer("/params/requestId").and_then(Value::as_str),
-                        event.get("params"),
-                    ) {
-                        response_extra_infos.insert(request_id.to_string(), params.clone());
-                        if response_extra_request_id
-                            .as_deref()
-                            .map(|pending_id| pending_id == request_id)
-                            .unwrap_or(false)
-                        {
-                            if let Some(existing_response) = response.as_mut() {
-                                apply_response_extra_info(existing_response, params);
-                            }
-                            response_extra_request_id = None;
-                            response_extra_deadline = None;
-                            if state_ready_to_return {
-                                return Ok(completed_navigation(response, false));
-                            }
-                        }
-                    }
-                    continue;
-                }
-                if method == "Network.loadingFinished" || method == "Network.loadingFailed" {
-                    if method == "Network.loadingFailed" {
-                        if let Some(message) = navigation_failure_message(
-                            &event,
-                            loader_id,
-                            expected_url,
-                            &requests,
-                            response.as_ref(),
-                            method_label,
-                        ) {
-                            return Err(RwError::Message(message));
-                        }
-                    }
-                    if let Some(request_id) =
-                        event.pointer("/params/requestId").and_then(Value::as_str)
-                    {
-                        active_requests.remove(request_id);
-                    }
-                    if state == "networkidle" && load_reached && active_requests.is_empty() {
-                        network_idle_deadline =
-                            Some(tokio::time::Instant::now() + Duration::from_millis(500));
-                    }
-                    continue;
-                }
-
-                if let Some(terminal_event) = navigation_terminal_event(
+                let previous_replay_cursor = replay_cursor;
+                replay_cursor = client
+                    .event_log
+                    .lock()
+                    .unwrap()
+                    .cursor_after_event(replay_cursor, &event);
+                let event_log_position = (replay_cursor != previous_replay_cursor)
+                    .then(|| replay_cursor.wrapping_sub(1));
+                if let Some(completed) = process_navigation_event(
                     &event,
+                    event_log_position,
                     session_id,
                     state,
-                    expected_url,
                     expected_frame_id,
+                    loader_id,
+                    expected_url,
                     same_document_url,
-                ) {
-                    if terminal_event == NavigationTerminalEvent::SameDocument {
-                        return Ok(completed_navigation(response, true));
-                    }
-                    if state == "networkidle" {
-                        load_reached = true;
-                        if active_requests.is_empty() {
-                            network_idle_deadline =
-                                Some(tokio::time::Instant::now() + Duration::from_millis(500));
-                        }
-                        continue;
-                    }
-                    if response.is_some() {
-                        if response_extra_deadline.is_some() {
-                            state_ready_to_return = true;
-                            continue;
-                        }
-                        return Ok(completed_navigation(response, false));
-                    }
-                    state_reached_deadline =
-                        Some(tokio::time::Instant::now() + Duration::from_millis(250));
-                    continue;
+                    legacy_loaderless_response,
+                    method_label,
+                    restore_initiation_cursor,
+                    &mut matcher,
+                )? {
+                    return Ok(completed);
                 }
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                let replayed_terminal = {
-                    let event_log = client.event_log.lock().unwrap();
-                    event_log
-                        .entries_since(event_cursor)
-                        .into_iter()
-                        .filter_map(|(_, event)| {
-                            navigation_terminal_event(
-                                &event,
-                                session_id,
-                                state,
-                                expected_url,
-                                expected_frame_id,
-                                same_document_url,
-                            )
-                        })
-                        .fold(None, |replayed, terminal| {
-                            if replayed == Some(NavigationTerminalEvent::SameDocument)
-                                || terminal == NavigationTerminalEvent::SameDocument
-                            {
-                                Some(NavigationTerminalEvent::SameDocument)
-                            } else {
-                                Some(terminal)
-                            }
-                        })
-                };
-                if let Some(terminal_event) = replayed_terminal {
-                    if terminal_event == NavigationTerminalEvent::SameDocument {
-                        return Ok(completed_navigation(response, true));
+                let (replacement, replay_end) = client.subscribe_with_cursor();
+                let replayed_events = client
+                    .event_log
+                    .lock()
+                    .unwrap()
+                    .entries_between(replay_cursor, replay_end);
+                *events = replacement;
+                replay_cursor = replay_end;
+                for (event_log_position, event) in replayed_events {
+                    if let Some(completed) = process_navigation_event(
+                        &event,
+                        Some(event_log_position),
+                        session_id,
+                        state,
+                        expected_frame_id,
+                        loader_id,
+                        expected_url,
+                        same_document_url,
+                        legacy_loaderless_response,
+                        method_label,
+                        restore_initiation_cursor,
+                        &mut matcher,
+                    )? {
+                        return Ok(completed);
                     }
-                    if state == "networkidle" {
-                        if !load_reached {
-                            load_reached = true;
-                            if active_requests.is_empty() {
-                                network_idle_deadline =
-                                    Some(tokio::time::Instant::now() + Duration::from_millis(500));
-                            }
-                        }
-                        continue;
-                    }
-                    if response.is_some() {
-                        if response_extra_deadline.is_some() {
-                            state_ready_to_return = true;
-                            continue;
-                        }
-                        return Ok(completed_navigation(response, false));
-                    }
-                    state_reached_deadline =
-                        Some(tokio::time::Instant::now() + Duration::from_millis(250));
-                    continue;
                 }
-                if reconcile_navigation_state(client, session_id, state, deadline).await? {
-                    return Ok(completed_navigation(response, false));
+                if matcher.response.is_none()
+                    && reconcile_navigation_state(
+                        client,
+                        session_id,
+                        state,
+                        expected_frame_id,
+                        expected_url,
+                        deadline,
+                    )
+                    .await?
+                {
+                    return Ok(completed_navigation(None, false));
                 }
                 continue;
             }
@@ -31771,23 +33936,45 @@ async fn wait_for_navigation(
                     continue;
                 }
                 if state == "networkidle"
-                    && load_reached
-                    && response.is_some()
-                    && active_requests.is_empty()
+                    && matcher.load_reached
+                    && matcher.response.is_some()
+                    && matcher.active_requests.is_empty()
                 {
-                    return Ok(completed_navigation(response, false));
+                    return Ok(completed_navigation(matcher.response.take(), false));
                 }
-                if state_reached_deadline.is_some() {
-                    return Ok(completed_navigation(response, false));
+                if matcher.state_reached_deadline.is_some() {
+                    return Ok(completed_navigation(matcher.response.take(), false));
                 }
                 return Err(navigation_timeout(deadline));
             }
         }
     }
 }
+fn request_redirect_chain_first_url(request: Option<&Value>) -> Option<&str> {
+    let mut current = request?;
+    while let Some(previous) = current.get("redirected_from") {
+        current = previous;
+    }
+    current.get("url").and_then(Value::as_str)
+}
+
+fn response_matches_failed_request_hop(
+    response: &Value,
+    request_id: &str,
+    request: Option<&Value>,
+) -> bool {
+    let Some(request) = request else {
+        return false;
+    };
+    response.get("request_id").and_then(Value::as_str) == Some(request_id)
+        && response.get("url").and_then(Value::as_str) == request.get("url").and_then(Value::as_str)
+        && response.get("redirect_hop").and_then(Value::as_u64)
+            == request.get("redirect_hop").and_then(Value::as_u64)
+}
 
 fn navigation_failure_message(
     event: &Value,
+    expected_frame_id: Option<&str>,
     loader_id: Option<&str>,
     expected_url: Option<&str>,
     requests: &HashMap<String, Value>,
@@ -31797,6 +33984,10 @@ fn navigation_failure_message(
     let params = event.get("params")?;
     let request_id = params.get("requestId").and_then(Value::as_str)?;
     let request = requests.get(request_id);
+    // Request ids survive redirects. Bind response metadata to the current hop,
+    // so a completed redirect response cannot classify the later failed hop.
+    let response =
+        response.filter(|value| response_matches_failed_request_hop(value, request_id, request));
     let resource_type = params
         .get("type")
         .and_then(Value::as_str)
@@ -31807,18 +33998,23 @@ fn navigation_failure_message(
     }
 
     let request_loader = request.and_then(|value| value.get("loader_id").and_then(Value::as_str));
+    let request_frame = request.and_then(|value| value.get("frame_id").and_then(Value::as_str));
     let response_loader = response.and_then(|value| value.get("loader_id").and_then(Value::as_str));
+    let response_frame = response.and_then(|value| value.get("frame_id").and_then(Value::as_str));
     let request_url = request.and_then(|value| value.get("url").and_then(Value::as_str));
     let response_url = response.and_then(|value| value.get("url").and_then(Value::as_str));
-    let response_request_id =
-        response.and_then(|value| value.get("request_id").and_then(Value::as_str));
+
+    let failed_frame_id = request_frame.or(response_frame);
+    if expected_frame_id.is_some() && failed_frame_id != expected_frame_id {
+        return None;
+    }
 
     let matches_navigation = if let Some(expected_loader_id) = loader_id {
         request_loader == Some(expected_loader_id) || response_loader == Some(expected_loader_id)
     } else if let Some(expected) = expected_url {
-        request_url == Some(expected) || response_url == Some(expected)
+        request_redirect_chain_first_url(request) == Some(expected)
     } else {
-        response_request_id == Some(request_id)
+        response.is_some()
     };
     if !matches_navigation {
         return None;
@@ -31852,12 +34048,368 @@ fn response_has_attachment_disposition(response: Option<&Value>) -> bool {
     })
 }
 
+#[cfg(test)]
+mod navigation_and_action_retry_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_navigation_events_require_the_expected_frame() {
+        let child_same_document = json!({
+            "sessionId": "session",
+            "method": "Page.navigatedWithinDocument",
+            "params": {
+                "frameId": "child",
+                "url": "https://example.test/saved",
+            },
+        });
+        assert_eq!(
+            navigation_terminal_event(
+                &child_same_document,
+                "session",
+                "load",
+                Some("main"),
+                Some("https://example.test/saved"),
+                Some("https://example.test/saved"),
+            ),
+            None
+        );
+        let mut main_same_document = child_same_document;
+        main_same_document["params"]["frameId"] = json!("main");
+        assert_eq!(
+            navigation_terminal_event(
+                &main_same_document,
+                "session",
+                "load",
+                Some("main"),
+                Some("https://example.test/saved"),
+                Some("https://example.test/saved"),
+            ),
+            Some(NavigationTerminalEvent::SameDocument)
+        );
+
+        let child_frame_navigated = json!({
+            "sessionId": "session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "child",
+                    "url": "https://example.test/saved",
+                },
+            },
+        });
+        assert_eq!(
+            navigation_terminal_event(
+                &child_frame_navigated,
+                "session",
+                "load",
+                Some("main"),
+                Some("https://example.test/saved"),
+                Some("https://example.test/saved"),
+            ),
+            None
+        );
+        let mut main_frame_navigated = child_frame_navigated;
+        main_frame_navigated["params"]["frame"]["id"] = json!("main");
+        assert_eq!(
+            navigation_terminal_event(
+                &main_frame_navigated,
+                "session",
+                "load",
+                Some("main"),
+                Some("https://example.test/saved"),
+                Some("https://example.test/saved"),
+            ),
+            Some(NavigationTerminalEvent::Lifecycle)
+        );
+    }
+
+    #[test]
+    fn navigation_failure_matches_redirect_ancestry_and_failed_request_metadata() {
+        let failed_request = json!({
+            "request_id": "redirect-chain",
+            "loader_id": "",
+            "frame_id": "main",
+            "resource_type": "Document",
+            "url": "https://example.test/blocked",
+            "redirected_from": {
+                "request_id": "redirect-chain",
+                "frame_id": "main",
+                "resource_type": "Document",
+                "url": "https://example.test/saved",
+            },
+        });
+        let requests = HashMap::from([("redirect-chain".to_string(), failed_request)]);
+        let unrelated_response = json!({
+            "request_id": "parent-response",
+            "loader_id": "parent-loader",
+            "frame_id": "main",
+            "resource_type": "Document",
+            "url": "https://example.test/saved",
+            "headers": {
+                "Content-Disposition": "attachment",
+            },
+        });
+        let failed = json!({
+            "params": {
+                "requestId": "redirect-chain",
+                "type": "Document",
+                "errorText": "net::ERR_FAILED",
+            },
+        });
+
+        assert_eq!(
+            navigation_failure_message(
+                &failed,
+                Some("main"),
+                None,
+                Some("https://example.test/saved"),
+                &requests,
+                Some(&unrelated_response),
+                "Page.go_back",
+            ),
+            Some("Page.go_back: net::ERR_FAILED at https://example.test/blocked".to_string())
+        );
+    }
+
+    #[test]
+    fn failed_redirect_hop_rejects_stale_attachment_response_metadata() {
+        let failed_request = json!({
+            "request_id": "redirect-chain",
+            "loader_id": "loader",
+            "frame_id": "main",
+            "resource_type": "Document",
+            "url": "https://example.test/final",
+            "redirect_hop": 1,
+            "redirected_from": {
+                "request_id": "redirect-chain",
+                "loader_id": "loader",
+                "frame_id": "main",
+                "resource_type": "Document",
+                "url": "https://example.test/redirect",
+                "redirect_hop": 0,
+            },
+        });
+        let requests = HashMap::from([("redirect-chain".to_string(), failed_request)]);
+        let stale_redirect_response = json!({
+            "request_id": "redirect-chain",
+            "loader_id": "loader",
+            "frame_id": "main",
+            "resource_type": "Document",
+            "url": "https://example.test/redirect",
+            "redirect_hop": 0,
+            "headers": {
+                "Content-Disposition": "attachment",
+            },
+        });
+        let failed = json!({
+            "params": {
+                "requestId": "redirect-chain",
+                "type": "Document",
+                "errorText": "net::ERR_FAILED",
+            },
+        });
+
+        assert_eq!(
+            navigation_failure_message(
+                &failed,
+                Some("main"),
+                Some("loader"),
+                None,
+                &requests,
+                Some(&stale_redirect_response),
+                "Page.goto",
+            ),
+            Some("Page.goto: net::ERR_FAILED at https://example.test/final".to_string())
+        );
+    }
+
+    #[test]
+    fn history_failure_requires_expected_url_as_redirect_chain_first_hop() {
+        let concurrent_request = json!({
+            "request_id": "concurrent-chain",
+            "loader_id": "",
+            "frame_id": "main",
+            "resource_type": "Document",
+            "url": "https://example.test/blocked",
+            "redirect_hop": 2,
+            "redirected_from": {
+                "request_id": "concurrent-chain",
+                "frame_id": "main",
+                "resource_type": "Document",
+                "url": "https://example.test/saved",
+                "redirect_hop": 1,
+                "redirected_from": {
+                    "request_id": "concurrent-chain",
+                    "frame_id": "main",
+                    "resource_type": "Document",
+                    "url": "https://example.test/other",
+                    "redirect_hop": 0,
+                },
+            },
+        });
+        let requests = HashMap::from([("concurrent-chain".to_string(), concurrent_request)]);
+        let failed = json!({
+            "params": {
+                "requestId": "concurrent-chain",
+                "type": "Document",
+                "errorText": "net::ERR_FAILED",
+            },
+        });
+
+        assert_eq!(
+            navigation_failure_message(
+                &failed,
+                Some("main"),
+                None,
+                Some("https://example.test/saved"),
+                &requests,
+                None,
+                "Page.go_back",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn action_resolution_retry_classifier_excludes_contract_and_owner_errors() {
+        assert!(is_transient_action_resolution_error(&RwError::Cdp {
+            method: "Runtime.evaluate".to_string(),
+            message: "Execution context was destroyed.".to_string(),
+        }));
+        assert!(is_transient_action_resolution_error(&RwError::Message(
+            "cross-origin iframe did not expose a CDP frame id".to_string(),
+        )));
+        assert!(!is_transient_action_resolution_error(&RwError::Message(
+            "strict mode violation: locator resolved to 2 elements".to_string(),
+        )));
+        assert!(!is_transient_action_resolution_error(&RwError::Message(
+            "Element is not a <select> element".to_string(),
+        )));
+        assert!(!is_transient_action_resolution_error(
+            &RwError::TargetClosed(TargetClosedKind::Page)
+        ));
+        assert_eq!(
+            action_dispatch_reply_disposition(&RwError::Cdp {
+                method: "Runtime.callFunctionOn".to_string(),
+                message: "Execution context was destroyed.".to_string(),
+            }),
+            ActionDispatchReplyDisposition::AmbiguousContextLoss
+        );
+        assert_eq!(
+            action_dispatch_reply_disposition(&RwError::Cdp {
+                method: "Runtime.callFunctionOn".to_string(),
+                message: "Inspected target navigated or closed".to_string(),
+            }),
+            ActionDispatchReplyDisposition::AmbiguousContextLoss
+        );
+        for message in [
+            "Cannot find context with specified id",
+            "Session is detached",
+            "Session with given id not found",
+        ] {
+            assert_eq!(
+                action_dispatch_reply_disposition(&RwError::Cdp {
+                    method: "Runtime.callFunctionOn".to_string(),
+                    message: message.to_string(),
+                }),
+                ActionDispatchReplyDisposition::SafeRetry
+            );
+        }
+        assert_eq!(
+            action_dispatch_reply_disposition(&RwError::Message(
+                ACTION_DISPATCH_OPTION_LIST_CHANGED_MARKER.to_string(),
+            )),
+            ActionDispatchReplyDisposition::SafeRetry
+        );
+        assert_eq!(
+            action_dispatch_reply_disposition(&RwError::Message(
+                "__rustwright_action_dispatch_not_started__: element detached".to_string(),
+            )),
+            ActionDispatchReplyDisposition::DeterministicFailure
+        );
+        assert_eq!(
+            action_dispatch_reply_disposition(&RwError::Cdp {
+                method: "Runtime.callFunctionOn".to_string(),
+                message: "JavaScript exception".to_string(),
+            }),
+            ActionDispatchReplyDisposition::DeterministicFailure
+        );
+        assert_eq!(
+            action_dispatch_receipt_from_event(&json!({
+                "sessionId": "page-session",
+                "method": "Page.frameNavigated",
+                "params": { "frame": { "id": "target" } },
+            })),
+            None,
+            "navigation is not action commitment evidence"
+        );
+        assert_eq!(
+            action_dispatch_receipt_from_event(&json!({
+                "sessionId": "page-session",
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "name": ACTION_DISPATCH_BINDING_NAME,
+                    "payload": "{\"dispatchId\":\"dispatch-1\",\"token\":\"authentic-token\",\"result\":true,\"commitment\":\"commencing\"}",
+                },
+            })),
+            Some((
+                "page-session".to_string(),
+                "dispatch-1".to_string(),
+                "authentic-token".to_string(),
+                Value::Bool(true),
+                ActionDispatchCommitmentKind::Commencing,
+            ))
+        );
+    }
+
+    #[test]
+    fn loader_backed_document_response_requires_expected_frame() {
+        let child_response = json!({
+            "params": {
+                "requestId": "child-request",
+                "loaderId": "shared-loader",
+                "frameId": "child",
+                "type": "Document",
+                "response": {
+                    "url": "https://example.test/child",
+                    "status": 200,
+                },
+            },
+        });
+        assert_eq!(
+            navigation_response_from_event(
+                &child_response,
+                Some("main"),
+                Some("shared-loader"),
+                None,
+                None,
+                false,
+                None,
+            ),
+            None
+        );
+
+        let mut main_response = child_response;
+        main_response["params"]["frameId"] = json!("main");
+        assert!(navigation_response_from_event(
+            &main_response,
+            Some("main"),
+            Some("shared-loader"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .is_some());
+    }
+}
+
 fn navigation_response_from_event(
     event: &Value,
+    expected_frame_id: Option<&str>,
     loader_id: Option<&str>,
     request: Option<Value>,
     expected_url: Option<&str>,
-    expected_frame_id: Option<&str>,
     legacy_loaderless_response: bool,
     response_extra: Option<&Value>,
 ) -> Option<Value> {
@@ -31865,11 +34417,15 @@ fn navigation_response_from_event(
     let response_type = params.get("type").and_then(Value::as_str).unwrap_or("");
     let response = params.get("response")?;
     if let Some(expected_loader_id) = loader_id {
-        let actual_loader_id = params.get("loaderId").and_then(Value::as_str);
-        if actual_loader_id != Some(expected_loader_id) {
+        if response_type != "Document" {
             return None;
         }
-        if response_type != "Document" {
+        if expected_frame_id.is_some()
+            && params.get("frameId").and_then(Value::as_str) != expected_frame_id
+        {
+            return None;
+        }
+        if params.get("loaderId").and_then(Value::as_str) != Some(expected_loader_id) {
             return None;
         }
     } else if legacy_loaderless_response {
@@ -31889,20 +34445,19 @@ fn navigation_response_from_event(
         if response_type != "Document" {
             return None;
         }
-        let matches_main_frame = expected_frame_id
-            .zip(params.get("frameId").and_then(Value::as_str))
-            .map(|(expected, actual)| expected == actual)
-            .unwrap_or(false);
-        let matches_expected_url = expected_url
-            .zip(response.get("url").and_then(Value::as_str))
-            .map(|(expected, actual)| expected == actual)
-            .unwrap_or(false);
-        if expected_frame_id.is_some() {
-            if !matches_main_frame {
+        if expected_frame_id.is_some()
+            && params.get("frameId").and_then(Value::as_str) != expected_frame_id
+        {
+            return None;
+        }
+        if let Some(expected) = expected_url {
+            let actual = request
+                .as_ref()
+                .and_then(|request| request_redirect_chain_first_url(Some(request)))
+                .or_else(|| response.get("url").and_then(Value::as_str));
+            if actual != Some(expected) {
                 return None;
             }
-        } else if expected_url.is_some() && !matches_expected_url {
-            return None;
         }
     }
     let mut payload = json!({
@@ -31923,6 +34478,9 @@ fn navigation_response_from_event(
         "from_service_worker": response.get("fromServiceWorker").cloned().unwrap_or(Value::Bool(false)),
     });
     if let Some(request) = request {
+        if let Some(redirect_hop) = request.get("redirect_hop") {
+            payload["redirect_hop"] = redirect_hop.clone();
+        }
         payload["request"] = request;
     }
     if let Some(extra) = response_extra {
