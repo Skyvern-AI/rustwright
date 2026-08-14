@@ -1109,6 +1109,43 @@ def oopif_test_server():
                     """
                 )
                 return
+            if path == "/oopif-swap-top":
+                self._send_html(
+                    f"""
+                    <!doctype html>
+                    <title>OOPIF process swap</title>
+                    <iframe id="child" src="{origin_127}/oopif-swap-document?stage=same-origin-a"></iframe>
+                    <output id="last-input"></output>
+                    <script>
+                    addEventListener('message', event => {{
+                      if (event.data && event.data.kind === 'swap-input') {{
+                        document.querySelector('#last-input').textContent =
+                          `${{event.data.stage}}:${{event.data.value}}`;
+                      }}
+                    }});
+                    </script>
+                    """
+                )
+                return
+            if path == "/oopif-swap-document":
+                stage = parse_qs(urlparse(self.path).query).get("stage", ["missing"])[0]
+                self._send_html(
+                    f"""
+                    <!doctype html>
+                    <p id="stage">{escape(stage)}</p>
+                    <input id="route-input" aria-label="Route input">
+                    <script>
+                    document.querySelector('#route-input').addEventListener('input', event => {{
+                      parent.postMessage({{
+                        kind: 'swap-input',
+                        stage: {json.dumps(stage)},
+                        value: event.target.value,
+                      }}, '*');
+                    }});
+                    </script>
+                    """
+                )
+                return
             if path == "/oopif-child":
                 self._send_html(
                     """
@@ -1317,14 +1354,15 @@ def oopif_test_server():
         def log_message(self, *_):
             return
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
     thread = threading.Thread(target=_serve_forever_fast, args=(server,), daemon=True)
     thread.start()
     try:
         port = server.server_address[1]
         yield {
             "top": f"http://127.0.0.1:{port}",
-            "frame": f"http://localhost:{port}",
+            "frame": f"http://a.localhost:{port}",
+            "frame_b": f"http://b.localhost:{port}",
         }
     finally:
         server.shutdown()
@@ -1735,6 +1773,9 @@ def slow_attach_cdp_server():
         "commands": [],
         "port": None,
         "delay_create_target": False,
+        "frame_owner_present": False,
+        "withhold_iframe_file_chooser": False,
+        "withheld_commands": [],
         "slow_create_started": slow_create_started,
         "slow_enable_started": slow_enable_started,
     }
@@ -1795,6 +1836,16 @@ def slow_attach_cdp_server():
         if method == "Target.attachToTarget":
             target_id = command.get("params", {}).get("targetId")
             return {"sessionId": f"session-{target_id}"}
+        if method == "Runtime.evaluate":
+            expression = str(command.get("params", {}).get("expression") or "")
+            if "document.querySelectorAll('iframe,frame')" in expression:
+                entries = (
+                    [{"name": "", "url": "", "frame_index": 0}]
+                    if state["frame_owner_present"]
+                    else []
+                )
+                return {"result": {"type": "object", "value": entries}}
+            return {"result": {"type": "undefined"}}
         if method == "Browser.getVersion":
             return {
                 "product": "Chrome/120.0.0.0",
@@ -1854,6 +1905,16 @@ def slow_attach_cdp_server():
                 except OSError:
                     pass
 
+            def emit(event):
+                message = json.dumps(event, separators=(",", ":"))
+                with send_lock:
+                    conn.sendall(ws_text_frame(message))
+
+            state["emit"] = emit
+            state["respond"] = lambda command: respond(
+                command, result_for(command, target_counter)
+            )
+
             while not stop.is_set():
                 try:
                     frame = read_ws_frame(conn)
@@ -1885,6 +1946,12 @@ def slow_attach_cdp_server():
                 ):
                     slow_enable_started.set()
                     threading.Timer(0.75, respond, args=(command, result)).start()
+                elif (
+                    state["withhold_iframe_file_chooser"]
+                    and command.get("method") == "Page.setInterceptFileChooserDialog"
+                    and command.get("sessionId") == "metadata-child-session"
+                ):
+                    state["withheld_commands"].append(command)
                 else:
                     respond(command, result)
 
@@ -18024,6 +18091,78 @@ def test_forced_site_isolation_oopif_uses_iframe_target_session(playwright, oopi
         browser.close()
 
 
+def test_forced_site_isolation_real_oopif_process_swap_routes_each_input(
+    playwright, oopif_test_server
+):
+    browser = playwright.chromium.launch(headless=True, args=["--site-per-process"])
+    try:
+        page = browser.new_page()
+        page.goto(f"{oopif_test_server['top']}/oopif-swap-top")
+        cdp = page.context.new_cdp_session(page)
+        child = page.frame_locator("#child")
+
+        def iframe_targets() -> list[dict[str, Any]]:
+            return [
+                target
+                for target in cdp.send("Target.getTargets")["targetInfos"]
+                if target.get("type") == "iframe"
+            ]
+
+        def wait_for_target_state(url: str, expected: bool) -> None:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                present = any(target.get("url") == url for target in iframe_targets())
+                if present is expected:
+                    return
+                time.sleep(0.01)
+            raise AssertionError(
+                f"iframe target state for {url!r} did not become {expected}: {iframe_targets()}"
+            )
+
+        def assert_routed_input(stage: str, url: str, expect_oopif: bool) -> None:
+            expect(child.locator("#stage")).to_have_text(stage, timeout=3_000)
+            wait_for_target_state(url, expect_oopif)
+            value = f"value-{stage}"
+            started = time.monotonic()
+            child.locator("#route-input").fill(value, timeout=3_000)
+            elapsed = time.monotonic() - started
+            # Three seconds leaves a two-second CI margin below the historical stall.
+            assert elapsed < 3
+            assert child.locator("#route-input").input_value() == value
+            expect(page.locator("#last-input")).to_have_text(
+                f"{stage}:{value}", timeout=1_000
+            )
+
+        initial_url = (
+            f"{oopif_test_server['top']}/oopif-swap-document?stage=same-origin-a"
+        )
+        assert_routed_input("same-origin-a", initial_url, False)
+
+        cross_origin_a = (
+            f"{oopif_test_server['frame']}/oopif-swap-document?stage=cross-origin-a"
+        )
+        page.locator("#child").evaluate("(frame, url) => { frame.src = url; }", cross_origin_a)
+        assert_routed_input("cross-origin-a", cross_origin_a, True)
+
+        cross_origin_b = (
+            f"{oopif_test_server['frame_b']}/oopif-swap-document?stage=cross-origin-b"
+        )
+        page.locator("#child").evaluate("(frame, url) => { frame.src = url; }", cross_origin_b)
+        assert_routed_input("cross-origin-b", cross_origin_b, True)
+        assert not any(target.get("url") == cross_origin_a for target in iframe_targets())
+
+        final_same_origin = (
+            f"{oopif_test_server['top']}/oopif-swap-document?stage=same-origin-b"
+        )
+        page.locator("#child").evaluate(
+            "(frame, url) => { frame.src = url; }", final_same_origin
+        )
+        assert_routed_input("same-origin-b", final_same_origin, False)
+        assert not any(target.get("url") == cross_origin_b for target in iframe_targets())
+    finally:
+        browser.close()
+
+
 def test_forced_site_isolation_oopif_fill_uses_iframe_target_frame(
     playwright, oopif_test_server
 ):
@@ -29157,6 +29296,114 @@ def test_async_unrelated_new_page_is_not_blocked_by_slow_attach(slow_attach_cdp_
                 await browser.close()
 
     asyncio.run(run())
+
+
+def test_fake_cdp_frame_lookup_preserves_fresh_routable_metadata(slow_attach_cdp_server):
+    # This synthetic transport test covers metadata precedence only. The forced-site-isolation
+    # process-swap test above is the real Chromium detach/adoption proof.
+    endpoint, state = slow_attach_cdp_server
+    adopted_url = "https://adopted.example.test/window"
+    fresh_url = "https://fresh.example.test/navigated"
+    stale_url = "https://stale.example.test/target"
+
+    def wait_until(predicate, message):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.005)
+        raise AssertionError(message)
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(endpoint)
+        page = browser.new_page()
+        state["frame_owner_present"] = True
+        state["withhold_iframe_file_chooser"] = True
+        state["emit"](
+            {
+                "sessionId": "session-target-1",
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": "metadata-child-session",
+                    "targetInfo": {
+                        "type": "iframe",
+                        "targetId": "metadata-child-frame",
+                        "parentFrameId": "frame-session-target-1",
+                        "name": "adopted-name",
+                        "url": adopted_url,
+                    },
+                },
+            }
+        )
+        wait_until(
+            lambda: bool(state["withheld_commands"]),
+            "iframe setup did not reach the post-routable withheld command",
+        )
+
+        adopted = page.frame(url=adopted_url)
+        assert adopted is not None
+        assert adopted in page.frames
+        assert page.frame(name="adopted-name") is adopted
+
+        state["emit"](
+            {
+                "sessionId": "metadata-child-session",
+                "method": "Page.frameNavigated",
+                "params": {
+                    "frame": {
+                        "id": "metadata-child-frame",
+                        "parentId": "frame-session-target-1",
+                        "name": "navigated-name",
+                        "url": fresh_url,
+                    }
+                },
+            }
+        )
+        wait_until(
+            lambda: page.frame(url=fresh_url) is adopted,
+            "frameNavigated metadata did not reach public frame lookup",
+        )
+
+        prior_auto_attach_count = sum(
+            command.get("method") == "Target.setAutoAttach"
+            and command.get("sessionId") == "metadata-child-session"
+            for command in state["commands"]
+        )
+        state["emit"](
+            {
+                "sessionId": "session-target-1",
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": "metadata-child-session",
+                    "targetInfo": {
+                        "type": "iframe",
+                        "targetId": "metadata-child-frame",
+                        "parentFrameId": "frame-session-target-1",
+                        "name": "stale-target-name",
+                        "url": stale_url,
+                    },
+                },
+            }
+        )
+        wait_until(
+            lambda: sum(
+                command.get("method") == "Target.setAutoAttach"
+                and command.get("sessionId") == "metadata-child-session"
+                for command in state["commands"]
+            )
+            > prior_auto_attach_count,
+            "late TargetInfo was not processed",
+        )
+
+        assert page.frame(url=fresh_url) is adopted
+        assert page.frame(name="navigated-name") is adopted
+        assert page.frame(url=stale_url) is None
+        assert page.frame(name="stale-target-name") is None
+
+        state["withhold_iframe_file_chooser"] = False
+        for command in state["withheld_commands"]:
+            state["respond"](command)
+        browser.close()
 
 
 def test_async_cancelled_page_attach_detaches_created_cdp_session(slow_attach_cdp_server):
