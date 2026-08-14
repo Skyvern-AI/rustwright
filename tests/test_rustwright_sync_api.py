@@ -342,6 +342,9 @@ def chromium_arg_probe_wrapper(tmp_path: Path, real_chromium: str, args_file: Pa
 def http_server():
     class Handler(BaseHTTPRequestHandler):
         flaky_count = 0
+        history_frame_target_count = 0
+        history_redirect_saved_count = 0
+        action_dispatch_count = 0
         auth_challenge_count = 0
 
         def do_GET(self):
@@ -420,6 +423,186 @@ def http_server():
                 """
                 self.send_response(200, "OK")
                 self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/route-abort-child-parent":
+                body = b"""
+                <main id="parent-ready">Parent ready</main>
+                <iframe name="child" src="/route-abort-child"></iframe>
+                """
+                self.send_response(200, "OK")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/route-abort-child":
+                body = b"<main>Child should be aborted</main>"
+                self.send_response(200, "OK")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/route-abort-top-level":
+                body = b"<main>Top-level should be aborted</main>"
+                self.send_response(200, "OK")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/history-frame-target":
+                type(self).history_frame_target_count += 1
+                if type(self).history_frame_target_count > 1:
+                    time.sleep(0.5)
+                body = b"""
+                <script>addEventListener('unload', () => {});</script>
+                <main id="history-target">History target</main>
+                """
+                self.send_response(200, "OK")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/history-frame-current":
+                body = b"""
+                <iframe id="history-child" src="/history-frame-child"></iframe>
+                <script>
+                addEventListener('beforeunload', () => {
+                  const child = document.querySelector('#history-child');
+                  child.contentWindow.history.pushState({}, '', '/history-frame-target');
+                  const releaseAt = performance.now() + 150;
+                  while (performance.now() < releaseAt) {}
+                });
+                </script>
+                <main id="history-current">History current</main>
+                """
+                self.send_response(200, "OK")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/history-frame-child":
+                body = b"<main>History child</main>"
+                self.send_response(200, "OK")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/history-redirect-saved":
+                type(self).history_redirect_saved_count += 1
+                if type(self).history_redirect_saved_count > 1:
+                    self.send_response(302, "Found")
+                    self.send_header("Location", "/history-redirect-blocked")
+                    self.send_header("Content-Disposition", 'attachment; filename="stale.txt"')
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = b"""
+                <script>addEventListener('unload', () => {});</script>
+                <main id="history-saved">Saved history entry</main>
+                """
+                self.send_response(200, "OK")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/history-redirect-after":
+                body = b"<main id='history-after'>After saved history entry</main>"
+                self.send_response(200, "OK")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/history-redirect-blocked":
+                body = b"<main>Blocked redirect destination</main>"
+                self.send_response(200, "OK")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/action-dispatch-forgery":
+                body = b"""
+                <select id="binding-warmup">
+                  <option value="a">Alpha</option>
+                  <option value="b">Beta</option>
+                </select>
+                <select id="forged-select">
+                  <option value="a">Alpha</option>
+                  <option value="b">Beta</option>
+                </select>
+                <script>
+                window.__forgeDispatchReceipts = () => {
+                  const binding = globalThis.__rustwright_dispatch__;
+                  if (typeof binding !== 'function') return 0;
+                  for (let index = 1; index <= 2000; index += 1) {
+                    binding(JSON.stringify({
+                      dispatchId: String(index),
+                      token: `forged-token-${index}`,
+                      result: ['forged'],
+                      commitment: null,
+                    }));
+                  }
+                  return 2000;
+                };
+                window.__startupForgedReceipts = 0;
+                const startupForger = setInterval(() => {
+                  const forged = window.__forgeDispatchReceipts();
+                  if (forged) {
+                    window.__startupForgedReceipts = forged;
+                    clearInterval(startupForger);
+                  }
+                }, 0);
+                document.querySelector('#forged-select').addEventListener('input', () => {
+                  window.__forgeDispatchReceipts();
+                  location.href = '/json';
+                });
+                </script>
+                """
+                self.send_response(200, "OK")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/action-dispatch-once":
+                body = b"""
+                <select id="dispatch-once" oninput="
+                  navigator.sendBeacon('/action-dispatch-record', 'selected');
+                  location.reload();
+                ">
+                  <option value="one">One</option>
+                  <option value="two">Two</option>
+                </select>
+                """
+                self.send_response(200, "OK")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/action-dispatch-count":
+                body = json.dumps({"count": type(self).action_dispatch_count}).encode("utf-8")
+                self.send_response(200, "OK")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -795,6 +978,14 @@ def http_server():
                 pass
 
         def do_POST(self):
+            if self.path == "/action-dispatch-record":
+                content_length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(content_length)
+                type(self).action_dispatch_count += 1
+                self.send_response(204, "No Content")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if self.path == "/echo":
                 content_length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(content_length)
@@ -925,6 +1116,11 @@ def oopif_test_server():
                     <title>OOPIF child</title>
                     <h1 id="title">Cross Origin Child</h1>
                     <input id="name" aria-label="Name">
+                    <select id="color">
+                      <option value="red">Red</option>
+                      <option value="blue">Blue</option>
+                    </select>
+                    <input id="enabled" type="checkbox">
                     <button
                         id="button"
                         style="margin-left: 120px; margin-top: 80px"
@@ -939,6 +1135,31 @@ def oopif_test_server():
                       document.body.appendChild(delayed);
                     }, 50);
                     </script>
+                    """
+                )
+                return
+            if path == "/oopif-race-top":
+                self._send_html(
+                    f"""
+                    <!doctype html>
+                    <iframe id="child" src="{origin_localhost}/oopif-race-old"></iframe>
+                    """
+                )
+                return
+            if path == "/oopif-race-old":
+                self._send_html(
+                    """
+                    <!doctype html>
+                    <select id="target"><option value="old">Old document</option></select>
+                    """
+                )
+                return
+            if path == "/oopif-race-new":
+                self._send_html(
+                    """
+                    <!doctype html>
+                    <select id="target"><option value="new">New document</option></select>
+                    <p id="race-marker">new document</p>
                     """
                 )
                 return
@@ -3956,6 +4177,19 @@ def test_history_navigation_returns_real_responses(page, http_server):
     assert forward_response.json() == {"ok": True, "path": "/json"}
 
 
+def test_history_navigation_boundaries_return_none_without_waiting(page, http_server):
+    started = time.monotonic()
+    assert page.go_back(timeout=2_000) is None
+    assert time.monotonic() - started < 1
+
+    page.goto(f"{http_server}/page")
+    page.goto(f"{http_server}/page#same-document")
+
+    started = time.monotonic()
+    assert page.go_forward(timeout=2_000) is None
+    assert time.monotonic() - started < 1
+
+
 def test_history_navigation_wait_until_commit_returns_real_responses(page, http_server):
     page.goto(f"{http_server}/page")
     page.goto(f"{http_server}/json")
@@ -6615,6 +6849,519 @@ def test_page_requestfailed_event_captures_aborted_request(page, http_server):
     assert request_info.value.failure
     assert wait_until(lambda: page.evaluate("document.body.dataset.failed")) == "yes"
     assert wait_until(lambda: failures)[0][0] == f"{http_server}/json"
+
+
+def test_child_frame_route_abort_does_not_fail_parent_goto(page, http_server):
+    child_url = f"{http_server}/route-abort-child"
+    page.route(child_url, lambda route: route.abort("failed"))
+
+    with page.expect_event(
+        "requestfailed",
+        lambda request: request.url == child_url,
+    ) as failed_info:
+        response = page.goto(f"{http_server}/route-abort-child-parent")
+
+    failed_request = failed_info.value
+    assert response is not None
+    assert response.ok
+    assert page.locator("#parent-ready").inner_text() == "Parent ready"
+    assert failed_request.failure == "net::ERR_FAILED"
+    assert failed_request.frame is not page.main_frame
+    assert failed_request.frame.name == "child"
+
+
+def test_top_level_route_abort_still_fails_goto(page, http_server):
+    target_url = f"{http_server}/route-abort-top-level"
+    page.route(target_url, lambda route: route.abort("failed"))
+
+    with pytest.raises(Error, match=r"Page\.goto: net::ERR_FAILED"):
+        page.goto(target_url)
+
+
+def test_history_navigation_ignores_matching_child_same_document_event(
+    page, http_server
+):
+    target_url = f"{http_server}/history-frame-target"
+    page.goto(target_url)
+    page.goto(f"{http_server}/history-frame-current")
+
+    started = time.monotonic()
+    response = page.go_back(timeout=2_000)
+    elapsed = time.monotonic() - started
+
+    assert response is not None
+    assert response.url == target_url
+    assert page.url == target_url
+    assert page.locator("#history-target").inner_text() == "History target"
+    assert elapsed >= 0.4
+
+
+def test_history_redirect_abort_rejects_stale_attachment_response(page, http_server):
+    saved_url = f"{http_server}/history-redirect-saved"
+    blocked_url = f"{http_server}/history-redirect-blocked"
+    page.goto(saved_url)
+    page.goto(f"{http_server}/history-redirect-after")
+    page.route(blocked_url, lambda route: route.abort("failed"))
+
+    with pytest.raises(
+        Error,
+        match=r"Page\.go_back: net::ERR_FAILED at .*/history-redirect-blocked",
+    ):
+        page.go_back(timeout=2_000)
+
+
+def test_select_option_navigation_during_dispatch_is_not_retried(page, http_server):
+    def dispatch_count() -> int:
+        with urlopen(f"{http_server}/action-dispatch-count", timeout=2) as response:
+            return json.load(response)["count"]
+
+    page.goto(f"{http_server}/action-dispatch-once")
+    selected = page.locator("#dispatch-once").select_option("two")
+
+    assert selected == ["two"]
+    assert wait_until(lambda: dispatch_count() == 1)
+    time.sleep(0.2)
+    assert dispatch_count() == 1
+
+
+def test_action_dispatch_binding_is_silent_to_public_console(page):
+    observed: list[str] = []
+    page.on("console", lambda message: observed.append(message.text))
+    page.set_content(
+        """
+        <button id="click-target">Click</button>
+        <select id="select-target">
+          <option value="a">Alpha</option>
+          <option value="b">Beta</option>
+        </select>
+        <input id="type-target">
+        """
+    )
+    page.evaluate(
+        "() => document.body.appendChild(document.createElement('div')).attachShadow({mode: 'open'})"
+    )
+
+    page.locator("#click-target").click()
+    assert page.locator("#select-target").select_option("b") == ["b"]
+    page.locator("#type-target").type("typed")
+
+    assert observed == []
+    assert page.console_messages(filter="all") == []
+
+
+def test_click_dispatch_commitment_survives_navigation(page, http_server):
+    page.set_content("<button id='navigating-click'>Click</button>")
+    page.evaluate(
+        """([target]) => {
+          document.body.appendChild(document.createElement('div')).attachShadow({mode: 'open'});
+          document.querySelector('#navigating-click').addEventListener(
+            'click',
+            () => { location.href = target; },
+          );
+        }""",
+        [f"{http_server}/page"],
+    )
+
+    page.locator("#navigating-click").click()
+
+    assert wait_until(lambda: page.url == f"{http_server}/page")
+
+
+def test_dispatch_receipt_survives_console_burst_and_navigation(page, http_server):
+    observed: list[str] = []
+    page.on("console", lambda message: observed.append(message.text))
+    page.set_content(
+        """
+        <select id="burst-select">
+          <option value="a">Alpha</option>
+          <option value="b">Beta</option>
+        </select>
+        """
+    )
+    page.evaluate(
+        """([target]) => {
+          document.body.appendChild(document.createElement('div')).attachShadow({mode: 'open'});
+          document.querySelector('#burst-select').addEventListener('change', () => {
+            for (let index = 0; index < 8300; index += 1) {
+              console.log(`burst-${index}`);
+            }
+            location.href = target;
+          });
+        }""",
+        [f"{http_server}/page"],
+    )
+
+    selected = page.locator("#burst-select").select_option("b", timeout=15_000)
+
+    assert selected == ["b"]
+
+
+def test_dispatch_receipt_rejects_forgery_and_survives_2000_binding_calls(
+    page, http_server
+):
+    target_url = f"{http_server}/json"
+    page.goto(f"{http_server}/action-dispatch-forgery")
+
+    page.locator("#binding-warmup").select_option("b")
+    assert wait_until(
+        lambda: page.evaluate("window.__startupForgedReceipts") == 2000
+    )
+
+    selected = page.locator("#forged-select").select_option("b", timeout=15_000)
+
+    assert selected == ["b"]
+    assert wait_until(lambda: page.url == target_url)
+
+
+@pytest.mark.parametrize(
+    ("selection", "expected"),
+    [
+        pytest.param({"value": "b"}, "b", id="value"),
+        pytest.param({"label": "Beta"}, "b", id="label"),
+        pytest.param({"index": 1}, "a", id="live-index"),
+    ],
+)
+def test_select_option_rematches_original_criteria_against_live_options(
+    page, selection, expected
+):
+    page.set_content(
+        """
+        <select id="live-select">
+          <option value="a">Alpha</option>
+          <option value="b">Beta</option>
+        </select>
+        """
+    )
+    session = page.context.new_cdp_session(page)
+    frame_id = session.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    utility_context_id = session.send(
+        "Page.createIsolatedWorld",
+        {"frameId": frame_id, "worldName": "__utility_world__"},
+    )["executionContextId"]
+    session.send(
+        "Runtime.evaluate",
+        {
+            "contextId": utility_context_id,
+            "expression": """(() => {
+              const select = document.querySelector('#live-select');
+              const nativeOptions =
+                Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'options').get;
+              let firstRead = true;
+              Object.defineProperty(select, 'options', {
+                configurable: true,
+                get() {
+                  const options = nativeOptions.call(select);
+                  if (firstRead) {
+                    firstRead = false;
+                    queueMicrotask(() => {
+                      const inserted = document.createElement('option');
+                      inserted.value = 'inserted';
+                      inserted.textContent = 'Inserted';
+                      select.prepend(inserted);
+                    });
+                  }
+                  return options;
+                },
+              });
+            })()""",
+        },
+    )
+
+    assert page.locator("#live-select").select_option(**selection) == [expected]
+    assert page.locator("#live-select").evaluate(
+        "select => Array.from(select.options, option => option.value)"
+    ) == ["inserted", "a", "b"]
+
+
+def test_select_option_navigation_returns_live_dispatch_rematch(page, http_server):
+    page.set_content(
+        """
+        <select id="live-navigating-select">
+          <option value="a">Alpha</option>
+          <option value="b">Beta</option>
+        </select>
+        """
+    )
+    page.evaluate(
+        """([target]) => {
+          document.body.appendChild(document.createElement('div')).attachShadow({mode: 'open'});
+          document.querySelector('#live-navigating-select').addEventListener(
+            'change',
+            () => { location.href = target; },
+          );
+        }""",
+        [f"{http_server}/page"],
+    )
+    session = page.context.new_cdp_session(page)
+    frame_id = session.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    utility_context_id = session.send(
+        "Page.createIsolatedWorld",
+        {"frameId": frame_id, "worldName": "__utility_world__"},
+    )["executionContextId"]
+    session.send(
+        "Runtime.evaluate",
+        {
+            "contextId": utility_context_id,
+            "expression": """(() => {
+              const select = document.querySelector('#live-navigating-select');
+              const nativeOptions =
+                Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'options').get;
+              let firstRead = true;
+              Object.defineProperty(select, 'options', {
+                configurable: true,
+                get() {
+                  const options = nativeOptions.call(select);
+                  if (firstRead) {
+                    firstRead = false;
+                    queueMicrotask(() => {
+                      const inserted = document.createElement('option');
+                      inserted.value = 'inserted';
+                      inserted.textContent = 'Inserted';
+                      select.prepend(inserted);
+                    });
+                  }
+                  return options;
+                },
+              });
+            })()""",
+        },
+    )
+
+    selected = page.locator("#live-navigating-select").select_option(index=1)
+
+    assert selected == ["a"]
+
+
+def test_select_option_persistent_dispatch_miss_times_out(page):
+    page.set_content(
+        """
+        <select id="dispatch-miss-select">
+          <option value="b">Beta</option>
+        </select>
+        """
+    )
+    page.evaluate(
+        "() => document.body.appendChild(document.createElement('div')).attachShadow({mode: 'open'})"
+    )
+    session = page.context.new_cdp_session(page)
+    frame_id = session.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    utility_context_id = session.send(
+        "Page.createIsolatedWorld",
+        {"frameId": frame_id, "worldName": "__utility_world__"},
+    )["executionContextId"]
+    session.send(
+        "Runtime.evaluate",
+        {
+            "contextId": utility_context_id,
+            "expression": """(() => {
+              const select = document.querySelector('#dispatch-miss-select');
+              const option = select.querySelector('option');
+              const nativeOptions =
+                Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'options').get;
+              Object.defineProperty(select, 'options', {
+                configurable: true,
+                get() {
+                  const options = nativeOptions.call(select);
+                  if (option.isConnected) {
+                    queueMicrotask(() => option.remove());
+                  } else {
+                    queueMicrotask(() => select.append(option));
+                  }
+                  return options;
+                },
+              });
+            })()""",
+        },
+    )
+
+    with pytest.raises(TimeoutError, match=r"Locator\.select_option: Timeout 300ms exceeded"):
+        page.locator("#dispatch-miss-select").select_option("b", timeout=300)
+
+
+def test_cdp_action_dispatch_reply_semantics_against_chromium(
+    page, browser, http_server
+):
+    def dispatch_count() -> int:
+        with urlopen(f"{http_server}/action-dispatch-count", timeout=2) as response:
+            return json.load(response)["count"]
+
+    session = page.context.new_cdp_session(page)
+    session.send("Page.enable")
+    page.goto(f"{http_server}/page")
+    frame_id = session.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    stale_context_id = session.send(
+        "Page.createIsolatedWorld",
+        {"frameId": frame_id, "worldName": "rustwright-stale-context-probe"},
+    )["executionContextId"]
+    page.goto(f"{http_server}/json")
+    with pytest.raises(Error, match="Cannot find context with specified id"):
+        session.send(
+            "Runtime.evaluate",
+            {
+                "expression": "1",
+                "contextId": stale_context_id,
+                "returnByValue": True,
+            },
+        )
+
+    navigated_frames: list[str] = []
+    session.on(
+        "Page.frameNavigated",
+        lambda params: navigated_frames.append(str(params.get("frame", {}).get("id") or "")),
+    )
+    page.goto(f"{http_server}/action-dispatch-once")
+    frame_id = session.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    dispatch_context_id = session.send(
+        "Page.createIsolatedWorld",
+        {"frameId": frame_id, "worldName": "rustwright-dispatch-context-probe"},
+    )["executionContextId"]
+    select_object_id = session.send(
+        "Runtime.evaluate",
+        {
+            "expression": "document.querySelector('#dispatch-once')",
+            "contextId": dispatch_context_id,
+            "returnByValue": False,
+        },
+    )["result"]["objectId"]
+    binding_payloads: list[dict[str, Any]] = []
+    session.on(
+        "Runtime.bindingCalled",
+        lambda params: binding_payloads.append(json.loads(params["payload"]))
+        if params.get("name") == "__rustwright_dispatch_probe__"
+        else None,
+    )
+    session.send("Runtime.addBinding", {"name": "__rustwright_dispatch_probe__"})
+    with pytest.raises(Error) as ambiguous_info:
+        session.send(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": select_object_id,
+                "functionDeclaration": """function() {
+                  this.options[1].selected = true;
+                  globalThis.__rustwright_dispatch_probe__(
+                    JSON.stringify({dispatchId: 'empirical-dispatch', result: ['two']})
+                  );
+                  this.dispatchEvent(new Event('input', { bubbles: true }));
+                  return new Promise(() => {});
+                }""",
+                "awaitPromise": True,
+                "returnByValue": True,
+            },
+        )
+    assert any(
+        reply in str(ambiguous_info.value)
+        for reply in (
+            "Execution context was destroyed",
+            "Inspected target navigated or closed",
+        )
+    )
+    assert wait_until(
+        lambda: next(
+            (
+                payload
+                for payload in binding_payloads
+                if payload.get("dispatchId") == "empirical-dispatch"
+            ),
+            None,
+        )
+    )["result"] == ["two"]
+    assert wait_until(lambda: frame_id in navigated_frames)
+    assert wait_until(lambda: dispatch_count() == 1)
+
+    page.goto(f"{http_server}/page")
+    root = browser.new_browser_cdp_session()
+    target_id = next(
+        target["targetId"]
+        for target in root.send("Target.getTargets")["targetInfos"]
+        if target.get("url") == page.url
+    )
+    received: list[dict[str, Any]] = []
+
+    def record_inner_reply(payload: dict[str, Any]) -> None:
+        message = payload.get("message")
+        if isinstance(message, str):
+            received.append(json.loads(message))
+
+    root.on("Target.receivedMessageFromTarget", record_inner_reply)
+    detached_session_id = root.send(
+        "Target.attachToTarget", {"targetId": target_id, "flatten": False}
+    )["sessionId"]
+    root.send(
+        "Target.sendMessageToTarget",
+        {
+            "sessionId": detached_session_id,
+            "message": json.dumps(
+                {
+                    "id": 901,
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": (
+                            "globalThis.__rustwrightDetachedMidCall = true;"
+                            "new Promise(() => {})"
+                        ),
+                        "awaitPromise": True,
+                    },
+                }
+            ),
+        },
+    )
+    assert wait_until(
+        lambda: page.evaluate("globalThis.__rustwrightDetachedMidCall === true")
+    )
+    root.send("Target.detachFromTarget", {"sessionId": detached_session_id})
+
+    before_retry = dispatch_count()
+    with pytest.raises(Error, match="No session with given id"):
+        root.send(
+            "Target.sendMessageToTarget",
+            {
+                "sessionId": detached_session_id,
+                "message": json.dumps(
+                    {
+                        "id": 902,
+                        "method": "Runtime.evaluate",
+                        "params": {
+                            "expression": (
+                                "navigator.sendBeacon('/action-dispatch-record', 'stale')"
+                            )
+                        },
+                    }
+                ),
+            },
+        )
+    time.sleep(0.1)
+    assert dispatch_count() == before_retry
+
+    retry_session_id = root.send(
+        "Target.attachToTarget", {"targetId": target_id, "flatten": False}
+    )["sessionId"]
+    root.send(
+        "Target.sendMessageToTarget",
+        {
+            "sessionId": retry_session_id,
+            "message": json.dumps(
+                {
+                    "id": 903,
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": (
+                            "navigator.sendBeacon('/action-dispatch-record', 'retry')"
+                        ),
+                        "returnByValue": True,
+                    },
+                }
+            ),
+        },
+    )
+    retry_reply = wait_until(
+        lambda: next((reply for reply in received if reply.get("id") == 903), None)
+    )
+    assert "error" not in retry_reply
+    assert wait_until(lambda: dispatch_count() == before_retry + 1)
+    time.sleep(0.1)
+    assert dispatch_count() == before_retry + 1
+    root.send("Target.detachFromTarget", {"sessionId": retry_session_id})
+    root.detach()
 
 
 def test_route_abort_option_validation_matches_playwright(page, http_server):
@@ -13090,6 +13837,68 @@ def test_native_value_fill_evaluator_retry_dispatches_events_once(page, monkeypa
     assert page.evaluate("window.__fillAudit") == {"input": 1, "change": 1}
 
 
+@pytest.mark.parametrize(
+    ("input_type", "initial_value", "fill_value"),
+    [
+        pytest.param("date", "2025-01-01", "2026-08-12", id="date"),
+        pytest.param("color", "#000000", "#12AB34", id="color"),
+        pytest.param("range", "10", "75", id="range"),
+    ],
+)
+def test_value_like_fill_navigation_commits_exactly_once(
+    page, http_server, input_type, initial_value, fill_value
+):
+    target_url = f"{http_server}/json"
+    storage_key = f"rustwright-value-like-fill-{input_type}"
+    page.goto(f"{http_server}/page")
+    page.evaluate("(key) => localStorage.removeItem(key)", storage_key)
+    page.set_content(
+        f"""
+        <input id="target" type="{input_type}" value="{initial_value}">
+        <script>
+        document.querySelector('#target').addEventListener('input', () => {{
+          const key = {json.dumps(storage_key)};
+          localStorage.setItem(key, String(Number(localStorage.getItem(key) || 0) + 1));
+          location.href = {json.dumps(target_url)};
+        }});
+        </script>
+        """
+    )
+
+    page.locator("#target").fill(fill_value, timeout=15_000)
+
+    assert wait_until(lambda: page.url == target_url)
+    assert page.evaluate(
+        "(key) => Number(localStorage.getItem(key) || 0)", storage_key
+    ) == 1
+
+
+def test_native_text_fill_navigation_returns_committed_success(page, http_server):
+    target_url = f"{http_server}/json"
+    storage_key = "rustwright-native-text-fill"
+    page.goto(f"{http_server}/page")
+    page.evaluate("(key) => localStorage.removeItem(key)", storage_key)
+    page.set_content(
+        f"""
+        <input id="target" value="old">
+        <script>
+        document.querySelector('#target').addEventListener('input', () => {{
+          const key = {json.dumps(storage_key)};
+          localStorage.setItem(key, String(Number(localStorage.getItem(key) || 0) + 1));
+          location.href = {json.dumps(target_url)};
+        }});
+        </script>
+        """
+    )
+
+    page.locator("#target").fill("committed", timeout=15_000)
+
+    assert wait_until(lambda: page.url == target_url)
+    assert page.evaluate(
+        "(key) => Number(localStorage.getItem(key) || 0)", storage_key
+    ) == 1
+
+
 def test_type_inserts_at_focus_caret_like_playwright(page):
     page.set_content("<input id='message' value='hello'>")
 
@@ -17112,6 +17921,43 @@ def test_frame_locator_scopes_locators_to_iframe_content(page):
     assert from_locator.locator("button").inner_text() == "Inside"
 
 
+def test_frame_locator_actions_resolve_in_the_child_frame_realm(page):
+    child = """
+    <select id="color">
+      <option value="red">Red</option>
+      <option value="blue">Blue</option>
+    </select>
+    <input id="name">
+    <button id="save" onclick="document.body.dataset.saved = 'child'">Save</button>
+    <input id="enabled" type="checkbox">
+    """
+    page.set_content(
+        f"""
+        <div id="color">Parent color decoy</div>
+        <input id="name" value="parent">
+        <button id="save" onclick="document.body.dataset.saved = 'parent'">Save</button>
+        <input id="enabled" type="checkbox">
+        <iframe id="child-frame" name="child" srcdoc="{escape(child, quote=True)}"></iframe>
+        """
+    )
+
+    child_frame = page.frame(name="child")
+    assert child_frame is not None
+    child_locator = page.frame_locator("#child-frame")
+
+    child_locator.locator("#name").fill("child")
+    child_locator.locator("#save").click()
+    child_locator.locator("#enabled").check()
+    assert child_locator.locator("#color").select_option("blue") == ["blue"]
+    assert child_frame.locator("#color").select_option("red") == ["red"]
+
+    assert child_locator.locator("#name").input_value() == "child"
+    assert child_locator.locator("body").get_attribute("data-saved") == "child"
+    assert child_locator.locator("#enabled").is_checked()
+    assert page.locator("#name").input_value() == "parent"
+    assert page.locator("body").get_attribute("data-saved") is None
+    assert not page.locator("#enabled").is_checked()
+
 def test_cross_origin_oopif_frame_locator_actions_and_page_frames(page, oopif_test_server):
     page.goto(f"{oopif_test_server['top']}/oopif-top")
 
@@ -17198,6 +18044,228 @@ def test_forced_site_isolation_oopif_fill_uses_iframe_target_frame(
         frame_locator.locator("#name").fill("Ada Lovelace")
 
         assert frame_locator.locator("#name").input_value() == "Ada Lovelace"
+    finally:
+        browser.close()
+
+
+def test_oopif_fill_detached_after_commencing_receipt_is_not_false_success(
+    playwright, oopif_test_server
+):
+    browser = playwright.chromium.launch(headless=True, args=["--site-per-process"])
+    root = browser.new_browser_cdp_session()
+    target_id = None
+    fill_thread = None
+    try:
+        page = browser.new_page()
+        page.goto(f"{oopif_test_server['top']}/oopif-top")
+        target = next(
+            target
+            for target in root.send("Target.getTargets")["targetInfos"]
+            if target.get("type") == "iframe"
+            and target.get("url", "").endswith("/oopif-child")
+        )
+        target_id = target["targetId"]
+        session_id = root.send(
+            "Target.attachToTarget",
+            {"targetId": target_id, "flatten": False},
+        )["sessionId"]
+        received: list[dict[str, Any]] = []
+
+        def record_message(payload: dict[str, Any]) -> None:
+            if payload.get("sessionId") != session_id:
+                return
+            received.append(json.loads(payload["message"]))
+
+        root.on("Target.receivedMessageFromTarget", record_message)
+        next_command_id = [0]
+
+        def send_to_target(method: str, params: dict[str, Any]) -> dict[str, Any]:
+            next_command_id[0] += 1
+            command_id = next_command_id[0]
+            root.send(
+                "Target.sendMessageToTarget",
+                {
+                    "sessionId": session_id,
+                    "message": json.dumps(
+                        {
+                            "id": command_id,
+                            "method": method,
+                            "params": params,
+                        }
+                    ),
+                },
+            )
+            return wait_until(
+                lambda: next(
+                    (
+                        message
+                        for message in received
+                        if message.get("id") == command_id
+                    ),
+                    None,
+                ),
+                timeout=2,
+            )
+
+        send_to_target("Runtime.enable", {})
+        send_to_target("Debugger.enable", {})
+        send_to_target(
+            "Debugger.setInstrumentationBreakpoint",
+            {"instrumentation": "beforeScriptExecution"},
+        )
+
+        fill_result: dict[str, Any] = {}
+
+        def fill_target() -> None:
+            try:
+                page.frame_locator("#child").locator("#name").fill(
+                    "committed",
+                    timeout=10_000,
+                )
+                fill_result["ok"] = True
+            except Exception as error:
+                fill_result["error"] = error
+
+        fill_thread = threading.Thread(target=fill_target)
+        fill_thread.start()
+        processed_pauses = 0
+        commitment_intercepted = False
+        interception_deadline = time.monotonic() + 8
+        while fill_thread.is_alive() and time.monotonic() < interception_deadline:
+            pauses = [
+                message
+                for message in received
+                if message.get("method") == "Debugger.paused"
+            ]
+            if processed_pauses >= len(pauses):
+                time.sleep(0.002)
+                continue
+            paused = pauses[processed_pauses]
+            processed_pauses += 1
+            location = paused["params"]["callFrames"][0]["location"]
+            script_id = location["scriptId"]
+            source = send_to_target(
+                "Debugger.getScriptSource",
+                {"scriptId": script_id},
+            )["result"]["scriptSource"]
+            if "commitment: 'commencing'" not in source:
+                send_to_target("Debugger.resume", {})
+                continue
+
+            return_line = source[: source.index("return null;")].count("\n")
+            send_to_target(
+                "Debugger.setBreakpoint",
+                {
+                    "location": {
+                        "scriptId": script_id,
+                        "lineNumber": return_line,
+                        "columnNumber": 0,
+                    }
+                },
+            )
+            send_to_target("Debugger.resume", {})
+            breakpoint_pause = wait_until(
+                lambda: next(
+                    (
+                        message
+                        for message in [
+                            item
+                            for item in received
+                            if item.get("method") == "Debugger.paused"
+                        ][processed_pauses:]
+                        if message["params"]["callFrames"][0]["location"]["scriptId"]
+                        == script_id
+                    ),
+                    None,
+                ),
+                timeout=2,
+            )
+            assert breakpoint_pause["params"]["reason"] == "other"
+            processed_pauses += 1
+            assert root.send("Target.closeTarget", {"targetId": target_id})[
+                "success"
+            ]
+            commitment_intercepted = True
+            break
+
+        fill_thread.join(timeout=10)
+        assert not fill_thread.is_alive()
+        assert commitment_intercepted
+        assert "ok" not in fill_result
+        assert isinstance(fill_result.get("error"), Error)
+    finally:
+        if fill_thread is not None and fill_thread.is_alive() and target_id is not None:
+            root.send("Target.closeTarget", {"targetId": target_id})
+            fill_thread.join(timeout=2)
+        root.detach()
+        browser.close()
+
+
+def test_forced_site_isolation_actions_use_clean_oopif_utility_world(
+    playwright, oopif_test_server
+):
+    browser = playwright.chromium.launch(headless=True, args=["--site-per-process"])
+    try:
+        page = browser.new_page()
+        page.goto(f"{oopif_test_server['top']}/oopif-top")
+        child_frame = page.frame(url=re.compile(r"/oopif-child$"))
+        assert child_frame is not None
+        child_frame.evaluate(
+            """() => {
+            const PoisonEvent = function() { throw new Error('poisoned Event'); };
+            const PoisonSelect = function() { throw new Error('poisoned HTMLSelectElement'); };
+            Object.defineProperty(PoisonSelect, Symbol.hasInstance, {
+              value() { throw new Error('poisoned HTMLSelectElement instanceof'); },
+            });
+            Object.defineProperty(window, 'Event', { configurable: true, value: PoisonEvent });
+            Object.defineProperty(window, 'HTMLSelectElement', {
+              configurable: true,
+              value: PoisonSelect,
+            });
+            }"""
+        )
+
+        child = page.frame_locator("#child")
+        assert child.locator("#color").select_option("blue") == ["blue"]
+        child.locator("#enabled").check()
+        child.locator("#button").click()
+
+        assert child.locator("#enabled").is_checked()
+        assert child.locator("#status").inner_text() == "clicked"
+    finally:
+        browser.close()
+
+
+def test_action_re_resolves_after_oopif_navigation_during_frame_resolution(
+    playwright, oopif_test_server
+):
+    browser = playwright.chromium.launch(headless=True, args=["--site-per-process"])
+    try:
+        page = browser.new_page()
+        page.goto(f"{oopif_test_server['top']}/oopif-race-top")
+        page.evaluate(
+            """newUrl => {
+            const frame = document.querySelector('#child');
+            Object.defineProperty(frame, 'tagName', {
+              configurable: true,
+              get() {
+                if (!frame.dataset.didNavigate) {
+                  frame.dataset.didNavigate = 'yes';
+                  frame.src = newUrl;
+                  const releaseAt = performance.now() + 50;
+                  while (performance.now() < releaseAt) {}
+                }
+                return 'IFRAME';
+              },
+            });
+            }""",
+            f"{oopif_test_server['frame']}/oopif-race-new",
+        )
+
+        child = page.frame_locator("#child")
+        assert child.locator("#target").select_option("new", timeout=3_000) == ["new"]
+        assert page.locator("#child").get_attribute("data-did-navigate") == "yes"
+        assert child.locator("#race-marker").inner_text() == "new document"
     finally:
         browser.close()
 
