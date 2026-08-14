@@ -19793,10 +19793,767 @@ def test_focus_press_keyboard_and_hover(page):
     assert page.evaluate("document.querySelector('#dbl').dataset.double") == "yes"
 
 
+def test_text_input_actions_use_trusted_browser_editing(page):
+    page.set_content(
+        """
+        <form id="form">
+          <input id="typed">
+          <input id="submitted">
+          <input id="selected" value="before">
+          <input id="limited" maxlength="5">
+          <button type="submit">Submit</button>
+        </form>
+        <script>
+        window.inputAudit = [];
+        const controlled = document.querySelector('#typed');
+        const valueDescriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+        let trackedValue = valueDescriptor.get.call(controlled);
+        Object.defineProperty(controlled, 'value', {
+          configurable: true,
+          get() { return valueDescriptor.get.call(this); },
+          set(nextValue) {
+            trackedValue = String(nextValue);
+            valueDescriptor.set.call(this, nextValue);
+          },
+        });
+        controlled._valueTracker = {
+          getValue() { return trackedValue; },
+          setValue(nextValue) { trackedValue = String(nextValue); },
+        };
+        controlled.addEventListener('input', () => {
+          const liveValue = valueDescriptor.get.call(controlled);
+          if (liveValue === controlled._valueTracker.getValue()) {
+            valueDescriptor.set.call(controlled, 'reverted');
+          } else {
+            controlled._valueTracker.setValue(liveValue);
+          }
+        });
+        for (const type of ['keydown', 'keypress', 'input', 'keyup']) {
+          document.querySelector('#typed').addEventListener(type, event => {
+            window.inputAudit.push({
+              type,
+              trusted: event.isTrusted,
+              inputType: event.inputType || null,
+              data: event.data || null,
+            });
+          });
+        }
+        document.querySelector('#form').addEventListener('submit', event => {
+          event.preventDefault();
+          document.body.dataset.submitted = 'yes';
+        });
+        </script>
+        """
+    )
+
+    page.locator("#typed").type("a")
+    assert page.locator("#typed").input_value() == "a"
+    assert page.evaluate("window.inputAudit") == [
+        {"type": "keydown", "trusted": True, "inputType": None, "data": None},
+        {"type": "keypress", "trusted": True, "inputType": None, "data": None},
+        {"type": "input", "trusted": True, "inputType": "insertText", "data": "a"},
+        {"type": "keyup", "trusted": True, "inputType": None, "data": None},
+    ]
+
+    page.locator("#submitted").press("Enter")
+    assert page.evaluate("document.body.dataset.submitted") == "yes"
+
+    page.locator("#selected").press("ControlOrMeta+A")
+    page.locator("#selected").type("Z")
+    assert page.locator("#selected").input_value() == "Z"
+
+    page.locator("#limited").fill("ABCDEFGHIJ")
+    assert page.locator("#limited").input_value() == "ABCDE"
+
+
+def test_native_keyboard_and_locator_routes_marshal_exact_core_calls():
+    from rustwright.sync_api import Keyboard, Locator
+
+    class FakeCore:
+        def __init__(self):
+            self.calls = []
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def type_text_native(self, *args):
+            self.calls.append(("type_text_native", args))
+
+        def press_key_native(self, *args):
+            self.calls.append(("press_key_native", args))
+
+        def keyboard_type_native(self, *args):
+            self.calls.append(("keyboard_type_native", args))
+
+        def keyboard_press_native(self, *args):
+            self.calls.append(("keyboard_press_native", args))
+
+    core = FakeCore()
+    fake_page = type(
+        "FakePage",
+        (),
+        {
+            "_core": core,
+            "_default_timeout": 10.0,
+            "_slow_mo": lambda self: None,
+        },
+    )()
+    locator = Locator(fake_page, {"kind": "css", "selector": "#target"})
+    locator._wait_for_single = lambda *args, **kwargs: None
+
+    locator.type("Ada", delay=7.5, timeout=125.0)
+    locator.press("Control+A", delay=8.5, timeout=250.0)
+    keyboard = Keyboard(fake_page)
+    keyboard.type("ab", delay=25.0)
+    keyboard.press("Enter", delay=30.0)
+
+    assert core.calls[0][0] == "type_text_native"
+    assert core.calls[0][1][:-1] == ('{"kind":"css","selector":"#target"}', 0, "Ada", 7.5)
+    assert 0 < core.calls[0][1][-1] <= 125.0
+    assert core.calls[1][0] == "press_key_native"
+    assert core.calls[1][1][:-1] == ('{"kind":"css","selector":"#target"}', 0, "Control+A", 8.5)
+    assert 0 < core.calls[1][1][-1] <= 250.0
+    assert core.calls[2:] == [
+        ("keyboard_type_native", ("ab", 25.0, 10.0)),
+        ("keyboard_press_native", ("Enter", 30.0, 10.0)),
+    ]
+
+
+@pytest.mark.parametrize("action", ["type", "press"])
+def test_locator_native_input_uses_one_default_timeout_budget(action):
+    from rustwright.sync_api import Locator
+
+    class FakeCore:
+        def __init__(self):
+            self.timeout = None
+
+        def type_text_native(self, _locator, _index, _text, _delay, timeout):
+            self.timeout = timeout
+            time.sleep(timeout / 1000)
+
+        def press_key_native(self, _locator, _index, _key, _delay, timeout):
+            self.timeout = timeout
+            time.sleep(timeout / 1000)
+
+    class FakePage:
+        def __init__(self):
+            self._core = FakeCore()
+            self._default_timeout = 30_000.0
+
+        def set_default_timeout(self, timeout):
+            self._default_timeout = timeout
+
+        def _slow_mo(self):
+            pass
+
+    fake_page = FakePage()
+    fake_page.set_default_timeout(200.0)
+    locator = Locator(fake_page, {"kind": "css", "selector": "#target"})
+    locator._wait_for_single = lambda *args, **kwargs: time.sleep(0.15)
+
+    started = time.monotonic()
+    getattr(locator, action)("x")
+    elapsed = time.monotonic() - started
+
+    assert 1.0 <= fake_page._core.timeout < 100.0
+    assert elapsed < 0.275
+
+    getattr(locator, action)("x", timeout=0)
+    assert fake_page._core.timeout == 0.0
+
+
+def test_direct_keyboard_native_delay_is_not_bounded_by_page_default_timeout():
+    from rustwright.sync_api import Keyboard
+
+    class FakeCore:
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def keyboard_type_native(self, text, delay, timeout):
+            assert (text, delay, timeout) == ("ab", 25.0, 10.0)
+            time.sleep(delay / 1000.0)
+
+        def keyboard_press_native(self, key, delay, timeout):
+            assert (key, delay, timeout) == ("a", 25.0, 10.0)
+            time.sleep(delay / 1000.0)
+
+    fake_page = type(
+        "FakePage",
+        (),
+        {"_core": FakeCore(), "_default_timeout": 10.0},
+    )()
+    keyboard = Keyboard(fake_page)
+
+    started = time.monotonic()
+    keyboard.type("ab", delay=25.0)
+    assert time.monotonic() - started >= 0.025
+
+    started = time.monotonic()
+    keyboard.press("a", delay=25.0)
+    assert time.monotonic() - started >= 0.025
+
+
+def test_native_invalid_keys_use_public_errors_for_keyboard_and_locator():
+    from rustwright.sync_api import Keyboard, Locator
+
+    class FakeCore:
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def keyboard_press_native(self, *_args):
+            raise ValueError("unsupported key: Esc")
+
+        def press_key_native(self, *_args):
+            raise ValueError("unsupported key modifier: Ctrl")
+
+    fake_page = type(
+        "FakePage",
+        (),
+        {
+            "_core": FakeCore(),
+            "_default_timeout": 30_000.0,
+            "_slow_mo": lambda self: None,
+        },
+    )()
+    keyboard = Keyboard(fake_page)
+    locator = Locator(fake_page, {"kind": "css", "selector": "#target"})
+    locator._wait_for_single = lambda *args, **kwargs: None
+
+    with pytest.raises(Error, match=re.escape('Keyboard.press: Unknown key: "Esc"')):
+        keyboard.press("Esc")
+    with pytest.raises(Error, match=re.escape('Locator.press: Unknown key: "Ctrl"')):
+        locator.press("Ctrl+A")
+
+
+def test_parallel_held_key_descriptors_match_rust_descriptor_contract():
+    from rustwright.sync_api import Keyboard
+
+    core = type(
+        "FakeCore",
+        (),
+        {"keyboard_primary_modifier": lambda self: "Control"},
+    )()
+    fake_page = type(
+        "FakePage",
+        (),
+        {"_core": core, "_default_timeout": 30_000.0},
+    )()
+    keyboard = Keyboard(fake_page)
+    expected = json.loads(
+        (REPO_ROOT / "tests" / "input_key_descriptor_conformance.json").read_text()
+    )
+
+    for input_key, key, code, virtual_key, location, text, implied_shift in expected:
+        descriptor = keyboard._key_descriptor(input_key)
+        assert descriptor == {
+            "key": key,
+            "code": code,
+            "windowsVirtualKeyCode": virtual_key,
+            "nativeVirtualKeyCode": virtual_key,
+            "location": location,
+            "text": text,
+            "impliedShift": implied_shift,
+        }, input_key
+
+    for number in range(1, 13):
+        key = f"F{number}"
+        assert keyboard._key_descriptor(key) == {
+            "key": key,
+            "code": key,
+            "windowsVirtualKeyCode": 111 + number,
+            "nativeVirtualKeyCode": 111 + number,
+            "location": 0,
+            "text": None,
+            "impliedShift": False,
+        }
+    for character in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        key = f"Key{character}"
+        assert keyboard._key_descriptor(key) == {
+            "key": character.lower(),
+            "code": key,
+            "windowsVirtualKeyCode": ord(character),
+            "nativeVirtualKeyCode": ord(character),
+            "location": 0,
+            "text": character.lower(),
+            "impliedShift": False,
+        }
+    for character in "0123456789":
+        key = f"Digit{character}"
+        assert keyboard._key_descriptor(key) == {
+            "key": character,
+            "code": key,
+            "windowsVirtualKeyCode": ord(character),
+            "nativeVirtualKeyCode": ord(character),
+            "location": 0,
+            "text": character,
+            "impliedShift": False,
+        }
+    for character in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
+        expected_code = (
+            f"Digit{character}" if character.isdigit() else f"Key{character.upper()}"
+        )
+        virtual_key = ord(character if character.isdigit() else character.upper())
+        assert keyboard._key_descriptor(character) == {
+            "key": character,
+            "code": expected_code,
+            "windowsVirtualKeyCode": virtual_key,
+            "nativeVirtualKeyCode": virtual_key,
+            "location": 0,
+            "text": character,
+            "impliedShift": False,
+        }
+
+
+@pytest.mark.parametrize("action", ["type", "press"])
+def test_locator_input_targets_open_shadow_root_input(page, action):
+    page.set_content(
+        """
+        <div id="host"></div>
+        <script>
+        const root = document.querySelector('#host').attachShadow({mode: 'open'});
+        root.innerHTML = '<input id="shadow-input">';
+        </script>
+        """
+    )
+    locator = page.locator("#shadow-input")
+
+    if action == "type":
+        locator.type("shadow")
+        assert locator.input_value() == "shadow"
+    else:
+        locator.press("A")
+        assert locator.input_value() == "A"
+
+
+def test_keyboard_shifted_punctuation_with_unrelated_held_key(page):
+    page.set_content(
+        """
+        <input id="value">
+        <script>
+        window.keyEvents = [];
+        document.querySelector('#value').addEventListener('keydown', event => {
+          window.keyEvents.push({
+            key: event.key,
+            code: event.code,
+            shiftKey: event.shiftKey,
+          });
+        });
+        </script>
+        """
+    )
+    page.focus("#value")
+
+    page.keyboard.down("ArrowLeft")
+    page.keyboard.press("!")
+    page.keyboard.up("ArrowLeft")
+
+    assert page.locator("#value").input_value() == "!"
+    assert page.evaluate("window.keyEvents") == [
+        {"key": "ArrowLeft", "code": "ArrowLeft", "shiftKey": False},
+        {"key": "Shift", "code": "ShiftLeft", "shiftKey": True},
+        {"key": "!", "code": "Digit1", "shiftKey": True},
+    ]
+
+@pytest.mark.parametrize(
+    ("press_method", "expected_event_types"),
+    [
+        ("press", ["rawKeyDown", "rawKeyDown", "char", "keyUp", "keyUp"]),
+        ("_press_without_text", ["rawKeyDown", "rawKeyDown", "keyUp", "keyUp"]),
+    ],
+)
+def test_implied_shift_cleanup_runs_after_base_key_up_not_written(
+    press_method,
+    expected_event_types,
+):
+    from rustwright.sync_api import Keyboard
+
+    class FakeCore:
+        def __init__(self):
+            self.events = []
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def keyboard_dispatch_native(self, method, params_json, timeout):
+            assert method == "Input.dispatchKeyEvent"
+            params = json.loads(params_json)
+            self.events.append(params)
+            if params["type"] == "keyUp" and params["key"] == "!":
+                return json.dumps(
+                    {
+                        "write_status": "not_written",
+                        "commitment": "not_committed",
+                        "error": '__rustwright_timeout__:{"ms":25}',
+                    }
+                )
+            return json.dumps(
+                {
+                    "write_status": "written",
+                    "commitment": "confirmed",
+                    "error": None,
+                }
+            )
+
+    core = FakeCore()
+    fake_page = type(
+        "FakePage",
+        (),
+        {"_core": core, "_default_timeout": 25.0},
+    )()
+    keyboard = Keyboard(fake_page)
+    keyboard._pressed_keys.add("ArrowLeft")
+
+    with pytest.raises(TimeoutError, match="timed out after 25 ms"):
+        getattr(keyboard, press_method)("!")
+
+    assert [event["type"] for event in core.events] == expected_event_types
+    assert sum(
+        event["type"] == "keyUp" and event["key"] == "Shift"
+        for event in core.events
+    ) == 1
+    assert "Shift" not in keyboard._modifiers
+    assert "Shift" not in keyboard._pressed_keys
+
+
+def test_unrelated_confirmed_key_up_does_not_clear_uncertain_key_poison():
+    from rustwright.sync_api import Keyboard
+
+    class FakeCore:
+        def __init__(self):
+            self.uncertain_raw_down_sent = False
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def keyboard_dispatch_native(self, method, params_json, timeout):
+            assert method == "Input.dispatchKeyEvent"
+            params = json.loads(params_json)
+            if (
+                params["type"] == "rawKeyDown"
+                and params["key"] == "a"
+                and not self.uncertain_raw_down_sent
+            ):
+                self.uncertain_raw_down_sent = True
+                return json.dumps(
+                    {
+                        "write_status": "indeterminate",
+                        "commitment": "written_unconfirmed",
+                        "error": '__rustwright_timeout__:{"ms":25}',
+                    }
+                )
+            return json.dumps(
+                {
+                    "write_status": "written",
+                    "commitment": "confirmed",
+                    "error": None,
+                }
+            )
+
+    fake_page = type(
+        "FakePage",
+        (),
+        {"_core": FakeCore(), "_default_timeout": 25.0},
+    )()
+    keyboard = Keyboard(fake_page)
+    keyboard._pressed_keys.add("ArrowLeft")
+
+    with pytest.raises(TimeoutError):
+        keyboard.down("a")
+    assert keyboard._uncertain_pressed_key == "a"
+    poison = keyboard._input_state_poisoned
+
+    keyboard.up("ArrowLeft")
+
+    assert keyboard._input_state_poisoned == poison
+    assert keyboard._uncertain_pressed_key == "a"
+    with pytest.raises(Error, match="input state is uncertain"):
+        keyboard.down("b")
+
+    keyboard.up("a")
+
+    assert keyboard._input_state_poisoned is None
+    assert keyboard._uncertain_pressed_key is None
+    keyboard.down("b")
+    keyboard.up("b")
+
+
+def test_held_keyboard_detached_session_raises_target_closed(browser):
+    from rustwright.sync_api import TargetClosedError
+
+    page = browser.new_page()
+    page.keyboard.down("ArrowLeft")
+    page._core.cdp_session().detach(30_000.0)
+
+    with pytest.raises(TargetClosedError, match="Session with given id not found"):
+        page.keyboard.press("a")
+
+
+def test_held_keyboard_bridge_timeout_stays_timeout_error():
+    from rustwright.sync_api import Keyboard
+
+    class FakeCore:
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def keyboard_dispatch_native(self, method, params_json, timeout):
+            return json.dumps(
+                {
+                    "write_status": "not_written",
+                    "commitment": "not_committed",
+                    "error": '__rustwright_timeout__:{"ms":25}',
+                }
+            )
+
+    fake_page = type(
+        "FakePage",
+        (),
+        {"_core": FakeCore(), "_default_timeout": 25.0},
+    )()
+    keyboard = Keyboard(fake_page)
+    keyboard._pressed_keys.add("ArrowLeft")
+
+    with pytest.raises(TimeoutError, match="timed out after 25 ms"):
+        keyboard.press("a")
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    ["rawKeyDown", "char", "keyUp"],
+)
+def test_held_keyboard_lost_reply_commits_state_once_and_poisoning(
+    event_type,
+):
+    from rustwright.sync_api import Keyboard
+
+    class FakeCore:
+        def __init__(self):
+            self.events = []
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def keyboard_dispatch_native(self, method, params_json, timeout):
+            assert method == "Input.dispatchKeyEvent"
+            params = json.loads(params_json)
+            self.events.append(params)
+            if params["type"] != event_type:
+                return json.dumps(
+                    {
+                        "write_status": "written",
+                        "commitment": "confirmed",
+                        "error": None,
+                    }
+                )
+            return json.dumps(
+                {
+                    "write_status": "written",
+                    "commitment": "written_unconfirmed",
+                    "error": None,
+                }
+            )
+
+    core = FakeCore()
+    fake_page = type(
+        "FakePage",
+        (),
+        {"_core": core, "_default_timeout": 25.0},
+    )()
+    keyboard = Keyboard(fake_page)
+    keyboard._pressed_keys.add("ArrowLeft")
+
+    if event_type == "rawKeyDown":
+        keyboard.down("a")
+        assert "a" in keyboard._pressed_keys
+        assert keyboard._input_state_poisoned is not None
+        keyboard.up("a")
+        assert "a" not in keyboard._pressed_keys
+        keyboard.down("b")
+        assert "b" in keyboard._pressed_keys
+        keyboard.up("b")
+    elif event_type == "char":
+        keyboard.down("a")
+        assert "a" in keyboard._pressed_keys
+        assert keyboard._input_state_poisoned is not None
+        keyboard.up("a")
+        assert "a" not in keyboard._pressed_keys
+        with pytest.raises(Error, match="input state is uncertain"):
+            keyboard.down("b")
+    else:
+        keyboard._pressed_keys.add("a")
+        keyboard.up("a")
+        assert "a" not in keyboard._pressed_keys
+        with pytest.raises(Error, match="input state is uncertain"):
+            keyboard.down("b")
+
+
+def test_held_keyboard_indeterminate_char_poisoning():
+    from rustwright.sync_api import Keyboard
+
+    class FakeCore:
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def keyboard_dispatch_native(self, method, params_json, timeout):
+            params = json.loads(params_json)
+            if params["type"] == "char":
+                return json.dumps(
+                    {
+                        "write_status": "indeterminate",
+                        "commitment": "written_unconfirmed",
+                        "error": "__rustwright_timeout__:{\"ms\":25}",
+                    }
+                )
+            return json.dumps(
+                {
+                    "write_status": "written",
+                    "commitment": "confirmed",
+                    "error": None,
+                }
+            )
+
+    fake_page = type(
+        "FakePage",
+        (),
+        {"_core": FakeCore(), "_default_timeout": 25.0},
+    )()
+    keyboard = Keyboard(fake_page)
+    keyboard._pressed_keys.add("ArrowLeft")
+
+    with pytest.raises(TimeoutError):
+        keyboard.down("a")
+
+    assert "a" in keyboard._pressed_keys
+    assert keyboard._input_state_poisoned is not None
+    keyboard.up("a")
+    with pytest.raises(Error, match="input state is uncertain"):
+        keyboard.down("b")
+
+
+def test_held_keyboard_not_written_raw_down_preserves_local_state():
+    from rustwright.sync_api import Keyboard
+
+    class FakeCore:
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def keyboard_dispatch_native(self, method, params_json, timeout):
+            assert json.loads(params_json)["type"] == "rawKeyDown"
+            return json.dumps(
+                {
+                    "write_status": "not_written",
+                    "commitment": "not_committed",
+                    "error": "__rustwright_timeout__:{\"ms\":25}",
+                }
+            )
+
+    fake_page = type(
+        "FakePage",
+        (),
+        {"_core": FakeCore(), "_default_timeout": 25.0},
+    )()
+    keyboard = Keyboard(fake_page)
+    keyboard._pressed_keys.add("ArrowLeft")
+
+    with pytest.raises(TimeoutError):
+        keyboard.down("a")
+
+    assert keyboard._pressed_keys == {"ArrowLeft"}
+    assert keyboard._input_state_poisoned is None
+
+
+def test_locator_type_shifted_punctuation_uses_browser_keyboard_layout(page):
+    page.set_content(
+        """
+        <input id="value">
+        <script>
+        window.shiftedKey = null;
+        document.querySelector('#value').addEventListener('keydown', event => {
+          if (event.key !== 'Shift') {
+            window.shiftedKey = {key: event.key, code: event.code, shiftKey: event.shiftKey};
+          }
+        });
+        </script>
+        """
+    )
+
+    page.locator("#value").type("!")
+
+    assert page.locator("#value").input_value() == "!"
+    assert page.evaluate("window.shiftedKey") == {
+        "key": "!",
+        "code": "Digit1",
+        "shiftKey": True,
+    }
+
+
+def test_locator_press_enter_in_textarea_does_not_submit_form(page):
+    page.set_content(
+        """
+        <form id="form">
+          <textarea id="value"></textarea>
+          <button type="submit">Submit</button>
+        </form>
+        <script>
+        window.submitCount = 0;
+        document.querySelector('#form').addEventListener('submit', event => {
+          event.preventDefault();
+          window.submitCount += 1;
+        });
+        </script>
+        """
+    )
+
+    page.locator("#value").press("Enter")
+
+    assert page.locator("#value").input_value() == "\n"
+    assert page.evaluate("window.submitCount") == 0
+
+
+def test_direct_keyboard_select_all_then_type_replaces_value(page):
+    page.set_content('<input id="value" value="before">')
+    page.focus("#value")
+    primary = page._core.keyboard_primary_modifier()
+
+    page.keyboard.press(f"{primary}+A")
+    page.keyboard.type("after")
+
+    assert page.locator("#value").input_value() == "after"
+
+
 def test_locator_type_press_attached_input_behavior_matches_playwright(page):
     from benchmarks.automation_cases import locator_type_press_attached_input_behavior_matches_playwright
 
     locator_type_press_attached_input_behavior_matches_playwright(page)
+
+
+def test_locator_type_and_press_do_not_dispatch_to_previous_focus_when_target_cannot_focus(page):
+    page.set_content(
+        """
+        <input id="previous" value="before">
+        <div id="target">target</div>
+        <script>
+        window.previousKeyEvents = [];
+        const previous = document.querySelector('#previous');
+        for (const type of ['keydown', 'keypress', 'input', 'keyup']) {
+          previous.addEventListener(type, event => window.previousKeyEvents.push(event.type));
+        }
+        </script>
+        """
+    )
+    previous = page.locator("#previous")
+    target = page.locator("#target")
+
+    previous.focus()
+    assert target.type("x") is None
+    assert previous.input_value() == "before"
+    assert page.evaluate("window.previousKeyEvents") == []
+    assert page.locator('[data-rustwright-keyboard-fallback="true"]').count() == 0
+
+    previous.focus()
+    assert target.press("x") is None
+    assert previous.input_value() == "before"
+    assert page.evaluate("window.previousKeyEvents") == []
+    assert page.locator('[data-rustwright-keyboard-fallback="true"]').count() == 0
 
 
 def test_selector_and_element_type_press_attached_input_behavior_matches_playwright(page):
@@ -19943,15 +20700,18 @@ def test_keyboard_punctuation_key_metadata_matches_playwright(page):
         <input id="name">
         <script>
         window.keyEvents = [];
-        document.querySelector('#name').addEventListener('keydown', event => {
-          window.keyEvents.push({
-            key: event.key,
-            code: event.code,
-            keyCode: event.keyCode,
-            which: event.which,
-            shift: event.shiftKey
+        for (const type of ['keydown', 'keyup']) {
+          document.querySelector('#name').addEventListener(type, event => {
+            window.keyEvents.push({
+              type,
+              key: event.key,
+              code: event.code,
+              keyCode: event.keyCode,
+              which: event.which,
+              shift: event.shiftKey
+            });
           });
-        });
+        }
         </script>
         """
     )
@@ -19962,11 +20722,22 @@ def test_keyboard_punctuation_key_metadata_matches_playwright(page):
 
     assert page.input_value("#name") == "/.!@?"
     assert page.evaluate("() => window.keyEvents") == [
-        {"key": "/", "code": "Slash", "keyCode": 191, "which": 191, "shift": False},
-        {"key": ".", "code": "Period", "keyCode": 190, "which": 190, "shift": False},
-        {"key": "!", "code": "Digit1", "keyCode": 49, "which": 49, "shift": False},
-        {"key": "@", "code": "Digit2", "keyCode": 50, "which": 50, "shift": False},
-        {"key": "?", "code": "Slash", "keyCode": 191, "which": 191, "shift": False},
+        {"type": "keydown", "key": "/", "code": "Slash", "keyCode": 191, "which": 191, "shift": False},
+        {"type": "keyup", "key": "/", "code": "Slash", "keyCode": 191, "which": 191, "shift": False},
+        {"type": "keydown", "key": ".", "code": "Period", "keyCode": 190, "which": 190, "shift": False},
+        {"type": "keyup", "key": ".", "code": "Period", "keyCode": 190, "which": 190, "shift": False},
+        {"type": "keydown", "key": "Shift", "code": "ShiftLeft", "keyCode": 16, "which": 16, "shift": True},
+        {"type": "keydown", "key": "!", "code": "Digit1", "keyCode": 49, "which": 49, "shift": True},
+        {"type": "keyup", "key": "!", "code": "Digit1", "keyCode": 49, "which": 49, "shift": True},
+        {"type": "keyup", "key": "Shift", "code": "ShiftLeft", "keyCode": 16, "which": 16, "shift": False},
+        {"type": "keydown", "key": "Shift", "code": "ShiftLeft", "keyCode": 16, "which": 16, "shift": True},
+        {"type": "keydown", "key": "@", "code": "Digit2", "keyCode": 50, "which": 50, "shift": True},
+        {"type": "keyup", "key": "@", "code": "Digit2", "keyCode": 50, "which": 50, "shift": True},
+        {"type": "keyup", "key": "Shift", "code": "ShiftLeft", "keyCode": 16, "which": 16, "shift": False},
+        {"type": "keydown", "key": "Shift", "code": "ShiftLeft", "keyCode": 16, "which": 16, "shift": True},
+        {"type": "keydown", "key": "?", "code": "Slash", "keyCode": 191, "which": 191, "shift": True},
+        {"type": "keyup", "key": "?", "code": "Slash", "keyCode": 191, "which": 191, "shift": True},
+        {"type": "keyup", "key": "Shift", "code": "ShiftLeft", "keyCode": 16, "which": 16, "shift": False},
     ]
 
 
