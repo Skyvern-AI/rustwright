@@ -17,11 +17,14 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmcp::model::RequestId;
 use rustwright::{
     ActionOptions, Browser, CancelToken, CloseOptions, ConnectOptions, ConsoleRecord,
-    ConsoleRecords, Dialog, DialogKind, Error, EventReceiver, FileChooser, GotoOptions,
-    LaunchOptions, NavigationDetail, NavigationDetailReceiver, NavigationObservation, NetworkBody,
-    NetworkRecord, NetworkRecords, Page, PageEvent, ScreenshotOptions, TargetLifecycleEvent,
-    TargetLifecycleReceiver, chromium,
+    ConsoleRecords, Dialog, DialogKind, Error, EventReceiver, FailureMetadata, FileChooser,
+    GotoOptions, LaunchOptions, NavigationDetail, NavigationDetailReceiver, NavigationObservation,
+    NetworkBody, NetworkRecord, NetworkRecords, Page, PageEvent, ScreenshotOptions,
+    TargetLifecycleEvent, TargetLifecycleReceiver, chromium,
 };
+
+#[cfg(test)]
+use rustwright::{CommandWritten, FailureKind, FailurePhase, FailureTargetKind};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
@@ -612,6 +615,10 @@ pub(crate) enum BrowserError {
     Cancelled,
     Timeout(u64),
     Stopped,
+    Classified {
+        message: String,
+        metadata: FailureMetadata,
+    },
     Message(String),
 }
 
@@ -627,9 +634,111 @@ impl fmt::Display for BrowserError {
                 write!(formatter, "browser command timed out after {timeout_ms} ms")
             }
             Self::Stopped => formatter.write_str("browser actor stopped"),
-            Self::Message(message) => formatter.write_str(message),
+            Self::Message(message) | Self::Classified { message, .. } => {
+                formatter.write_str(message)
+            }
         }
     }
+}
+
+impl BrowserError {
+    pub(crate) fn structured_metadata(&self) -> Option<FailureMetadata> {
+        match self {
+            Self::Classified { metadata, .. } => Some(*metadata),
+            Self::Timeout(_) => Some(Error::Timeout(0).failure_metadata()),
+            _ => None,
+        }
+    }
+
+    fn with_context(self, prefix: impl AsRef<str>) -> Self {
+        match self {
+            Self::Classified { message, metadata } => Self::Classified {
+                message: format!("{}: {message}", prefix.as_ref()),
+                metadata,
+            },
+            Self::Message(message) => Self::Message(format!("{}: {message}", prefix.as_ref())),
+            other => other,
+        }
+    }
+
+    fn with_partial_completion(self, detail: &str, snapshot: TextResult) -> Self {
+        let failure = self.to_string();
+        let message = match snapshot {
+            Ok(snapshot) => format!(
+                "Action partially completed: {detail}. Later step failed: {failure}\n\n\
+                 ### Snapshot\n{snapshot}"
+            ),
+            Err(snapshot_error) => format!(
+                "Action partially completed: {detail}. Later step failed: {failure}\n\n\
+                 Page state could not be captured: {snapshot_error}"
+            ),
+        };
+        match self {
+            Self::Classified { metadata, .. } => Self::Classified { message, metadata },
+            Self::Timeout(_) => Self::Classified {
+                message,
+                metadata: Error::Timeout(0).failure_metadata(),
+            },
+            _ => Self::Message(message),
+        }
+    }
+
+    fn after_prior_effect(self) -> Self {
+        match self {
+            Self::Classified {
+                message,
+                mut metadata,
+            } => {
+                metadata.retryable = Some(false);
+                Self::Classified { message, metadata }
+            }
+            Self::Timeout(_) => {
+                let message = self.to_string();
+                let mut metadata = Error::Timeout(0).failure_metadata();
+                metadata.retryable = Some(false);
+                Self::Classified { message, metadata }
+            }
+            other => other,
+        }
+    }
+}
+
+fn classify_core_contract(
+    context: &str,
+    error: impl fmt::Display,
+    metadata: FailureMetadata,
+    remote_unreachable: bool,
+) -> BrowserError {
+    let message = if remote_unreachable {
+        REMOTE_UNREACHABLE.to_owned()
+    } else {
+        format!("{context}: {error}")
+    };
+    if metadata != FailureMetadata::default() {
+        BrowserError::Classified { message, metadata }
+    } else {
+        BrowserError::Message(message)
+    }
+}
+
+fn classify_core_error(
+    context: &str,
+    error: Error,
+    cancellation: &CommandCancellation,
+    timeout_ms: u64,
+    remote_unreachable: bool,
+) -> BrowserError {
+    if matches!(error, Error::Cancelled) {
+        return cancellation
+            .reason()
+            .error(timeout_ms)
+            .unwrap_or(BrowserError::Cancelled);
+    }
+    if matches!(error, Error::Timeout(_)) {
+        return BrowserError::Timeout(timeout_ms);
+    }
+    let metadata = error.failure_metadata();
+    classify_core_contract(context, error, metadata, remote_unreachable)
 }
 
 pub(crate) type BrowserResult = Result<BrowserOutput, BrowserError>;
@@ -801,6 +910,7 @@ impl ActorShared {
         // dispatched paths remain cancellable, but return `Ok` after checking
         // live write progress and resolving password taint.
         if request.cancellation.is_committed()
+            || matches!(result, Err(BrowserError::Classified { .. }))
             || (result.is_ok()
                 && matches!(&request.op, BrowserOp::Type { .. } | BrowserOp::FillForm(_)))
         {
@@ -1057,6 +1167,12 @@ impl Drop for BrowserActor {
     }
 }
 
+#[cfg(test)]
+struct CoreFailureSeam {
+    display: &'static str,
+    metadata: FailureMetadata,
+}
+
 struct BrowserState {
     features: FeatureConfig,
     browser: Option<Browser>,
@@ -1080,6 +1196,12 @@ struct BrowserState {
     lifecycle_subscription_provider: LifecycleSubscriptionProvider,
     browser_query_provider: Box<dyn BrowserQueryProvider>,
     page_lifecycle_seam: Option<Box<dyn PageLifecycleSeam>>,
+    #[cfg(test)]
+    fill_form_native_error: Option<CoreFailureSeam>,
+    #[cfg(test)]
+    fill_form_native_successes: usize,
+    #[cfg(test)]
+    type_submit_native_error: Option<CoreFailureSeam>,
 }
 
 type SnapshotEvaluationSeam = Box<dyn FnMut(&'static str, &Value) -> Result<Value, BrowserError>>;
@@ -1201,17 +1323,13 @@ impl BrowserQueryProvider for LiveBrowserQueryProvider {
                 Some(&request.cancellation.engine),
             )
             .map_err(|error| {
-                if matches!(error, Error::Cancelled) {
-                    request
-                        .cancellation
-                        .reason()
-                        .error(request.timeout_ms)
-                        .unwrap_or(BrowserError::Cancelled)
-                } else if matches!(error, Error::Timeout(_)) {
-                    BrowserError::Timeout(request.timeout_ms)
-                } else {
-                    BrowserError::Message(format!("tab listing failed: {error}"))
-                }
+                classify_core_error(
+                    "tab listing failed",
+                    error,
+                    &request.cancellation,
+                    request.timeout_ms,
+                    false,
+                )
             })
             .map(|pages| {
                 pages
@@ -1294,6 +1412,12 @@ impl Default for BrowserState {
             }),
             browser_query_provider: Box::new(LiveBrowserQueryProvider),
             page_lifecycle_seam: None,
+            #[cfg(test)]
+            fill_form_native_error: None,
+            #[cfg(test)]
+            fill_form_native_successes: 0,
+            #[cfg(test)]
+            type_submit_native_error: None,
         }
     }
 }
@@ -1679,17 +1803,13 @@ impl BrowserState {
     }
 
     fn remote_attach_error(error: Error, request: &ActorRequest) -> BrowserError {
-        if matches!(error, Error::Cancelled) {
-            return request
-                .cancellation
-                .reason()
-                .error(request.timeout_ms)
-                .unwrap_or(BrowserError::Cancelled);
-        }
-        if matches!(error, Error::Timeout(_)) {
-            return BrowserError::Timeout(request.timeout_ms);
-        }
-        BrowserError::Message(REMOTE_UNREACHABLE.to_owned())
+        classify_core_error(
+            "remote attachment failed",
+            error,
+            &request.cancellation,
+            request.timeout_ms,
+            true,
+        )
     }
 
     fn ensure_page(&mut self, request: &ActorRequest) -> Result<&ActivePageHandle, BrowserError> {
@@ -2329,24 +2449,13 @@ impl BrowserState {
         cancellation: &CommandCancellation,
         timeout_ms: u64,
     ) -> BrowserError {
-        if matches!(error, Error::Cancelled) {
-            return cancellation
-                .reason()
-                .error(timeout_ms)
-                .unwrap_or(BrowserError::Cancelled);
-        }
-        if matches!(error, Error::Timeout(_)) {
-            return BrowserError::Timeout(timeout_ms);
-        }
         let disconnected = self
             .browser
             .as_ref()
             .is_some_and(|browser| !browser.is_connected());
-        if self.remote && (disconnected || matches!(error, Error::ConnectFailed | Error::Closed)) {
-            BrowserError::Message(REMOTE_UNREACHABLE.to_owned())
-        } else {
-            BrowserError::Message(format!("{context}: {error}"))
-        }
+        let remote_unreachable =
+            self.remote && (disconnected || matches!(error, Error::ConnectFailed | Error::Closed));
+        classify_core_error(context, error, cancellation, timeout_ms, remote_unreachable)
     }
 
     fn remaining(request: &ActorRequest) -> Result<Duration, BrowserError> {
@@ -3276,10 +3385,31 @@ impl BrowserState {
         self.dispatch_ref_action(
             target,
             |state| {
-                let tracks_password =
-                    state.begin_sensitive_snapshot_tracking(&selector, target, request)?;
+                #[cfg(test)]
+                let injected_submit = submit && state.type_submit_native_error.is_some();
+                #[cfg(not(test))]
+                let injected_submit = false;
+                let tracks_password = if injected_submit {
+                    false
+                } else {
+                    state.begin_sensitive_snapshot_tracking(&selector, target, request)?
+                };
                 tracks_sensitive_value.set(tracks_password);
                 let result = (|| {
+                    #[cfg(test)]
+                    if injected_submit {
+                        write_completed.set(true);
+                        let error = state
+                            .type_submit_native_error
+                            .take()
+                            .expect("injected submit failure");
+                        return Err(classify_core_contract(
+                            &format!("submit failed for {target}"),
+                            error.display,
+                            error.metadata,
+                            false,
+                        ));
+                    }
                     let remaining = Self::remaining(request)?;
                     let options = ActionOptions::timeout(Self::engine_timeout(remaining));
                     let page = state.ensure_page(request)?.clone();
@@ -3399,7 +3529,7 @@ impl BrowserState {
                     } else {
                         "the text write reached an unknown state"
                     };
-                    partial_completion_result(completed, &error.to_string(), snapshot)
+                    partial_completion_or_error(completed, error, snapshot, true)
                 } else {
                     snapshot
                 }
@@ -3489,61 +3619,131 @@ impl BrowserState {
                     );
                 }
             };
+            #[cfg(test)]
+            let injected_native_fill =
+                matches!(field.kind, FillFieldKind::Textbox | FillFieldKind::Slider)
+                    && (self.fill_form_native_successes > 0
+                        || self.fill_form_native_error.is_some());
+            #[cfg(not(test))]
+            let injected_native_fill = false;
             let options = ActionOptions::timeout(Self::engine_timeout(remaining));
-            let page = match self.ensure_page(request) {
-                Ok(page) => page.clone(),
-                Err(error) => {
-                    let error = Self::fill_form_pre_dispatch_error(field, error);
-                    return self.fill_form_field_failure(
-                        field,
-                        &completed_fields,
-                        completed_fields.len(),
-                        fields.len(),
-                        error,
-                        request,
-                    );
+            let page = if injected_native_fill {
+                None
+            } else {
+                match self.ensure_page(request) {
+                    Ok(page) => Some(page.clone()),
+                    Err(error) => {
+                        let error = Self::fill_form_pre_dispatch_error(field, error);
+                        return self.fill_form_field_failure(
+                            field,
+                            &completed_fields,
+                            completed_fields.len(),
+                            fields.len(),
+                            error,
+                            request,
+                        );
+                    }
                 }
             };
-            let tracks_sensitive_value =
-                if matches!(field.kind, FillFieldKind::Textbox | FillFieldKind::Slider) {
-                    match self.begin_sensitive_snapshot_tracking(&selector, &field.target, request)
-                    {
-                        Ok(tracks_sensitive_value) => tracks_sensitive_value,
-                        Err(error) => {
-                            let error = Self::fill_form_pre_dispatch_error(field, error);
-                            return self.fill_form_field_failure(
-                                field,
-                                &completed_fields,
-                                completed_fields.len(),
-                                fields.len(),
-                                error,
-                                request,
-                            );
-                        }
+            let tracks_sensitive_value = if injected_native_fill {
+                false
+            } else if matches!(field.kind, FillFieldKind::Textbox | FillFieldKind::Slider) {
+                match self.begin_sensitive_snapshot_tracking(&selector, &field.target, request) {
+                    Ok(tracks_sensitive_value) => tracks_sensitive_value,
+                    Err(error) => {
+                        let error = Self::fill_form_pre_dispatch_error(field, error);
+                        return self.fill_form_field_failure(
+                            field,
+                            &completed_fields,
+                            completed_fields.len(),
+                            fields.len(),
+                            error,
+                            request,
+                        );
                     }
-                } else {
-                    false
-                };
-            // Engine errors become `Message` here, so the only `Timeout` that can
-            // reach the arbitration below is a budget check propagating its own
-            // variant -- which is exactly the case that arbitration exists for.
+                }
+            } else {
+                false
+            };
+            // Route every native field failure through the shared core classifier.
             let result: Result<(), BrowserError> = match field.kind {
-                FillFieldKind::Textbox | FillFieldKind::Slider => page
-                    .fill_with_cancel(
-                        &selector,
-                        &field.value,
-                        options,
-                        Some(&request.cancellation.engine),
-                    )
-                    .map(|_| ())
-                    .map_err(|error| BrowserError::Message(error.to_string())),
+                FillFieldKind::Textbox | FillFieldKind::Slider => {
+                    #[cfg(test)]
+                    if self.fill_form_native_successes > 0 {
+                        self.fill_form_native_successes -= 1;
+                        Ok(())
+                    } else if let Some(error) = self.fill_form_native_error.take() {
+                        Err(classify_core_contract(
+                            "form field dispatch failed",
+                            error.display,
+                            error.metadata,
+                            false,
+                        ))
+                    } else {
+                        page.as_ref()
+                            .expect("non-injected form fill has a page")
+                            .fill_with_cancel(
+                                &selector,
+                                &field.value,
+                                options,
+                                Some(&request.cancellation.engine),
+                            )
+                            .map(|_| ())
+                            .map_err(|error| {
+                                self.operation_error(
+                                    "form field dispatch failed",
+                                    error,
+                                    &request.cancellation,
+                                    request.timeout_ms,
+                                )
+                            })
+                    }
+                    #[cfg(not(test))]
+                    let native_result = page
+                        .as_ref()
+                        .expect("production form fill has a page")
+                        .fill_with_cancel(
+                            &selector,
+                            &field.value,
+                            options,
+                            Some(&request.cancellation.engine),
+                        )
+                        .map(|_| ());
+                    #[cfg(not(test))]
+                    native_result.map_err(|error| {
+                        self.operation_error(
+                            "form field dispatch failed",
+                            error,
+                            &request.cancellation,
+                            request.timeout_ms,
+                        )
+                    })
+                }
                 FillFieldKind::Checkbox => match field.value.as_str() {
                     "true" => page
+                        .as_ref()
+                        .expect("checkbox form fill has a page")
                         .check_with_cancel(&selector, options, Some(&request.cancellation.engine))
-                        .map_err(|error| BrowserError::Message(error.to_string())),
+                        .map_err(|error| {
+                            self.operation_error(
+                                "form field dispatch failed",
+                                error,
+                                &request.cancellation,
+                                request.timeout_ms,
+                            )
+                        }),
                     "false" => page
+                        .as_ref()
+                        .expect("checkbox form fill has a page")
                         .uncheck_with_cancel(&selector, options, Some(&request.cancellation.engine))
-                        .map_err(|error| BrowserError::Message(error.to_string())),
+                        .map_err(|error| {
+                            self.operation_error(
+                                "form field dispatch failed",
+                                error,
+                                &request.cancellation,
+                                request.timeout_ms,
+                            )
+                        }),
                     _ => Err(BrowserError::Message(
                         "checkbox value must be 'true' or 'false'".to_owned(),
                     )),
@@ -3557,30 +3757,47 @@ impl BrowserState {
                         };
                         Err(BrowserError::Message(detail.to_owned()))
                     } else {
-                        page.check_with_cancel(
-                            &selector,
-                            options,
-                            Some(&request.cancellation.engine),
-                        )
-                        .map_err(|error| BrowserError::Message(error.to_string()))
+                        page.as_ref()
+                            .expect("radio form fill has a page")
+                            .check_with_cancel(
+                                &selector,
+                                options,
+                                Some(&request.cancellation.engine),
+                            )
+                            .map_err(|error| {
+                                self.operation_error(
+                                    "form field dispatch failed",
+                                    error,
+                                    &request.cancellation,
+                                    request.timeout_ms,
+                                )
+                            })
                     }
                 }
                 FillFieldKind::Combobox => {
                     let values = [field.value.clone()];
-                    page.select_options_by_value_or_label_with_options_and_cancel(
-                        &selector,
-                        &values,
-                        options,
-                        Some(&request.cancellation.engine),
-                    )
-                    .map(|_| ())
-                    .map_err(|error| BrowserError::Message(error.to_string()))
+                    page.as_ref()
+                        .expect("combobox form fill has a page")
+                        .select_options_by_value_or_label_with_options_and_cancel(
+                            &selector,
+                            &values,
+                            options,
+                            Some(&request.cancellation.engine),
+                        )
+                        .map(|_| ())
+                        .map_err(|error| {
+                            self.operation_error(
+                                "form field dispatch failed",
+                                error,
+                                &request.cancellation,
+                                request.timeout_ms,
+                            )
+                        })
                 }
             };
             if let Err(error) = result {
                 if tracks_sensitive_value {
-                    let write_error =
-                        BrowserError::Message(format!("Field {:?} failed: {error}", field.name));
+                    let write_error = error.with_context(format!("Field {:?} failed", field.name));
                     // Resolve before reporting, on every exit below. The taint
                     // this field's tracker installed outlives the call, and the
                     // interruption exits return without taking a snapshot, so
@@ -3606,7 +3823,7 @@ impl BrowserState {
                         Ok(SensitiveWriteProgress::Partial) => {
                             self.current_refs.clear();
                             let snapshot = self.committed_post_action_snapshot(request);
-                            return partial_completion_result(
+                            return partial_completion_or_error(
                                 &format!(
                                     "{} of {} form fields completed; field {:?} \
                                      was partially written",
@@ -3614,8 +3831,9 @@ impl BrowserState {
                                     fields.len(),
                                     field.name
                                 ),
-                                &write_error.to_string(),
+                                write_error,
                                 snapshot,
+                                true,
                             );
                         }
                         Ok(SensitiveWriteProgress::Unchanged) => {
@@ -3632,7 +3850,7 @@ impl BrowserState {
                             self.current_refs.clear();
                             let snapshot = self
                                 .committed_sensitive_post_action_snapshot(&field.value, request);
-                            return partial_completion_result(
+                            return partial_completion_or_error(
                                 &format!(
                                     "{} of {} form fields completed; field {:?} \
                                      may have been partially written",
@@ -3640,8 +3858,9 @@ impl BrowserState {
                                     fields.len(),
                                     field.name
                                 ),
-                                &write_error.to_string(),
+                                write_error,
                                 snapshot,
+                                true,
                             );
                         }
                     }
@@ -3651,7 +3870,7 @@ impl BrowserState {
                     &completed_fields,
                     completed_fields.len(),
                     fields.len(),
-                    BrowserError::Message(format!("Field {:?} failed: {error}", field.name)),
+                    error.with_context(format!("Field {:?} failed", field.name)),
                     request,
                 );
             }
@@ -3689,10 +3908,7 @@ impl BrowserState {
         if matches!(error, BrowserError::Timeout(_)) {
             return error;
         }
-        BrowserError::Message(format!(
-            "Field {:?} failed before dispatch: {error}",
-            field.name
-        ))
+        error.with_context(format!("Field {:?} failed before dispatch", field.name))
     }
 
     /// Decide how a failed field is reported, in one place, so the interruption
@@ -3711,6 +3927,11 @@ impl BrowserState {
         error: BrowserError,
         request: &ActorRequest,
     ) -> TextResult {
+        // Core metadata is authoritative, including when the request deadline
+        // task publishes concurrently with the classified native result.
+        if matches!(error, BrowserError::Classified { .. }) {
+            return self.fill_form_failure(completed_count, total_fields, error, request);
+        }
         let reason = request.cancellation.reason();
         if reason != CancellationReason::Active {
             return Err(Self::fill_form_interruption(
@@ -3753,10 +3974,11 @@ impl BrowserState {
         }
         self.current_refs.clear();
         let snapshot = self.committed_post_action_snapshot(request);
-        partial_completion_result(
+        partial_completion_or_error(
             &format!("{completed_fields} of {total_fields} form fields were written"),
-            &error.to_string(),
+            error,
             snapshot,
+            true,
         )
     }
 
@@ -4970,6 +5192,23 @@ fn partial_completion_result(
     ))
 }
 
+fn partial_completion_or_error(
+    completed: &str,
+    error: BrowserError,
+    snapshot: TextResult,
+    prior_effect: bool,
+) -> TextResult {
+    if error.structured_metadata().is_none() {
+        return partial_completion_result(completed, &error.to_string(), snapshot);
+    }
+    let error = error.with_partial_completion(completed, snapshot);
+    Err(if prior_effect {
+        error.after_prior_effect()
+    } else {
+        error
+    })
+}
+
 fn render_drag_result(start_display: &str, end_display: &str, snapshot: &str) -> String {
     format!("### Result\nDragged {start_display} to {end_display}.\n\n### Snapshot\n{snapshot}")
 }
@@ -5044,9 +5283,12 @@ fn validate_file_upload_multiplicity(
 }
 
 fn file_upload_retry_error(error: BrowserError) -> BrowserError {
-    BrowserError::Message(format!(
-        "{error} Retry by clicking the same file input again."
-    ))
+    let metadata = error.structured_metadata();
+    let message = format!("{error} Retry by clicking the same file input again.");
+    match metadata {
+        Some(metadata) => BrowserError::Classified { message, metadata },
+        None => BrowserError::Message(message),
+    }
 }
 
 fn render_find_matches(lines: &[String], matching_indices: &[usize]) -> (String, FindStructure) {
@@ -5912,6 +6154,161 @@ fn mime_for_path(path: &Path) -> &'static str {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn production_form_fill_unknown_outcome_result() -> BrowserResult {
+    let metadata = FailureMetadata {
+        kind: Some(FailureKind::UnknownOutcome),
+        phase: Some(FailurePhase::Dispatch),
+        target_kind: Some(FailureTargetKind::Page),
+        command_written: Some(CommandWritten::Indeterminate),
+        retryable: Some(false),
+    };
+    let field = || FillField {
+        target: "e1".to_owned(),
+        name: "empty textbox".to_owned(),
+        kind: FillFieldKind::Textbox,
+        value: String::new(),
+    };
+    let fields = vec![field()];
+    let (reply, _response) = oneshot::channel();
+    let request = ActorRequest {
+        request_id: RequestId::Number(70_001),
+        op: BrowserOp::FillForm(vec![field()]),
+        cancellation: Arc::new(CommandCancellation::new()),
+        deadline: Instant::now() + Duration::from_secs(1),
+        timeout_ms: 1_000,
+        reply,
+    };
+    let shared = ActorShared::new();
+    shared.queue.lock().unwrap().in_flight = Some(InFlight {
+        request_id: request.request_id.clone(),
+        cancellation: Arc::clone(&request.cancellation),
+    });
+    let mut state = BrowserState::default();
+    state.current_refs.insert("e1".to_owned());
+    state.fill_form_native_error = Some(CoreFailureSeam {
+        display: "input command may have reached the browser, but its outcome is unknown; retrying may repeat the action",
+        metadata,
+    });
+    let result = state.fill_form(&fields, &request);
+    shared.complete(&request, result)
+}
+
+#[cfg(test)]
+pub(crate) fn production_form_fill_safe_later_failure_result() -> BrowserResult {
+    let metadata = FailureMetadata {
+        kind: Some(FailureKind::Timeout),
+        phase: Some(FailurePhase::Dispatch),
+        target_kind: Some(FailureTargetKind::Page),
+        command_written: Some(CommandWritten::No),
+        retryable: Some(true),
+    };
+    let field = |target: &str, name: &str| FillField {
+        target: target.to_owned(),
+        name: name.to_owned(),
+        kind: FillFieldKind::Textbox,
+        value: String::new(),
+    };
+    let fields = vec![field("e1", "first"), field("e2", "second")];
+    let (reply, _response) = oneshot::channel();
+    let request = ActorRequest {
+        request_id: RequestId::Number(70_002),
+        op: BrowserOp::FillForm(vec![field("e1", "first"), field("e2", "second")]),
+        cancellation: Arc::new(CommandCancellation::new()),
+        deadline: Instant::now() + Duration::from_secs(1),
+        timeout_ms: 1_000,
+        reply,
+    };
+    let shared = ActorShared::new();
+    let mut state = BrowserState::default();
+    state.current_refs = HashSet::from(["e1".to_owned(), "e2".to_owned()]);
+    state.fill_form_native_successes = 1;
+    state.fill_form_native_error = Some(CoreFailureSeam {
+        display: "timed out after 25 ms",
+        metadata,
+    });
+    state.snapshot_evaluator = Some(Box::new(|_, _| {
+        Ok(json!({ "outline": "captured", "nextRef": 1, "refs": [] }))
+    }));
+    let result = state.fill_form(&fields, &request);
+    shared.complete(&request, result)
+}
+
+#[cfg(test)]
+pub(crate) fn production_type_submit_unknown_outcome_result() -> BrowserResult {
+    let metadata = FailureMetadata {
+        kind: Some(FailureKind::UnknownOutcome),
+        phase: Some(FailurePhase::Dispatch),
+        target_kind: Some(FailureTargetKind::Page),
+        command_written: Some(CommandWritten::Indeterminate),
+        retryable: Some(false),
+    };
+    let (reply, _response) = oneshot::channel();
+    let request = ActorRequest {
+        request_id: RequestId::Number(70_003),
+        op: BrowserOp::Type {
+            target: "e1".to_owned(),
+            text: String::new(),
+            submit: true,
+            slowly: false,
+            clear: true,
+        },
+        cancellation: Arc::new(CommandCancellation::new()),
+        deadline: Instant::now() + Duration::from_secs(1),
+        timeout_ms: 1_000,
+        reply,
+    };
+    let shared = ActorShared::new();
+    let mut state = BrowserState::default();
+    state.current_refs.insert("e1".to_owned());
+    state.type_submit_native_error = Some(CoreFailureSeam {
+        display: "input command may have reached the browser, but its outcome is unknown; retrying may repeat the action",
+        metadata,
+    });
+    state.snapshot_evaluator = Some(Box::new(|_, _| {
+        Ok(json!({ "outline": "captured", "nextRef": 1, "refs": [] }))
+    }));
+    let result = state.type_text("e1", "", true, false, true, &request);
+    shared.complete(&request, result)
+}
+
+#[cfg(test)]
+pub(crate) fn production_type_submit_safe_failure_result() -> BrowserResult {
+    let metadata = FailureMetadata {
+        kind: Some(FailureKind::Timeout),
+        phase: Some(FailurePhase::Dispatch),
+        target_kind: Some(FailureTargetKind::Page),
+        command_written: Some(CommandWritten::No),
+        retryable: Some(true),
+    };
+    let (reply, _response) = oneshot::channel();
+    let request = ActorRequest {
+        request_id: RequestId::Number(70_004),
+        op: BrowserOp::Type {
+            target: "e1".to_owned(),
+            text: String::new(),
+            submit: true,
+            slowly: false,
+            clear: true,
+        },
+        cancellation: Arc::new(CommandCancellation::new()),
+        deadline: Instant::now() + Duration::from_secs(1),
+        timeout_ms: 1_000,
+        reply,
+    };
+    let shared = ActorShared::new();
+    let mut state = BrowserState::default();
+    state.current_refs.insert("e1".to_owned());
+    state.type_submit_native_error = Some(CoreFailureSeam {
+        display: "timed out after 25 ms",
+        metadata,
+    });
+    state.snapshot_evaluator = Some(Box::new(|_, _| {
+        Ok(json!({ "outline": "captured", "nextRef": 1, "refs": [] }))
+    }));
+    let result = state.type_text("e1", "", true, false, true, &request);
+    shared.complete(&request, result)
+}
 fn actor_main(shared: Arc<ActorShared>, startup: BrowserStartup, features: FeatureConfig) {
     let mut state = BrowserState::new(startup, features);
     eprintln!("browser actor: ready");
@@ -5938,6 +6335,171 @@ mod tests {
     };
 
     use super::*;
+    use rustwright::{CommandWritten, FailureKind, FailurePhase, FailureTargetKind};
+
+    fn classified_metadata(
+        kind: Option<FailureKind>,
+        command_written: CommandWritten,
+        retryable: bool,
+    ) -> FailureMetadata {
+        FailureMetadata {
+            kind,
+            phase: Some(match command_written {
+                CommandWritten::Yes => FailurePhase::Settle,
+                CommandWritten::No | CommandWritten::Indeterminate => FailurePhase::Dispatch,
+            }),
+            target_kind: Some(FailureTargetKind::Page),
+            command_written: Some(command_written),
+            retryable: Some(retryable),
+        }
+    }
+
+    #[test]
+    fn classify_core_error_preserves_retry_contract() {
+        let cancellation = CommandCancellation::new();
+        let timeout = classify_core_error(
+            "action failed",
+            Error::Timeout(25),
+            &cancellation,
+            25,
+            false,
+        );
+        assert_eq!(timeout, BrowserError::Timeout(25));
+        assert_eq!(
+            timeout.structured_metadata().unwrap().kind,
+            Some(FailureKind::Timeout)
+        );
+
+        let terminal = classify_core_error(
+            "action failed",
+            Error::PageCrashed,
+            &cancellation,
+            25,
+            false,
+        );
+        assert!(matches!(terminal, BrowserError::Classified { .. }));
+        let metadata = terminal.structured_metadata().unwrap();
+        assert_eq!(metadata.kind, Some(FailureKind::PageCrashed));
+        assert_eq!(metadata.target_kind, Some(FailureTargetKind::Page));
+        assert_eq!(metadata.retryable, Some(false));
+
+        let remote =
+            classify_core_error("action failed", Error::PageCrashed, &cancellation, 25, true);
+        assert_eq!(remote.to_string(), REMOTE_UNREACHABLE);
+        assert_eq!(
+            remote.structured_metadata().unwrap().kind,
+            Some(FailureKind::PageCrashed)
+        );
+
+        let rejection = classify_core_error(
+            "action failed",
+            Error::Cdp {
+                method: "Input.dispatchKeyEvent".to_owned(),
+                message: "rejected".to_owned(),
+            },
+            &cancellation,
+            25,
+            false,
+        );
+        assert!(matches!(rejection, BrowserError::Message(_)));
+        assert!(rejection.structured_metadata().is_none());
+    }
+
+    #[test]
+    fn browser_error_context_preserves_metadata() {
+        let metadata = classified_metadata(
+            Some(FailureKind::UnknownOutcome),
+            CommandWritten::Indeterminate,
+            false,
+        );
+        let error = BrowserError::Classified {
+            message: "unsafe input".to_owned(),
+            metadata,
+        }
+        .with_context("field")
+        .with_context("form");
+        assert_eq!(error.to_string(), "form: field: unsafe input");
+        assert_eq!(error.structured_metadata(), Some(metadata));
+
+        let safe = BrowserError::Classified {
+            message: "not written".to_owned(),
+            metadata: classified_metadata(Some(FailureKind::Timeout), CommandWritten::No, true),
+        }
+        .after_prior_effect();
+        let downgraded = safe.structured_metadata().unwrap();
+        assert_eq!(downgraded.command_written, Some(CommandWritten::No));
+        assert_eq!(downgraded.retryable, Some(false));
+    }
+
+    #[test]
+    fn fill_form_safe_later_substep_is_not_composite_retryable() {
+        let error = BrowserError::Classified {
+            message: "field was not written".to_owned(),
+            metadata: classified_metadata(Some(FailureKind::Timeout), CommandWritten::No, true),
+        };
+        let result = partial_completion_or_error(
+            "1 of 2 form fields were written",
+            error,
+            Ok("snapshot".to_owned()),
+            true,
+        )
+        .expect_err("classified partial completion must remain an MCP error");
+        let metadata = result.structured_metadata().unwrap();
+        assert_eq!(metadata.command_written, Some(CommandWritten::No));
+        assert_eq!(metadata.retryable, Some(false));
+        assert!(
+            result
+                .to_string()
+                .contains("1 of 2 form fields were written")
+        );
+        assert!(result.to_string().contains("snapshot"));
+    }
+
+    #[test]
+    fn type_submit_unknown_outcome_reaches_server_structured_content() {
+        let error = BrowserError::Classified {
+            message: "submit outcome is unknown".to_owned(),
+            metadata: classified_metadata(
+                Some(FailureKind::UnknownOutcome),
+                CommandWritten::Indeterminate,
+                false,
+            ),
+        };
+        let result = partial_completion_or_error(
+            "the text write completed",
+            error,
+            Ok("snapshot".to_owned()),
+            true,
+        )
+        .expect_err("classified submit failure must remain an MCP error");
+        assert_eq!(
+            result.structured_metadata().unwrap(),
+            classified_metadata(
+                Some(FailureKind::UnknownOutcome),
+                CommandWritten::Indeterminate,
+                false,
+            )
+        );
+        assert!(result.to_string().contains("the text write completed"));
+    }
+
+    #[test]
+    fn type_submit_safe_enter_is_not_composite_retryable() {
+        let error = BrowserError::Classified {
+            message: "Enter was not written".to_owned(),
+            metadata: classified_metadata(Some(FailureKind::Timeout), CommandWritten::No, true),
+        };
+        let result = partial_completion_or_error(
+            "the text write completed",
+            error,
+            Ok("snapshot".to_owned()),
+            true,
+        )
+        .expect_err("classified submit failure must remain an MCP error");
+        let metadata = result.structured_metadata().unwrap();
+        assert_eq!(metadata.command_written, Some(CommandWritten::No));
+        assert_eq!(metadata.retryable, Some(false));
+    }
 
     #[test]
     fn header_switch_off_allocates_no_header_state() {
@@ -11872,8 +12434,15 @@ mod tests {
                 Duration::from_millis(200),
             )
             .await
-            .expect("landed password type must report complete or partial success");
-        let typed = output_text(&typed);
+            .expect_err("landed password type timeout must retain classified failure metadata");
+        let metadata = typed
+            .structured_metadata()
+            .expect("post-dispatch timeout metadata");
+        assert_eq!(metadata.kind, Some(FailureKind::Timeout));
+        assert_eq!(metadata.phase, None);
+        assert_eq!(metadata.command_written, None);
+        assert_eq!(metadata.retryable, Some(false));
+        let typed = typed.to_string();
         assert!(typed.contains("Action partially completed"), "{typed}");
         assert_eq!(typed.matches("[value=••••••]").count(), 2, "{typed}");
         assert!(!typed.contains(sentinel), "{typed}");
@@ -11929,8 +12498,15 @@ mod tests {
                 Duration::from_millis(200),
             )
             .await
-            .expect("landed password fill must report complete or partial success");
-        let filled = output_text(&filled);
+            .expect_err("landed password fill timeout must retain classified failure metadata");
+        let metadata = filled
+            .structured_metadata()
+            .expect("post-dispatch timeout metadata");
+        assert_eq!(metadata.kind, Some(FailureKind::Timeout));
+        assert_eq!(metadata.phase, None);
+        assert_eq!(metadata.command_written, None);
+        assert_eq!(metadata.retryable, Some(false));
+        let filled = filled.to_string();
         assert!(filled.contains("Action partially completed"), "{filled}");
         assert_eq!(filled.matches("[value=••••••]").count(), 2, "{filled}");
         assert!(!filled.contains(sentinel), "{filled}");
