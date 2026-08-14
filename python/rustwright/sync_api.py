@@ -1537,7 +1537,7 @@ def _is_target_closed_message(message: str) -> bool:
     )
 
 
-def _translate_error(exc: RuntimeError) -> Error:
+def _translate_error(exc: Exception) -> Error:
     message = str(exc)
     wire_error = _decode_wire_error(message)
     if wire_error is not None:
@@ -1555,8 +1555,22 @@ def _translate_error(exc: RuntimeError) -> Error:
 def _call(fn, *args, **kwargs):
     try:
         return fn(*args, **kwargs)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         raise _translate_error(exc) from None
+
+
+def _call_native_key(method: str, key: str, fn, *args):
+    try:
+        return _call_with_method_prefix(method, fn, *args)
+    except Error as exc:
+        message = str(exc).removeprefix(f"{method}: ")
+        unsupported = re.fullmatch(r"unsupported key(?: modifier)?: (.*)", message)
+        if unsupported is not None or message == "key must not be empty":
+            unknown = unsupported.group(1) if unsupported is not None else key
+            raise Error(
+                f"{method}: Unknown key: {json.dumps(unknown, ensure_ascii=False)}"
+            ) from None
+        raise
 
 
 def _call_with_method_prefix(method: str, fn, *args, **kwargs):
@@ -23013,17 +23027,22 @@ return { ok: true, selected: Array.from(el.selectedOptions).map(option => option
             name="text",
             missing_type_error="Frame.type() missing 1 required positional argument: 'text'",
         )
-        self._wait_for_single("type", state="attached", timeout=timeout)
-        fallback_focused = self._focus_for_keyboard_action(timeout=timeout)
-        try:
-            if fallback_focused:
-                self._page.keyboard._type_without_text(text, delay=delay)
-            else:
-                self._page.keyboard.type(text, delay=delay)
-            self._page._slow_mo()
-        finally:
-            if fallback_focused:
-                self._cleanup_keyboard_fallback_focus()
+        delay_value = None if delay is None else _normalize_float_option(
+            delay, method="Locator.type", name="delay"
+        )
+        timeout_ms = _default_timeout_for_method(self._page, timeout, method="Locator.type")
+        deadline = None if timeout_ms <= 0 else time.monotonic() + (timeout_ms / 1000)
+        self._wait_for_single("type", state="attached", timeout=timeout_ms)
+        remaining_ms = 0.0 if deadline is None else max((deadline - time.monotonic()) * 1000, 1.0)
+        _call(
+            self._page._core.type_text_native,
+            _json(self._spec),
+            self._index,
+            text,
+            delay_value,
+            remaining_ms,
+        )
+        self._page._slow_mo()
 
     def press(
         self,
@@ -23040,17 +23059,24 @@ return { ok: true, selected: Array.from(el.selectedOptions).map(option => option
             missing_type_error="Frame.press() missing 1 required positional argument: 'key'",
         )
         no_wait_after = _normalize_action_boolean(no_wait_after, method="Locator.press", name="no_wait_after")
-        self._wait_for_single("press", state="attached", timeout=timeout)
-        fallback_focused = self._focus_for_keyboard_action(timeout=timeout)
-        try:
-            if fallback_focused:
-                self._page.keyboard._press_without_text(key, delay=delay)
-            else:
-                self._page.keyboard.press(key, delay=delay)
-            self._page._slow_mo()
-        finally:
-            if fallback_focused:
-                self._cleanup_keyboard_fallback_focus()
+        delay_value = None if delay is None else _normalize_float_option(
+            delay, method="Locator.press", name="delay"
+        )
+        timeout_ms = _default_timeout_for_method(self._page, timeout, method="Locator.press")
+        deadline = None if timeout_ms <= 0 else time.monotonic() + (timeout_ms / 1000)
+        self._wait_for_single("press", state="attached", timeout=timeout_ms)
+        remaining_ms = 0.0 if deadline is None else max((deadline - time.monotonic()) * 1000, 1.0)
+        _call_native_key(
+            "Locator.press",
+            key,
+            self._page._core.press_key_native,
+            _json(self._spec),
+            self._index,
+            key,
+            delay_value,
+            remaining_ms,
+        )
+        self._page._slow_mo()
 
     def hover(
         self,
@@ -25159,11 +25185,22 @@ class Keyboard(_EventEmitter):
         self._page = page
         self._modifiers: set[str] = set()
         self._pressed_keys: set[str] = set()
-        self._cdp_session: Optional[CDPSession] = None
+        self._input_state_poisoned: Optional[str] = None
+        self._uncertain_pressed_key: Optional[str] = None
+        self._primary_modifier = str(_call(self._page._core.keyboard_primary_modifier))
 
     def type(self, text: str, *, delay: Optional[float] = None) -> None:
+        self._ensure_input_state_usable()
         text = _normalize_string_option(text, method="Keyboard.type", name="text")
         delay_value = None if delay is None else _normalize_float_option(delay, method="Keyboard.type", name="delay")
+        if not self._modifiers and not self._pressed_keys:
+            _call(
+                self._page._core.keyboard_type_native,
+                text,
+                delay_value,
+                self._page._default_timeout,
+            )
+            return
         for char in text:
             if self._is_known_key(char):
                 self.press(char, delay=delay_value)
@@ -25172,6 +25209,7 @@ class Keyboard(_EventEmitter):
                 self._sleep_for_delay(delay_value)
 
     def _type_without_text(self, text: str, *, delay: Optional[float] = None) -> None:
+        self._ensure_input_state_usable()
         text = _normalize_string_option(text, method="Keyboard.type", name="text")
         delay_value = None if delay is None else _normalize_float_option(delay, method="Keyboard.type", name="delay")
         for char in text:
@@ -25181,93 +25219,218 @@ class Keyboard(_EventEmitter):
                 self._sleep_for_delay(delay_value)
 
     def insert_text(self, text: str) -> None:
+        self._ensure_input_state_usable()
         text = _normalize_string_option(text, method="Keyboard.insert_text", name="text")
         self._send("Input.insertText", {"text": text})
 
     def press(self, key: str, *, delay: Optional[float] = None) -> None:
+        self._ensure_input_state_usable()
         key = _normalize_string_option(key, method="Keyboard.press", name="key")
         delay_value = None if delay is None else _normalize_float_option(delay, method="Keyboard.press", name="delay")
+        if not self._modifiers and not self._pressed_keys:
+            _call_native_key(
+                "Keyboard.press",
+                key,
+                self._page._core.keyboard_press_native,
+                key,
+                delay_value,
+                self._page._default_timeout,
+            )
+            return
         modifiers, base_key = self._split_shortcut(key)
         self._validate_key(self._normalize_modifier(base_key) or base_key, "press")
+        base_descriptor = self._key_descriptor(base_key, "press")
+        if (
+            base_descriptor["impliedShift"]
+            and "Shift" not in self._modifiers
+            and "Shift" not in modifiers
+        ):
+            modifiers.append("Shift")
         pressed_modifiers: list[str] = []
-        base_down = False
+        primary_error: Optional[BaseException] = None
         try:
             for modifier in modifiers:
-                self.down(modifier)
                 pressed_modifiers.append(modifier)
+                self.down(modifier)
             self.down(base_key)
-            base_down = True
             self._sleep_for_delay(delay_value)
+        except BaseException as error:
+            primary_error = error
         finally:
-            if base_down:
-                self.up(base_key)
-            for modifier in reversed(pressed_modifiers):
-                if modifier in self._modifiers:
-                    self.up(modifier)
+            self._release_after_press(base_key, pressed_modifiers, primary_error)
 
     def down(self, key: str) -> None:
+        self._ensure_input_state_usable()
         self._down_impl(key, insert_text=True)
 
     def _press_without_text(self, key: str, *, delay: Optional[float] = None) -> None:
+        self._ensure_input_state_usable()
         key = _normalize_string_option(key, method="Keyboard.press", name="key")
         delay_value = None if delay is None else _normalize_float_option(delay, method="Keyboard.press", name="delay")
         modifiers, base_key = self._split_shortcut(key)
+        base_descriptor = self._key_descriptor(base_key, "press")
+        if (
+            base_descriptor["impliedShift"]
+            and "Shift" not in self._modifiers
+            and "Shift" not in modifiers
+        ):
+            modifiers.append("Shift")
         self._validate_key(self._normalize_modifier(base_key) or base_key, "press")
         pressed_modifiers: list[str] = []
-        base_down = False
+        primary_error: Optional[BaseException] = None
         try:
             for modifier in modifiers:
-                self._down_impl(modifier, insert_text=False)
                 pressed_modifiers.append(modifier)
+                self._down_impl(modifier, insert_text=False)
             self._down_impl(base_key, insert_text=False)
-            base_down = True
             self._sleep_for_delay(delay_value)
+        except BaseException as error:
+            primary_error = error
         finally:
-            if base_down:
-                self.up(base_key)
-            for modifier in reversed(pressed_modifiers):
-                if modifier in self._modifiers:
-                    self.up(modifier)
+            self._release_after_press(base_key, pressed_modifiers, primary_error)
+
+    def _release_after_press(
+        self,
+        base_key: str,
+        pressed_modifiers: list[str],
+        primary_error: Optional[BaseException],
+    ) -> None:
+        errors = [] if primary_error is None else [primary_error]
+        release_keys = [base_key, *reversed(pressed_modifiers)]
+        released_identities: set[str] = set()
+        for key in release_keys:
+            key_identity = self._key_identity(key)
+            if key_identity in released_identities:
+                continue
+            released_identities.add(key_identity)
+            if (
+                key_identity not in self._pressed_keys
+                and self._uncertain_pressed_key != key_identity
+            ):
+                continue
+            try:
+                self._up_impl(key)
+            except BaseException as error:
+                errors.append(error)
+        if not errors:
+            return
+        primary_error = errors[0]
+        context = primary_error.__context__
+        if any(context is error for error in errors):
+            context = None
+        for error in reversed(errors[1:]):
+            error.__context__ = context
+            context = error
+        primary_error.__context__ = context
+        raise primary_error
 
     def _down_impl(self, key: str, *, insert_text: bool) -> None:
         key = _normalize_string_option(key, method="Keyboard.down", name="key")
         modifier = self._normalize_modifier(key)
         event_key = modifier if key == "ControlOrMeta" and modifier else key
-        if modifier:
-            self._modifiers.add(modifier)
-            key = modifier
-        key_identity = self._key_identity(key)
-        params = self._key_event_params(event_key, "down")
-        text = self._input_text_for_key(event_key)
-        if insert_text and text is not None:
-            params["type"] = "keyDown"
-            params["text"] = text
-            params["unmodifiedText"] = text
-        else:
-            params["type"] = "rawKeyDown"
+        normalized_key = modifier or key
+        key_identity = self._key_identity(normalized_key)
+        event_modifiers = self._modifiers | ({modifier} if modifier else set())
+        params = self._key_event_params(event_key, "down", event_modifiers)
+        descriptor = self._key_descriptor(event_key, "down")
+        text = descriptor["text"]
+        if text is None:
+            text = self._input_text_for_key(event_key, event_modifiers)
+        params["type"] = "rawKeyDown"
+        commands = self._editing_commands(event_key, event_modifiers)
+        if commands:
+            params["commands"] = commands
         if key_identity in self._pressed_keys:
             params["autoRepeat"] = True
-        self._send("Input.dispatchKeyEvent", params)
+        try:
+            commitment = self._send("Input.dispatchKeyEvent", params)
+        except Error:
+            if (self._input_state_poisoned or "").startswith("rawKeyDown"):
+                self._uncertain_pressed_key = key_identity
+            raise
+        if commitment == "written_unconfirmed":
+            self._uncertain_pressed_key = key_identity
         self._pressed_keys.add(key_identity)
+        if modifier:
+            self._modifiers.add(modifier)
+        if insert_text and text is not None:
+            char_params = self._key_event_params(event_key, "down", event_modifiers)
+            char_params["type"] = "char"
+            char_params["text"] = text
+            char_params["unmodifiedText"] = text
+            self._send("Input.dispatchKeyEvent", char_params)
 
     def up(self, key: str) -> None:
         key = _normalize_string_option(key, method="Keyboard.up", name="key")
+        key_identity = self._key_identity(key)
+        if self._input_state_poisoned is not None:
+            if (
+                key_identity not in self._pressed_keys
+                and self._uncertain_pressed_key != key_identity
+            ):
+                self._ensure_input_state_usable()
+        self._up_impl(key)
+
+    def _up_impl(self, key: str) -> None:
+        key = _normalize_string_option(key, method="Keyboard.up", name="key")
         modifier = self._normalize_modifier(key)
         event_key = modifier if key == "ControlOrMeta" and modifier else key
-        if modifier:
-            key = modifier
-        key_identity = self._key_identity(key)
-        params = self._key_event_params(event_key, "up")
+        normalized_key = modifier or key
+        key_identity = self._key_identity(normalized_key)
+        event_modifiers = self._modifiers - ({modifier} if modifier else set())
+        params = self._key_event_params(event_key, "up", event_modifiers)
         params["type"] = "keyUp"
-        self._send("Input.dispatchKeyEvent", params)
+        commitment = self._send("Input.dispatchKeyEvent", params)
         self._pressed_keys.discard(key_identity)
         if modifier:
             self._modifiers.discard(modifier)
+        if (
+            commitment == "confirmed"
+            and self._uncertain_pressed_key == key_identity
+            and (
+                (self._input_state_poisoned or "").startswith("rawKeyDown")
+                or (self._input_state_poisoned or "").startswith("keyUp")
+            )
+        ):
+            self._input_state_poisoned = None
+            self._uncertain_pressed_key = None
 
-    def _send(self, method: str, params: dict[str, Any]) -> None:
-        if self._cdp_session is None:
-            self._cdp_session = CDPSession(_call(self._page._core.cdp_session))
-        self._cdp_session.send(method, params)
+    def _send(self, method: str, params: dict[str, Any]) -> str:
+        outcome = _decode_json_result(
+            json.loads(
+                _call(
+                    self._page._core.keyboard_dispatch_native,
+                    method,
+                    json.dumps(params),
+                    self._page._default_timeout,
+                )
+            )
+        )
+        error_message = outcome.get("error")
+        commitment = outcome.get("commitment")
+        if commitment == "written_unconfirmed" and params.get("type") in {
+            "rawKeyDown",
+            "char",
+            "keyUp",
+        }:
+            self._input_state_poisoned = (
+                f"{params.get('type')} dispatch was written but unconfirmed"
+            )
+        if error_message is None:
+            return str(commitment)
+        error = _translate_error(RuntimeError(str(error_message)))
+        if commitment == "written_unconfirmed":
+            self._input_state_poisoned = (
+                f"{params.get('type', method)} dispatch may have reached the browser"
+            )
+        raise error
+
+    def _ensure_input_state_usable(self) -> None:
+        if self._input_state_poisoned is not None:
+            raise Error(
+                "Keyboard input state is uncertain after an unconfirmed key event; "
+                "create a new page before sending more input"
+            )
 
     def _sleep_for_delay(self, delay: Optional[float]) -> None:
         if delay is None:
@@ -25298,7 +25461,7 @@ class Keyboard(_EventEmitter):
             "Control": "Control",
             "ControlLeft": "Control",
             "ControlRight": "Control",
-            "ControlOrMeta": "Meta" if sys.platform == "darwin" else "Control",
+            "ControlOrMeta": self._primary_modifier,
             "Meta": "Meta",
             "MetaLeft": "Meta",
             "MetaRight": "Meta",
@@ -25308,32 +25471,55 @@ class Keyboard(_EventEmitter):
         }
         return mapping.get(key)
 
-    def _modifiers_mask(self) -> int:
+    def _modifiers_mask(self, modifiers: Optional[set[str]] = None) -> int:
+        modifiers = self._modifiers if modifiers is None else modifiers
         mask = 0
-        if "Alt" in self._modifiers:
+        if "Alt" in modifiers:
             mask |= 1
-        if "Control" in self._modifiers:
+        if "Control" in modifiers:
             mask |= 2
-        if "Meta" in self._modifiers:
+        if "Meta" in modifiers:
             mask |= 4
-        if "Shift" in self._modifiers:
+        if "Shift" in modifiers:
             mask |= 8
         return mask
 
-    def _should_insert_text(self, key: str) -> bool:
+    def _editing_commands(
+        self, key: str, modifiers: Optional[set[str]] = None
+    ) -> list[str]:
+        """Map the connected browser's primary+A chord to selectAll."""
+        modifiers = self._modifiers if modifiers is None else modifiers
+        if key.lower() == "a" and modifiers == {self._primary_modifier}:
+            return ["selectAll"]
+        return []
+
+    def _should_insert_text(
+        self, key: str, modifiers: Optional[set[str]] = None
+    ) -> bool:
+        modifiers = self._modifiers if modifiers is None else modifiers
         if len(key) != 1:
             return False
-        return not bool(self._modifiers.intersection({"Alt", "Control", "Meta"}))
+        return not bool(modifiers.intersection({"Alt", "Control", "Meta"}))
 
-    def _text_for_key(self, key: str) -> str:
-        if "Shift" in self._modifiers and len(key) == 1 and key.isalpha():
+    def _text_for_key(
+        self, key: str, modifiers: Optional[set[str]] = None
+    ) -> str:
+        modifiers = self._modifiers if modifiers is None else modifiers
+        if "Shift" in modifiers and len(key) == 1 and key.isalpha():
             return key.upper()
         return key
 
-    def _input_text_for_key(self, key: str) -> Optional[str]:
-        if bool(self._modifiers.intersection({"Alt", "Control", "Meta"})):
+    def _input_text_for_key(
+        self, key: str, modifiers: Optional[set[str]] = None
+    ) -> Optional[str]:
+        modifiers = self._modifiers if modifiers is None else modifiers
+        if bool(modifiers.intersection({"Alt", "Control", "Meta"})):
             return None
-        physical_text = self._physical_key_text(key)
+        if key in {"Enter", "NumpadEnter"}:
+            return "\r"
+        if key == "Space":
+            return " "
+        physical_text = self._physical_key_text(key, modifiers)
         if physical_text is not None:
             return physical_text
         numpad_text = {
@@ -25344,16 +25530,19 @@ class Keyboard(_EventEmitter):
         }.get(key)
         if numpad_text is not None:
             return numpad_text
-        if self._should_insert_text(key):
-            return self._text_for_key(key)
+        if self._should_insert_text(key, modifiers):
+            return self._text_for_key(key, modifiers)
         return None
 
     def _key_identity(self, key: str) -> str:
         modifier = self._normalize_modifier(key)
         return modifier or key
 
-    def _physical_key_text(self, key: str) -> Optional[str]:
-        shifted = "Shift" in self._modifiers
+    def _physical_key_text(
+        self, key: str, modifiers: Optional[set[str]] = None
+    ) -> Optional[str]:
+        modifiers = self._modifiers if modifiers is None else modifiers
+        shifted = "Shift" in modifiers
         if re.fullmatch(r"Key[A-Z]", key):
             letter = key[-1]
             return letter if shifted else letter.lower()
@@ -25389,7 +25578,7 @@ class Keyboard(_EventEmitter):
             return None
         return punctuation[1] if shifted else punctuation[0]
 
-    def _key_event_params(self, key: str, action: str = "press") -> dict[str, Any]:
+    def _key_descriptor(self, key: str, action: str = "press") -> dict[str, Any]:
         aliases = {
             "Alt": ("Alt", "AltLeft", 18, 1),
             "AltLeft": ("Alt", "AltLeft", 18, 1),
@@ -25503,15 +25692,32 @@ class Keyboard(_EventEmitter):
             location = 0
         else:
             self._raise_unknown_key(action, key)
-        params = {
+        text = self._input_text_for_key(key)
+        implied_shift = key in frozenset("~_+{}|:\"<>?!@#$%^&*()")
+        return {
             "key": normalized,
             "code": code,
-            "modifiers": self._modifiers_mask(),
             "windowsVirtualKeyCode": virtual_key,
             "nativeVirtualKeyCode": virtual_key,
             "location": location,
+            "text": text,
+            "impliedShift": implied_shift,
         }
-        if location == 3:
+
+    def _key_event_params(
+        self,
+        key: str,
+        action: str = "press",
+        modifiers: Optional[set[str]] = None,
+    ) -> dict[str, Any]:
+        descriptor = self._key_descriptor(key, action)
+        params = {
+            name: value
+            for name, value in descriptor.items()
+            if name not in {"text", "impliedShift"}
+        }
+        params["modifiers"] = self._modifiers_mask(modifiers)
+        if descriptor["location"] == 3:
             params["isKeypad"] = True
         return params
 
