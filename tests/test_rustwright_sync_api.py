@@ -15903,6 +15903,158 @@ def test_simple_role_count_and_attribute_fast_paths(page):
     assert page.get_by_role("button", disabled=False)._try_fast_simple_role_count(timeout=500) == 3
 
 
+def test_role_name_aggregates_nested_swagger_operation_content(page):
+    page.goto((REPO_ROOT / "tests" / "fixtures" / "swagger_operation_buttons.html").as_uri())
+
+    operation = page.get_by_role("button", name="GET /items/ Read Items", exact=True)
+
+    assert operation.count() == 1
+    operation.click()
+    assert page.locator("#role-target").get_attribute("data-clicked") == "yes"
+
+
+def test_label_normalizes_zero_width_characters_and_preserves_case_rules(page):
+    page.goto((REPO_ROOT / "tests" / "fixtures" / "swagger_operation_buttons.html").as_uri())
+
+    exact_label = page.get_by_label("post /heroes/", exact=True)
+
+    assert exact_label.get_attribute("id") == "label-target"
+    assert page.get_by_label("POST /HEROES/").count() == 1
+    assert page.get_by_label("POST /HEROES/", exact=True).count() == 0
+    exact_label.click()
+    assert page.locator("#label-target").get_attribute("data-clicked") == "yes"
+
+
+def test_role_name_hidden_descendants_preserve_display_boundaries(page):
+    page.set_content(
+        """
+        <button id="inline">A<span style="visibility:hidden;display:inline">x</span>B</button>
+        <button id="block">A<span style="display:none">x</span>B</button>
+        """
+    )
+
+    assert page.get_by_role("button", name="AB", exact=True).get_attribute("id") == "inline"
+    assert page.get_by_role("button", name="A B", exact=True).get_attribute("id") == "block"
+    assert page.get_by_role("button", name="A B", exact=True)._try_fast_simple_role_count(timeout=500) == 1
+    assert page.locator("#inline").aria_snapshot().splitlines()[0].removesuffix(":") == '- button "AB"'
+    assert page.locator("#block").aria_snapshot().splitlines()[0].removesuffix(":") == '- button "A B"'
+
+
+def test_named_attribute_locators_preserve_zero_width_characters(page):
+    page.set_content(
+        """
+        <input id="plain" placeholder="AB">
+        <input id="zero-width" placeholder="A\u200bB">
+        <img id="alt" alt="A\u200bB">
+        <div id="title" title="A\u200bB">Title target</div>
+        """
+    )
+
+    assert page.get_by_placeholder("AB", exact=True).evaluate_all("(els) => els.map(el => el.id)") == ["plain"]
+    assert page.get_by_placeholder("A\u200bB", exact=True).get_attribute("id") == "zero-width"
+    assert page.get_by_placeholder("ab").evaluate_all("(els) => els.map(el => el.id)") == ["plain"]
+    assert page.get_by_alt_text("AB").count() == 0
+    assert page.get_by_alt_text("A\u200bB", exact=True).get_attribute("id") == "alt"
+    assert page.get_by_title("AB").count() == 0
+    assert page.get_by_title("A\u200bB", exact=True).get_attribute("id") == "title"
+
+    page.get_by_placeholder("AB", exact=True).fill("plain-only")
+    assert page.locator("#plain").input_value() == "plain-only"
+    assert page.locator("#zero-width").input_value() == ""
+
+
+def test_swagger_operation_aria_snapshot_matches_playwright(page):
+    page.goto((REPO_ROOT / "tests" / "fixtures" / "swagger_operation_buttons.html").as_uri())
+
+    snapshot = page.locator("#role-target").aria_snapshot()
+
+    assert snapshot == (
+        '- button "GET /items/ Read Items":\n'
+        "  - text: GET\n"
+        "  - link /items/:\n"
+        '    - /url: "#/default/read_items_items__get"\n'
+        "  - text: Read Items"
+    )
+
+
+def test_get_by_text_regex_matches_raw_full_text(page):
+    page.set_content('<p id="zero-width">A\u200bB</p>')
+    ids = "(els) => els.map(el => el.id)"
+
+    assert page.get_by_text(re.compile("AB")).evaluate_all(ids) == []
+    assert page.get_by_text(re.compile("A\u200bB")).evaluate_all(ids) == ["zero-width"]
+    assert page.get_by_text("AB", exact=True).evaluate_all(ids) == ["zero-width"]
+
+
+def test_aria_snapshot_urls_match_upstream_yaml_quoting(page):
+    page.set_content('<a id="link">Link</a>')
+    link = page.locator("#link")
+    cases = [
+        ("page #fragment", '"page #fragment"'),
+        ("?relative", '"?relative"'),
+        ("%rel", '"%rel"'),
+        ("123", '"123"'),
+        ("true", '"true"'),
+        ("{x}", '"{x}"'),
+        ("`tick", '"`tick"'),
+        ("line\nbreak", '"line\\nbreak"'),
+        ("\u00a0", '"\u00a0"'),
+        ("https://example.test/A\u200bB", "https://example.test/A\u200bB"),
+    ]
+
+    for value, serialized in cases:
+        link.evaluate('(el, href) => el.setAttribute("href", href)', value)
+        assert link.aria_snapshot() == (
+            '- link "Link":\n'
+            f"  - /url: {serialized}"
+        )
+
+
+def test_accessibility_and_text_assertions_normalize_zero_width_characters(page):
+    zero_width = "A\u200bB\u00adC"
+    page.set_content(
+        f"""
+        <button id="name">{zero_width}</button>
+        <button id="description" aria-describedby="description-text">Action</button>
+        <span id="description-text">{zero_width}</span>
+        <input id="error" aria-invalid="true" aria-errormessage="error-text">
+        <span id="error-text">{zero_width}</span>
+        <div id="text">{zero_width}</div>
+        <input id="raw" value="{zero_width}" data-value="{zero_width}">
+        """
+    )
+
+    name = expect(page.locator("#name"))
+    name.to_have_accessible_name("ABC")
+    name.to_have_accessible_name(zero_width)
+    name.to_have_accessible_name(re.compile("ABC"))
+    name.not_to_have_accessible_name(re.compile(zero_width))
+
+    description = expect(page.locator("#description"))
+    description.to_have_accessible_description("ABC")
+    description.to_have_accessible_description(zero_width)
+    description.to_have_accessible_description(re.compile("ABC"))
+    description.not_to_have_accessible_description(re.compile(zero_width))
+
+    error = expect(page.locator("#error"))
+    error.to_have_accessible_error_message("ABC")
+    error.to_have_accessible_error_message(zero_width)
+    error.to_have_accessible_error_message(re.compile("ABC"))
+    error.not_to_have_accessible_error_message(re.compile(zero_width))
+
+    text = expect(page.locator("#text"))
+    text.to_have_text("ABC")
+    text.to_have_text(zero_width)
+    text.not_to_have_text(re.compile("ABC"))
+    text.to_have_text(re.compile(zero_width))
+
+    raw = expect(page.locator("#raw"))
+    raw.to_have_attribute("data-value", zero_width)
+    raw.not_to_have_attribute("data-value", "ABC")
+    raw.to_have_value(zero_width)
+    raw.not_to_have_value("ABC")
+
+
 def test_get_by_role_supports_common_state_filters(page):
     page.set_content(
         """
