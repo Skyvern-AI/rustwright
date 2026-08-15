@@ -447,6 +447,18 @@ const CDP_DIAGNOSTIC_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const TIMEOUT_DIAGNOSTIC_BANNER: &str = "RUSTWRIGHT TIMEOUT DIAGNOSTIC";
 const FRAME_UTILITY_WORLD_NAME: &str = "__utility_world__";
 static NEXT_FILL_GUARD_ID: AtomicU64 = AtomicU64::new(1);
+// These counters identify state created during one browser/page lifetime. Reaching
+// the wrap guard would require more state transitions than the process can retain
+// or dispatch, so equal generations can never legitimately span a wrap.
+const LIFETIME_COUNTER_WRAP_GUARD: u64 = u64::MAX - (1 << 32);
+
+fn advance_lifetime_counter(counter: &mut u64) {
+    debug_assert!(
+        *counter < LIFETIME_COUNTER_WRAP_GUARD,
+        "browser-lifetime counter approached u64 wrap"
+    );
+    *counter = counter.wrapping_add(1);
+}
 static NEXT_ACTION_DISPATCH_ID: AtomicU64 = AtomicU64::new(1);
 const ACTION_DISPATCH_BINDING_NAME: &str = "__rustwright_dispatch__";
 const ACTION_DISPATCH_TOKEN_BYTES: usize = 32;
@@ -3196,6 +3208,17 @@ mod tests {
             .unwrap_or_else(|error| panic!("invalid {field} action dispatch literal: {error}"))
     }
 
+    fn input_command_expression(command: &Value) -> Option<&str> {
+        command["params"]["expression"]
+            .as_str()
+            .or_else(|| command["params"]["functionDeclaration"].as_str())
+            .or_else(|| {
+                command["params"]["arguments"]
+                    .get(0)
+                    .and_then(|argument| argument["value"].as_str())
+            })
+    }
+
     impl InputCdpPeer {
         async fn next_protocol_command(&mut self) -> Value {
             let outgoing = match self.write_rx.recv().await {
@@ -3403,20 +3426,13 @@ mod tests {
         }
         async fn next_command(&mut self) -> Value {
             loop {
-                let mut command = self.next_protocol_command().await;
+                let command = self.next_protocol_command().await;
                 let source = command["params"]["expression"]
                     .as_str()
                     .or_else(|| command["params"]["functionDeclaration"].as_str())
                     .unwrap_or("");
                 if source.contains("__rustwright_serializer_factory__") {
                     continue;
-                }
-                if command["method"] == "Runtime.callFunctionOn"
-                    && source.contains("__rustwright_evaluate_wrapper__")
-                {
-                    let source = source.to_string();
-                    command["method"] = Value::String("Runtime.evaluate".to_string());
-                    command["params"]["expression"] = Value::String(source);
                 }
                 return command;
             }
@@ -3453,6 +3469,7 @@ mod tests {
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
             sent_context_dispose_count: AtomicU64::new(0),
+            sent_get_frame_tree_count: AtomicU64::new(0),
             alive: Arc::new(AtomicBool::new(true)),
             alive_tx,
         };
@@ -3512,6 +3529,7 @@ mod tests {
                 session_id: "test-session".to_string(),
                 context_id: None,
                 main_frame_id: Mutex::new(None),
+                navigation_transition_lock: Mutex::new(NavigationTransitionState::default()),
                 frame_state: Mutex::new(PageFrameState::new("test-session".to_string())),
                 iframe_setup_tasks: IframeSetupTaskRegistry::default(),
                 network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
@@ -3526,7 +3544,7 @@ mod tests {
                 crashed: AtomicBool::new(false),
                 close_target_on_drop: AtomicBool::new(false),
                 console_records: Mutex::new(ConsoleRecordStore::default()),
-                console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                console_capture: ConsoleCaptureState::default(),
                 console_replay_until_event_cursor: Mutex::new(HashMap::new()),
                 observation_event_cursor: AtomicU64::new(0),
                 native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
@@ -4822,15 +4840,14 @@ multiline-compatible = """4.5.6"""
         let operation = std::thread::spawn(move || {
             page.type_text_with_timeout_and_cancel("#nonfocusable", "x", None, Some(1_000.0), None)
         });
-        let commands = peer.commands(7).await;
+        let commands = peer.commands(6).await;
         operation.join().unwrap().unwrap();
 
         let focus_index = commands
             .iter()
             .position(|command| {
-                command["method"] == "Runtime.evaluate"
-                    && command["params"]["expression"]
-                        .as_str()
+                command["method"] == "Runtime.callFunctionOn"
+                    && input_command_expression(command)
                         .is_some_and(|expression| expression.contains("fallback.focus();"))
             })
             .expect("focus failure must install and focus the safe fallback");
@@ -4844,13 +4861,11 @@ multiline-compatible = """4.5.6"""
         let cleanup_index = commands
             .iter()
             .position(|command| {
-                command["method"] == "Runtime.evaluate"
-                    && command["params"]["expression"]
-                        .as_str()
-                        .is_some_and(|expression| {
-                            expression
-                                .contains("for (const fallback of Array.from(doc.querySelectorAll")
-                        })
+                command["method"] == "Runtime.callFunctionOn"
+                    && input_command_expression(command).is_some_and(|expression| {
+                        expression
+                            .contains("for (const fallback of Array.from(doc.querySelectorAll")
+                    })
             })
             .expect("safe fallback must be cleaned up");
 
@@ -4876,20 +4891,24 @@ multiline-compatible = """4.5.6"""
             let token = CancelToken::new();
             let operation_page = page.clone();
             let operation_token = token.clone();
-            let operation = std::thread::spawn(move || match entry_path {
-                EntryPath::PageType => operation_page.type_text_with_timeout_and_cancel(
-                    "#nonfocusable",
-                    "x",
-                    None,
-                    Some(1_000.0),
-                    Some(&operation_token),
-                ),
-                EntryPath::PagePress => operation_page.press_key_with_timeout_and_cancel(
-                    Some("#nonfocusable"),
-                    "a",
-                    Some(1_000.0),
-                    Some(&operation_token),
-                ),
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = match entry_path {
+                    EntryPath::PageType => operation_page.type_text_with_timeout_and_cancel(
+                        "#nonfocusable",
+                        "x",
+                        None,
+                        Some(1_000.0),
+                        Some(&operation_token),
+                    ),
+                    EntryPath::PagePress => operation_page.press_key_with_timeout_and_cancel(
+                        Some("#nonfocusable"),
+                        "a",
+                        Some(1_000.0),
+                        Some(&operation_token),
+                    ),
+                };
+                let _ = result_tx.send(result);
             });
 
             let frame_tree = peer.next_command().await;
@@ -4907,31 +4926,40 @@ multiline-compatible = """4.5.6"""
             });
             let focus = peer.next_command().await;
             cancellation.await.unwrap();
-            assert_eq!(focus["method"], "Runtime.evaluate", "{entry_path:?}");
+            assert_eq!(focus["method"], "Runtime.callFunctionOn", "{entry_path:?}");
             assert!(
-                focus["params"]["expression"]
-                    .as_str()
+                input_command_expression(&focus)
                     .is_some_and(|expression| expression.contains("fallback.focus();")),
                 "{entry_path:?}"
             );
 
             peer.response_delay = None;
-            let sweep = tokio::time::timeout(Duration::from_secs(2), peer.commands(3))
-                .await
-                .expect("cancelled focus fallback sweep must be bounded");
-            assert_eq!(sweep[0]["method"], "Page.getFrameTree", "{entry_path:?}");
-            assert_eq!(
-                sweep[1]["method"], "Page.createIsolatedWorld",
-                "{entry_path:?}"
-            );
-            assert_eq!(sweep[2]["method"], "Runtime.evaluate", "{entry_path:?}");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let mut sweep = Vec::new();
+            let result = loop {
+                if let Ok(result) = result_rx.try_recv() {
+                    break result;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "cancelled focus fallback sweep must be bounded"
+                );
+                if let Ok(command) =
+                    tokio::time::timeout(Duration::from_millis(25), peer.next_command()).await
+                {
+                    sweep.push(command);
+                }
+            };
             assert!(
-                sweep[2]["params"]["expression"]
-                    .as_str()
-                    .is_some_and(|expression| expression.contains("fallback.remove();")),
-                "{entry_path:?}"
+                sweep.iter().any(|command| {
+                    matches!(
+                        command["method"].as_str(),
+                        Some("Runtime.evaluate" | "Runtime.callFunctionOn")
+                    ) && input_command_expression(command)
+                        .is_some_and(|expression| expression.contains("fallback.remove();"))
+                }),
+                "{entry_path:?}: {sweep:?}"
             );
-            let result = operation.join().unwrap();
             assert!(
                 matches!(result, Err(RwError::Cancelled)),
                 "{entry_path:?}: {result:?}"
@@ -4966,11 +4994,12 @@ multiline-compatible = """4.5.6"""
             peer.focus_target = false;
             peer.focus_response_error_after_execution = Some(FOCUS_ERROR.to_string());
             let operation_page = page.clone();
-            let operation = std::thread::spawn(move || {
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
                 let page = Arc::clone(&operation_page.inner);
                 let browser = Arc::clone(&page.browser);
                 let locator_json = selector_to_locator_json("#nonfocusable").unwrap();
-                match entry_path {
+                let result = match entry_path {
                     EntryPath::LocatorType => browser.block_on_raw(type_locator_for_native_input(
                         &page,
                         &locator_json,
@@ -4993,7 +5022,8 @@ multiline-compatible = """4.5.6"""
                             None,
                         ))
                     }
-                }
+                };
+                let _ = result_tx.send(result);
             });
 
             let frame_tree = peer.next_command().await;
@@ -5004,30 +5034,39 @@ multiline-compatible = """4.5.6"""
                 "{entry_path:?}"
             );
             let focus = peer.next_command().await;
-            assert_eq!(focus["method"], "Runtime.evaluate", "{entry_path:?}");
+            assert_eq!(focus["method"], "Runtime.callFunctionOn", "{entry_path:?}");
             assert!(
-                focus["params"]["expression"]
-                    .as_str()
+                input_command_expression(&focus)
                     .is_some_and(|expression| expression.contains("fallback.focus();")),
                 "{entry_path:?}"
             );
 
-            let sweep = tokio::time::timeout(Duration::from_secs(2), peer.commands(3))
-                .await
-                .expect("failed locator focus fallback sweep must be bounded");
-            assert_eq!(sweep[0]["method"], "Page.getFrameTree", "{entry_path:?}");
-            assert_eq!(
-                sweep[1]["method"], "Page.createIsolatedWorld",
-                "{entry_path:?}"
-            );
-            assert_eq!(sweep[2]["method"], "Runtime.evaluate", "{entry_path:?}");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let mut sweep = Vec::new();
+            let result = loop {
+                if let Ok(result) = result_rx.try_recv() {
+                    break result;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "failed locator focus fallback sweep must be bounded"
+                );
+                if let Ok(command) =
+                    tokio::time::timeout(Duration::from_millis(25), peer.next_command()).await
+                {
+                    sweep.push(command);
+                }
+            };
             assert!(
-                sweep[2]["params"]["expression"]
-                    .as_str()
-                    .is_some_and(|expression| expression.contains("fallback.remove();")),
-                "{entry_path:?}"
+                sweep.iter().any(|command| {
+                    matches!(
+                        command["method"].as_str(),
+                        Some("Runtime.evaluate" | "Runtime.callFunctionOn")
+                    ) && input_command_expression(command)
+                        .is_some_and(|expression| expression.contains("fallback.remove();"))
+                }),
+                "{entry_path:?}: {sweep:?}"
             );
-            let result = operation.join().unwrap();
             assert!(
                 matches!(
                     &result,
@@ -5079,10 +5118,31 @@ multiline-compatible = """4.5.6"""
 
     async fn assert_public_fill_input_protocol(value: &str, expected_input: Vec<Value>) {
         let (page, mut peer) = input_protocol_page(Some(value));
+        peer.allow_close = true;
         let value = value.to_string();
-        let operation = std::thread::spawn(move || page.fill("#target", &value, Some(1_000.0)));
-        let commands = peer.commands(11 + expected_input.len()).await;
-        operation.join().unwrap().unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = result_tx.send(page.fill("#target", &value, Some(1_000.0)));
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut commands = Vec::new();
+        let result = loop {
+            if let Ok(result) = result_rx.try_recv() {
+                break result;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "public fill input protocol did not finish"
+            );
+            if let Ok(command) =
+                tokio::time::timeout(Duration::from_millis(25), peer.next_command()).await
+            {
+                if command["method"] != "__closed__" {
+                    commands.push(command);
+                }
+            }
+        };
+        result.unwrap();
         let input = commands
             .iter()
             .filter(|command| {
@@ -5217,10 +5277,11 @@ multiline-compatible = """4.5.6"""
         );
         assert!(
             commands.iter().any(|command| {
-                command["method"] == "Runtime.evaluate"
-                    && command["params"]["expression"]
-                        .as_str()
-                        .is_some_and(|expression| expression.contains("g.passive = true"))
+                matches!(
+                    command["method"].as_str(),
+                    Some("Runtime.evaluate" | "Runtime.callFunctionOn")
+                ) && input_command_expression(command)
+                    .is_some_and(|expression| expression.contains("g.passive = true"))
             }),
             "unknown outcome must passivate the fill guard for late observation"
         );
@@ -5250,6 +5311,7 @@ multiline-compatible = """4.5.6"""
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
             sent_context_dispose_count: AtomicU64::new(0),
+            sent_get_frame_tree_count: AtomicU64::new(0),
             alive: Arc::new(AtomicBool::new(true)),
             alive_tx,
         });
@@ -5276,6 +5338,7 @@ multiline-compatible = """4.5.6"""
                 session_id: "test-session".to_string(),
                 context_id: None,
                 main_frame_id: Mutex::new(None),
+                navigation_transition_lock: Mutex::new(NavigationTransitionState::default()),
                 frame_state: Mutex::new(PageFrameState::new("test-session".to_string())),
                 iframe_setup_tasks: IframeSetupTaskRegistry::default(),
                 network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
@@ -5290,12 +5353,20 @@ multiline-compatible = """4.5.6"""
                 crashed: AtomicBool::new(false),
                 close_target_on_drop: AtomicBool::new(false),
                 console_records: Mutex::new(ConsoleRecordStore::default()),
-                console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                console_capture: ConsoleCaptureState::default(),
                 console_replay_until_event_cursor: Mutex::new(HashMap::new()),
                 observation_event_cursor: AtomicU64::new(0),
                 native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
             }),
         };
+        *page.inner.main_frame_id.lock().unwrap() = Some("main-frame".to_string());
+        page.inner.frame_state.lock().unwrap().record_frame(
+            "main-frame".to_string(),
+            None,
+            None,
+            None,
+            "test-session".to_string(),
+        );
         let token = CancelToken::new();
         let dispatch_token = token.clone();
         let responder = browser.runtime.handle().spawn(async move {
@@ -5310,10 +5381,12 @@ multiline-compatible = """4.5.6"""
                     };
                     let method = command["method"].as_str().unwrap();
                     let result = match method {
-                        "Page.getFrameTree" => {
-                            json!({ "frameTree": { "frame": { "id": "test-frame" } } })
-                        }
-                        "Page.createIsolatedWorld" => json!({ "executionContextId": 1 }),
+                        "Page.getFrameTree" => json!({
+                            "frameTree": {
+                                "frame": {"id": "main-frame", "url": "about:blank"}
+                            }
+                        }),
+                        "Page.createIsolatedWorld" => json!({"executionContextId": 7}),
                         "Runtime.evaluate" => {
                             json!({
                                 "result": {
@@ -5398,6 +5471,7 @@ multiline-compatible = """4.5.6"""
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
             sent_context_dispose_count: AtomicU64::new(0),
+            sent_get_frame_tree_count: AtomicU64::new(0),
             alive: Arc::new(AtomicBool::new(true)),
             alive_tx,
         });
@@ -5424,6 +5498,7 @@ multiline-compatible = """4.5.6"""
                 session_id: "test-session".to_string(),
                 context_id: None,
                 main_frame_id: Mutex::new(None),
+                navigation_transition_lock: Mutex::new(NavigationTransitionState::default()),
                 frame_state: Mutex::new(PageFrameState::new("test-session".to_string())),
                 iframe_setup_tasks: IframeSetupTaskRegistry::default(),
                 network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
@@ -5438,7 +5513,7 @@ multiline-compatible = """4.5.6"""
                 crashed: AtomicBool::new(false),
                 close_target_on_drop: AtomicBool::new(false),
                 console_records: Mutex::new(ConsoleRecordStore::default()),
-                console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                console_capture: ConsoleCaptureState::default(),
                 console_replay_until_event_cursor: Mutex::new(HashMap::new()),
                 observation_event_cursor: AtomicU64::new(0),
                 native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
@@ -5509,6 +5584,7 @@ multiline-compatible = """4.5.6"""
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
             sent_context_dispose_count: AtomicU64::new(0),
+            sent_get_frame_tree_count: AtomicU64::new(0),
             alive: Arc::new(AtomicBool::new(true)),
             alive_tx,
         };
@@ -5908,6 +5984,7 @@ multiline-compatible = """4.5.6"""
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
             sent_context_dispose_count: AtomicU64::new(0),
+            sent_get_frame_tree_count: AtomicU64::new(0),
             alive: Arc::new(AtomicBool::new(true)),
             alive_tx,
         };
@@ -5986,6 +6063,7 @@ multiline-compatible = """4.5.6"""
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
             sent_context_dispose_count: AtomicU64::new(0),
+            sent_get_frame_tree_count: AtomicU64::new(0),
             alive: Arc::new(AtomicBool::new(true)),
             alive_tx,
         };
@@ -6087,6 +6165,7 @@ multiline-compatible = """4.5.6"""
                 sent_runtime_enable_count: AtomicU64::new(0),
                 sent_target_close_count: AtomicU64::new(0),
                 sent_context_dispose_count: AtomicU64::new(0),
+                sent_get_frame_tree_count: AtomicU64::new(0),
                 alive: Arc::new(AtomicBool::new(true)),
                 alive_tx,
             }),
@@ -6110,11 +6189,12 @@ multiline-compatible = """4.5.6"""
                 session_id: "test-session".to_string(),
                 context_id: None,
                 main_frame_id: Mutex::new(None),
+                navigation_transition_lock: Mutex::new(NavigationTransitionState::default()),
                 frame_state: Mutex::new(PageFrameState::new("test-session".to_string())),
                 iframe_setup_tasks: IframeSetupTaskRegistry::default(),
                 network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
                 console_records: Mutex::new(ConsoleRecordStore::default()),
-                console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                console_capture: ConsoleCaptureState::default(),
                 console_replay_until_event_cursor: Mutex::new(HashMap::new()),
                 observation_event_cursor: AtomicU64::new(0),
                 native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
@@ -6130,6 +6210,14 @@ multiline-compatible = """4.5.6"""
                 close_target_on_drop: AtomicBool::new(false),
             }),
         };
+        *page.inner.main_frame_id.lock().unwrap() = Some("main-frame".to_string());
+        page.inner.frame_state.lock().unwrap().record_frame(
+            "main-frame".to_string(),
+            None,
+            None,
+            None,
+            "test-session".to_string(),
+        );
         (page, write_rx)
     }
 
@@ -6892,6 +6980,241 @@ multiline-compatible = """4.5.6"""
                 .map(String::as_str),
             Some("outer")
         );
+    }
+
+    #[test]
+    fn frame_tree_refresh_prunes_missing_same_session_frames_only() {
+        let mut state = PageFrameState::new("session-main".to_string());
+        state.record_frame(
+            "main".to_string(),
+            None,
+            None,
+            None,
+            "session-main".to_string(),
+        );
+        state.record_frame(
+            "stale-child".to_string(),
+            Some("main".to_string()),
+            None,
+            None,
+            "session-main".to_string(),
+        );
+        state.record_session_for_frame("oopif-child", "session-oopif");
+        state.record_frame(
+            "oopif-child".to_string(),
+            Some("main".to_string()),
+            None,
+            None,
+            "session-oopif".to_string(),
+        );
+
+        apply_authoritative_tree_for_test(
+            &mut state,
+            &json!({"frame": {"id": "main"}}),
+            "session-main",
+        );
+
+        assert!(!state.frames.contains_key("stale-child"));
+        assert!(state.frames.contains_key("oopif-child"));
+        assert_eq!(
+            state.frame_sessions.get("oopif-child").map(String::as_str),
+            Some("session-oopif")
+        );
+    }
+
+    #[test]
+    fn authoritative_oopif_refresh_transfers_cached_descendant_subtree() {
+        let mut state = PageFrameState::new("session-main".to_string());
+        state.record_frame(
+            "main".to_string(),
+            None,
+            None,
+            None,
+            "session-main".to_string(),
+        );
+        state.record_frame(
+            "outer".to_string(),
+            Some("main".to_string()),
+            None,
+            None,
+            "session-main".to_string(),
+        );
+        state.record_frame(
+            "nested".to_string(),
+            Some("outer".to_string()),
+            None,
+            None,
+            "session-main".to_string(),
+        );
+
+        state.record_session_for_frame("outer", "session-oopif");
+        apply_authoritative_tree_for_test(
+            &mut state,
+            &json!({
+                "frame": {"id": "outer", "parentId": "main"},
+                "childFrames": [{
+                    "frame": {"id": "nested", "parentId": "outer"}
+                }]
+            }),
+            "session-oopif",
+        );
+
+        assert_eq!(state.frame_sessions["outer"], "session-oopif");
+        assert_eq!(state.frame_sessions["nested"], "session-oopif");
+        assert_eq!(state.session_frames["session-oopif"], "outer");
+        assert_eq!(
+            state.frames["nested"].session_id.as_deref(),
+            Some("session-oopif")
+        );
+    }
+
+    #[test]
+    fn authoritative_parent_refresh_reclaims_detached_oopif_subtree() {
+        let mut state = PageFrameState::new("session-main".to_string());
+        state.record_frame(
+            "main".to_string(),
+            None,
+            None,
+            None,
+            "session-main".to_string(),
+        );
+        state.record_session_for_frame("outer", "session-oopif");
+        state.record_frame(
+            "outer".to_string(),
+            Some("main".to_string()),
+            None,
+            None,
+            "session-oopif".to_string(),
+        );
+        state.record_frame(
+            "nested".to_string(),
+            Some("outer".to_string()),
+            None,
+            None,
+            "session-oopif".to_string(),
+        );
+
+        state.detach_session("session-oopif");
+        apply_authoritative_tree_for_test(
+            &mut state,
+            &json!({
+                "frame": {"id": "outer", "parentId": "main"},
+                "childFrames": [{
+                    "frame": {"id": "nested", "parentId": "outer"}
+                }]
+            }),
+            "session-main",
+        );
+
+        assert!(!state.session_frames.contains_key("session-oopif"));
+        assert_eq!(state.frame_sessions["outer"], "session-main");
+        assert_eq!(state.frame_sessions["nested"], "session-main");
+        assert_eq!(
+            state.frames["nested"].session_id.as_deref(),
+            Some("session-main")
+        );
+    }
+
+    #[test]
+    fn nested_oopif_registered_root_survives_outer_refresh_then_reclaims_after_detach() {
+        let harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.record_session_for_frame("outer-frame", "session-outer");
+            state.record_frame(
+                "outer-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                None,
+                "session-outer".to_string(),
+            );
+            state.record_frame(
+                "middle-frame".to_string(),
+                Some("outer-frame".to_string()),
+                None,
+                None,
+                "session-outer".to_string(),
+            );
+            state.record_frame(
+                "leaf-frame".to_string(),
+                Some("middle-frame".to_string()),
+                None,
+                None,
+                "session-outer".to_string(),
+            );
+            state.record_session_for_frame("middle-frame", "session-middle");
+        }
+
+        let middle_tree = json!({
+            "frame": {
+                "id": "middle-frame",
+                "parentId": "outer-frame",
+                "loaderId": "loader-middle"
+            },
+            "childFrames": [{
+                "frame": {
+                    "id": "leaf-frame",
+                    "parentId": "middle-frame",
+                    "loaderId": "loader-leaf"
+                }
+            }]
+        });
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            apply_authoritative_tree_for_test(&mut state, &middle_tree, "session-middle");
+        }
+        {
+            let state = harness.page.frame_state.lock().unwrap();
+            assert_eq!(state.frame_sessions["middle-frame"], "session-middle");
+            assert_eq!(state.frame_sessions["leaf-frame"], "session-middle");
+        }
+
+        let outer_tree = json!({
+            "frame": {
+                "id": "outer-frame",
+                "parentId": "main-frame",
+                "loaderId": "loader-outer"
+            },
+            "childFrames": [{
+                "frame": {
+                    "id": "middle-frame",
+                    "parentId": "outer-frame",
+                    "loaderId": "loader-middle"
+                },
+                "childFrames": [{
+                    "frame": {
+                        "id": "leaf-frame",
+                        "parentId": "middle-frame",
+                        "loaderId": "loader-leaf"
+                    }
+                }]
+            }]
+        });
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            apply_authoritative_tree_for_test(&mut state, &outer_tree, "session-outer");
+        }
+        {
+            let state = harness.page.frame_state.lock().unwrap();
+            assert_eq!(state.frame_sessions["middle-frame"], "session-middle");
+            assert_eq!(state.frame_sessions["leaf-frame"], "session-middle");
+        }
+
+        harness
+            .page
+            .frame_state
+            .lock()
+            .unwrap()
+            .detach_session("session-middle");
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            apply_authoritative_tree_for_test(&mut state, &outer_tree, "session-outer");
+        }
+        let state = harness.page.frame_state.lock().unwrap();
+        assert!(!state.session_frames.contains_key("session-middle"));
+        assert_eq!(state.frame_sessions["middle-frame"], "session-outer");
+        assert_eq!(state.frame_sessions["leaf-frame"], "session-outer");
     }
 
     #[test]
@@ -7767,8 +8090,7 @@ multiline-compatible = """4.5.6"""
             "tracked timeout must retain its structured metadata: {error}"
         );
         assert!(commands.iter().any(|command| {
-            command["params"]["expression"]
-                .as_str()
+            input_command_expression(command)
                 .is_some_and(|expression| expression.contains("guard.cleanup()"))
         }));
     }
@@ -8772,6 +9094,7 @@ multiline-compatible = """4.5.6"""
                     sent_runtime_enable_count: AtomicU64::new(0),
                     sent_target_close_count: AtomicU64::new(0),
                     sent_context_dispose_count: AtomicU64::new(0),
+                    sent_get_frame_tree_count: AtomicU64::new(0),
                     alive: Arc::new(AtomicBool::new(true)),
                     alive_tx,
                 }),
@@ -8840,6 +9163,7 @@ multiline-compatible = """4.5.6"""
                 sent_runtime_enable_count: AtomicU64::new(0),
                 sent_target_close_count: AtomicU64::new(0),
                 sent_context_dispose_count: AtomicU64::new(0),
+                sent_get_frame_tree_count: AtomicU64::new(0),
                 alive: Arc::new(AtomicBool::new(true)),
                 alive_tx,
             }),
@@ -8864,11 +9188,12 @@ multiline-compatible = """4.5.6"""
             session_id: "root-session".to_string(),
             context_id: None,
             main_frame_id: Mutex::new(None),
+            navigation_transition_lock: Mutex::new(NavigationTransitionState::default()),
             frame_state: Mutex::new(frame_state),
             iframe_setup_tasks: IframeSetupTaskRegistry::default(),
             network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
             console_records: Mutex::new(ConsoleRecordStore::default()),
-            console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+            console_capture: ConsoleCaptureState::default(),
             console_replay_until_event_cursor: Mutex::new(HashMap::new()),
             observation_event_cursor: AtomicU64::new(0),
             native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
@@ -8926,6 +9251,7 @@ multiline-compatible = """4.5.6"""
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
             sent_context_dispose_count: AtomicU64::new(0),
+            sent_get_frame_tree_count: AtomicU64::new(0),
             alive: Arc::new(AtomicBool::new(true)),
             alive_tx,
         };
@@ -9004,6 +9330,7 @@ multiline-compatible = """4.5.6"""
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
             sent_context_dispose_count: AtomicU64::new(0),
+            sent_get_frame_tree_count: AtomicU64::new(0),
             alive: Arc::new(AtomicBool::new(true)),
             alive_tx,
         };
@@ -9089,6 +9416,7 @@ multiline-compatible = """4.5.6"""
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
             sent_context_dispose_count: AtomicU64::new(0),
+            sent_get_frame_tree_count: AtomicU64::new(0),
             alive: Arc::new(AtomicBool::new(true)),
             alive_tx,
         };
@@ -9164,6 +9492,7 @@ multiline-compatible = """4.5.6"""
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
             sent_context_dispose_count: AtomicU64::new(0),
+            sent_get_frame_tree_count: AtomicU64::new(0),
             alive: Arc::new(AtomicBool::new(true)),
             alive_tx,
         });
@@ -9339,6 +9668,7 @@ multiline-compatible = """4.5.6"""
                 sent_runtime_enable_count: AtomicU64::new(0),
                 sent_target_close_count: AtomicU64::new(0),
                 sent_context_dispose_count: AtomicU64::new(0),
+                sent_get_frame_tree_count: AtomicU64::new(0),
                 alive: Arc::new(AtomicBool::new(true)),
                 alive_tx,
             }),
@@ -9362,11 +9692,12 @@ multiline-compatible = """4.5.6"""
                 session_id: format!("session-{generation}"),
                 context_id: None,
                 main_frame_id: Mutex::new(None),
+                navigation_transition_lock: Mutex::new(NavigationTransitionState::default()),
                 frame_state: Mutex::new(PageFrameState::new(format!("session-{generation}"))),
                 iframe_setup_tasks: IframeSetupTaskRegistry::default(),
                 network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
                 console_records: Mutex::new(ConsoleRecordStore::default()),
-                console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                console_capture: ConsoleCaptureState::default(),
                 console_replay_until_event_cursor: Mutex::new(HashMap::new()),
                 observation_event_cursor: AtomicU64::new(0),
                 native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
@@ -10077,6 +10408,51 @@ multiline-compatible = """4.5.6"""
             assert_eq!(command["method"], expected_method);
             command
         }
+        async fn next_runtime_evaluation(&mut self) -> Value {
+            let command = self.next_command_any().await;
+            assert!(
+                matches!(
+                    command["method"].as_str(),
+                    Some("Runtime.evaluate" | "Runtime.callFunctionOn")
+                ),
+                "expected runtime evaluation command, got {command}"
+            );
+            command
+        }
+
+        async fn reply_next_runtime_evaluation(&mut self, result: Value) {
+            let command = self.next_runtime_evaluation().await;
+            self.reply(&command, result);
+        }
+
+        async fn reply_serializer_install(
+            &mut self,
+            expected_session_id: &str,
+            expected_context_id: Option<u64>,
+            object_id: &str,
+        ) {
+            let command = self.next_command("Runtime.evaluate").await;
+            assert_eq!(command["sessionId"], expected_session_id);
+            assert!(
+                command["params"]["expression"].as_str().is_some_and(
+                    |expression| expression.contains("__rustwright_serializer_factory__")
+                )
+            );
+            if let Some(context_id) = expected_context_id {
+                assert_eq!(command["params"]["contextId"], context_id);
+            } else {
+                assert!(command["params"].get("contextId").is_none());
+            }
+            self.reply(
+                &command,
+                json!({
+                    "result": {
+                        "type": "object",
+                        "objectId": object_id,
+                    }
+                }),
+            );
+        }
 
         fn reply(&self, command: &Value, result: Value) {
             dispatch_cdp_payload(
@@ -10089,7 +10465,10 @@ multiline-compatible = """4.5.6"""
 
         fn reply_error(&self, command: &Value, message: &str) {
             dispatch_cdp_payload(
-                json!({ "id": command["id"], "error": { "message": message } }),
+                json!({
+                    "id": command["id"],
+                    "error": { "code": -32000, "message": message }
+                }),
                 Arc::clone(&self.pending),
                 self.events.clone(),
                 Arc::clone(&self.event_log),
@@ -10111,6 +10490,22 @@ multiline-compatible = """4.5.6"""
         async fn reply_next(&mut self, expected_method: &str, result: Value) {
             let command = self.next_command(expected_method).await;
             self.reply(&command, result);
+        }
+
+        async fn reply_frame_owner(&mut self, frame_id: &str, same_origin: bool) {
+            let owner = self.next_command("Runtime.evaluate").await;
+            self.reply(
+                &owner,
+                json!({"result": {"type": "object", "objectId": "frame-owner"}}),
+            );
+            let describe = self.next_command("DOM.describeNode").await;
+            self.reply(&describe, json!({"node": {"frameId": frame_id}}));
+            self.reply_next(
+                "Runtime.callFunctionOn",
+                json!({"result": {"type": "boolean", "value": same_origin}}),
+            )
+            .await;
+            self.reply_next("Runtime.releaseObject", json!({})).await;
         }
 
         fn observe_runtime_event(&self, event: &Value) {
@@ -10164,6 +10559,7 @@ multiline-compatible = """4.5.6"""
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
             sent_context_dispose_count: AtomicU64::new(0),
+            sent_get_frame_tree_count: AtomicU64::new(0),
             alive: Arc::new(AtomicBool::new(true)),
             alive_tx,
         });
@@ -10189,11 +10585,12 @@ multiline-compatible = """4.5.6"""
             session_id: "page-session".to_string(),
             context_id: None,
             main_frame_id: Mutex::new(None),
+            navigation_transition_lock: Mutex::new(NavigationTransitionState::default()),
             frame_state: Mutex::new(PageFrameState::new("page-session".to_string())),
             iframe_setup_tasks: IframeSetupTaskRegistry::default(),
             network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
             console_records: Mutex::new(ConsoleRecordStore::default()),
-            console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+            console_capture: ConsoleCaptureState::default(),
             console_replay_until_event_cursor: Mutex::new(HashMap::new()),
             observation_event_cursor: AtomicU64::new(0),
             native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
@@ -10215,6 +10612,4841 @@ multiline-compatible = """4.5.6"""
             events,
             event_log,
         }
+    }
+
+    fn warm_main_frame_cache(page: &Arc<PageInner>) {
+        *page.main_frame_id.lock().unwrap() = Some("main-frame".to_string());
+        let mut state = page.frame_state.lock().unwrap();
+        state.mark_frame_event_listener_registered();
+        state.mark_page_domain_enabled("page-session");
+        state.record_frame_loader("main-frame", Some("loader-main"));
+        state.record_frame(
+            "main-frame".to_string(),
+            None,
+            None,
+            Some("https://example.test/".to_string()),
+            "page-session".to_string(),
+        );
+        let generation = state
+            .frame_cache_refresh_generation("page-session")
+            .expect("new frame cache must require its first refresh");
+        state.mark_frame_tree_refreshed("page-session", generation);
+    }
+
+    fn navigation_observation_snapshot(
+        page: &PageInner,
+    ) -> (u64, u64, Option<String>, usize, u64, usize) {
+        let network = page.native_network_records.lock().unwrap();
+        let network_snapshot = (
+            network.navigation_epoch,
+            network.navigation_start_index,
+            network.current_loader_id.clone(),
+            network.records.len(),
+        );
+        drop(network);
+        let console = page.console_records.lock().unwrap();
+        (
+            network_snapshot.0,
+            network_snapshot.1,
+            network_snapshot.2,
+            network_snapshot.3,
+            console.navigation_epoch,
+            console.records.len(),
+        )
+    }
+
+    async fn wait_for_contiguous_event_watermark(page: &PageInner, expected_cursor: u64) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let watermark = page
+                    .navigation_transition_lock
+                    .lock()
+                    .unwrap()
+                    .contiguous_event_watermark;
+                if expected_cursor == 0
+                    || watermark
+                        .is_some_and(|sequence| sequence.saturating_add(1) >= expected_cursor)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener or reconciliation must advance contiguous event progress");
+    }
+
+    async fn wait_for_navigation_observation_counts(
+        page: &PageInner,
+        expected_network: usize,
+        expected_console: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = navigation_observation_snapshot(page);
+                if snapshot.3 >= expected_network && snapshot.5 >= expected_console {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener must handle retained observation events");
+    }
+
+    fn apply_authoritative_tree_for_test(
+        state: &mut PageFrameState,
+        root: &Value,
+        session_id: &str,
+    ) {
+        let registered_root_sessions = state.registered_root_sessions();
+        let tree =
+            materialize_authoritative_frame_tree(root, session_id, &registered_root_sessions)
+                .expect("test frame tree");
+        state.apply_authoritative_frame_tree(session_id, tree);
+    }
+
+    #[tokio::test]
+    async fn main_frame_locator_observes_main_world_override_and_frame_hop_uses_isolated_world() {
+        let mut harness = navigation_test_harness(16);
+        warm_main_frame_cache(&harness.page);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.record_session_for_frame("outer-frame", "session-b");
+            state.record_frame(
+                "outer-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                Some("https://child.test/".to_string()),
+                "session-b".to_string(),
+            );
+            state.mark_page_domain_enabled("session-b");
+            state.mark_iframe_session_ready_for_session("outer-frame", "session-b");
+            let generation = state
+                .frame_cache_refresh_generation("session-b")
+                .expect("explicit frame-hop session cache starts dirty");
+            state.mark_frame_tree_refreshed("session-b", generation);
+        }
+
+        let page = Arc::clone(&harness.page);
+        let operations = async move {
+            let installed = evaluate_expression_in_session(
+                &page.browser.client,
+                "page-session",
+                None,
+                r##"
+const target = document.querySelector("#target");
+target.scrollIntoView = () => {
+  target.dataset.mainWorldOverride = "observed";
+};
+true
+"##
+                .to_string(),
+                Duration::from_millis(500),
+            )
+            .await
+            .expect("install element override in the main world");
+            assert_eq!(installed, "true");
+
+            let main_result = evaluate_locator_for_page(
+                Arc::clone(&page),
+                json!({"kind": "css", "selector": "#target"}).to_string(),
+                0,
+                r#"
+this.scrollIntoView();
+return this.dataset.mainWorldOverride === "observed";
+"#
+                .to_string(),
+                Duration::from_millis(500),
+            )
+            .await
+            .expect("plain main-frame locator action");
+            assert_eq!(main_result, "true");
+
+            let frame_result = evaluate_locator_for_page(
+                page,
+                json!({
+                    "kind": "frame",
+                    "frame_selector": "iframe",
+                    "inner": {"kind": "css", "selector": "button"}
+                })
+                .to_string(),
+                0,
+                "return true;".to_string(),
+                Duration::from_millis(500),
+            )
+            .await
+            .expect("explicit frame-hop locator action");
+            assert_eq!(frame_result, "true");
+        };
+
+        let responder = async move {
+            harness
+                .reply_serializer_install("page-session", None, "main-world-serializer")
+                .await;
+            let install_override = harness.next_command("Runtime.callFunctionOn").await;
+            assert_eq!(
+                install_override["params"]["objectId"],
+                "main-world-serializer"
+            );
+            assert!(install_override["params"]["functionDeclaration"]
+                .as_str()
+                .unwrap()
+                .contains("target.dataset.mainWorldOverride"));
+            harness.reply(
+                &install_override,
+                json!({"result": {"type": "boolean", "value": true}}),
+            );
+
+            let main_action = harness.next_command("Runtime.callFunctionOn").await;
+            assert_eq!(main_action["params"]["objectId"], "main-world-serializer");
+            assert!(main_action["params"]["functionDeclaration"]
+                .as_str()
+                .unwrap()
+                .contains("this.scrollIntoView()"));
+            harness.reply(
+                &main_action,
+                json!({"result": {"type": "boolean", "value": true}}),
+            );
+
+            harness.reply_frame_owner("outer-frame", false).await;
+            let create_world = harness.next_command("Page.createIsolatedWorld").await;
+            assert_eq!(create_world["sessionId"], "session-b");
+            assert_eq!(create_world["params"]["frameId"], "outer-frame");
+            harness.reply(&create_world, json!({"executionContextId": 41}));
+            harness
+                .reply_serializer_install("session-b", Some(41), "frame-world-serializer")
+                .await;
+            let frame_action = harness.next_command("Runtime.callFunctionOn").await;
+            assert_eq!(frame_action["sessionId"], "session-b");
+            assert_eq!(frame_action["params"]["objectId"], "frame-world-serializer");
+            harness.reply(
+                &frame_action,
+                json!({"result": {"type": "boolean", "value": true}}),
+            );
+            assert!(harness.write_rx.try_recv().is_err());
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(operations, responder)
+        })
+        .await
+        .expect("execution-world protocol capture must finish");
+    }
+
+    #[tokio::test]
+    async fn unsubscribed_or_page_disabled_frame_cache_remains_cold() {
+        let mut harness = navigation_test_harness(8);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.record_frame(
+                "main-frame".to_string(),
+                None,
+                None,
+                Some("https://example.test/".to_string()),
+                "page-session".to_string(),
+            );
+            state.mark_frame_tree_refreshed("page-session", 0);
+        }
+        let page = Arc::clone(&harness.page);
+        let resolutions = async move {
+            for _ in 0..2 {
+                resolve_locator_session(
+                    Arc::clone(&page),
+                    &json!({"kind": "css", "selector": "#target"}).to_string(),
+                    OperationDeadline::new(Duration::from_millis(250)),
+                )
+                .await
+                .expect("cold cache locator resolution");
+            }
+        };
+        let responder = async move {
+            for _ in 0..2 {
+                let command = harness.next_command("Page.getFrameTree").await;
+                harness.reply(
+                    &command,
+                    json!({
+                        "frameTree": {
+                            "frame": {
+                                "id": "main-frame",
+                                "url": "https://example.test/"
+                            }
+                        }
+                    }),
+                );
+            }
+            assert!(harness.write_rx.try_recv().is_err());
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(resolutions, responder)
+        })
+        .await
+        .expect("cold cache command capture must finish");
+    }
+
+    #[tokio::test]
+    async fn steady_locator_action_and_assertion_iteration_populates_once_then_skips_refresh() {
+        let mut harness = navigation_test_harness(8);
+        let event_cursor = harness.page.browser.client.event_cursor();
+        start_page_frame_cache_tracking(&harness.page, event_cursor, "page-session");
+        let page = Arc::clone(&harness.page);
+        let operations = async move {
+            let action = evaluate_locator_for_page(
+                Arc::clone(&page),
+                json!({"kind": "css", "selector": "#target"}).to_string(),
+                0,
+                "return true;".to_string(),
+                Duration::from_millis(250),
+            )
+            .await
+            .expect("first locator action");
+            assert_eq!(action, "true");
+            let assertion = assert_locator_for_page(
+                page,
+                json!({"kind": "css", "selector": "#target"}).to_string(),
+                0,
+                json!({"kind": "count", "expected": 1, "negated": false}).to_string(),
+                Duration::from_millis(250),
+                Duration::from_millis(10),
+            )
+            .await
+            .expect("steady assertion iteration");
+            let assertion: LocatorAssertionResult = serde_json::from_str(&assertion).unwrap();
+            assert!(assertion.passed);
+        };
+        let responder = async move {
+            let mut methods = Vec::new();
+            let population = harness.next_command("Page.getFrameTree").await;
+            methods.push("Page.getFrameTree".to_string());
+            harness.reply(
+                &population,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "main-frame",
+                            "url": "https://example.test/"
+                        }
+                    }
+                }),
+            );
+
+            methods.push("Runtime.evaluate".to_string());
+            harness
+                .reply_serializer_install("page-session", None, "steady-main-serializer")
+                .await;
+
+            let action = harness.next_command("Runtime.callFunctionOn").await;
+            methods.push("Runtime.callFunctionOn".to_string());
+            assert_eq!(action["params"]["objectId"], "steady-main-serializer");
+            harness.reply(
+                &action,
+                json!({"result": {"type": "boolean", "value": true}}),
+            );
+
+            let assertion = harness.next_command("Runtime.callFunctionOn").await;
+            methods.push("Runtime.callFunctionOn".to_string());
+            assert_eq!(assertion["params"]["objectId"], "steady-main-serializer");
+            let assertion_wire_value = json!({
+                "__rustwright_cdp_object__": 1,
+                "entries": {
+                    "passed": true,
+                    "actual": 1,
+                    "log": "matched"
+                }
+            });
+            harness.reply(
+                &assertion,
+                json!({
+                    "result": {
+                        "type": "object",
+                        "value": assertion_wire_value
+                    }
+                }),
+            );
+            assert!(harness.write_rx.try_recv().is_err());
+            methods
+        };
+        let ((), methods) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(operations, responder)
+        })
+        .await
+        .expect("steady locator command capture must finish");
+        eprintln!("round3 steady protocol: {}", methods.join(" -> "));
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| method.as_str() == "Page.getFrameTree")
+                .count(),
+            1
+        );
+        assert_eq!(
+            methods,
+            [
+                "Page.getFrameTree",
+                "Runtime.evaluate",
+                "Runtime.callFunctionOn",
+                "Runtime.callFunctionOn",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn same_session_navigation_keeps_main_frame_locator_in_main_world() {
+        let mut harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            assert!(state.cache_execution_context("main-frame", "page-session", json!(11),));
+        }
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "main-frame",
+                    "loaderId": "loader-next",
+                    "url": "https://example.test/next"
+                }
+            }
+        }));
+
+        let page = Arc::clone(&harness.page);
+        let action = evaluate_locator_for_page(
+            page,
+            json!({"kind": "css", "selector": "#target"}).to_string(),
+            0,
+            "return true;".to_string(),
+            Duration::from_millis(500),
+        );
+        let result_page = Arc::clone(&harness.page);
+        let responder = async move {
+            let refresh = harness.next_command("Page.getFrameTree").await;
+            harness.reply(
+                &refresh,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "main-frame",
+                            "loaderId": "loader-next",
+                            "url": "https://example.test/next"
+                        }
+                    }
+                }),
+            );
+            harness
+                .reply_serializer_install("page-session", None, "navigation-main-serializer")
+                .await;
+            let dispatch = harness.next_command("Runtime.callFunctionOn").await;
+            assert_eq!(dispatch["params"]["objectId"], "navigation-main-serializer");
+            harness.reply(
+                &dispatch,
+                json!({"result": {"type": "boolean", "value": true}}),
+            );
+            assert!(harness.write_rx.try_recv().is_err());
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(action, responder)
+        })
+        .await
+        .expect("same-session navigation action must complete");
+        assert_eq!(result.expect("post-navigation action"), "true");
+        assert!(result_page
+            .frame_state
+            .lock()
+            .unwrap()
+            .cached_execution_context("main-frame", "page-session")
+            .is_none());
+    }
+
+    #[test]
+    fn protocol_execution_context_events_invalidate_cached_frame_contexts_when_capture_requested() {
+        let harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        harness
+            .page
+            .console_capture
+            .requested
+            .store(true, Ordering::SeqCst);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.record_session_for_frame("outer-frame", "session-a");
+            state.record_frame(
+                "outer-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                None,
+                "session-a".to_string(),
+            );
+            assert!(state.cache_execution_context("main-frame", "page-session", json!(11)));
+            assert!(state.cache_execution_context("outer-frame", "session-a", json!(22)));
+        }
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.executionContextDestroyed",
+            "params": {"executionContextId": 11}
+        }));
+        harness.emit(json!({
+            "sessionId": "session-a",
+            "method": "Runtime.executionContextsCleared",
+            "params": {}
+        }));
+        reconcile_frame_cache_invalidations(&harness.page);
+        let state = harness.page.frame_state.lock().unwrap();
+        assert!(state
+            .cached_execution_context("main-frame", "page-session")
+            .is_none());
+        assert!(state
+            .cached_execution_context("outer-frame", "session-a")
+            .is_none());
+    }
+
+    #[test]
+    fn page_and_target_lifecycle_events_evict_every_affected_context_cache() {
+        let harness = navigation_test_harness(16);
+        warm_main_frame_cache(&harness.page);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            assert!(state.cache_execution_context("main-frame", "page-session", json!(11)));
+        }
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "main-frame",
+                    "loaderId": "loader-next",
+                    "url": "https://example.test/next"
+                }
+            }
+        }));
+        reconcile_frame_cache_invalidations(&harness.page);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            assert!(state
+                .cached_execution_context("main-frame", "page-session")
+                .is_none());
+            assert!(state.cache_execution_context("main-frame", "page-session", json!(12)));
+        }
+
+        // Chromium represents a frame swap as Page.frameDetached(reason=swap).
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameDetached",
+            "params": {"frameId": "main-frame", "reason": "swap"}
+        }));
+        reconcile_frame_cache_invalidations(&harness.page);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            assert!(state
+                .cached_execution_context("main-frame", "page-session")
+                .is_none());
+            state.record_frame(
+                "child-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                None,
+                "page-session".to_string(),
+            );
+            assert!(state.cache_execution_context("child-frame", "page-session", json!(13)));
+        }
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameDetached",
+            "params": {"frameId": "child-frame", "reason": "remove"}
+        }));
+        reconcile_frame_cache_invalidations(&harness.page);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            assert!(state
+                .cached_execution_context("child-frame", "page-session")
+                .is_none());
+            state.record_session_for_frame("outer-frame", "session-a");
+            state.record_frame(
+                "outer-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                None,
+                "session-a".to_string(),
+            );
+            state.record_frame(
+                "descendant-frame".to_string(),
+                Some("outer-frame".to_string()),
+                None,
+                None,
+                "session-a".to_string(),
+            );
+            assert!(state.cache_execution_context("outer-frame", "session-a", json!(14)));
+            assert!(state.cache_execution_context("descendant-frame", "session-a", json!(15)));
+        }
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.detachedFromTarget",
+            "params": {"sessionId": "session-a", "targetId": "outer-frame"}
+        }));
+        reconcile_frame_cache_invalidations(&harness.page);
+        let state = harness.page.frame_state.lock().unwrap();
+        assert!(state
+            .cached_execution_context("outer-frame", "session-a")
+            .is_none());
+        assert!(state
+            .cached_execution_context("descendant-frame", "session-a")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_lifecycle_events_invalidate_cached_context_after_console_capture_enable() {
+        let mut harness = navigation_test_harness(8);
+        let event_cursor = harness.page.browser.client.event_cursor();
+        start_page_frame_cache_tracking(&harness.page, event_cursor, "page-session");
+        warm_main_frame_cache(&harness.page);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            assert!(state.cache_execution_context("main-frame", "page-session", json!(11)));
+        }
+
+        let page = Arc::clone(&harness.page);
+        let pending = Arc::clone(&harness.pending);
+        let events = harness.events.clone();
+        let event_log = Arc::clone(&harness.event_log);
+        let runtime_state = Arc::clone(&harness.page.browser.client.runtime_state);
+        let operations = async move {
+            enable_console_capture(&page, Duration::from_millis(500))
+                .await
+                .expect("console capture must explicitly enable Runtime");
+            assert!(page.console_capture.requested.load(Ordering::SeqCst));
+            assert!(page
+                .console_capture
+                .enabled_sessions
+                .lock()
+                .await
+                .contains("page-session"));
+
+            let destroyed_event = json!({
+                "sessionId": "page-session",
+                "method": "Runtime.executionContextDestroyed",
+                "params": {"executionContextId": 11}
+            });
+            runtime_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .observe_event(&destroyed_event);
+            dispatch_cdp_payload(
+                destroyed_event,
+                Arc::clone(&pending),
+                events.clone(),
+                Arc::clone(&event_log),
+            );
+            tokio::time::timeout(Duration::from_millis(250), async {
+                loop {
+                    if page
+                        .frame_state
+                        .lock()
+                        .unwrap()
+                        .cached_execution_context("main-frame", "page-session")
+                        .is_none()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("destroyed event must reach the page listener");
+
+            let first = evaluate_locator_for_page(
+                Arc::clone(&page),
+                json!({"kind": "css", "selector": "#target"}).to_string(),
+                0,
+                "return true;".to_string(),
+                Duration::from_millis(500),
+            )
+            .await
+            .expect("destroyed context must not affect the main-world action");
+            {
+                let mut state = page.frame_state.lock().unwrap();
+                assert!(state
+                    .cached_execution_context("main-frame", "page-session")
+                    .is_none());
+                assert!(state.cache_execution_context("main-frame", "page-session", json!(12)));
+            }
+
+            let cleared_event = json!({
+                "sessionId": "page-session",
+                "method": "Runtime.executionContextsCleared",
+                "params": {}
+            });
+            runtime_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .observe_event(&cleared_event);
+            dispatch_cdp_payload(cleared_event, pending, events, event_log);
+            tokio::time::timeout(Duration::from_millis(250), async {
+                loop {
+                    if page
+                        .frame_state
+                        .lock()
+                        .unwrap()
+                        .cached_execution_context("main-frame", "page-session")
+                        .is_none()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cleared event must reach the page listener");
+
+            let second = evaluate_locator_for_page(
+                Arc::clone(&page),
+                json!({"kind": "css", "selector": "#target"}).to_string(),
+                0,
+                "return true;".to_string(),
+                Duration::from_millis(500),
+            )
+            .await
+            .expect("cleared context must not affect the main-world action");
+            assert!(page
+                .frame_state
+                .lock()
+                .unwrap()
+                .cached_execution_context("main-frame", "page-session")
+                .is_none());
+            (first, second)
+        };
+        let responder = async move {
+            let mut methods = Vec::new();
+            let runtime_enable = harness.next_command("Runtime.enable").await;
+            methods.push("Runtime.enable");
+            assert_eq!(runtime_enable["sessionId"], "page-session");
+            harness.reply(&runtime_enable, json!({}));
+            for index in 0..2 {
+                methods.push("Runtime.evaluate");
+                harness
+                    .reply_serializer_install(
+                        "page-session",
+                        None,
+                        &format!("lifecycle-main-serializer-{index}"),
+                    )
+                    .await;
+                let action = harness.next_command("Runtime.callFunctionOn").await;
+                methods.push("Runtime.callFunctionOn");
+                assert_eq!(action["sessionId"], "page-session");
+                assert_eq!(
+                    action["params"]["objectId"],
+                    format!("lifecycle-main-serializer-{index}")
+                );
+                harness.reply(
+                    &action,
+                    json!({"result": {"type": "boolean", "value": true}}),
+                );
+            }
+            assert!(
+                harness.write_rx.try_recv().is_err(),
+                "lifecycle invalidation must not burn a structural-failure retry"
+            );
+            methods
+        };
+        let ((first, second), methods) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(operations, responder)
+        })
+        .await
+        .expect("runtime lifecycle protocol test must finish");
+        assert_eq!(first, "true");
+        assert_eq!(second, "true");
+        assert_eq!(
+            methods,
+            [
+                "Runtime.enable",
+                "Runtime.evaluate",
+                "Runtime.callFunctionOn",
+                "Runtime.evaluate",
+                "Runtime.callFunctionOn",
+            ]
+        );
+    }
+
+    #[test]
+    fn console_bookkeeping_ignores_events_until_capture_is_requested() {
+        let harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        let console_event = json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "object", "description": "Error: getter probe"}]
+            }
+        });
+        for epoch in 0..4 {
+            record_page_observation_event(
+                &harness.page,
+                &json!({
+                    "sessionId": "page-session",
+                    "method": "Page.navigatedWithinDocument",
+                    "params": {
+                        "frameId": "main-frame",
+                        "url": format!("https://example.test/#{epoch}")
+                    }
+                }),
+            );
+            for _ in 0..=NATIVE_CONSOLE_RECORD_CAPACITY {
+                record_page_observation_event(&harness.page, &console_event);
+            }
+        }
+        {
+            let records = harness.page.console_records.lock().unwrap();
+            assert!(records.records.is_empty());
+            assert!(records.evictions_by_epoch.is_empty());
+            assert_eq!(records.evictions_total, 0);
+        }
+
+        harness
+            .page
+            .console_capture
+            .requested
+            .store(true, Ordering::SeqCst);
+        record_page_observation_event(&harness.page, &console_event);
+        let records = harness.page.console_records.lock().unwrap();
+        assert_eq!(records.records.len(), 1);
+        assert!(records.evictions_by_epoch.is_empty());
+        assert_eq!(
+            harness
+                .page
+                .browser
+                .client
+                .sent_runtime_enable_count
+                .load(Ordering::SeqCst),
+            0,
+            "bookkeeping must not implicitly enable Runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_oopif_descendant_context_caches_under_registered_session() {
+        let mut harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        let resolution = {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.record_session_for_frame("outer-frame", "session-b");
+            state.record_frame(
+                "outer-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                Some("https://b.test/outer".to_string()),
+                "session-b".to_string(),
+            );
+            state.record_frame(
+                "child-frame".to_string(),
+                Some("outer-frame".to_string()),
+                None,
+                Some("https://b.test/child".to_string()),
+                "session-b".to_string(),
+            );
+            LocatorSessionResolution {
+                session_id: "session-b".to_string(),
+                frame_id: Some("child-frame".to_string()),
+                locator_json: json!({"kind": "css", "selector": "input"}).to_string(),
+                ownership_generation: state.frame_ownership_generation,
+            }
+        };
+
+        let page = Arc::clone(&harness.page);
+        let acquisition = execution_context_for_locator_resolution(
+            &page,
+            &resolution,
+            OperationDeadline::new(Duration::from_millis(500)),
+        );
+        let responder = async move {
+            let create_world = harness.next_command("Page.createIsolatedWorld").await;
+            assert_eq!(create_world["sessionId"], "session-b");
+            assert_eq!(create_world["params"]["frameId"], "child-frame");
+            harness.reply(&create_world, json!({"executionContextId": 42}));
+            assert!(harness.write_rx.try_recv().is_err());
+        };
+        let (context_id, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(acquisition, responder)
+        })
+        .await
+        .expect("nested OOPIF context acquisition must finish");
+        assert_eq!(
+            context_id.expect("the descendant must remain owned by the live OOPIF session"),
+            json!(42)
+        );
+
+        let state = page.frame_state.lock().unwrap();
+        assert_eq!(state.session_frames["session-b"], "outer-frame");
+        assert_eq!(state.frame_sessions["child-frame"], "session-b");
+        assert_eq!(
+            state.cached_execution_context("child-frame", "session-b"),
+            Some(json!(42))
+        );
+        assert!(state
+            .cached_execution_context("child-frame", "page-session")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_frame_events_each_refresh_the_affected_session_once() {
+        let mut harness = navigation_test_harness(8);
+        let event_cursor = harness.page.browser.client.event_cursor();
+        start_page_frame_cache_tracking(&harness.page, event_cursor, "page-session");
+        let page = Arc::clone(&harness.page);
+        let pending = Arc::clone(&harness.pending);
+        let events = harness.events.clone();
+        let event_log = Arc::clone(&harness.event_log);
+        let operations = async move {
+            resolve_locator_session(
+                Arc::clone(&page),
+                &json!({"kind": "css", "selector": "#target"}).to_string(),
+                OperationDeadline::new(Duration::from_millis(250)),
+            )
+            .await
+            .expect("initial frame-tree population");
+
+            dispatch_cdp_payload(
+                json!({
+                    "sessionId": "page-session",
+                    "method": "Page.frameAttached",
+                    "params": {
+                        "frameId": "child-frame",
+                        "parentFrameId": "main-frame"
+                    }
+                }),
+                Arc::clone(&pending),
+                events.clone(),
+                Arc::clone(&event_log),
+            );
+            for _ in 0..2 {
+                resolve_locator_session(
+                    Arc::clone(&page),
+                    &json!({"kind": "css", "selector": "#target"}).to_string(),
+                    OperationDeadline::new(Duration::from_millis(250)),
+                )
+                .await
+                .expect("locator resolution after frame attach");
+                tokio::task::yield_now().await;
+            }
+
+            dispatch_cdp_payload(
+                json!({
+                    "sessionId": "page-session",
+                    "method": "Page.frameNavigated",
+                    "params": {
+                        "frame": {
+                            "id": "main-frame",
+                            "url": "https://example.test/next"
+                        }
+                    }
+                }),
+                pending,
+                events,
+                event_log,
+            );
+            for _ in 0..2 {
+                resolve_locator_session(
+                    Arc::clone(&page),
+                    &json!({"kind": "css", "selector": "#target"}).to_string(),
+                    OperationDeadline::new(Duration::from_millis(250)),
+                )
+                .await
+                .expect("locator resolution after navigation");
+                tokio::task::yield_now().await;
+            }
+        };
+        let responder = async move {
+            let mut sessions = Vec::new();
+            for _ in 0..3 {
+                let command = harness.next_command("Page.getFrameTree").await;
+                sessions.push(command["sessionId"].as_str().unwrap().to_string());
+                harness.reply(
+                    &command,
+                    json!({
+                        "frameTree": {
+                            "frame": {
+                                "id": "main-frame",
+                                "url": "https://example.test/next"
+                            },
+                            "childFrames": [{
+                                "frame": {
+                                    "id": "child-frame",
+                                    "parentId": "main-frame",
+                                    "url": "about:blank"
+                                }
+                            }]
+                        }
+                    }),
+                );
+            }
+            tokio::task::yield_now().await;
+            assert!(harness.write_rx.try_recv().is_err());
+            sessions
+        };
+        let ((), sessions) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(operations, responder)
+        })
+        .await
+        .expect("real-dispatch invalidation capture must finish");
+        eprintln!(
+            "round2 invalidation protocol: initial population + one refresh per dispatched event = {}",
+            sessions.join(" -> ")
+        );
+        assert_eq!(sessions, ["page-session", "page-session", "page-session"]);
+    }
+
+    #[tokio::test]
+    async fn stale_frame_resolution_refreshes_once_then_succeeds() {
+        let mut harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        let page = Arc::clone(&harness.page);
+        let locator_json = json!({
+            "kind": "frame",
+            "frame_selector": "iframe",
+            "frame_index": 0,
+            "inner": {"kind": "css", "selector": "button"}
+        })
+        .to_string();
+        let resolution = resolve_locator_session_with_frame_mode(
+            page,
+            &locator_json,
+            OperationDeadline::new(Duration::from_millis(500)),
+            true,
+        );
+        let responder = async move {
+            let mut methods = Vec::new();
+            let stale = harness.next_command_any().await;
+            methods.push(stale["method"].as_str().unwrap().to_string());
+            harness.reply_error(&stale, "No frame with given id found");
+
+            let refresh = harness.next_command_any().await;
+            methods.push(refresh["method"].as_str().unwrap().to_string());
+            harness.reply(
+                &refresh,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "main-frame",
+                            "url": "https://example.test/"
+                        },
+                        "childFrames": [{
+                            "frame": {
+                                "id": "child-frame",
+                                "parentId": "main-frame",
+                                "url": "about:blank"
+                            }
+                        }]
+                    }
+                }),
+            );
+
+            let owner = harness.next_command_any().await;
+            methods.push(owner["method"].as_str().unwrap().to_string());
+            harness.reply(
+                &owner,
+                json!({"result": {"type": "object", "objectId": "frame-owner"}}),
+            );
+            let describe = harness.next_command_any().await;
+            methods.push(describe["method"].as_str().unwrap().to_string());
+            harness.reply(&describe, json!({"node": {"frameId": "child-frame"}}));
+            let same_origin = harness.next_command_any().await;
+            methods.push(same_origin["method"].as_str().unwrap().to_string());
+            harness.reply(
+                &same_origin,
+                json!({"result": {"type": "boolean", "value": true}}),
+            );
+            let release = harness.next_command_any().await;
+            methods.push(release["method"].as_str().unwrap().to_string());
+            harness.reply(&release, json!({}));
+            assert!(harness.write_rx.try_recv().is_err());
+            methods
+        };
+        let (resolution, methods) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(resolution, responder)
+        })
+        .await
+        .expect("stale frame command capture must finish");
+        eprintln!("round2 stale retry protocol: {}", methods.join(" -> "));
+        let resolution = resolution.expect("single refresh should recover stale frame");
+        assert_eq!(resolution.session_id, "page-session");
+        assert_eq!(resolution.frame_id.as_deref(), Some("child-frame"));
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| method.as_str() == "Page.getFrameTree")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn same_document_context_loss_allows_two_bounded_resolution_reresolves() {
+        let mut harness = navigation_test_harness(32);
+        warm_main_frame_cache(&harness.page);
+        let resolution_page = Arc::clone(&harness.page);
+        let locator_json = json!({
+            "kind": "frame",
+            "frame_selector": "#outer",
+            "inner": {
+                "kind": "frame",
+                "frame_selector": "#inner",
+                "inner": {"kind": "css", "selector": "button"}
+            }
+        })
+        .to_string();
+        let resolution = resolve_locator_session_with_frame_mode(
+            resolution_page,
+            &locator_json,
+            OperationDeadline::new(Duration::from_millis(750)),
+            true,
+        );
+        let responder = async {
+            for context_id in [31, 32] {
+                harness.reply_frame_owner("outer-frame", true).await;
+                let create_world = harness.next_command("Page.createIsolatedWorld").await;
+                assert_eq!(create_world["params"]["frameId"], "outer-frame");
+                harness.reply(&create_world, json!({"executionContextId": context_id}));
+                let stale_probe = harness.next_command("Runtime.evaluate").await;
+                assert_eq!(stale_probe["params"]["contextId"], context_id);
+                harness.reply_error(&stale_probe, "Cannot find context with specified id");
+
+                let refresh = harness.next_command("Page.getFrameTree").await;
+                harness.reply(
+                    &refresh,
+                    json!({
+                        "frameTree": {
+                            "frame": {
+                                "id": "main-frame",
+                                "loaderId": "loader-main",
+                                "url": "https://example.test/"
+                            },
+                            "childFrames": [{
+                                "frame": {
+                                    "id": "outer-frame",
+                                    "parentId": "main-frame",
+                                    "url": "about:blank"
+                                },
+                                "childFrames": [{
+                                    "frame": {
+                                        "id": "inner-frame",
+                                        "parentId": "outer-frame",
+                                        "url": "about:blank"
+                                    }
+                                }]
+                            }]
+                        }
+                    }),
+                );
+            }
+
+            harness.reply_frame_owner("outer-frame", true).await;
+            let create_world = harness.next_command("Page.createIsolatedWorld").await;
+            assert_eq!(create_world["params"]["frameId"], "outer-frame");
+            harness.reply(&create_world, json!({"executionContextId": 33}));
+            let owner = harness.next_command("Runtime.evaluate").await;
+            assert_eq!(owner["params"]["contextId"], 33);
+            harness.reply(
+                &owner,
+                json!({"result": {"type": "object", "objectId": "inner-owner"}}),
+            );
+            let describe = harness.next_command("DOM.describeNode").await;
+            harness.reply(&describe, json!({"node": {"frameId": "inner-frame"}}));
+            let same_origin = harness.next_command("Runtime.callFunctionOn").await;
+            harness.reply(
+                &same_origin,
+                json!({"result": {"type": "boolean", "value": true}}),
+            );
+            let release = harness.next_command("Runtime.releaseObject").await;
+            harness.reply(&release, json!({}));
+            assert!(harness.write_rx.try_recv().is_err());
+        };
+        let (resolution, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(resolution, responder)
+        })
+        .await
+        .expect("bounded re-resolution protocol must finish");
+        let resolution = resolution.expect("third resolution probe must succeed");
+        assert_eq!(resolution.session_id, "page-session");
+        assert_eq!(resolution.frame_id.as_deref(), Some("inner-frame"));
+        assert_eq!(
+            harness
+                .page
+                .frame_state
+                .lock()
+                .unwrap()
+                .locator_resolution_reresolve_count,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_tree_refresh_lock_wait_obeys_locator_deadline() {
+        let mut harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        let refresh_lock = {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.mark_frame_cache_dirty("page-session");
+            Arc::clone(&state.frame_tree_refresh_lock)
+        };
+        let refresh_guard = refresh_lock.lock().await;
+        let started = Instant::now();
+        let result = resolve_locator_session(
+            Arc::clone(&harness.page),
+            &json!({
+                "kind": "frame",
+                "frame_selector": "iframe",
+                "inner": {"kind": "css", "selector": "button"}
+            })
+            .to_string(),
+            OperationDeadline::new(Duration::from_millis(30)),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        drop(refresh_guard);
+
+        assert!(matches!(result, Err(RwError::Timeout(30))));
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "lock wait exceeded locator budget: {elapsed:?}"
+        );
+        assert!(harness.write_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn transient_oopif_frame_tree_population_failure_is_retryable() {
+        let mut harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.record_session_for_frame("outer-frame", "session-b");
+            state.record_frame(
+                "outer-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                None,
+                "session-b".to_string(),
+            );
+            state.mark_page_domain_enabled("session-b");
+            state.mark_iframe_session_ready_for_session("outer-frame", "session-b");
+        }
+
+        let first_population_page = Arc::clone(&harness.page);
+        let first_population = ensure_frame_tree_session(
+            &first_population_page,
+            "session-b",
+            Duration::from_millis(25),
+        );
+        let consume_first_command = async {
+            let command = harness.next_command("Page.getFrameTree").await;
+            assert_eq!(command["sessionId"], "session-b");
+        };
+        let (first_result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(first_population, consume_first_command)
+        })
+        .await
+        .expect("first population timeout must complete");
+        assert!(matches!(first_result, Err(RwError::Timeout(ms)) if ms <= 25));
+        assert!(harness
+            .page
+            .frame_state
+            .lock()
+            .unwrap()
+            .frame_session_errors
+            .get("outer-frame")
+            .is_none());
+
+        let page = Arc::clone(&harness.page);
+        let locator_json = json!({
+            "kind": "frame",
+            "frame_selector": "iframe",
+            "inner": {"kind": "css", "selector": "button"}
+        })
+        .to_string();
+        let resolution = resolve_locator_session(
+            page,
+            &locator_json,
+            OperationDeadline::new(Duration::from_millis(500)),
+        );
+        let responder = async move {
+            harness.reply_frame_owner("outer-frame", false).await;
+            let refresh = harness.next_command("Page.getFrameTree").await;
+            assert_eq!(refresh["sessionId"], "session-b");
+            harness.reply(
+                &refresh,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "outer-frame",
+                            "parentId": "main-frame",
+                            "url": "https://child.test/"
+                        }
+                    }
+                }),
+            );
+            assert!(harness.write_rx.try_recv().is_err());
+        };
+        let (resolution, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(resolution, responder)
+        })
+        .await
+        .expect("recovered transport resolution must complete");
+        let resolution = resolution.expect("later locator must retry cold OOPIF cache");
+        assert_eq!(resolution.session_id, "session-b");
+    }
+
+    #[tokio::test]
+    async fn detached_oopif_setup_completion_does_not_resurrect_cache_metadata() {
+        let mut harness = navigation_test_harness(8);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.record_session_for_frame("outer-frame", "session-a");
+            state.record_frame(
+                "outer-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                None,
+                "session-a".to_string(),
+            );
+        }
+        let page = Arc::clone(&harness.page);
+        let setup_page = Arc::clone(&harness.page);
+        let assertion_page = Arc::clone(&harness.page);
+        let setup = setup_attached_iframe_session_with_timeout(
+            setup_page,
+            "outer-frame".to_string(),
+            "session-a".to_string(),
+            ATTACHED_IFRAME_SETUP_TIMEOUT,
+        );
+        let responder = async move {
+            let auto_attach = harness.next_command("Target.setAutoAttach").await;
+            assert_eq!(auto_attach["sessionId"], "session-a");
+            harness.reply(&auto_attach, json!({}));
+            let mut commands = Vec::new();
+            for _ in DEFAULT_ATTACHED_SESSION_DOMAINS {
+                let command = harness.next_command_any().await;
+                assert_eq!(command["sessionId"], "session-a");
+                commands.push(command);
+            }
+            page.frame_state.lock().unwrap().detach_session("session-a");
+            for command in &commands {
+                harness.reply(command, json!({}));
+            }
+            tokio::task::yield_now().await;
+            assert!(harness.write_rx.try_recv().is_err());
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(setup, responder)
+        })
+        .await
+        .expect("detached setup must finish");
+        result.expect("late setup completion is ignored");
+        let mut state = assertion_page.frame_state.lock().unwrap();
+        // The spawned wrapper performs this final step after setup returns.
+        // Its ownership guard must also reject the stale completion.
+        state.mark_iframe_session_ready_for_session("outer-frame", "session-a");
+        assert!(!state.page_domain_enabled_sessions.contains("session-a"));
+        assert!(!state.frame_tree_populated_sessions.contains("session-a"));
+        assert!(!state.frame_tree_dirty_sessions.contains("session-a"));
+        assert!(!state.frame_tree_generations.contains_key("session-a"));
+        assert!(!state.iframe_sessions_ready.contains("session-a"));
+    }
+
+    #[tokio::test]
+    async fn event_log_barrier_rejects_stale_refresh_before_listener_runs() {
+        let mut harness = navigation_test_harness(16);
+        start_page_frame_cache_tracking_without_listener(&harness.page, 0, "page-session");
+        warm_main_frame_cache(&harness.page);
+        let generation = {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.record_session_for_frame("outer-frame", "session-a");
+            state.record_frame(
+                "outer-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                Some("https://a.test/".to_string()),
+                "session-a".to_string(),
+            );
+            state.mark_page_domain_enabled("session-a");
+            state
+                .frame_cache_refresh_generation("session-a")
+                .expect("session A must require refresh")
+        };
+
+        let refresh_page = Arc::clone(&harness.page);
+        let refresh = refresh_frame_tree_session_locked(
+            &refresh_page,
+            "session-a",
+            generation,
+            Duration::from_millis(500),
+        );
+        let interleave = async {
+            let command = harness.next_command("Page.getFrameTree").await;
+            assert_eq!(command["sessionId"], "session-a");
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Target.detachedFromTarget",
+                "params": {
+                    "sessionId": "session-a",
+                    "targetId": "outer-frame"
+                }
+            }));
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": "session-b",
+                    "targetInfo": {
+                        "targetId": "outer-frame",
+                        "parentFrameId": "main-frame",
+                        "type": "iframe",
+                        "attached": true
+                    },
+                    "waitingForDebugger": false
+                }
+            }));
+            harness.reply(
+                &command,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "outer-frame",
+                            "parentId": "main-frame",
+                            "url": "https://stale-a.test/"
+                        },
+                        "childFrames": [{
+                            "frame": {
+                                "id": "stale-a-child",
+                                "parentId": "outer-frame",
+                                "url": "https://stale-a.test/child"
+                            }
+                        }]
+                    }
+                }),
+            );
+        };
+        let (refresh_result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(refresh, interleave)
+        })
+        .await
+        .expect("refresh interleaving must finish");
+        refresh_result.expect("stale response is rejected without surfacing an error");
+        let replacement_generation = {
+            let state = harness.page.frame_state.lock().unwrap();
+            assert_eq!(
+                state.frame_sessions.get("outer-frame").map(String::as_str),
+                Some("session-b")
+            );
+            assert!(!state.frames.contains_key("stale-a-child"));
+            state
+                .frame_cache_refresh_generation("session-b")
+                .expect("replacement session must require its own publication")
+        };
+
+        let replacement_page = Arc::clone(&harness.page);
+        let replacement_refresh = refresh_frame_tree_session_locked(
+            &replacement_page,
+            "session-b",
+            replacement_generation,
+            Duration::from_millis(500),
+        );
+        let publish_replacement = async {
+            let command = harness.next_command("Page.getFrameTree").await;
+            assert_eq!(command["sessionId"], "session-b");
+            harness.reply(
+                &command,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "outer-frame",
+                            "parentId": "main-frame",
+                            "url": "https://b.test/"
+                        },
+                        "childFrames": [{
+                            "frame": {
+                                "id": "b-child",
+                                "parentId": "outer-frame",
+                                "url": "https://b.test/child"
+                            }
+                        }]
+                    }
+                }),
+            );
+        };
+        let (replacement_result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(replacement_refresh, publish_replacement)
+        })
+        .await
+        .expect("replacement publication must finish");
+        replacement_result.expect("replacement tree must publish");
+        let state = harness.page.frame_state.lock().unwrap();
+        assert_eq!(state.frame_sessions["outer-frame"], "session-b");
+        assert_eq!(state.frame_sessions["b-child"], "session-b");
+        assert_eq!(state.frames["outer-frame"].url, "https://b.test/");
+        assert!(!state.frames.contains_key("stale-a-child"));
+    }
+
+    #[tokio::test]
+    async fn same_document_event_log_barrier_rejects_stale_refresh_before_listener_runs() {
+        let mut harness = navigation_test_harness(16);
+        start_page_frame_cache_tracking_without_listener(&harness.page, 0, "page-session");
+        warm_main_frame_cache(&harness.page);
+        let generation = {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.mark_frame_cache_dirty("page-session");
+            state
+                .frame_cache_refresh_generation("page-session")
+                .expect("main session must require refresh")
+        };
+
+        let refresh_page = Arc::clone(&harness.page);
+        let refresh = refresh_frame_tree_session_locked(
+            &refresh_page,
+            "page-session",
+            generation,
+            Duration::from_millis(500),
+        );
+        let interleave = async {
+            let command = harness.next_command("Page.getFrameTree").await;
+            assert_eq!(command["sessionId"], "page-session");
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.navigatedWithinDocument",
+                "params": {
+                    "frameId": "main-frame",
+                    "url": "https://example.test/#new"
+                }
+            }));
+            harness.reply(
+                &command,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "main-frame",
+                            "url": "https://example.test/#stale"
+                        },
+                        "childFrames": [{
+                            "frame": {
+                                "id": "stale-child",
+                                "parentId": "main-frame",
+                                "url": "https://stale.test/"
+                            }
+                        }]
+                    }
+                }),
+            );
+        };
+        let (refresh_result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(refresh, interleave)
+        })
+        .await
+        .expect("same-document refresh interleaving must finish");
+        refresh_result.expect("stale response is rejected without surfacing an error");
+
+        let state = harness.page.frame_state.lock().unwrap();
+        assert_eq!(state.frames["main-frame"].url, "https://example.test/#new");
+        assert!(!state.frames.contains_key("stale-child"));
+        let refreshed_generation = state
+            .frame_cache_refresh_generation("page-session")
+            .expect("same-document navigation must keep the cache dirty");
+        assert!(refreshed_generation > generation);
+    }
+
+    #[test]
+    fn wide_authoritative_tree_materializes_and_commits_with_linear_maps() {
+        let child_count = 2_000usize;
+        let children = (0..child_count)
+            .map(|index| {
+                json!({
+                    "frame": {
+                        "id": format!("child-{index}"),
+                        "parentId": "main-frame",
+                        "loaderId": format!("loader-{index}"),
+                        "url": format!("https://child-{index}.test/")
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let root = json!({
+            "frame": {
+                "id": "main-frame",
+                "loaderId": "loader-main",
+                "url": "https://example.test/"
+            },
+            "childFrames": children
+        });
+        let started = Instant::now();
+        let tree = materialize_authoritative_frame_tree(&root, "page-session", &HashMap::new())
+            .expect("wide tree");
+        assert_eq!(tree.frames.len(), child_count + 1);
+        assert_eq!(tree.frame_sessions.len(), child_count + 1);
+        assert_eq!(tree.child_order["main-frame"].len(), child_count);
+        assert_eq!(
+            tree.child_order.values().map(Vec::len).sum::<usize>(),
+            child_count
+        );
+
+        let mut state = PageFrameState::new("page-session".to_string());
+        state.apply_authoritative_frame_tree("page-session", tree);
+        let elapsed = started.elapsed();
+        assert_eq!(state.frames.len(), child_count + 1);
+        assert_eq!(state.child_order["main-frame"].len(), child_count);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "2,000-sibling materialize+commit exceeded the linear-path bound: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_merge_fix_round1_authoritative_commit_wakes_waiter_and_aborts_setup() {
+        let mut harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        let (stale_pin, mut waiter_updates) = {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.record_frame(
+                "stale-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                Some("https://example.test/stale".to_string()),
+                "page-session".to_string(),
+            );
+            let pin = state
+                .session_pin_for_frame("stale-frame")
+                .expect("stale attachment pin");
+            state.register_frame_session_waiter("stale-frame", pin.generation);
+            state.mark_frame_cache_dirty("page-session");
+            (pin, state.subscribe_session_updates())
+        };
+        let stale_setup = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        harness
+            .page
+            .iframe_setup_tasks
+            .handles
+            .lock()
+            .unwrap()
+            .insert(
+                stale_pin.generation,
+                IframeSetupTaskEntry {
+                    token: u64::MAX,
+                    handle: Some(stale_setup.abort_handle()),
+                },
+            );
+
+        let generation = harness
+            .page
+            .frame_state
+            .lock()
+            .unwrap()
+            .frame_cache_refresh_generation("page-session")
+            .expect("dirty main-session cache generation");
+        let refresh_page = Arc::clone(&harness.page);
+        let refresh = tokio::spawn(async move {
+            refresh_frame_tree_session_locked(
+                &refresh_page,
+                "page-session",
+                generation,
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        let command = harness.next_command("Page.getFrameTree").await;
+        harness.reply(
+            &command,
+            json!({
+                "frameTree": {
+                    "frame": {
+                        "id": "main-frame",
+                        "url": "https://example.test/"
+                    }
+                }
+            }),
+        );
+        refresh
+            .await
+            .expect("refresh task")
+            .expect("authoritative refresh");
+
+        assert!(!harness
+            .page
+            .iframe_setup_tasks
+            .handles
+            .lock()
+            .unwrap()
+            .contains_key(&stale_pin.generation));
+        assert!(stale_setup
+            .await
+            .expect_err("removed setup generation must be aborted")
+            .is_cancelled());
+        tokio::time::timeout(Duration::from_millis(100), waiter_updates.changed())
+            .await
+            .expect("authoritative ownership change must notify pinned waiters")
+            .expect("session update channel");
+        let mut state = harness.page.frame_state.lock().unwrap();
+        assert!(!state.frames.contains_key("stale-frame"));
+        assert!(!state.frame_sessions.contains_key("stale-frame"));
+        state.unregister_frame_session_waiter("stale-frame", stale_pin.generation);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn frame_tree_payload_and_refresh_commit_do_not_deadlock() {
+        let mut harness = navigation_test_harness(64);
+        warm_main_frame_cache(&harness.page);
+        let children = (0..100)
+            .map(|index| {
+                json!({
+                    "frame": {
+                        "id": format!("child-{index}"),
+                        "parentId": "main-frame",
+                        "url": "about:blank"
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let root = json!({
+            "frame": {
+                "id": "main-frame",
+                "loaderId": "loader-main",
+                "url": "https://example.test/"
+            },
+            "childFrames": children
+        });
+        let done = Arc::new(AtomicBool::new(false));
+        let payload_threads = (0..4)
+            .map(|_| {
+                let page = Arc::clone(&harness.page);
+                let done = Arc::clone(&done);
+                std::thread::spawn(move || {
+                    let mut calls = 0usize;
+                    while !done.load(Ordering::SeqCst) {
+                        let payload = page.frame_tree_payload();
+                        assert!(payload.get("frameTree").is_some());
+                        calls += 1;
+                        std::thread::yield_now();
+                    }
+                    calls
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let refresh_page = Arc::clone(&harness.page);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let refreshes = async {
+                for _ in 0..50 {
+                    let generation = refresh_page
+                        .frame_state
+                        .lock()
+                        .unwrap()
+                        .frame_tree_generations
+                        .get("page-session")
+                        .copied()
+                        .unwrap_or(0);
+                    refresh_frame_tree_session_locked(
+                        &refresh_page,
+                        "page-session",
+                        generation,
+                        Duration::from_millis(500),
+                    )
+                    .await
+                    .expect("refresh commit");
+                }
+            };
+            let replies = async {
+                for _ in 0..50 {
+                    let command = harness.next_command("Page.getFrameTree").await;
+                    harness.reply(&command, json!({"frameTree": root.clone()}));
+                }
+            };
+            tokio::join!(refreshes, replies);
+            done.store(true, Ordering::SeqCst);
+            let call_counts = tokio::task::spawn_blocking(move || {
+                payload_threads
+                    .into_iter()
+                    .map(|thread| thread.join().expect("payload thread"))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .expect("payload joins");
+            assert!(call_counts.iter().all(|calls| *calls > 0));
+        })
+        .await
+        .expect("payload construction and refresh commits deadlocked");
+    }
+
+    #[tokio::test]
+    async fn transient_prearm_timeout_retries_registration_and_later_locator_succeeds() {
+        let mut harness = navigation_test_harness(32);
+        warm_main_frame_cache(&harness.page);
+        *harness
+            .page
+            .browser
+            .stealth_user_agent_override
+            .lock()
+            .unwrap() = Some(Value::Null);
+
+        let registration_page = Arc::clone(&harness.page);
+        let resolution_page = Arc::clone(&harness.page);
+        let operations = async move {
+            register_attached_iframe_session_at_sequence(
+                registration_page,
+                "outer-frame".to_string(),
+                Some("main-frame".to_string()),
+                "page-session".to_string(),
+                "session-b".to_string(),
+                None,
+                Duration::from_millis(30),
+            )
+            .expect("registration dispatch");
+            let mut updates = resolution_page
+                .frame_state
+                .lock()
+                .unwrap()
+                .subscribe_session_updates();
+            loop {
+                if resolution_page
+                    .frame_state
+                    .lock()
+                    .unwrap()
+                    .iframe_sessions_ready
+                    .contains("session-b")
+                {
+                    break;
+                }
+                updates.changed().await.expect("setup update channel");
+            }
+            resolve_locator_session(
+                resolution_page,
+                &json!({
+                    "kind": "frame",
+                    "frame_selector": "iframe",
+                    "inner": {"kind": "css", "selector": "button"}
+                })
+                .to_string(),
+                OperationDeadline::new(Duration::from_millis(750)),
+            )
+            .await
+        };
+        let responder = async {
+            let first_prearm = harness.next_command("Target.setAutoAttach").await;
+            assert_eq!(first_prearm["sessionId"], "session-b");
+            // Withhold the first response until its command deadline expires.
+            let retry_prearm = harness.next_command("Target.setAutoAttach").await;
+            assert_eq!(retry_prearm["sessionId"], "session-b");
+            harness.reply(&retry_prearm, json!({}));
+
+            let mut domain_methods = HashSet::new();
+            for _ in DEFAULT_ATTACHED_SESSION_DOMAINS {
+                let command = harness.next_command_any().await;
+                assert_eq!(command["sessionId"], "session-b");
+                domain_methods.insert(command["method"].as_str().unwrap().to_string());
+                harness.reply(&command, json!({}));
+            }
+            assert_eq!(
+                domain_methods,
+                HashSet::from([
+                    "Page.enable".to_string(),
+                    "DOM.enable".to_string(),
+                    "Network.enable".to_string(),
+                ])
+            );
+            harness.reply_action_dispatch_binding("session-b").await;
+            let focus = harness
+                .next_command("Emulation.setFocusEmulationEnabled")
+                .await;
+            assert_eq!(focus["sessionId"], "session-b");
+            harness.reply(&focus, json!({}));
+            let intercept = harness
+                .next_command("Page.setInterceptFileChooserDialog")
+                .await;
+            harness.reply(&intercept, json!({}));
+            let mut stealth_methods = HashSet::new();
+            for _ in 0..2 {
+                let command = harness.next_command_any().await;
+                stealth_methods.insert(command["method"].as_str().unwrap().to_string());
+                harness.reply(&command, json!({}));
+            }
+            assert_eq!(
+                stealth_methods,
+                HashSet::from([
+                    "Page.addScriptToEvaluateOnNewDocument".to_string(),
+                    "Runtime.evaluate".to_string(),
+                ])
+            );
+
+            let child_refresh = harness.next_command("Page.getFrameTree").await;
+            assert_eq!(child_refresh["sessionId"], "session-b");
+            harness.reply(
+                &child_refresh,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "outer-frame",
+                            "parentId": "main-frame",
+                            "url": "https://b.test/"
+                        }
+                    }
+                }),
+            );
+            let parent_refresh = harness.next_command("Page.getFrameTree").await;
+            assert_eq!(parent_refresh["sessionId"], "page-session");
+            harness.reply(
+                &parent_refresh,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "main-frame",
+                            "url": "https://example.test/"
+                        },
+                        "childFrames": [{
+                            "frame": {
+                                "id": "outer-frame",
+                                "parentId": "main-frame",
+                                "url": "https://b.test/"
+                            }
+                        }]
+                    }
+                }),
+            );
+            harness.reply_frame_owner("outer-frame", false).await;
+            assert!(harness.write_rx.try_recv().is_err());
+        };
+        let (resolution, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(operations, responder)
+        })
+        .await
+        .expect("retrying pre-arm and locator must finish");
+        let resolution = resolution.expect("later locator must recover after pre-arm retry");
+        assert_eq!(resolution.session_id, "session-b");
+        let state = harness.page.frame_state.lock().unwrap();
+        assert!(state.iframe_sessions_armed.contains("session-b"));
+        assert!(state.iframe_sessions_ready.contains("session-b"));
+        assert!(state.frame_session_errors.get("outer-frame").is_none());
+        assert!(state.iframe_setup_started.contains("session-b"));
+    }
+
+    #[tokio::test]
+    async fn persistent_prearm_timeout_records_authoritative_error_after_one_retry() {
+        let mut harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        let page = Arc::clone(&harness.page);
+        register_attached_iframe_session_at_sequence(
+            Arc::clone(&page),
+            "outer-frame".to_string(),
+            Some("main-frame".to_string()),
+            "page-session".to_string(),
+            "session-b".to_string(),
+            None,
+            Duration::from_millis(25),
+        )
+        .expect("registration dispatch");
+
+        let wait_for_error = async {
+            let mut updates = page.frame_state.lock().unwrap().subscribe_session_updates();
+            loop {
+                if page
+                    .frame_state
+                    .lock()
+                    .unwrap()
+                    .frame_session_errors
+                    .contains_key("outer-frame")
+                {
+                    break;
+                }
+                updates.changed().await.expect("error update");
+            }
+        };
+        let exhaust_retry = async {
+            for _ in 0..=ATTACHED_IFRAME_SETUP_RETRY_LIMIT {
+                let command = harness.next_command("Target.setAutoAttach").await;
+                assert_eq!(command["sessionId"], "session-b");
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(wait_for_error, exhaust_retry)
+        })
+        .await
+        .expect("persistent pre-arm failure must settle");
+        let error = frame_session_for_frame(&page, "outer-frame", None)
+            .expect_err("second timeout must be authoritative")
+            .to_string();
+        assert!(error.contains("timed out"), "{error}");
+        let state = page.frame_state.lock().unwrap();
+        assert!(!state.iframe_sessions_armed.contains("session-b"));
+        assert!(!state.iframe_sessions_ready.contains("session-b"));
+        assert!(harness.write_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn same_owner_replay_and_registration_preserve_authoritative_setup_error() {
+        let mut harness = navigation_test_harness(16);
+        warm_main_frame_cache(&harness.page);
+        let page = Arc::clone(&harness.page);
+        register_attached_iframe_session_at_sequence(
+            Arc::clone(&page),
+            "outer-frame".to_string(),
+            Some("main-frame".to_string()),
+            "page-session".to_string(),
+            "session-b".to_string(),
+            None,
+            Duration::from_millis(25),
+        )
+        .expect("registration dispatch");
+
+        let wait_for_error = async {
+            let mut updates = page.frame_state.lock().unwrap().subscribe_session_updates();
+            loop {
+                if page
+                    .frame_state
+                    .lock()
+                    .unwrap()
+                    .frame_session_errors
+                    .contains_key("outer-frame")
+                {
+                    break;
+                }
+                updates.changed().await.expect("error update");
+            }
+        };
+        let exhaust_retry = async {
+            for _ in 0..=ATTACHED_IFRAME_SETUP_RETRY_LIMIT {
+                let command = harness.next_command("Target.setAutoAttach").await;
+                assert_eq!(command["sessionId"], "session-b");
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(wait_for_error, exhaust_retry)
+        })
+        .await
+        .expect("persistent pre-arm failure must settle");
+        let authoritative_error = frame_session_for_frame(&page, "outer-frame", None)
+            .expect_err("second timeout must be authoritative")
+            .to_string();
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "session-b",
+                "targetInfo": {
+                    "targetId": "outer-frame",
+                    "parentFrameId": "main-frame",
+                    "type": "iframe",
+                    "attached": true
+                },
+                "waitingForDebugger": false
+            }
+        }));
+        reconcile_frame_cache_invalidations(&page);
+        register_attached_iframe_session_at_sequence(
+            Arc::clone(&page),
+            "outer-frame".to_string(),
+            Some("main-frame".to_string()),
+            "page-session".to_string(),
+            "session-b".to_string(),
+            None,
+            Duration::from_millis(25),
+        )
+        .expect("same-owner registration remains idempotent");
+        assert_eq!(
+            frame_session_for_frame(&page, "outer-frame", None)
+                .expect_err("same-owner replay must preserve the setup error")
+                .to_string(),
+            authoritative_error
+        );
+        assert!(
+            harness.write_rx.try_recv().is_err(),
+            "same-owner replay must not start a third setup attempt"
+        );
+
+        let locator_json = json!({
+            "kind": "frame",
+            "frame_selector": "iframe",
+            "inner": {"kind": "css", "selector": "button"}
+        })
+        .to_string();
+        let locator = resolve_locator_session(
+            Arc::clone(&page),
+            &locator_json,
+            OperationDeadline::new(Duration::from_millis(500)),
+        );
+        let responder = async {
+            let refresh = harness.next_command("Page.getFrameTree").await;
+            assert_eq!(refresh["sessionId"], "page-session");
+            harness.reply(
+                &refresh,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "main-frame",
+                            "url": "https://example.test/"
+                        },
+                        "childFrames": [{
+                            "frame": {
+                                "id": "outer-frame",
+                                "parentId": "main-frame",
+                                "url": "https://b.test/"
+                            }
+                        }]
+                    }
+                }),
+            );
+            harness.reply_frame_owner("outer-frame", false).await;
+            assert!(harness.write_rx.try_recv().is_err());
+        };
+        let (locator_result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(locator, responder)
+        })
+        .await
+        .expect("locator must receive the authoritative setup failure");
+        let locator_error = match locator_result {
+            Ok(_) => panic!("locator must fail with the setup error"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(locator_error, authoritative_error);
+    }
+
+    #[test]
+    fn reconciliation_replay_does_not_resurrect_frame_after_newer_detach() {
+        let harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameAttached",
+            "params": {
+                "frameId": "child-frame",
+                "parentFrameId": "main-frame"
+            }
+        }));
+        let attached_sequence = harness.event_log.lock().unwrap().cursor() - 1;
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "child-frame",
+                    "parentId": "main-frame",
+                    "loaderId": "child-loader",
+                    "name": "child",
+                    "url": "https://child.test/"
+                }
+            }
+        }));
+        let navigated_sequence = harness.event_log.lock().unwrap().cursor() - 1;
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameDetached",
+            "params": {
+                "frameId": "child-frame",
+                "reason": "remove"
+            }
+        }));
+        let detached_sequence = harness.event_log.lock().unwrap().cursor() - 1;
+
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            assert!(
+                state.mark_frame_cache_dirty_at_sequence("page-session", Some(attached_sequence))
+            );
+            state.record_frame(
+                "child-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                None,
+                "page-session".to_string(),
+            );
+            assert!(
+                state.mark_frame_cache_dirty_at_sequence("page-session", Some(navigated_sequence))
+            );
+            state.record_frame_loader("child-frame", Some("child-loader"));
+            state.record_frame(
+                "child-frame".to_string(),
+                Some("main-frame".to_string()),
+                Some("child".to_string()),
+                Some("https://child.test/".to_string()),
+                "page-session".to_string(),
+            );
+            assert!(
+                state.mark_frame_cache_dirty_at_sequence("page-session", Some(detached_sequence))
+            );
+            state.remove_frame("child-frame");
+        }
+
+        reconcile_frame_cache_invalidations(&harness.page);
+
+        let state = harness.page.frame_state.lock().unwrap();
+        assert!(!state.frames.contains_key("child-frame"));
+        assert!(!state.frame_sessions.contains_key("child-frame"));
+        assert!(!state.frame_loader_ids.contains_key("child-frame"));
+        assert!(!state
+            .child_order
+            .get("main-frame")
+            .is_some_and(|children| children.iter().any(|child| child == "child-frame")));
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_replay_and_listener_do_not_resurrect_detached_target() {
+        let mut harness = navigation_test_harness(128);
+        warm_main_frame_cache(&harness.page);
+        for index in 0..100 {
+            harness.emit(json!({
+                "method": "Test.broadcastFiller",
+                "params": {"index": index}
+            }));
+        }
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "session-b",
+                "targetInfo": {
+                    "targetId": "outer-frame",
+                    "parentFrameId": "main-frame",
+                    "type": "iframe",
+                    "attached": true
+                },
+                "waitingForDebugger": false
+            }
+        }));
+        let attached_sequence = harness.event_log.lock().unwrap().cursor() - 1;
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.detachedFromTarget",
+            "params": {"sessionId": "session-b"}
+        }));
+        let detached_session_sequence = harness.event_log.lock().unwrap().cursor() - 1;
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameDetached",
+            "params": {
+                "frameId": "outer-frame",
+                "reason": "remove"
+            }
+        }));
+        let detached_frame_sequence = harness.event_log.lock().unwrap().cursor() - 1;
+        assert_eq!(
+            (
+                attached_sequence,
+                detached_session_sequence,
+                detached_frame_sequence
+            ),
+            (100, 101, 102)
+        );
+        let stale_attached_event = harness
+            .event_log
+            .lock()
+            .unwrap()
+            .entries_since(attached_sequence)
+            .into_iter()
+            .next()
+            .unwrap()
+            .1;
+
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            assert!(
+                state.mark_frame_cache_dirty_at_sequence("page-session", Some(attached_sequence))
+            );
+            state.record_session_for_frame_at_sequence(
+                "outer-frame",
+                "session-b",
+                Some(attached_sequence),
+            );
+            state.record_frame(
+                "outer-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                None,
+                "session-b".to_string(),
+            );
+            state.detach_session_at_sequence("session-b", Some(detached_session_sequence));
+            assert!(state
+                .mark_frame_cache_dirty_at_sequence("page-session", Some(detached_frame_sequence)));
+            state.remove_frame("outer-frame");
+            state.set_frame_event_cursor(attached_sequence);
+        }
+
+        let reconciliation = {
+            let event_log = harness.event_log.lock().unwrap();
+            let mut main_frame_id = harness.page.main_frame_id.lock().unwrap();
+            let mut state = harness.page.frame_state.lock().unwrap();
+            reconcile_frame_cache_invalidations_locked(
+                &mut state,
+                &mut main_frame_id,
+                &harness.page.crashed,
+                harness.page.session_id.as_str(),
+                &event_log,
+                None,
+                None,
+            )
+        };
+        assert!(
+            reconciliation.recovered_sessions.is_empty(),
+            "stale replay must not schedule recovered-session arming"
+        );
+        assert!(reconciliation.navigation_observations.is_empty());
+        handle_page_oopif_event(Arc::clone(&harness.page), stale_attached_event).await;
+        tokio::task::yield_now().await;
+
+        let state = harness.page.frame_state.lock().unwrap();
+        assert!(!state.frames.contains_key("outer-frame"));
+        assert!(!state.frame_sessions.contains_key("outer-frame"));
+        assert!(!state.session_frames.contains_key("session-b"));
+        assert!(!state
+            .child_order
+            .get("main-frame")
+            .is_some_and(|children| children.iter().any(|child| child == "outer-frame")));
+        assert!(!state.iframe_setup_started.contains("session-b"));
+        assert!(!state.iframe_sessions_armed.contains("session-b"));
+        assert!(!state.iframe_sessions_ready.contains("session-b"));
+        drop(state);
+        assert!(
+            harness.write_rx.try_recv().is_err(),
+            "stale attachment must not send recovery setup commands"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_live_iframe_attachments_without_parent_mapping_are_noops() {
+        let mut harness = navigation_test_harness(16);
+        warm_main_frame_cache(&harness.page);
+        harness.page.frame_state.lock().unwrap().record_frame(
+            "removed-parent".to_string(),
+            Some("main-frame".to_string()),
+            None,
+            None,
+            "page-session".to_string(),
+        );
+
+        let stale_removed_parent_attachment = json!({
+            "__rustwright_cdp_event_seq": 10,
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "removed-parent-child-session",
+                "targetInfo": {
+                    "targetId": "removed-parent-child",
+                    "parentFrameId": "removed-parent",
+                    "type": "iframe",
+                    "attached": true
+                },
+                "waitingForDebugger": false
+            }
+        });
+        handle_page_oopif_event(
+            Arc::clone(&harness.page),
+            json!({
+                "__rustwright_cdp_event_seq": 11,
+                "sessionId": "page-session",
+                "method": "Page.frameDetached",
+                "params": {
+                    "frameId": "removed-parent",
+                    "reason": "remove"
+                }
+            }),
+        )
+        .await;
+        assert!(!harness
+            .page
+            .frame_state
+            .lock()
+            .unwrap()
+            .frames
+            .contains_key("removed-parent"));
+        handle_page_oopif_event(Arc::clone(&harness.page), stale_removed_parent_attachment).await;
+
+        let stale_missing_parent_attachment = json!({
+            "__rustwright_cdp_event_seq": 12,
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "missing-parent-child-session",
+                "targetInfo": {
+                    "targetId": "missing-parent-child",
+                    "type": "iframe",
+                    "attached": true
+                },
+                "waitingForDebugger": false
+            }
+        });
+        handle_page_oopif_event(
+            Arc::clone(&harness.page),
+            json!({
+                "__rustwright_cdp_event_seq": 13,
+                "sessionId": "page-session",
+                "method": "Page.frameDetached",
+                "params": {
+                    "frameId": "newer-detach",
+                    "reason": "remove"
+                }
+            }),
+        )
+        .await;
+        handle_page_oopif_event(Arc::clone(&harness.page), stale_missing_parent_attachment).await;
+        tokio::task::yield_now().await;
+
+        let state = harness.page.frame_state.lock().unwrap();
+        for (frame_id, session_id) in [
+            ("removed-parent-child", "removed-parent-child-session"),
+            ("missing-parent-child", "missing-parent-child-session"),
+        ] {
+            assert!(!state.frames.contains_key(frame_id));
+            assert!(!state.frame_sessions.contains_key(frame_id));
+            assert!(!state.session_frames.contains_key(session_id));
+            assert!(!state
+                .child_order
+                .values()
+                .flatten()
+                .any(|child| child == frame_id));
+            assert!(!state.iframe_setup_started.contains(session_id));
+            assert!(!state.iframe_sessions_armed.contains(session_id));
+            assert!(!state.iframe_sessions_ready.contains(session_id));
+        }
+        drop(state);
+        assert!(
+            harness.write_rx.try_recv().is_err(),
+            "rejected attachments must not send setup commands"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_stale_page_listener_copies_are_noops_after_reconciliation() {
+        let harness = navigation_test_harness(16);
+        warm_main_frame_cache(&harness.page);
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameAttached",
+            "params": {
+                "frameId": "removed-child",
+                "parentFrameId": "main-frame"
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameDetached",
+            "params": {
+                "frameId": "removed-child",
+                "reason": "remove"
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "stale-main",
+                    "loaderId": "stale-loader",
+                    "url": "https://stale.test/"
+                }
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.navigatedWithinDocument",
+            "params": {
+                "frameId": "stale-main",
+                "url": "https://stale.test/#fragment"
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameDetached",
+            "params": {
+                "frameId": "stale-main",
+                "reason": "remove"
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameDetached",
+            "params": {
+                "frameId": "surviving-child",
+                "reason": "remove"
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameAttached",
+            "params": {
+                "frameId": "surviving-child",
+                "parentFrameId": "main-frame"
+            }
+        }));
+        let logged_events = harness.event_log.lock().unwrap().entries_since(0);
+        assert_eq!(logged_events.len(), 7);
+        let stale_attached_event = logged_events[0].1.clone();
+        let stale_navigated_event = logged_events[2].1.clone();
+        let stale_same_document_event = logged_events[3].1.clone();
+        let stale_detached_event = logged_events[5].1.clone();
+
+        harness.page.crashed.store(true, Ordering::SeqCst);
+        reconcile_frame_cache_invalidations(&harness.page);
+        {
+            let state = harness.page.frame_state.lock().unwrap();
+            assert!(!state.frames.contains_key("removed-child"));
+            assert!(!state.frames.contains_key("stale-main"));
+            assert!(state.frames.contains_key("surviving-child"));
+        }
+        let network_before = {
+            let network = harness.page.native_network_records.lock().unwrap();
+            (
+                network.navigation_epoch,
+                network.navigation_start_index,
+                network.current_loader_id.clone(),
+            )
+        };
+        let console_epoch_before = harness
+            .page
+            .console_records
+            .lock()
+            .unwrap()
+            .navigation_epoch;
+
+        handle_page_oopif_event(Arc::clone(&harness.page), stale_attached_event).await;
+        handle_page_oopif_event(Arc::clone(&harness.page), stale_navigated_event).await;
+        handle_page_oopif_event(Arc::clone(&harness.page), stale_same_document_event).await;
+        handle_page_oopif_event(Arc::clone(&harness.page), stale_detached_event).await;
+
+        assert_eq!(
+            harness.page.main_frame_id.lock().unwrap().as_deref(),
+            Some("stale-main")
+        );
+        assert!(!harness.page.crashed.load(Ordering::SeqCst));
+        {
+            let state = harness.page.frame_state.lock().unwrap();
+            assert!(!state.frames.contains_key("removed-child"));
+            assert!(!state.frames.contains_key("stale-main"));
+            assert!(!state.frame_loader_ids.contains_key("stale-main"));
+            assert!(state.frames.contains_key("surviving-child"));
+            assert!(state
+                .child_order
+                .get("main-frame")
+                .is_some_and(|children| children.iter().any(|child| child == "surviving-child")));
+        }
+        let network_after_stale = {
+            let network = harness.page.native_network_records.lock().unwrap();
+            (
+                network.navigation_epoch,
+                network.navigation_start_index,
+                network.current_loader_id.clone(),
+            )
+        };
+        assert_eq!(network_after_stale, network_before);
+        assert_eq!(
+            harness
+                .page
+                .console_records
+                .lock()
+                .unwrap()
+                .navigation_epoch,
+            console_epoch_before
+        );
+
+        handle_page_oopif_event(
+            Arc::clone(&harness.page),
+            json!({
+                "__rustwright_cdp_event_seq": 100,
+                "sessionId": "page-session",
+                "method": "Page.frameNavigated",
+                "params": {
+                    "frame": {
+                        "id": "accepted-main",
+                        "loaderId": "accepted-loader",
+                        "url": "https://accepted.test/"
+                    }
+                }
+            }),
+        )
+        .await;
+        {
+            let network = harness.page.native_network_records.lock().unwrap();
+            assert_eq!(network.navigation_epoch, network_before.0 + 1);
+            assert_eq!(network.navigation_start_index, network_before.1);
+            assert_eq!(
+                network.current_loader_id.as_deref(),
+                Some("accepted-loader")
+            );
+        }
+        assert_eq!(
+            harness
+                .page
+                .console_records
+                .lock()
+                .unwrap()
+                .navigation_epoch,
+            console_epoch_before + 1
+        );
+
+        handle_page_oopif_event(
+            Arc::clone(&harness.page),
+            json!({
+                "__rustwright_cdp_event_seq": 101,
+                "sessionId": "page-session",
+                "method": "Page.navigatedWithinDocument",
+                "params": {
+                    "frameId": "accepted-main",
+                    "url": "https://accepted.test/#fragment"
+                }
+            }),
+        )
+        .await;
+        {
+            let network = harness.page.native_network_records.lock().unwrap();
+            assert_eq!(network.navigation_epoch, network_before.0 + 2);
+            assert_eq!(network.navigation_start_index, network_before.1);
+            assert_eq!(
+                network.current_loader_id.as_deref(),
+                Some("accepted-loader")
+            );
+        }
+        assert_eq!(
+            harness
+                .page
+                .console_records
+                .lock()
+                .unwrap()
+                .navigation_epoch,
+            console_epoch_before + 2
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_replay_first_same_document_navigation_applies_observation_once() {
+        let harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        let before = navigation_observation_snapshot(&harness.page);
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.navigatedWithinDocument",
+            "params": {
+                "frameId": "main-frame",
+                "url": "https://example.test/#replayed"
+            }
+        }));
+        let listener_copy = harness
+            .event_log
+            .lock()
+            .unwrap()
+            .entries_since(0)
+            .pop()
+            .expect("logged same-document navigation")
+            .1;
+
+        reconcile_frame_cache_invalidations(&harness.page);
+
+        assert_eq!(
+            harness.page.frame_state.lock().unwrap().frames["main-frame"].url,
+            "https://example.test/#replayed"
+        );
+        let after_reconciliation = navigation_observation_snapshot(&harness.page);
+        assert_eq!(after_reconciliation.0, before.0 + 1);
+        assert_eq!(after_reconciliation.1, before.1);
+        assert_eq!(after_reconciliation.2, before.2);
+        assert_eq!(after_reconciliation.3, before.3);
+        assert_eq!(after_reconciliation.4, before.4 + 1);
+        assert_eq!(after_reconciliation.5, before.5);
+
+        handle_page_oopif_event(Arc::clone(&harness.page), listener_copy).await;
+
+        assert_eq!(
+            navigation_observation_snapshot(&harness.page),
+            after_reconciliation,
+            "the rejected listener copy must not repeat replay side effects"
+        );
+        assert_eq!(
+            harness.page.frame_state.lock().unwrap().frames["main-frame"].url,
+            "https://example.test/#replayed"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_replay_first_main_navigation_applies_crash_recovery_once() {
+        let harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        harness.page.crashed.store(true, Ordering::SeqCst);
+        let before = navigation_observation_snapshot(&harness.page);
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "recovered-main-frame",
+                    "loaderId": "recovered-loader",
+                    "url": "https://recovered.test/"
+                }
+            }
+        }));
+        let listener_copy = harness
+            .event_log
+            .lock()
+            .unwrap()
+            .entries_since(0)
+            .pop()
+            .expect("logged recovering navigation")
+            .1;
+
+        reconcile_frame_cache_invalidations(&harness.page);
+
+        assert!(!harness.page.crashed.load(Ordering::SeqCst));
+        assert_eq!(
+            harness.page.main_frame_id.lock().unwrap().as_deref(),
+            Some("recovered-main-frame")
+        );
+        {
+            let state = harness.page.frame_state.lock().unwrap();
+            assert_eq!(
+                state.frames["recovered-main-frame"].url,
+                "https://recovered.test/"
+            );
+            assert_eq!(
+                state.frame_loader_ids["recovered-main-frame"],
+                "recovered-loader"
+            );
+        }
+        let after_reconciliation = navigation_observation_snapshot(&harness.page);
+        assert_eq!(after_reconciliation.0, before.0 + 1);
+        assert_eq!(after_reconciliation.1, before.1);
+        assert_eq!(after_reconciliation.2.as_deref(), Some("recovered-loader"));
+        assert_eq!(after_reconciliation.3, before.3);
+        assert_eq!(after_reconciliation.4, before.4 + 1);
+        assert_eq!(after_reconciliation.5, before.5);
+
+        handle_page_oopif_event(Arc::clone(&harness.page), listener_copy).await;
+
+        assert_eq!(
+            navigation_observation_snapshot(&harness.page),
+            after_reconciliation,
+            "the rejected listener copy must not repeat replay side effects"
+        );
+        assert!(!harness.page.crashed.load(Ordering::SeqCst));
+        assert_eq!(
+            harness.page.main_frame_id.lock().unwrap().as_deref(),
+            Some("recovered-main-frame")
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_live_first_navigation_reconciliation_does_not_double_apply() {
+        let harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        harness.page.crashed.store(true, Ordering::SeqCst);
+        let before = navigation_observation_snapshot(&harness.page);
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "live-main-frame",
+                    "loaderId": "live-loader",
+                    "url": "https://live.test/"
+                }
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.navigatedWithinDocument",
+            "params": {
+                "frameId": "live-main-frame",
+                "url": "https://live.test/#fragment"
+            }
+        }));
+        let listener_copies = harness.event_log.lock().unwrap().entries_since(0);
+        assert_eq!(listener_copies.len(), 2);
+
+        for (_, listener_copy) in listener_copies {
+            handle_page_oopif_event(Arc::clone(&harness.page), listener_copy).await;
+        }
+
+        assert!(!harness.page.crashed.load(Ordering::SeqCst));
+        assert_eq!(
+            harness.page.main_frame_id.lock().unwrap().as_deref(),
+            Some("live-main-frame")
+        );
+        assert_eq!(
+            harness.page.frame_state.lock().unwrap().frames["live-main-frame"].url,
+            "https://live.test/#fragment"
+        );
+        let after_live = navigation_observation_snapshot(&harness.page);
+        assert_eq!(after_live.0, before.0 + 2);
+        assert_eq!(after_live.1, before.1);
+        assert_eq!(after_live.2.as_deref(), Some("live-loader"));
+        assert_eq!(after_live.3, before.3);
+        assert_eq!(after_live.4, before.4 + 2);
+        assert_eq!(after_live.5, before.5);
+
+        reconcile_frame_cache_invalidations(&harness.page);
+
+        assert_eq!(
+            navigation_observation_snapshot(&harness.page),
+            after_live,
+            "reconciliation must not repeat live-consumed side effects"
+        );
+        assert_eq!(
+            harness.page.frame_state.lock().unwrap().frames["live-main-frame"].url,
+            "https://live.test/#fragment"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_live_initial_document_request_uses_accepted_epoch() {
+        let harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+
+        handle_page_oopif_event(
+            Arc::clone(&harness.page),
+            json!({
+                "__rustwright_cdp_event_seq": 0,
+                "sessionId": "page-session",
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "initial-document",
+                    "frameId": "main-frame",
+                    "loaderId": "loader-initial",
+                    "type": "Document",
+                    "request": {
+                        "url": "https://example.test/initial",
+                        "method": "GET",
+                        "headers": {}
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let initial_index = {
+            let mut network = harness.page.native_network_records.lock().unwrap();
+            assert_eq!(network.navigation_epoch, 1);
+            let current = network.read(false, false);
+            assert_eq!(current.records.len(), 1);
+            let request = &current.records[0];
+            assert_eq!(network.navigation_start_index, request.index);
+            assert_eq!(request.navigation_epoch, network.navigation_epoch);
+            assert_eq!(request.url, "https://example.test/initial");
+            request.index
+        };
+
+        handle_page_oopif_event(
+            Arc::clone(&harness.page),
+            json!({
+                "__rustwright_cdp_event_seq": 1,
+                "sessionId": "page-session",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "initial-document",
+                    "response": {
+                        "status": 200,
+                        "headers": {"content-type": "text/html"},
+                        "mimeType": "text/html"
+                    }
+                }
+            }),
+        )
+        .await;
+        handle_page_oopif_event(
+            Arc::clone(&harness.page),
+            json!({
+                "__rustwright_cdp_event_seq": 2,
+                "sessionId": "page-session",
+                "method": "Network.loadingFinished",
+                "params": {"requestId": "initial-document"}
+            }),
+        )
+        .await;
+
+        let mut network = harness.page.native_network_records.lock().unwrap();
+        let current = network.read(false, false);
+        assert_eq!(current.records.len(), 1);
+        assert_eq!(current.records[0].index, initial_index);
+        assert_eq!(current.records[0].response_status, Some(200));
+        assert!(current.records[0].completed);
+        assert_eq!(current.records[0].navigation_epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_lag_reconciles_navigation_before_retained_observation() {
+        let harness = navigation_test_harness(2);
+        start_page_frame_cache_tracking(&harness.page, 0, "page-session");
+        warm_main_frame_cache(&harness.page);
+        harness
+            .page
+            .console_capture
+            .requested
+            .store(true, Ordering::SeqCst);
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "main-frame",
+                    "loaderId": "loader-after-lag",
+                    "url": "https://example.test/after-lag"
+                }
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "dropped-document",
+                "frameId": "main-frame",
+                "loaderId": "loader-after-lag",
+                "type": "Document",
+                "request": {
+                    "url": "https://example.test/after-lag",
+                    "method": "GET",
+                    "headers": {}
+                }
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "string", "value": "retained-after-lag"}]
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "retained-subresource",
+                "frameId": "main-frame",
+                "loaderId": "loader-after-lag",
+                "type": "Script",
+                "request": {
+                    "url": "https://example.test/app.js",
+                    "method": "GET",
+                    "headers": {}
+                }
+            }
+        }));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let console_recorded = !harness
+                    .page
+                    .console_records
+                    .lock()
+                    .unwrap()
+                    .records
+                    .is_empty();
+                let network_recorded = !harness
+                    .page
+                    .native_network_records
+                    .lock()
+                    .unwrap()
+                    .records
+                    .is_empty();
+                if console_recorded && network_recorded {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retained console event must reach the lagged listener");
+
+        {
+            let network = harness.page.native_network_records.lock().unwrap();
+            assert_eq!(network.navigation_epoch, 1);
+            assert_eq!(
+                network.current_loader_id.as_deref(),
+                Some("loader-after-lag")
+            );
+            // Lag recovery replays every observation retained by the event log, including
+            // entries already dropped by the smaller broadcast buffer. Each request must
+            // appear exactly once and remain attributed to the reconciled navigation epoch.
+            assert_eq!(network.records.len(), 2);
+            assert_eq!(
+                network
+                    .records
+                    .iter()
+                    .map(|entry| entry.record.url.as_str())
+                    .collect::<HashSet<_>>(),
+                HashSet::from([
+                    "https://example.test/after-lag",
+                    "https://example.test/app.js",
+                ])
+            );
+            assert!(network
+                .records
+                .iter()
+                .all(|entry| entry.record.navigation_epoch == 1));
+        }
+        assert_eq!(
+            harness.page.frame_state.lock().unwrap().frames["main-frame"].url,
+            "https://example.test/after-lag",
+            "Page.frameNavigated replay must update the authoritative frame record"
+        );
+        let mut console = harness.page.console_records.lock().unwrap();
+        assert_eq!(console.navigation_epoch, 1);
+        let current = console.read(false, false);
+        assert_eq!(current.records.len(), 1);
+        assert_eq!(current.records[0].text, "retained-after-lag");
+        assert_eq!(current.records[0].navigation_epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_lost_navigation_gap_creates_explicit_epoch_boundary() {
+        let harness = navigation_test_harness(1);
+        start_page_frame_cache_tracking(&harness.page, 0, "page-session");
+        warm_main_frame_cache(&harness.page);
+        harness
+            .page
+            .console_capture
+            .requested
+            .store(true, Ordering::SeqCst);
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "main-frame",
+                    "loaderId": "loader-lost",
+                    "url": "https://example.test/lost"
+                }
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "lost-document",
+                "frameId": "main-frame",
+                "loaderId": "loader-lost",
+                "type": "Document",
+                "request": {
+                    "url": "https://example.test/lost",
+                    "method": "GET",
+                    "headers": {}
+                }
+            }
+        }));
+        for index in 0..CDP_EVENT_LOG_LIMIT {
+            harness.emit(json!({
+                "method": "Test.broadcastFiller",
+                "params": {"index": index}
+            }));
+        }
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "string", "value": "retained-after-lost-gap"}]
+            }
+        }));
+        assert!(
+            harness.event_log.lock().unwrap().oldest_seq() > 0,
+            "the navigation must be older than the event-log low-water mark"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !harness
+                    .page
+                    .console_records
+                    .lock()
+                    .unwrap()
+                    .records
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retained console event must reach the lagged listener");
+
+        let network_epoch = harness
+            .page
+            .native_network_records
+            .lock()
+            .unwrap()
+            .navigation_epoch;
+        assert_eq!(network_epoch, 1);
+        let mut console = harness.page.console_records.lock().unwrap();
+        assert_eq!(console.navigation_epoch, network_epoch);
+        let current = console.read(false, false);
+        assert_eq!(current.records.len(), 1);
+        assert_eq!(current.records[0].text, "retained-after-lost-gap");
+        assert_eq!(current.records[0].navigation_epoch, network_epoch);
+        assert_ne!(current.records[0].navigation_epoch, 0);
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_foreground_reconciliation_commits_rotated_gap_once() {
+        const EVENT_CAPACITY: usize = 16;
+        let harness = navigation_test_harness(EVENT_CAPACITY);
+        warm_main_frame_cache(&harness.page);
+        harness
+            .page
+            .console_capture
+            .requested
+            .store(true, Ordering::SeqCst);
+        let (events, start_cursor) = harness.page.browser.client.subscribe_with_cursor();
+        start_page_frame_cache_tracking_without_listener(
+            &harness.page,
+            start_cursor,
+            "page-session",
+        );
+        let before = navigation_observation_snapshot(&harness.page);
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "main-frame",
+                    "loaderId": "loader-rotated-out",
+                    "url": "https://example.test/rotated-out"
+                }
+            }
+        }));
+        let lost_navigation_sequence = harness.page.browser.client.event_cursor() - 1;
+        for index in 0..CDP_EVENT_LOG_LIMIT {
+            harness.emit(json!({
+                "method": "Test.broadcastFiller",
+                "params": {"index": index}
+            }));
+        }
+        assert!(
+            harness.event_log.lock().unwrap().oldest_seq() > lost_navigation_sequence,
+            "the navigation must rotate out before foreground reconciliation"
+        );
+
+        reconcile_frame_cache_invalidations(&harness.page);
+        let after_foreground = navigation_observation_snapshot(&harness.page);
+        assert_eq!(after_foreground.0, before.0 + 1);
+        assert_eq!(after_foreground.2, None);
+        assert_eq!(after_foreground.4, before.4 + 1);
+        assert_eq!(after_foreground.3, 0);
+        assert_eq!(after_foreground.5, 0);
+
+        spawn_page_sequence_gated_event_listener(Arc::downgrade(&harness.page), events);
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "string", "value": "after-foreground-gap"}]
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "after-foreground-gap",
+                "frameId": "main-frame",
+                "type": "Script",
+                "request": {
+                    "url": "https://example.test/after-foreground-gap.js",
+                    "method": "GET",
+                    "headers": {}
+                }
+            }
+        }));
+        let live_cursor = harness.page.browser.client.event_cursor();
+        wait_for_navigation_observation_counts(&harness.page, 1, 1).await;
+        wait_for_contiguous_event_watermark(&harness.page, live_cursor).await;
+
+        let after_listener = navigation_observation_snapshot(&harness.page);
+        assert_eq!(
+            after_listener.0, after_foreground.0,
+            "the later Lagged reconciliation must not double-commit the boundary"
+        );
+        assert_eq!(after_listener.4, after_foreground.4);
+        assert_eq!(after_listener.3, 1);
+        assert_eq!(after_listener.5, 1);
+
+        let mut network = harness.page.native_network_records.lock().unwrap();
+        let current_network = network.read(false, false);
+        assert_eq!(current_network.records.len(), 1);
+        assert_eq!(
+            current_network.records[0].navigation_epoch,
+            after_foreground.0
+        );
+        drop(network);
+
+        let mut console = harness.page.console_records.lock().unwrap();
+        let current_console = console.read(false, false);
+        assert_eq!(current_console.records.len(), 1);
+        assert_eq!(
+            current_console.records[0].navigation_epoch,
+            after_foreground.4
+        );
+    }
+
+    #[test]
+    fn sequence_gate_foreground_reconciliation_retained_gap_has_no_boundary() {
+        let harness = navigation_test_harness(1);
+        warm_main_frame_cache(&harness.page);
+        let (mut events, start_cursor) = harness.page.browser.client.subscribe_with_cursor();
+        start_page_frame_cache_tracking_without_listener(
+            &harness.page,
+            start_cursor,
+            "page-session",
+        );
+        let before = navigation_observation_snapshot(&harness.page);
+
+        for index in 0..3 {
+            harness.emit(json!({
+                "method": "Test.broadcastFiller",
+                "params": {"index": index}
+            }));
+        }
+        assert_eq!(
+            harness.event_log.lock().unwrap().oldest_seq(),
+            start_cursor,
+            "the complete listener gap must remain available for replay"
+        );
+
+        reconcile_frame_cache_invalidations(&harness.page);
+        assert_eq!(navigation_observation_snapshot(&harness.page), before);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        reconcile_frame_cache_invalidations_after_lag(&harness.page);
+        assert_eq!(navigation_observation_snapshot(&harness.page), before);
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_merge_fix_round1_lag_replays_retained_observations_once() {
+        let harness = navigation_test_harness(1);
+        warm_main_frame_cache(&harness.page);
+        harness
+            .page
+            .console_capture
+            .requested
+            .store(true, Ordering::SeqCst);
+        let (events, start_cursor) = harness.page.browser.client.subscribe_with_cursor();
+        start_page_frame_cache_tracking_without_listener(
+            &harness.page,
+            start_cursor,
+            "page-session",
+        );
+
+        for index in 0..2 {
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Runtime.consoleAPICalled",
+                "params": {
+                    "type": "log",
+                    "args": [{"type": "string", "value": format!("retained-console-{index}")}]
+                }
+            }));
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": format!("retained-request-{index}"),
+                    "frameId": "main-frame",
+                    "type": "Script",
+                    "request": {
+                        "url": format!("https://example.test/retained-{index}.js"),
+                        "method": "GET",
+                        "headers": {}
+                    }
+                }
+            }));
+        }
+        let replay_cursor = harness.page.browser.client.event_cursor();
+        spawn_page_sequence_gated_event_listener(Arc::downgrade(&harness.page), events);
+        wait_for_navigation_observation_counts(&harness.page, 2, 2).await;
+        wait_for_contiguous_event_watermark(&harness.page, replay_cursor).await;
+        assert_eq!(
+            harness.page.observation_event_cursor.load(Ordering::SeqCst),
+            replay_cursor
+        );
+
+        let mut network = harness.page.native_network_records.lock().unwrap();
+        let network_batch = network.read(false, false);
+        assert_eq!(network_batch.records.len(), 2);
+        assert_eq!(
+            network_batch
+                .records
+                .iter()
+                .map(|record| record.url.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                "https://example.test/retained-0.js",
+                "https://example.test/retained-1.js",
+            ])
+        );
+        drop(network);
+
+        let mut console = harness.page.console_records.lock().unwrap();
+        let console_batch = console.read(false, false);
+        assert_eq!(console_batch.records.len(), 2);
+        assert_eq!(
+            console_batch
+                .records
+                .iter()
+                .map(|record| record.text.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["retained-console-0", "retained-console-1"])
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_merge_fix_round1_lag_replays_swap_lineage_and_aborts_setup() {
+        let mut harness = navigation_test_harness(1);
+        warm_main_frame_cache(&harness.page);
+        let start_cursor = harness.page.browser.client.event_cursor();
+        start_page_frame_cache_tracking_without_listener(
+            &harness.page,
+            start_cursor,
+            "page-session",
+        );
+        let losing_pin = register_attached_iframe_session(
+            &harness.page,
+            "swap-frame".to_string(),
+            Some("main-frame".to_string()),
+            "losing-session".to_string(),
+            None,
+            None,
+            Duration::from_secs(2),
+        );
+        let withheld_setup = harness.next_command("Target.setAutoAttach").await;
+        assert!(harness
+            .page
+            .iframe_setup_tasks
+            .handles
+            .lock()
+            .unwrap()
+            .contains_key(&losing_pin.generation));
+
+        harness.emit(json!({
+            "sessionId": "losing-session",
+            "method": "Page.frameDetached",
+            "params": {"frameId": "swap-frame", "reason": "swap"}
+        }));
+        reconcile_frame_cache_invalidations_after_lag(&harness.page);
+
+        {
+            let state = harness.page.frame_state.lock().unwrap();
+            let swap = state
+                .frame_swaps
+                .get("swap-frame")
+                .expect("replayed swap lineage");
+            assert_eq!(swap.lineage.len(), 1);
+            assert_eq!(swap.lineage[0].losing_session_id, "losing-session");
+            assert_eq!(swap.lineage[0].losing_generation, losing_pin.generation);
+            assert_eq!(swap.lineage[0].successor_generation, None);
+            assert!(!swap.successor_ready);
+            assert!(!state
+                .frame_attachment_generations
+                .contains_key("swap-frame"));
+        }
+        assert!(!harness
+            .page
+            .iframe_setup_tasks
+            .handles
+            .lock()
+            .unwrap()
+            .contains_key(&losing_pin.generation));
+        let withheld_setup_id = withheld_setup["id"].as_u64().unwrap();
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while harness
+                .pending
+                .lock()
+                .unwrap()
+                .contains_key(&withheld_setup_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replayed swap must cancel the pending setup command");
+
+        let successor_pin = {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.register_frame_session_waiter("swap-frame", losing_pin.generation);
+            let successor = state.record_session_for_frame("swap-frame", "successor-session");
+            state.mark_iframe_session_ready_for_session("swap-frame", "successor-session");
+            successor
+        };
+        let state = harness.page.frame_state.lock().unwrap();
+        assert!(state
+            .frame_swaps
+            .get("swap-frame")
+            .is_some_and(|swap| swap.successor_ready));
+        assert!(state.swap_replaces_pin("swap-frame", &losing_pin));
+        assert_eq!(
+            state
+                .frame_swaps
+                .get("swap-frame")
+                .and_then(|swap| swap.lineage[0].successor_generation),
+            Some(successor_pin.generation)
+        );
+        drop(state);
+        harness.reply_error(&withheld_setup, "setup task already cancelled");
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_retained_lag_after_live_horizon_does_not_create_epoch_boundary() {
+        const EVENT_CAPACITY: usize = 4096;
+        let harness = navigation_test_harness(EVENT_CAPACITY);
+        start_page_frame_cache_tracking(&harness.page, 0, "page-session");
+        warm_main_frame_cache(&harness.page);
+        harness
+            .page
+            .console_capture
+            .requested
+            .store(true, Ordering::SeqCst);
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "main-frame",
+                    "loaderId": "loader-live",
+                    "url": "https://example.test/live"
+                }
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "string", "value": "before-benign-lag"}]
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "before-benign-lag",
+                "frameId": "main-frame",
+                "loaderId": "loader-live",
+                "type": "Script",
+                "request": {
+                    "url": "https://example.test/before.js",
+                    "method": "GET",
+                    "headers": {}
+                }
+            }
+        }));
+        let initial_cursor = harness.page.browser.client.event_cursor();
+        wait_for_contiguous_event_watermark(&harness.page, initial_cursor).await;
+
+        let target_cursor = initial_cursor + CDP_EVENT_LOG_LIMIT as u64 + 1;
+        while harness.page.browser.client.event_cursor() < target_cursor {
+            for index in 0..EVENT_CAPACITY {
+                harness.emit(json!({
+                    "method": "Test.broadcastFiller",
+                    "params": {"index": index}
+                }));
+            }
+            let expected_cursor = harness.page.browser.client.event_cursor();
+            wait_for_contiguous_event_watermark(&harness.page, expected_cursor).await;
+        }
+        assert!(
+            harness.event_log.lock().unwrap().oldest_seq() > initial_cursor,
+            "the live-consumed navigation must rotate out of the event log"
+        );
+        let before_lag = navigation_observation_snapshot(&harness.page);
+        assert_eq!(before_lag.0, 1);
+        assert_eq!(before_lag.3, 1);
+        assert_eq!(before_lag.4, 1);
+        assert_eq!(before_lag.5, 1);
+
+        for index in 0..(EVENT_CAPACITY - 1) {
+            harness.emit(json!({
+                "method": "Test.broadcastFiller",
+                "params": {"index": index}
+            }));
+        }
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "string", "value": "after-benign-lag"}]
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "after-benign-lag",
+                "frameId": "main-frame",
+                "loaderId": "loader-live",
+                "type": "Script",
+                "request": {
+                    "url": "https://example.test/after.js",
+                    "method": "GET",
+                    "headers": {}
+                }
+            }
+        }));
+        let after_lag_cursor = harness.page.browser.client.event_cursor();
+        wait_for_contiguous_event_watermark(&harness.page, after_lag_cursor).await;
+        wait_for_navigation_observation_counts(&harness.page, 2, 2).await;
+
+        let after_lag = navigation_observation_snapshot(&harness.page);
+        assert_eq!(after_lag.0, before_lag.0, "network epoch must not advance");
+        assert_eq!(after_lag.4, before_lag.4, "console epoch must not advance");
+        assert_eq!(after_lag.3, before_lag.3 + 1);
+        assert_eq!(after_lag.5, before_lag.5 + 1);
+
+        let mut network = harness.page.native_network_records.lock().unwrap();
+        let current_network = network.read(false, false);
+        assert_eq!(current_network.records.len(), 2);
+        assert!(current_network
+            .records
+            .iter()
+            .all(|record| record.navigation_epoch == before_lag.0));
+        drop(network);
+
+        let mut console = harness.page.console_records.lock().unwrap();
+        let current_console = console.read(false, false);
+        assert_eq!(current_console.records.len(), 2);
+        assert!(current_console
+            .records
+            .iter()
+            .all(|record| record.navigation_epoch == before_lag.4));
+    }
+
+    #[test]
+    fn sequence_gate_back_to_back_retained_lags_do_not_create_epoch_boundary() {
+        const BURST_SIZE: usize = 4097;
+        let harness = navigation_test_harness(1);
+        warm_main_frame_cache(&harness.page);
+        let mut receiver = harness.page.browser.client.subscribe();
+        record_accepted_navigation_observation(
+            &harness.page,
+            AcceptedNavigationObservation::Document {
+                loader_id: Some("loader-live".to_owned()),
+            },
+            Some(0),
+        );
+        let after_live_navigation = navigation_observation_snapshot(&harness.page);
+
+        for index in 0..BURST_SIZE {
+            harness.emit(json!({
+                "method": "Test.broadcastFiller",
+                "params": {"burst": 1, "index": index}
+            }));
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        let pending = Arc::clone(&harness.pending);
+        let events = harness.events.clone();
+        let event_log = Arc::clone(&harness.event_log);
+        let (replay_started_tx, replay_started_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            replay_started_rx
+                .recv()
+                .expect("first reconciliation must start");
+            for index in 0..BURST_SIZE {
+                dispatch_cdp_payload(
+                    json!({
+                        "method": "Test.broadcastFiller",
+                        "params": {"burst": 2, "index": index}
+                    }),
+                    Arc::clone(&pending),
+                    events.clone(),
+                    Arc::clone(&event_log),
+                );
+            }
+        });
+        reconcile_frame_cache_invalidations_impl_with_hook(&harness.page, true, || {
+            replay_started_tx
+                .send(())
+                .expect("second producer must remain available");
+        });
+        producer
+            .join()
+            .expect("producer must emit the second burst");
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        assert!(
+            harness.event_log.lock().unwrap().oldest_seq() > 1,
+            "the second retained lag must rotate past the stale live-listener cursor"
+        );
+        reconcile_frame_cache_invalidations_after_lag(&harness.page);
+
+        assert_eq!(
+            navigation_observation_snapshot(&harness.page),
+            after_live_navigation,
+            "a second retained lag must use progress committed by the first reconciliation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequence_gate_constructor_setup_navigation_precedes_first_live_event() {
+        let harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        let before = navigation_observation_snapshot(&harness.page);
+        let (events, start_cursor) = harness.page.browser.client.subscribe_with_cursor();
+        start_page_frame_cache_tracking_without_listener(
+            &harness.page,
+            start_cursor,
+            "page-session",
+        );
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "main-frame",
+                    "loaderId": "loader-during-setup",
+                    "url": "https://example.test/during-setup"
+                }
+            }
+        }));
+        let setup_sequence = harness.page.browser.client.event_cursor() - 1;
+        assert!(
+            harness
+                .page
+                .native_network_records
+                .lock()
+                .unwrap()
+                .accepted_navigation_epochs
+                .low_water_mark
+                .is_none(),
+            "live progress must not prune past an event queued during setup"
+        );
+
+        reconcile_frame_cache_invalidations(&harness.page);
+        let after_reconciliation = navigation_observation_snapshot(&harness.page);
+        assert_eq!(after_reconciliation.0, before.0 + 1);
+        assert_eq!(
+            after_reconciliation.2.as_deref(),
+            Some("loader-during-setup")
+        );
+        assert_eq!(after_reconciliation.4, before.4 + 1);
+        assert_eq!(
+            harness
+                .page
+                .navigation_transition_lock
+                .lock()
+                .unwrap()
+                .contiguous_event_watermark,
+            Some(setup_sequence)
+        );
+
+        spawn_page_sequence_gated_event_listener(Arc::downgrade(&harness.page), events);
+        harness.emit(json!({
+            "method": "Test.broadcastFiller",
+            "params": {"phase": "after-listener-start"}
+        }));
+        let live_cursor = harness.page.browser.client.event_cursor();
+        wait_for_contiguous_event_watermark(&harness.page, live_cursor).await;
+
+        assert_eq!(
+            harness.page.frame_state.lock().unwrap().frames["main-frame"].url,
+            "https://example.test/during-setup"
+        );
+        assert_eq!(
+            navigation_observation_snapshot(&harness.page),
+            after_reconciliation,
+            "the retained setup event and later live event must not split epoch state"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_successful_recv_sequence_jump_reconciles_gap() {
+        let harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        start_page_frame_cache_tracking(&harness.page, 0, "page-session");
+        let before = navigation_observation_snapshot(&harness.page);
+
+        {
+            let mut event_log = harness.event_log.lock().unwrap();
+            let missing_live_event = event_log.push(json!({
+                "sessionId": "page-session",
+                "method": "Page.frameNavigated",
+                "params": {
+                    "frame": {
+                        "id": "main-frame",
+                        "loaderId": "loader-from-gap",
+                        "url": "https://example.test/from-gap"
+                    }
+                }
+            }));
+            assert_eq!(cdp_event_sequence(&missing_live_event), Some(0));
+        }
+        harness.emit(json!({
+            "method": "Test.broadcastFiller",
+            "params": {"phase": "successful-recv-after-gap"}
+        }));
+        let live_cursor = harness.page.browser.client.event_cursor();
+        wait_for_contiguous_event_watermark(&harness.page, live_cursor).await;
+
+        assert_eq!(
+            harness.page.frame_state.lock().unwrap().frames["main-frame"].url,
+            "https://example.test/from-gap"
+        );
+        let after = navigation_observation_snapshot(&harness.page);
+        assert_eq!(after.0, before.0 + 1);
+        assert_eq!(after.2.as_deref(), Some("loader-from-gap"));
+        assert_eq!(after.4, before.4 + 1);
+    }
+
+    #[test]
+    fn sequence_gate_rejects_navigation_at_or_below_pruned_low_water_mark() {
+        let harness = navigation_test_harness(8);
+        let before = navigation_observation_snapshot(&harness.page);
+        {
+            let mut navigation_transition = harness.page.navigation_transition_lock.lock().unwrap();
+            navigation_transition.advance_reconciled(11);
+            prune_page_navigation_epochs_to_contiguous_progress(
+                &harness.page,
+                &navigation_transition,
+            );
+        }
+
+        record_accepted_navigation_observation(
+            &harness.page,
+            AcceptedNavigationObservation::Document { loader_id: None },
+            Some(9),
+        );
+        record_accepted_navigation_observation(
+            &harness.page,
+            AcceptedNavigationObservation::SameDocument,
+            Some(9),
+        );
+        record_accepted_navigation_observation(
+            &harness.page,
+            AcceptedNavigationObservation::Document { loader_id: None },
+            Some(10),
+        );
+        record_accepted_navigation_observation(
+            &harness.page,
+            AcceptedNavigationObservation::Document {
+                loader_id: Some("rejected-loader".to_owned()),
+            },
+            Some(10),
+        );
+        record_accepted_navigation_observation(
+            &harness.page,
+            AcceptedNavigationObservation::SameDocument,
+            Some(10),
+        );
+        assert_eq!(
+            navigation_observation_snapshot(&harness.page),
+            before,
+            "synthetic and observed navigations at or below the low-water mark must be rejected"
+        );
+
+        record_accepted_navigation_observation(
+            &harness.page,
+            AcceptedNavigationObservation::Document {
+                loader_id: Some("retained-loader".to_owned()),
+            },
+            Some(11),
+        );
+        let after_retained_navigation = navigation_observation_snapshot(&harness.page);
+        assert_eq!(after_retained_navigation.0, before.0 + 1);
+        assert_eq!(after_retained_navigation.4, before.4 + 1);
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_pending_console_before_replayed_navigation_keeps_previous_epoch() {
+        let harness = navigation_test_harness(16);
+        warm_main_frame_cache(&harness.page);
+        harness
+            .page
+            .console_capture
+            .requested
+            .store(true, Ordering::SeqCst);
+        for index in 0..10 {
+            harness.emit(json!({
+                "method": "Test.broadcastFiller",
+                "params": {"index": index}
+            }));
+        }
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "string", "value": "document-a"}]
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "main-frame",
+                    "loaderId": "loader-b",
+                    "url": "https://example.test/b"
+                }
+            }
+        }));
+        let events = harness.event_log.lock().unwrap().entries_since(10);
+        assert_eq!(events[0].0, 10);
+        assert_eq!(events[1].0, 11);
+
+        let before = navigation_observation_snapshot(&harness.page);
+        reconcile_frame_cache_invalidations(&harness.page);
+        let after_replay = navigation_observation_snapshot(&harness.page);
+        assert_eq!(after_replay.0, before.0 + 1);
+        assert_eq!(after_replay.4, before.4 + 1);
+
+        handle_page_oopif_event(Arc::clone(&harness.page), events[0].1.clone()).await;
+        let current = harness
+            .page
+            .console_records
+            .lock()
+            .unwrap()
+            .read(false, false);
+        assert!(current.records.is_empty());
+        let all = harness
+            .page
+            .console_records
+            .lock()
+            .unwrap()
+            .read(true, false);
+        assert_eq!(all.records.len(), 1);
+        assert_eq!(all.records[0].text, "document-a");
+        assert_eq!(all.records[0].navigation_epoch, before.4);
+
+        handle_page_oopif_event(Arc::clone(&harness.page), events[1].1.clone()).await;
+        assert_eq!(
+            navigation_observation_snapshot(&harness.page),
+            (
+                after_replay.0,
+                after_replay.1,
+                after_replay.2,
+                after_replay.3,
+                after_replay.4,
+                after_replay.5 + 1,
+            ),
+            "the listener copy must only add the pending console record"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_older_document_request_after_replay_keeps_previous_epoch() {
+        let harness = navigation_test_harness(16);
+        warm_main_frame_cache(&harness.page);
+        for index in 0..10 {
+            harness.emit(json!({
+                "method": "Test.broadcastFiller",
+                "params": {"index": index}
+            }));
+        }
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "document-a-request",
+                "frameId": "main-frame",
+                "loaderId": "loader-a",
+                "type": "Document",
+                "request": {
+                    "url": "https://example.test/a",
+                    "method": "GET",
+                    "headers": {}
+                }
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "main-frame",
+                    "loaderId": "loader-b",
+                    "url": "https://example.test/b"
+                }
+            }
+        }));
+        let events = harness.event_log.lock().unwrap().entries_since(10);
+        assert_eq!(events[0].0, 10);
+        assert_eq!(events[1].0, 11);
+
+        let before = navigation_observation_snapshot(&harness.page);
+        reconcile_frame_cache_invalidations(&harness.page);
+        let after_replay = navigation_observation_snapshot(&harness.page);
+        assert_eq!(after_replay.0, before.0 + 1);
+        assert_eq!(after_replay.2.as_deref(), Some("loader-b"));
+
+        handle_page_oopif_event(Arc::clone(&harness.page), events[0].1.clone()).await;
+        {
+            let mut network = harness.page.native_network_records.lock().unwrap();
+            assert_eq!(network.navigation_epoch, after_replay.0);
+            assert_eq!(network.current_loader_id.as_deref(), Some("loader-b"));
+            assert!(network.read(false, false).records.is_empty());
+            let all = network.read(true, false);
+            assert_eq!(all.records.len(), 1);
+            assert_eq!(all.records[0].url, "https://example.test/a");
+            assert_eq!(all.records[0].navigation_epoch, before.0);
+        }
+
+        handle_page_oopif_event(Arc::clone(&harness.page), events[1].1.clone()).await;
+        let after_listener = navigation_observation_snapshot(&harness.page);
+        assert_eq!(after_listener.0, after_replay.0);
+        assert_eq!(after_listener.1, after_replay.1);
+        assert_eq!(after_listener.2, after_replay.2);
+        assert_eq!(after_listener.3, after_replay.3 + 1);
+        assert_eq!(after_listener.4, after_replay.4);
+        assert_eq!(after_listener.5, after_replay.5);
+    }
+
+    #[tokio::test]
+    async fn sequence_gate_pending_observations_straddling_replayed_navigations_use_interval_epochs(
+    ) {
+        let harness = navigation_test_harness(24);
+        warm_main_frame_cache(&harness.page);
+        harness
+            .page
+            .console_capture
+            .requested
+            .store(true, Ordering::SeqCst);
+        for index in 0..10 {
+            harness.emit(json!({
+                "method": "Test.broadcastFiller",
+                "params": {"index": index}
+            }));
+        }
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "string", "value": "before-b"}]
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "main-frame",
+                    "loaderId": "loader-b",
+                    "url": "https://example.test/b"
+                }
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "string", "value": "between-b-and-c"}]
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "main-frame",
+                    "loaderId": "loader-c",
+                    "url": "https://example.test/c"
+                }
+            }
+        }));
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "string", "value": "after-c"}]
+            }
+        }));
+        let events = harness.event_log.lock().unwrap().entries_since(10);
+        assert_eq!(
+            events
+                .iter()
+                .map(|(sequence, _)| *sequence)
+                .collect::<Vec<_>>(),
+            vec![10, 11, 12, 13, 14]
+        );
+
+        let initial_epoch = harness
+            .page
+            .console_records
+            .lock()
+            .unwrap()
+            .navigation_epoch;
+        reconcile_frame_cache_invalidations(&harness.page);
+        assert_eq!(
+            harness
+                .page
+                .console_records
+                .lock()
+                .unwrap()
+                .navigation_epoch,
+            initial_epoch + 2
+        );
+
+        for event_index in [0, 2, 4] {
+            handle_page_oopif_event(Arc::clone(&harness.page), events[event_index].1.clone()).await;
+        }
+        let mut console = harness.page.console_records.lock().unwrap();
+        let all = console.read(true, false);
+        assert_eq!(
+            all.records
+                .iter()
+                .map(|record| (record.text.as_str(), record.navigation_epoch))
+                .collect::<Vec<_>>(),
+            vec![
+                ("before-b", initial_epoch),
+                ("between-b-and-c", initial_epoch + 1),
+                ("after-c", initial_epoch + 2),
+            ]
+        );
+        let current = console.read(false, false);
+        assert_eq!(current.records.len(), 1);
+        assert_eq!(current.records[0].text, "after-c");
+    }
+
+    #[test]
+    fn sequence_gate_navigation_epoch_history_prunes_at_listener_low_water_mark() {
+        let mut epochs = AcceptedNavigationEpochs::default();
+        epochs.record(Some(10), 1);
+        epochs.record(Some(20), 2);
+        epochs.record(Some(30), 3);
+
+        epochs.prune_through(21);
+
+        assert_eq!(epochs.floor_epoch, 2);
+        assert_eq!(
+            epochs.by_sequence.keys().copied().collect::<Vec<_>>(),
+            vec![30]
+        );
+        assert_eq!(epochs.epoch_for_observation(Some(25), 3), 2);
+        assert_eq!(epochs.epoch_for_observation(Some(31), 3), 3);
+    }
+
+    #[tokio::test]
+    async fn lag_reconciliation_registers_recovered_iframe_session_once() {
+        let mut harness = navigation_test_harness(4096);
+        start_page_frame_cache_tracking(&harness.page, 0, "page-session");
+        warm_main_frame_cache(&harness.page);
+        *harness
+            .page
+            .browser
+            .stealth_user_agent_override
+            .lock()
+            .unwrap() = Some(Value::Null);
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "session-b",
+                "targetInfo": {
+                    "targetId": "outer-frame",
+                    "parentFrameId": "main-frame",
+                    "type": "iframe",
+                    "attached": true
+                },
+                "waitingForDebugger": false
+            }
+        }));
+        for index in 0..4096 {
+            harness.emit(json!({
+                "method": "Test.broadcastFiller",
+                "params": {"index": index}
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if harness
+                    .page
+                    .frame_state
+                    .lock()
+                    .unwrap()
+                    .frame_sessions
+                    .contains_key("outer-frame")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the lag branch must reconcile the dropped attachment");
+
+        let page = Arc::clone(&harness.page);
+        let operations = async move {
+            reconcile_frame_cache_invalidations(&page);
+            reconcile_frame_cache_invalidations(&page);
+            let mut updates = page.frame_state.lock().unwrap().subscribe_session_updates();
+            loop {
+                if page
+                    .frame_state
+                    .lock()
+                    .unwrap()
+                    .iframe_sessions_ready
+                    .contains("session-b")
+                {
+                    break;
+                }
+                updates.changed().await.expect("setup update");
+            }
+            resolve_locator_session(
+                Arc::clone(&page),
+                &json!({
+                    "kind": "frame",
+                    "frame_selector": "iframe",
+                    "inner": {"kind": "css", "selector": "button"}
+                })
+                .to_string(),
+                OperationDeadline::new(Duration::from_millis(750)),
+            )
+            .await
+        };
+        let responder = async {
+            let prearm = harness.next_command("Target.setAutoAttach").await;
+            assert_eq!(prearm["sessionId"], "session-b");
+            harness.reply(&prearm, json!({}));
+
+            let mut domain_methods = HashSet::new();
+            for _ in DEFAULT_ATTACHED_SESSION_DOMAINS {
+                let command = harness.next_command_any().await;
+                assert_eq!(command["sessionId"], "session-b");
+                domain_methods.insert(command["method"].as_str().unwrap().to_string());
+                harness.reply(&command, json!({}));
+            }
+            assert_eq!(
+                domain_methods,
+                HashSet::from([
+                    "Page.enable".to_string(),
+                    "DOM.enable".to_string(),
+                    "Network.enable".to_string(),
+                ])
+            );
+            harness.reply_action_dispatch_binding("session-b").await;
+            let focus = harness
+                .next_command("Emulation.setFocusEmulationEnabled")
+                .await;
+            assert_eq!(focus["sessionId"], "session-b");
+            harness.reply(&focus, json!({}));
+            let intercept = harness
+                .next_command("Page.setInterceptFileChooserDialog")
+                .await;
+            harness.reply(&intercept, json!({}));
+            let mut stealth_methods = HashSet::new();
+            for _ in 0..2 {
+                let command = harness.next_command_any().await;
+                stealth_methods.insert(command["method"].as_str().unwrap().to_string());
+                harness.reply(&command, json!({}));
+            }
+            assert_eq!(
+                stealth_methods,
+                HashSet::from([
+                    "Page.addScriptToEvaluateOnNewDocument".to_string(),
+                    "Runtime.evaluate".to_string(),
+                ])
+            );
+
+            let child_refresh = harness.next_command("Page.getFrameTree").await;
+            assert_eq!(child_refresh["sessionId"], "session-b");
+            harness.reply(
+                &child_refresh,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "outer-frame",
+                            "parentId": "main-frame",
+                            "url": "https://b.test/"
+                        }
+                    }
+                }),
+            );
+            let parent_refresh = harness.next_command("Page.getFrameTree").await;
+            assert_eq!(parent_refresh["sessionId"], "page-session");
+            harness.reply(
+                &parent_refresh,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "main-frame",
+                            "url": "https://example.test/"
+                        },
+                        "childFrames": [{
+                            "frame": {
+                                "id": "outer-frame",
+                                "parentId": "main-frame",
+                                "url": "https://b.test/"
+                            }
+                        }]
+                    }
+                }),
+            );
+            harness.reply_frame_owner("outer-frame", false).await;
+            assert!(
+                harness.write_rx.try_recv().is_err(),
+                "lag recovery must remain single-flight"
+            );
+        };
+        let (resolution, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(operations, responder)
+        })
+        .await
+        .expect("lag recovery and locator resolution must finish");
+        let resolution = resolution.expect("locator must use the recovered session");
+        assert_eq!(resolution.session_id, "session-b");
+        let state = harness.page.frame_state.lock().unwrap();
+        assert!(state.iframe_sessions_armed.contains("session-b"));
+        assert!(state.iframe_sessions_ready.contains("session-b"));
+        assert!(state.iframe_setup_started.contains("session-b"));
+        assert!(state.frame_session_errors.get("outer-frame").is_none());
+    }
+
+    #[tokio::test]
+    async fn recovered_session_detached_before_arm_is_not_restored_or_commanded() {
+        let mut harness = navigation_test_harness(16);
+        start_page_frame_cache_tracking_without_listener(&harness.page, 0, "page-session");
+        warm_main_frame_cache(&harness.page);
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "session-b",
+                "targetInfo": {
+                    "targetId": "outer-frame",
+                    "parentFrameId": "main-frame",
+                    "type": "iframe",
+                    "attached": true
+                },
+                "waitingForDebugger": false
+            }
+        }));
+        let recovered_session = {
+            let log = harness.event_log.lock().unwrap();
+            let mut main_frame_id = harness.page.main_frame_id.lock().unwrap();
+            let mut state = harness.page.frame_state.lock().unwrap();
+            let mut reconciliation = reconcile_frame_cache_invalidations_locked(
+                &mut state,
+                &mut main_frame_id,
+                &harness.page.crashed,
+                harness.page.session_id.as_str(),
+                &log,
+                None,
+                None,
+            );
+            assert!(reconciliation.navigation_observations.is_empty());
+            assert_eq!(reconciliation.recovered_sessions.len(), 1);
+            assert_eq!(state.frame_sessions["outer-frame"], "session-b");
+            reconciliation.recovered_sessions.pop().unwrap()
+        };
+
+        handle_page_oopif_event(
+            Arc::clone(&harness.page),
+            json!({
+                "sessionId": "page-session",
+                "method": "Target.detachedFromTarget",
+                "params": {"sessionId": "session-b"}
+            }),
+        )
+        .await;
+        assert!(
+            !arm_recovered_attached_iframe_session(
+                &harness.page,
+                recovered_session.frame_id,
+                recovered_session.child_session_id,
+                Duration::from_millis(500),
+            ),
+            "a detached recovered owner must not enter the setup FSM"
+        );
+        {
+            let state = harness.page.frame_state.lock().unwrap();
+            assert_eq!(state.frame_sessions["outer-frame"], "page-session");
+            assert!(!state.iframe_setup_started.contains("session-b"));
+            assert!(!state.iframe_sessions_armed.contains("session-b"));
+        }
+        assert!(
+            harness.write_rx.try_recv().is_err(),
+            "recovery must emit no command to the detached session"
+        );
+
+        handle_page_oopif_event(
+            Arc::clone(&harness.page),
+            json!({
+                "sessionId": "page-session",
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": "session-c",
+                    "targetInfo": {
+                        "targetId": "outer-frame",
+                        "parentFrameId": "main-frame",
+                        "type": "iframe",
+                        "attached": true
+                    },
+                    "waitingForDebugger": false
+                }
+            }),
+        )
+        .await;
+        let reattach_prearm = harness.next_command("Target.setAutoAttach").await;
+        assert_eq!(reattach_prearm["sessionId"], "session-c");
+        harness.reply_error(&reattach_prearm, "test stops after normal re-attach begins");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            harness.page.frame_state.lock().unwrap().frame_sessions["outer-frame"],
+            "session-c"
+        );
+        assert!(harness.write_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn recovered_session_superseded_before_arm_keeps_and_sets_up_newer_owner() {
+        let mut harness = navigation_test_harness(16);
+        start_page_frame_cache_tracking_without_listener(&harness.page, 0, "page-session");
+        warm_main_frame_cache(&harness.page);
+        *harness
+            .page
+            .browser
+            .stealth_user_agent_override
+            .lock()
+            .unwrap() = Some(Value::Null);
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "session-b",
+                "targetInfo": {
+                    "targetId": "outer-frame",
+                    "parentFrameId": "main-frame",
+                    "type": "iframe",
+                    "attached": true
+                },
+                "waitingForDebugger": false
+            }
+        }));
+        let recovered_session = {
+            let log = harness.event_log.lock().unwrap();
+            let mut main_frame_id = harness.page.main_frame_id.lock().unwrap();
+            let mut state = harness.page.frame_state.lock().unwrap();
+            let mut reconciliation = reconcile_frame_cache_invalidations_locked(
+                &mut state,
+                &mut main_frame_id,
+                &harness.page.crashed,
+                harness.page.session_id.as_str(),
+                &log,
+                None,
+                None,
+            );
+            assert!(reconciliation.navigation_observations.is_empty());
+            assert_eq!(reconciliation.recovered_sessions.len(), 1);
+            reconciliation.recovered_sessions.pop().unwrap()
+        };
+
+        handle_page_oopif_event(
+            Arc::clone(&harness.page),
+            json!({
+                "sessionId": "page-session",
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": "session-c",
+                    "targetInfo": {
+                        "targetId": "outer-frame",
+                        "parentFrameId": "main-frame",
+                        "type": "iframe",
+                        "attached": true
+                    },
+                    "waitingForDebugger": false
+                }
+            }),
+        )
+        .await;
+        assert!(
+            !arm_recovered_attached_iframe_session(
+                &harness.page,
+                recovered_session.frame_id,
+                recovered_session.child_session_id,
+                Duration::from_millis(500),
+            ),
+            "a superseded recovered owner must not enter the setup FSM"
+        );
+
+        let prearm = harness.next_command("Target.setAutoAttach").await;
+        assert_eq!(prearm["sessionId"], "session-c");
+        harness.reply(&prearm, json!({}));
+        let mut domain_methods = HashSet::new();
+        for _ in DEFAULT_ATTACHED_SESSION_DOMAINS {
+            let command = harness.next_command_any().await;
+            assert_eq!(command["sessionId"], "session-c");
+            domain_methods.insert(command["method"].as_str().unwrap().to_string());
+            harness.reply(&command, json!({}));
+        }
+        assert_eq!(
+            domain_methods,
+            HashSet::from([
+                "Page.enable".to_string(),
+                "DOM.enable".to_string(),
+                "Network.enable".to_string(),
+            ])
+        );
+        harness.reply_action_dispatch_binding("session-c").await;
+        let focus = harness
+            .next_command("Emulation.setFocusEmulationEnabled")
+            .await;
+        assert_eq!(focus["sessionId"], "session-c");
+        harness.reply(&focus, json!({}));
+        let intercept = harness
+            .next_command("Page.setInterceptFileChooserDialog")
+            .await;
+        assert_eq!(intercept["sessionId"], "session-c");
+        harness.reply(&intercept, json!({}));
+        let mut stealth_methods = HashSet::new();
+        for _ in 0..2 {
+            let command = harness.next_command_any().await;
+            assert_eq!(command["sessionId"], "session-c");
+            stealth_methods.insert(command["method"].as_str().unwrap().to_string());
+            harness.reply(&command, json!({}));
+        }
+        assert_eq!(
+            stealth_methods,
+            HashSet::from([
+                "Page.addScriptToEvaluateOnNewDocument".to_string(),
+                "Runtime.evaluate".to_string(),
+            ])
+        );
+        let child_refresh = harness.next_command("Page.getFrameTree").await;
+        assert_eq!(child_refresh["sessionId"], "session-c");
+        harness.reply(
+            &child_refresh,
+            json!({
+                "frameTree": {
+                    "frame": {
+                        "id": "outer-frame",
+                        "parentId": "main-frame",
+                        "url": "https://c.test/"
+                    }
+                }
+            }),
+        );
+        tokio::task::yield_now().await;
+        let state = harness.page.frame_state.lock().unwrap();
+        assert_eq!(state.frame_sessions["outer-frame"], "session-c");
+        assert!(!state.iframe_setup_started.contains("session-b"));
+        assert!(!state.iframe_sessions_armed.contains("session-b"));
+        assert!(state.iframe_sessions_armed.contains("session-c"));
+        assert!(state.iframe_sessions_ready.contains("session-c"));
+        assert!(harness.write_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn replaced_session_cannot_publish_after_late_prearm_success() {
+        let mut harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        register_attached_iframe_session_at_sequence(
+            Arc::clone(&harness.page),
+            "outer-frame".to_string(),
+            Some("main-frame".to_string()),
+            "page-session".to_string(),
+            "session-a".to_string(),
+            None,
+            Duration::from_millis(500),
+        )
+        .expect("session A registration dispatch");
+        let stale_prearm = harness.next_command("Target.setAutoAttach").await;
+        register_attached_iframe_session_at_sequence(
+            Arc::clone(&harness.page),
+            "outer-frame".to_string(),
+            Some("main-frame".to_string()),
+            "page-session".to_string(),
+            "session-b".to_string(),
+            None,
+            Duration::from_millis(500),
+        )
+        .expect("session B registration dispatch");
+        let replacement_prearm = harness.next_command("Target.setAutoAttach").await;
+
+        harness.reply(&stale_prearm, json!({}));
+        tokio::task::yield_now().await;
+        {
+            let state = harness.page.frame_state.lock().unwrap();
+            assert_eq!(state.frame_sessions["outer-frame"], "session-b");
+            assert!(!state.iframe_sessions_armed.contains("session-a"));
+            assert!(!state.iframe_sessions_ready.contains("session-a"));
+            assert!(!state.page_domain_enabled_sessions.contains("session-a"));
+        }
+        harness.reply_error(&replacement_prearm, "permanent rejection");
+        tokio::task::yield_now().await;
+        assert!(harness.write_rx.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn detached_oopif_retry_remaps_to_replacement_without_refreshing_dead_session() {
+        let mut harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.record_session_for_frame("outer-frame", "session-a");
+            state.record_frame(
+                "outer-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                None,
+                "session-a".to_string(),
+            );
+            state.record_frame(
+                "inner-frame".to_string(),
+                Some("outer-frame".to_string()),
+                None,
+                None,
+                "session-a".to_string(),
+            );
+            state.mark_page_domain_enabled("session-a");
+            state.mark_iframe_session_ready_for_session("outer-frame", "session-a");
+            let generation = state
+                .frame_cache_refresh_generation("session-a")
+                .expect("session A cache starts dirty");
+            state.mark_frame_tree_refreshed("session-a", generation);
+        }
+
+        let page = Arc::clone(&harness.page);
+        let responder_page = Arc::clone(&harness.page);
+        let locator_json = json!({
+            "kind": "frame",
+            "frame_selector": "#outer",
+            "inner": {
+                "kind": "frame",
+                "frame_selector": "#inner",
+                "inner": {"kind": "css", "selector": "button"}
+            }
+        })
+        .to_string();
+        let resolution = resolve_locator_session(
+            page,
+            &locator_json,
+            OperationDeadline::new(Duration::from_millis(750)),
+        );
+        let responder = async move {
+            harness.reply_frame_owner("outer-frame", false).await;
+            let stale = harness.next_command_any().await;
+            assert!(
+                stale["method"] == "Runtime.evaluate" || stale["method"] == "Page.getFrameTree"
+            );
+            assert_eq!(stale["sessionId"], "session-a");
+            harness.reply_error(&stale, "Session with given id not found");
+            {
+                let mut state = responder_page.frame_state.lock().unwrap();
+                state.record_session_for_frame("outer-frame", "session-b");
+                state.mark_page_domain_enabled("session-b");
+                state.mark_iframe_session_ready_for_session("outer-frame", "session-b");
+            }
+            let parent_refresh = harness.next_command("Page.getFrameTree").await;
+            assert_eq!(parent_refresh["sessionId"], "page-session");
+            harness.reply(
+                &parent_refresh,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "main-frame",
+                            "url": "https://example.test/"
+                        },
+                        "childFrames": [{
+                            "frame": {
+                                "id": "outer-frame",
+                                "parentId": "main-frame",
+                                "url": "https://child.test/"
+                            }
+                        }]
+                    }
+                }),
+            );
+
+            harness.reply_frame_owner("outer-frame", false).await;
+            let refresh = harness.next_command("Page.getFrameTree").await;
+            assert_eq!(refresh["sessionId"], "session-b");
+            harness.reply(
+                &refresh,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "outer-frame",
+                            "parentId": "main-frame",
+                            "url": "https://child.test/"
+                        },
+                        "childFrames": [{
+                            "frame": {
+                                "id": "inner-frame",
+                                "parentId": "outer-frame",
+                                "url": "about:blank"
+                            }
+                        }]
+                    }
+                }),
+            );
+            harness.reply_frame_owner("inner-frame", true).await;
+            assert!(harness.write_rx.try_recv().is_err());
+        };
+        let (resolution, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(resolution, responder)
+        })
+        .await
+        .expect("process-swap resolution must complete");
+        let resolution = resolution.expect("replacement session must resolve locator");
+        assert_eq!(resolution.session_id, "session-b");
+    }
+
+    #[tokio::test]
+    async fn ownership_barrier_retries_after_lagged_protocol_handoff_context_loss() {
+        let mut harness = navigation_test_harness(16);
+        warm_main_frame_cache(&harness.page);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.record_session_for_frame("outer-frame", "session-a");
+            state.record_frame(
+                "outer-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                None,
+                "session-a".to_string(),
+            );
+            state.mark_page_domain_enabled("session-a");
+            state.mark_iframe_session_ready_for_session("outer-frame", "session-a");
+            let generation = state
+                .frame_cache_refresh_generation("session-a")
+                .expect("session A cache starts dirty");
+            state.mark_frame_tree_refreshed("session-a", generation);
+            assert!(state.cache_execution_context("outer-frame", "session-a", json!(41),));
+        }
+
+        let page = Arc::clone(&harness.page);
+        let responder_page = Arc::clone(&harness.page);
+        let action = evaluate_locator_for_page(
+            page,
+            json!({
+                "kind": "frame",
+                "frame_selector": "iframe",
+                "inner": {"kind": "css", "selector": "button"}
+            })
+            .to_string(),
+            0,
+            "return true;".to_string(),
+            Duration::from_millis(750),
+        );
+        let responder = async move {
+            harness.reply_frame_owner("outer-frame", false).await;
+            harness
+                .reply_serializer_install("session-a", Some(41), "outgoing-serializer")
+                .await;
+            let outgoing_action = harness.next_command("Runtime.callFunctionOn").await;
+            assert_eq!(outgoing_action["sessionId"], "session-a");
+            assert_eq!(outgoing_action["params"]["objectId"], "outgoing-serializer");
+
+            // Chromium has committed the process swap and destroyed context 41,
+            // but its Target events are deliberately delivered only after the
+            // outgoing renderer rejects the context-bound call.
+            harness.reply_error(&outgoing_action, "Cannot find context with specified id");
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.frameDetached",
+                "params": {"frameId": "outer-frame", "reason": "swap"}
+            }));
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": "session-b",
+                    "targetInfo": {
+                        "targetId": "outer-frame",
+                        "parentFrameId": "main-frame",
+                        "type": "iframe",
+                        "attached": true
+                    },
+                    "waitingForDebugger": false
+                }
+            }));
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Target.detachedFromTarget",
+                "params": {
+                    "sessionId": "session-a",
+                    "targetId": "outer-frame"
+                }
+            }));
+            reconcile_frame_cache_invalidations(&responder_page);
+            let mut saw_recovered_prearm = false;
+            let mut rejected_stale_serializer_reinstall = false;
+            while !saw_recovered_prearm || !rejected_stale_serializer_reinstall {
+                let command = harness.next_command_any().await;
+                match (command["method"].as_str(), command["sessionId"].as_str()) {
+                    (Some("Target.setAutoAttach"), Some("session-b")) => {
+                        saw_recovered_prearm = true;
+                    }
+                    (Some("Runtime.evaluate"), Some("session-a")) => {
+                        assert_eq!(command["params"]["contextId"], 41);
+                        assert!(command["params"]["expression"]
+                            .as_str()
+                            .is_some_and(|expression| expression
+                                .contains("__rustwright_serializer_factory__")));
+                        harness.reply_error(&command, "Cannot find context with specified id");
+                        rejected_stale_serializer_reinstall = true;
+                    }
+                    _ => panic!("unexpected handoff recovery command: {command}"),
+                }
+            }
+            {
+                let mut state = responder_page.frame_state.lock().unwrap();
+                assert_eq!(
+                    state.frame_sessions.get("outer-frame").map(String::as_str),
+                    Some("session-b")
+                );
+                assert!(state.frame_tree_dirty_sessions.contains("page-session"));
+                // Reconciliation starts the real setup task. Its pre-arm response is
+                // withheld above, so apply deterministic readiness at this test seam.
+                state.mark_page_domain_enabled("session-b");
+                state.mark_iframe_session_ready_for_session("outer-frame", "session-b");
+            }
+
+            let parent_refresh = harness.next_command("Page.getFrameTree").await;
+            assert_eq!(parent_refresh["sessionId"], "page-session");
+            harness.reply(
+                &parent_refresh,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "main-frame",
+                            "loaderId": "loader-main",
+                            "url": "https://example.test/"
+                        },
+                        "childFrames": [{
+                            "frame": {
+                                "id": "outer-frame",
+                                "parentId": "main-frame",
+                                "loaderId": "loader-b",
+                                "url": "https://replacement.test/"
+                            }
+                        }]
+                    }
+                }),
+            );
+            harness.reply_frame_owner("outer-frame", false).await;
+            let child_refresh = harness.next_command("Page.getFrameTree").await;
+            assert_eq!(child_refresh["sessionId"], "session-b");
+            harness.reply(
+                &child_refresh,
+                json!({
+                    "frameTree": {
+                        "frame": {
+                            "id": "outer-frame",
+                            "parentId": "main-frame",
+                            "loaderId": "loader-b",
+                            "url": "https://replacement.test/"
+                        }
+                    }
+                }),
+            );
+            let create_world = harness.next_command("Page.createIsolatedWorld").await;
+            assert_eq!(create_world["sessionId"], "session-b");
+            assert_eq!(create_world["params"]["frameId"], "outer-frame");
+            harness.reply(&create_world, json!({"executionContextId": 42}));
+            harness
+                .reply_serializer_install("session-b", Some(42), "replacement-serializer")
+                .await;
+            let replacement_action = harness.next_command("Runtime.callFunctionOn").await;
+            assert_eq!(replacement_action["sessionId"], "session-b");
+            assert_eq!(
+                replacement_action["params"]["objectId"],
+                "replacement-serializer"
+            );
+            harness.reply(
+                &replacement_action,
+                json!({"result": {"type": "boolean", "value": true}}),
+            );
+            assert!(harness.write_rx.try_recv().is_err());
+        };
+        let (action, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(action, responder)
+        })
+        .await
+        .expect("lagged protocol handoff must complete");
+        assert_eq!(action.expect("replacement action"), "true");
+    }
+
+    #[tokio::test]
+    async fn ownership_change_applied_during_world_setup_blocks_outgoing_dispatch() {
+        let mut harness = navigation_test_harness(16);
+        warm_main_frame_cache(&harness.page);
+        let resolution = {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.record_session_for_frame("outer-frame", "session-a");
+            state.record_frame(
+                "outer-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                None,
+                "session-a".to_string(),
+            );
+            LocatorSessionResolution {
+                session_id: "session-a".to_string(),
+                frame_id: Some("outer-frame".to_string()),
+                locator_json: json!({"kind": "css", "selector": "button"}).to_string(),
+                ownership_generation: state.frame_ownership_generation,
+            }
+        };
+        let page = Arc::clone(&harness.page);
+        let evaluation = evaluate_locator_resolution(
+            &page,
+            &resolution,
+            "true".to_string(),
+            OperationDeadline::new(Duration::from_millis(500)),
+            Duration::ZERO,
+        );
+        let reconcile_page = Arc::clone(&harness.page);
+        let responder = async move {
+            let create_world = harness.next_command("Page.createIsolatedWorld").await;
+            assert_eq!(create_world["sessionId"], "session-a");
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Page.frameDetached",
+                "params": {"frameId": "outer-frame", "reason": "swap"}
+            }));
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": "session-b",
+                    "targetInfo": {
+                        "targetId": "outer-frame",
+                        "parentFrameId": "main-frame",
+                        "type": "iframe",
+                        "attached": true
+                    },
+                    "waitingForDebugger": false
+                }
+            }));
+            harness.emit(json!({
+                "sessionId": "page-session",
+                "method": "Target.detachedFromTarget",
+                "params": {"sessionId": "session-a", "targetId": "outer-frame"}
+            }));
+            reconcile_frame_cache_invalidations(&reconcile_page);
+            let recovered_prearm = harness.next_command("Target.setAutoAttach").await;
+            assert_eq!(recovered_prearm["sessionId"], "session-b");
+            harness.reply(&create_world, json!({"executionContextId": 41}));
+            tokio::task::yield_now().await;
+            assert!(
+                harness.write_rx.try_recv().is_err(),
+                "no Runtime call may reach session A after setup applies the handoff"
+            );
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(evaluation, responder)
+        })
+        .await
+        .expect("world-setup handoff must complete");
+        assert!(matches!(
+            &result,
+            Err(error) if is_frame_ownership_changed(error)
+        ));
     }
 
     struct PendingIframeSetup {
@@ -10395,12 +15627,12 @@ multiline-compatible = """4.5.6"""
                 json!({ "result": { "type": "object", "objectId": "frame-owner" } }),
             ),
             (
-                "Runtime.callFunctionOn",
-                json!({ "result": { "type": "boolean", "value": false } }),
-            ),
-            (
                 "DOM.describeNode",
                 json!({ "node": { "frameId": "child-frame" } }),
+            ),
+            (
+                "Runtime.callFunctionOn",
+                json!({ "result": { "type": "boolean", "value": false } }),
             ),
             ("Runtime.releaseObject", json!({})),
             (
@@ -10492,12 +15724,12 @@ multiline-compatible = """4.5.6"""
                 json!({ "result": { "type": "object", "objectId": "frame-owner" } }),
             ),
             (
-                "Runtime.callFunctionOn",
-                json!({ "result": { "type": "boolean", "value": false } }),
-            ),
-            (
                 "DOM.describeNode",
                 json!({ "node": { "frameId": "child-frame" } }),
+            ),
+            (
+                "Runtime.callFunctionOn",
+                json!({ "result": { "type": "boolean", "value": false } }),
             ),
             ("Runtime.releaseObject", json!({})),
             (
@@ -10584,12 +15816,12 @@ multiline-compatible = """4.5.6"""
                 json!({ "result": { "type": "object", "objectId": "frame-owner" } }),
             ),
             (
-                "Runtime.callFunctionOn",
-                json!({ "result": { "type": "boolean", "value": false } }),
-            ),
-            (
                 "DOM.describeNode",
                 json!({ "node": { "frameId": "auto-child-frame" } }),
+            ),
+            (
+                "Runtime.callFunctionOn",
+                json!({ "result": { "type": "boolean", "value": false } }),
             ),
             ("Runtime.releaseObject", json!({})),
         ] {
@@ -10679,12 +15911,12 @@ multiline-compatible = """4.5.6"""
                 json!({ "result": { "type": "object", "objectId": "frame-owner" } }),
             ),
             (
-                "Runtime.callFunctionOn",
-                json!({ "result": { "type": "boolean", "value": false } }),
-            ),
-            (
                 "DOM.describeNode",
                 json!({ "node": { "frameId": "racing-child-frame" } }),
+            ),
+            (
+                "Runtime.callFunctionOn",
+                json!({ "result": { "type": "boolean", "value": false } }),
             ),
             ("Runtime.releaseObject", json!({})),
             (
@@ -11576,12 +16808,12 @@ multiline-compatible = """4.5.6"""
                 json!({ "result": { "type": "object", "objectId": "frame-owner" } }),
             ),
             (
-                "Runtime.callFunctionOn",
-                json!({ "result": { "type": "boolean", "value": false } }),
-            ),
-            (
                 "DOM.describeNode",
                 json!({ "node": { "frameId": "existing-child-frame" } }),
+            ),
+            (
+                "Runtime.callFunctionOn",
+                json!({ "result": { "type": "boolean", "value": false } }),
             ),
             ("Runtime.releaseObject", json!({})),
         ] {
@@ -11832,14 +17064,23 @@ multiline-compatible = """4.5.6"""
                                     json!({ "executionContextId": 1 }),
                                 );
                             }
-                            "Runtime.evaluate"
+                            "Runtime.evaluate" | "Runtime.callFunctionOn"
                                 if session_id == Some("click-child-session")
-                                    && command["params"]["expression"] != "void 0" =>
+                                    && input_command_expression(&command) != Some("void 0") =>
                             {
-                                let expression = command["params"]["expression"]
-                                    .as_str()
+                                let expression = input_command_expression(&command)
                                     .expect("evaluation expression");
-                                if expression.contains("receives_events") {
+                                if expression.contains("__rustwright_serializer_factory__") {
+                                    harness.reply(
+                                        &command,
+                                        json!({
+                                            "result": {
+                                                "type": "object",
+                                                "objectId": "frame-serializer",
+                                            }
+                                        }),
+                                    );
+                                } else if expression.contains("receives_events") {
                                     harness.reply(
                                         &command,
                                         json!({ "result": { "type": "object", "value": actionable } }),
@@ -12186,6 +17427,58 @@ multiline-compatible = """4.5.6"""
     }
 
     #[tokio::test]
+    async fn sequence_gate_merge_fix_round1_rejected_attach_cannot_seed_stale_metadata() {
+        let harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        handle_page_oopif_event(
+            Arc::clone(&harness.page),
+            json!({
+                "__rustwright_cdp_event_seq": 10,
+                "sessionId": "page-session",
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": "current-session",
+                    "targetInfo": {
+                        "type": "iframe",
+                        "targetId": "metadata-frame",
+                        "parentFrameId": "main-frame",
+                        "name": "current-name",
+                        "url": "https://current.example.test/"
+                    }
+                }
+            }),
+        )
+        .await;
+        handle_page_oopif_event(
+            Arc::clone(&harness.page),
+            json!({
+                "__rustwright_cdp_event_seq": 9,
+                "sessionId": "page-session",
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": "stale-session",
+                    "targetInfo": {
+                        "type": "iframe",
+                        "targetId": "metadata-frame",
+                        "parentFrameId": "main-frame",
+                        "name": "stale-name",
+                        "url": "https://stale.example.test/"
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let state = harness.page.frame_state.lock().unwrap();
+        let frame = state.frames.get("metadata-frame").expect("attached frame");
+        assert_eq!(state.frame_sessions["metadata-frame"], "current-session");
+        assert_eq!(frame.name, "current-name");
+        assert_eq!(frame.url, "https://current.example.test/");
+        drop(state);
+        harness.page.abort_iframe_setup_tasks();
+    }
+
+    #[tokio::test]
     async fn frame_detached_event_invalidates_attachment_and_wakes_pinned_waiter() {
         let mut harness = navigation_test_harness(8);
         harness.listen_for_oopif_events();
@@ -12508,7 +17801,7 @@ multiline-compatible = """4.5.6"""
     }
 
     #[tokio::test]
-    async fn swap_mid_init_waiter_follows_fully_initialized_successor() {
+    async fn sequence_gate_merge_fix_round1_swap_mid_init_aborts_loser_and_follows_successor() {
         let mut harness = navigation_test_harness(16);
         harness.listen_for_oopif_events();
         let old_page = Arc::clone(&harness.page);
@@ -12525,6 +17818,7 @@ multiline-compatible = """4.5.6"""
         });
         harness.reply_next("Target.setAutoAttach", json!({})).await;
         let old_pin = old_registration.await.unwrap();
+        let old_generation = old_pin.generation;
 
         let mut old_setup_reply = None;
         for _ in 0..DEFAULT_ATTACHED_SESSION_DOMAINS.len() {
@@ -12572,6 +17866,21 @@ multiline-compatible = """4.5.6"""
         })
         .await
         .expect("swap event must reach the production listener");
+        assert!(!harness
+            .page
+            .iframe_setup_tasks
+            .handles
+            .lock()
+            .unwrap()
+            .contains_key(&old_generation));
+        let old_setup_id = old_setup_reply["id"].as_u64().unwrap();
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while harness.pending.lock().unwrap().contains_key(&old_setup_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("swap must cancel the losing generation's pending setup command");
         {
             let state = harness.page.frame_state.lock().unwrap();
             assert!(state.frames.contains_key("child-frame"));
@@ -13661,12 +18970,12 @@ multiline-compatible = """4.5.6"""
                 json!({ "result": { "type": "object", "objectId": "frame-owner" } }),
             ),
             (
-                "Runtime.callFunctionOn",
-                json!({ "result": { "type": "boolean", "value": false } }),
-            ),
-            (
                 "DOM.describeNode",
                 json!({ "node": { "frameId": "child-frame" } }),
+            ),
+            (
+                "Runtime.callFunctionOn",
+                json!({ "result": { "type": "boolean", "value": false } }),
             ),
             ("Runtime.releaseObject", json!({})),
             (
@@ -15108,8 +20417,7 @@ multiline-compatible = """4.5.6"""
                 );
                 harness.reply(&utility_world, json!({ "executionContextId": 2 }));
                 harness
-                    .reply_next(
-                        "Runtime.evaluate",
+                    .reply_next_runtime_evaluation(
                         json!({ "result": { "type": "object", "objectId": "node-dialog" } }),
                     )
                     .await;
@@ -15320,8 +20628,7 @@ multiline-compatible = """4.5.6"""
             );
             harness.reply(&utility_world, json!({ "executionContextId": 2 }));
             harness
-                .reply_next(
-                    "Runtime.evaluate",
+                .reply_next_runtime_evaluation(
                     json!({ "result": { "type": "object", "objectId": "node-1" } }),
                 )
                 .await;
@@ -16680,6 +21987,7 @@ multiline-compatible = """4.5.6"""
                 session_id: "page-session".to_string(),
                 frame_id: None,
                 locator_json: r#"{"kind":"css","selector":"button"}"#.to_string(),
+                ownership_generation: 0,
             },
             object_id: "resolved-object".to_string(),
         };
@@ -18601,6 +23909,7 @@ struct CdpClient {
     sent_runtime_enable_count: AtomicU64,
     sent_target_close_count: AtomicU64,
     sent_context_dispose_count: AtomicU64,
+    sent_get_frame_tree_count: AtomicU64,
     alive: Arc<AtomicBool>,
     alive_tx: watch::Sender<bool>,
 }
@@ -18694,13 +24003,20 @@ impl CdpEventLog {
         self.next_seq
     }
 
-    fn push(&mut self, event: Value) {
+    fn push(&mut self, mut event: Value) -> Value {
         let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
-        self.events.push_back((seq, event));
+        advance_lifetime_counter(&mut self.next_seq);
+        if let Some(object) = event.as_object_mut() {
+            object.insert(
+                "__rustwright_cdp_event_seq".to_string(),
+                Value::Number(seq.into()),
+            );
+        }
+        self.events.push_back((seq, event.clone()));
         while self.events.len() > CDP_EVENT_LOG_LIMIT {
             self.events.pop_front();
         }
+        event
     }
     fn register_action_dispatch(
         &mut self,
@@ -18847,7 +24163,7 @@ fn dispatch_cdp_payload_with_diagnostics(
             .push(CdpTrafficEntry::received_event(&payload));
         let mut event_log = event_log.lock().unwrap();
         event_log.record_action_dispatch_receipt(&payload);
-        event_log.push(payload.clone());
+        let payload = event_log.push(payload);
         let _ = events.send(payload);
     }
 }
@@ -19309,6 +24625,7 @@ impl CdpClient {
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
             sent_context_dispose_count: AtomicU64::new(0),
+            sent_get_frame_tree_count: AtomicU64::new(0),
             alive,
             alive_tx,
         }))
@@ -19451,6 +24768,7 @@ impl CdpClient {
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
             sent_context_dispose_count: AtomicU64::new(0),
+            sent_get_frame_tree_count: AtomicU64::new(0),
             alive,
             alive_tx,
         }))
@@ -19527,6 +24845,10 @@ impl CdpClient {
     }
 
     fn record_sent_command(&self, method: &str) {
+        if method == "Page.getFrameTree" {
+            self.sent_get_frame_tree_count
+                .fetch_add(1, Ordering::SeqCst);
+        }
         match method {
             "Runtime.enable" => {
                 self.sent_runtime_enable_count
@@ -19553,6 +24875,10 @@ impl CdpClient {
 
     fn sent_context_dispose_count(&self) -> u64 {
         self.sent_context_dispose_count.load(Ordering::SeqCst)
+    }
+
+    fn sent_get_frame_tree_count(&self) -> u64 {
+        self.sent_get_frame_tree_count.load(Ordering::SeqCst)
     }
 
     fn pending_command_count(&self) -> usize {
@@ -19609,6 +24935,27 @@ impl CdpClient {
             .await
     }
 
+    async fn send_with_event_cursor(
+        &self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+    ) -> RwResult<(Value, u64)> {
+        let mut event_cursor = 0;
+        let result = self
+            .send_with_optional_write_tracker(
+                method,
+                params,
+                session_id,
+                timeout,
+                None,
+                Some(&mut event_cursor),
+            )
+            .await?;
+        Ok((result, event_cursor))
+    }
+
     fn enqueue(
         &self,
         method: &str,
@@ -19646,15 +24993,17 @@ impl CdpClient {
             payload["sessionId"] = Value::String(session_id.to_string());
         }
 
-        if self
-            .write_tx
-            .send(CdpOutgoing::Text {
+        let send_result = {
+            // Event insertion and command enqueue share this mutex boundary, so every
+            // stamped event is ordered unambiguously before or after the command.
+            let _event_log = self.event_log.lock().unwrap();
+            self.write_tx.send(CdpOutgoing::Text {
                 payload: payload.to_string(),
                 tracker: None,
                 diagnostic_id: Some(id),
             })
-            .is_err()
-        {
+        };
+        if send_result.is_err() {
             self.mark_closed();
             return Err(RwError::Disconnected);
         }
@@ -19713,6 +25062,7 @@ impl CdpClient {
                     state: Arc::clone(&state),
                     ack: ack_tx,
                 }),
+                None,
             )
             .await;
         // A reply of any kind proves the command was written, so the happy path
@@ -19734,6 +25084,7 @@ impl CdpClient {
         session_id: Option<&str>,
         timeout: Duration,
         tracker: Option<CdpWriteTracker>,
+        event_cursor: Option<&mut u64>,
     ) -> RwResult<Value> {
         if !self.is_connected() {
             return Err(RwError::Disconnected);
@@ -19769,15 +25120,23 @@ impl CdpClient {
             payload["sessionId"] = Value::String(session_id.to_string());
         }
 
-        if self
-            .write_tx
-            .send(CdpOutgoing::Text {
-                payload: payload.to_string(),
-                tracker,
-                diagnostic_id: Some(id),
-            })
-            .is_err()
-        {
+        let outgoing = CdpOutgoing::Text {
+            payload: payload.to_string(),
+            tracker,
+            diagnostic_id: Some(id),
+        };
+        let send_result = match event_cursor {
+            Some(cursor) => {
+                // Event insertion and command enqueue share this mutex boundary.
+                // The recorded cursor therefore orders every received event
+                // unambiguously before or after this command send.
+                let event_log = self.event_log.lock().unwrap();
+                *cursor = event_log.cursor();
+                self.write_tx.send(outgoing)
+            }
+            None => self.write_tx.send(outgoing),
+        };
+        if send_result.is_err() {
             self.mark_closed();
             return Err(RwError::Disconnected);
         }
@@ -20874,11 +26233,66 @@ impl DefaultTimeoutRegister {
         })
     }
 }
+#[derive(Debug, Default)]
+struct NavigationTransitionState {
+    contiguous_event_watermark: Option<u64>,
+}
+
+impl NavigationTransitionState {
+    fn initialize(&mut self, event_cursor: u64) {
+        self.contiguous_event_watermark = event_cursor.checked_sub(1);
+    }
+
+    fn next_uncovered_sequence(&self) -> Option<u64> {
+        match self.contiguous_event_watermark {
+            Some(sequence) => sequence.checked_add(1),
+            None => Some(0),
+        }
+    }
+
+    fn covers(&self, sequence: u64) -> bool {
+        self.contiguous_event_watermark
+            .is_some_and(|watermark| sequence <= watermark)
+    }
+
+    fn sequence_has_gap_before(&self, sequence: u64) -> bool {
+        !self.covers(sequence) && self.next_uncovered_sequence() != Some(sequence)
+    }
+
+    fn has_unreplayable_gap(&self, oldest_sequence: u64) -> bool {
+        self.next_uncovered_sequence()
+            .is_some_and(|next| next < oldest_sequence)
+    }
+
+    fn advance_live(&mut self, sequence: u64) -> bool {
+        if self.next_uncovered_sequence() != Some(sequence) {
+            return false;
+        }
+        self.contiguous_event_watermark = Some(sequence);
+        true
+    }
+
+    fn advance_reconciled(&mut self, replay_cursor: u64) {
+        let Some(replayed_through) = replay_cursor.checked_sub(1) else {
+            return;
+        };
+        if self
+            .contiguous_event_watermark
+            .is_none_or(|watermark| watermark < replayed_through)
+        {
+            self.contiguous_event_watermark = Some(replayed_through);
+        }
+    }
+}
 const MAX_CONCURRENT_ATTACHED_IFRAME_SETUPS: usize = 8;
 const MAX_ATTACHED_IFRAME_SETUP_TASKS: usize = 32;
+#[cfg(test)]
 const MAX_AUTHORITATIVE_OOPIF_RECONCILIATION_ATTEMPTS: usize = 3;
+#[cfg(test)]
 const AUTHORITATIVE_OOPIF_RECONCILIATION_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
+#[cfg(test)]
 const AUTHORITATIVE_OOPIF_RECONCILIATION_MAX_BACKOFF: Duration = Duration::from_millis(100);
+#[cfg(test)]
 const OOPIF_OVERFLOW_RECONCILIATION_ERROR_PREFIX: &str =
     "OOPIF event-log overflow reconciliation failed";
 
@@ -20934,11 +26348,12 @@ struct PageInner {
     session_id: String,
     context_id: Option<String>,
     main_frame_id: Mutex<Option<String>>,
+    navigation_transition_lock: Mutex<NavigationTransitionState>,
     frame_state: Mutex<PageFrameState>,
     iframe_setup_tasks: IframeSetupTaskRegistry,
     network_requests: Arc<Mutex<NetworkRequestStore>>,
     console_records: Mutex<ConsoleRecordStore>,
-    console_capture: tokio::sync::Mutex<ConsoleCaptureState>,
+    console_capture: ConsoleCaptureState,
     console_replay_until_event_cursor: Mutex<HashMap<String, u64>>,
     observation_event_cursor: AtomicU64,
     native_network_records: Mutex<NativeNetworkRecordStore>,
@@ -20956,8 +26371,8 @@ struct PageInner {
 
 #[derive(Default)]
 struct ConsoleCaptureState {
-    requested: bool,
-    enabled_sessions: HashSet<String>,
+    requested: AtomicBool,
+    enabled_sessions: tokio::sync::Mutex<HashSet<String>>,
 }
 
 struct CreatedTargetGuard {
@@ -21334,22 +26749,96 @@ impl Default for NetworkRequestStore {
         Self::new(0)
     }
 }
+#[derive(Default)]
+struct AcceptedNavigationEpochs {
+    by_sequence: BTreeMap<u64, u64>,
+    floor_epoch: u64,
+    low_water_mark: Option<u64>,
+    last_accepted_sequence: Option<u64>,
+}
+
+impl AcceptedNavigationEpochs {
+    fn accepts(&self, sequence: Option<u64>) -> bool {
+        sequence.is_none_or(|sequence| {
+            self.low_water_mark
+                .is_none_or(|low_water_mark| low_water_mark < sequence)
+                && self
+                    .last_accepted_sequence
+                    .is_none_or(|accepted| accepted < sequence)
+        })
+    }
+
+    fn record(&mut self, sequence: Option<u64>, epoch: u64) {
+        let Some(sequence) = sequence else {
+            return;
+        };
+        debug_assert!(self.accepts(Some(sequence)));
+        self.by_sequence.insert(sequence, epoch);
+        self.last_accepted_sequence = Some(sequence);
+    }
+
+    fn epoch_for_observation(&self, sequence: Option<u64>, current_epoch: u64) -> u64 {
+        let Some(sequence) = sequence else {
+            return current_epoch;
+        };
+        self.by_sequence
+            .range(..sequence)
+            .next_back()
+            .map_or(self.floor_epoch, |(_, epoch)| *epoch)
+    }
+
+    fn prune_through(&mut self, low_water_mark: u64) {
+        if self
+            .low_water_mark
+            .is_some_and(|current| low_water_mark <= current)
+        {
+            return;
+        }
+        if let Some((_, epoch)) = self.by_sequence.range(..=low_water_mark).next_back() {
+            self.floor_epoch = *epoch;
+        }
+        self.by_sequence
+            .retain(|sequence, _| *sequence > low_water_mark);
+        self.low_water_mark = Some(low_water_mark);
+    }
+}
+
+enum NavigationEpochTransition {
+    Rejected,
+    Accepted { advanced: bool },
+}
 
 #[derive(Default)]
 struct ConsoleRecordStore {
     navigation_epoch: u64,
+    accepted_navigation_epochs: AcceptedNavigationEpochs,
     records: VecDeque<RustwrightConsoleRecord>,
     evictions_by_epoch: HashMap<u64, u64>,
     evictions_total: u64,
 }
 
 impl ConsoleRecordStore {
-    fn advance_navigation(&mut self) {
-        self.navigation_epoch = self.navigation_epoch.saturating_add(1);
+    fn record_navigation(&mut self, sequence: Option<u64>, epoch: u64) -> bool {
+        if !self.accepted_navigation_epochs.accepts(sequence) {
+            return false;
+        }
+        self.navigation_epoch = epoch;
+        self.accepted_navigation_epochs.record(sequence, epoch);
+        true
     }
 
-    fn push(&mut self, record: RustwrightConsoleRecord) {
-        self.push_at_epoch(record, self.navigation_epoch);
+    #[cfg(test)]
+    fn advance_navigation(&mut self) {
+        let epoch = self.navigation_epoch.saturating_add(1);
+        let accepted = self.record_navigation(None, epoch);
+        debug_assert!(accepted);
+    }
+
+    fn push(&mut self, record: RustwrightConsoleRecord, sequence: Option<u64>) {
+        let navigation_epoch = self
+            .accepted_navigation_epochs
+            .epoch_for_observation(sequence, self.navigation_epoch);
+        self.push_at_epoch(record, navigation_epoch);
     }
 
     fn push_capture_baseline(&mut self, record: RustwrightConsoleRecord) {
@@ -21368,6 +26857,11 @@ impl ConsoleRecordStore {
             }
         }
         self.records.push_back(record);
+    }
+
+    fn prune_navigation_epochs_through(&mut self, low_water_mark: u64) {
+        self.accepted_navigation_epochs
+            .prune_through(low_water_mark);
     }
 
     fn read(
@@ -21419,6 +26913,7 @@ struct NativeNetworkRecordStore {
     navigation_epoch: u64,
     navigation_start_index: u64,
     current_loader_id: Option<String>,
+    accepted_navigation_epochs: AcceptedNavigationEpochs,
     records: VecDeque<NativeNetworkEntry>,
     active_by_request: HashMap<(String, String), u64>,
     evictions_by_epoch: HashMap<u64, u64>,
@@ -21448,25 +26943,56 @@ impl NativeNetworkRecordStore {
             navigation_epoch: 0,
             navigation_start_index,
             current_loader_id: None,
+            accepted_navigation_epochs: AcceptedNavigationEpochs::default(),
             records: VecDeque::with_capacity(NATIVE_NETWORK_RECORD_CAPACITY),
             active_by_request: HashMap::new(),
             evictions_by_epoch: HashMap::new(),
         }
     }
 
-    fn begin_document_navigation(&mut self, loader_id: Option<&str>, start_index: u64) -> bool {
-        if loader_id.is_some() && self.current_loader_id.as_deref() == loader_id {
-            return false;
+    fn begin_document_navigation(
+        &mut self,
+        loader_id: Option<&str>,
+        start_index: u64,
+        sequence: Option<u64>,
+    ) -> NavigationEpochTransition {
+        if !self.accepted_navigation_epochs.accepts(sequence) {
+            return NavigationEpochTransition::Rejected;
+        }
+        let advanced = loader_id.is_none() || self.current_loader_id.as_deref() != loader_id;
+        if advanced {
+            self.navigation_epoch = self.navigation_epoch.saturating_add(1);
+            self.navigation_start_index = start_index;
+            self.current_loader_id = loader_id.map(ToString::to_string);
+        }
+        self.accepted_navigation_epochs
+            .record(sequence, self.navigation_epoch);
+        NavigationEpochTransition::Accepted { advanced }
+    }
+
+    fn begin_same_document_navigation(
+        &mut self,
+        start_index: u64,
+        sequence: Option<u64>,
+    ) -> NavigationEpochTransition {
+        if !self.accepted_navigation_epochs.accepts(sequence) {
+            return NavigationEpochTransition::Rejected;
         }
         self.navigation_epoch = self.navigation_epoch.saturating_add(1);
         self.navigation_start_index = start_index;
-        self.current_loader_id = loader_id.map(ToString::to_string);
-        true
+        self.accepted_navigation_epochs
+            .record(sequence, self.navigation_epoch);
+        NavigationEpochTransition::Accepted { advanced: true }
     }
 
-    fn begin_same_document_navigation(&mut self, start_index: u64) {
-        self.navigation_epoch = self.navigation_epoch.saturating_add(1);
-        self.navigation_start_index = start_index;
+    fn epoch_for_observation(&self, sequence: Option<u64>) -> u64 {
+        self.accepted_navigation_epochs
+            .epoch_for_observation(sequence, self.navigation_epoch)
+    }
+
+    fn prune_navigation_epochs_through(&mut self, low_water_mark: u64) {
+        self.accepted_navigation_epochs
+            .prune_through(low_water_mark);
     }
 
     fn push(&mut self, entry: NativeNetworkEntry) {
@@ -21738,6 +27264,31 @@ struct FrameSwapState {
 }
 
 #[derive(Debug)]
+struct AuthoritativeFrameRecord {
+    id: String,
+    parent_id: Option<String>,
+    name: Option<String>,
+    url: Option<String>,
+    session_id: String,
+}
+
+#[derive(Debug)]
+struct AuthoritativeFrameTree {
+    root_frame_id: String,
+    frames: HashMap<String, AuthoritativeFrameRecord>,
+    child_order: HashMap<String, Vec<String>>,
+    frame_loader_ids: HashMap<String, String>,
+    frame_sessions: HashMap<String, String>,
+    session_roots: HashMap<String, String>,
+}
+
+#[derive(Debug, Default)]
+struct AuthoritativeFrameTreeCommitEffects {
+    ownership_changed: bool,
+    removed_setup_generations: Vec<u64>,
+}
+
+#[derive(Debug)]
 struct PageFrameState {
     main_session_id: String,
     frame_sessions: HashMap<String, String>,
@@ -21749,11 +27300,24 @@ struct PageFrameState {
     session_frames: HashMap<String, String>,
     frames: HashMap<String, PageFrameRecord>,
     child_order: HashMap<String, Vec<String>>,
+    frame_loader_ids: HashMap<String, String>,
+    execution_contexts: HashMap<(String, String), Value>,
     frame_session_errors: HashMap<String, String>,
     iframe_sessions_armed: HashSet<String>,
     iframe_sessions_routable: HashSet<String>,
     iframe_sessions_ready: HashSet<String>,
     iframe_setup_started: HashSet<String>,
+    frame_event_listener_registered: bool,
+    page_domain_enabled_sessions: HashSet<String>,
+    frame_tree_populated_sessions: HashSet<String>,
+    frame_tree_dirty_sessions: HashSet<String>,
+    frame_tree_generations: HashMap<String, u64>,
+    frame_invalidation_sequences: HashMap<String, u64>,
+    frame_ownership_generation: u64,
+    frame_event_cursor: u64,
+    #[cfg(test)]
+    locator_resolution_reresolve_count: u64,
+    frame_tree_refresh_lock: Arc<tokio::sync::Mutex<()>>,
     session_updates: watch::Sender<u64>,
 }
 
@@ -21771,13 +27335,115 @@ impl PageFrameState {
             session_frames: HashMap::new(),
             frames: HashMap::new(),
             child_order: HashMap::new(),
+            frame_loader_ids: HashMap::new(),
+            execution_contexts: HashMap::new(),
             frame_session_errors: HashMap::new(),
             iframe_sessions_armed: HashSet::new(),
             iframe_sessions_routable: HashSet::new(),
             iframe_sessions_ready: HashSet::new(),
             iframe_setup_started: HashSet::new(),
+            frame_event_listener_registered: false,
+            page_domain_enabled_sessions: HashSet::new(),
+            frame_tree_populated_sessions: HashSet::new(),
+            frame_tree_dirty_sessions: HashSet::new(),
+            frame_tree_generations: HashMap::new(),
+            frame_invalidation_sequences: HashMap::new(),
+            frame_ownership_generation: 0,
+            frame_event_cursor: 0,
+            #[cfg(test)]
+            locator_resolution_reresolve_count: 0,
+            frame_tree_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             session_updates,
         }
+    }
+
+    fn set_frame_event_cursor(&mut self, cursor: u64) {
+        self.frame_event_cursor = cursor;
+    }
+
+    fn mark_frame_event_listener_registered(&mut self) {
+        self.frame_event_listener_registered = true;
+        self.mark_all_frame_caches_dirty();
+    }
+
+    fn mark_page_domain_enabled(&mut self, session_id: &str) {
+        self.page_domain_enabled_sessions
+            .insert(session_id.to_string());
+        self.mark_frame_cache_dirty(session_id);
+    }
+
+    fn mark_frame_cache_dirty(&mut self, session_id: &str) {
+        let generation = self
+            .frame_tree_generations
+            .entry(session_id.to_string())
+            .or_default();
+        advance_lifetime_counter(generation);
+        self.frame_tree_dirty_sessions
+            .insert(session_id.to_string());
+    }
+    fn mark_frame_cache_dirty_at_sequence(
+        &mut self,
+        session_id: &str,
+        sequence: Option<u64>,
+    ) -> bool {
+        if let Some(sequence) = sequence {
+            if self
+                .frame_invalidation_sequences
+                .get(session_id)
+                .is_some_and(|last_sequence| *last_sequence >= sequence)
+            {
+                return false;
+            }
+            self.frame_invalidation_sequences
+                .insert(session_id.to_string(), sequence);
+        }
+        self.mark_frame_cache_dirty(session_id);
+        true
+    }
+
+    fn mark_all_frame_caches_dirty(&mut self) {
+        for session_id in self.session_ids() {
+            self.mark_frame_cache_dirty(&session_id);
+        }
+    }
+
+    fn frame_cache_refresh_generation(&self, session_id: &str) -> Option<u64> {
+        let trusted = self.frame_event_listener_registered
+            && self.page_domain_enabled_sessions.contains(session_id);
+        let populated = self.frame_tree_populated_sessions.contains(session_id);
+        let dirty = self.frame_tree_dirty_sessions.contains(session_id);
+        (!trusted || !populated || dirty).then(|| {
+            self.frame_tree_generations
+                .get(session_id)
+                .copied()
+                .unwrap_or(0)
+        })
+    }
+
+    fn mark_frame_tree_refreshed(&mut self, session_id: &str, generation: u64) {
+        self.frame_tree_populated_sessions
+            .insert(session_id.to_string());
+        let generation_is_current = self
+            .frame_tree_generations
+            .get(session_id)
+            .copied()
+            .unwrap_or(0)
+            == generation;
+        if self.frame_event_listener_registered
+            && self.page_domain_enabled_sessions.contains(session_id)
+            && generation_is_current
+        {
+            self.frame_tree_dirty_sessions.remove(session_id);
+        }
+    }
+
+    fn forget_frame_session_cache(&mut self, session_id: &str) {
+        self.page_domain_enabled_sessions.remove(session_id);
+        self.frame_tree_populated_sessions.remove(session_id);
+        self.frame_tree_dirty_sessions.remove(session_id);
+        self.frame_tree_generations.remove(session_id);
+        self.frame_invalidation_sequences.remove(session_id);
+        self.invalidate_execution_contexts_for_session(session_id);
     }
 
     fn subscribe_session_updates(&self) -> watch::Receiver<u64> {
@@ -21785,8 +27451,7 @@ impl PageFrameState {
     }
 
     fn notify_session_update(&self) {
-        self.session_updates
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        self.session_updates.send_modify(advance_lifetime_counter);
     }
 
     fn record_frame_session_error(&mut self, frame_id: &str, error: String) {
@@ -21798,6 +27463,68 @@ impl PageFrameState {
     fn session_still_owns_frame(&self, frame_id: &str, session_id: &str) -> bool {
         self.session_frames.get(session_id).map(String::as_str) == Some(frame_id)
             && self.frame_sessions.get(frame_id).map(String::as_str) == Some(session_id)
+    }
+
+    fn session_owns_frame(&self, frame_id: &str, session_id: &str) -> bool {
+        self.owns_session(session_id)
+            && self.frame_sessions.get(frame_id).map(String::as_str) == Some(session_id)
+    }
+
+    fn cached_execution_context(&self, frame_id: &str, session_id: &str) -> Option<Value> {
+        self.execution_contexts
+            .get(&(session_id.to_string(), frame_id.to_string()))
+            .cloned()
+    }
+
+    fn cache_execution_context(
+        &mut self,
+        frame_id: &str,
+        session_id: &str,
+        context_id: Value,
+    ) -> bool {
+        if !self.session_owns_frame(frame_id, session_id) {
+            return false;
+        }
+        self.execution_contexts
+            .insert((session_id.to_string(), frame_id.to_string()), context_id);
+        true
+    }
+
+    fn invalidate_execution_context(&mut self, session_id: &str, context_id: &Value) {
+        self.execution_contexts
+            .retain(|(cached_session_id, _), cached_context_id| {
+                cached_session_id != session_id || cached_context_id != context_id
+            });
+    }
+
+    fn invalidate_execution_contexts_for_frame(&mut self, frame_id: &str) {
+        self.execution_contexts
+            .retain(|(_, cached_frame_id), _| cached_frame_id != frame_id);
+    }
+
+    fn invalidate_execution_contexts_for_session(&mut self, session_id: &str) {
+        self.execution_contexts
+            .retain(|(cached_session_id, _), _| cached_session_id != session_id);
+    }
+
+    fn record_frame_loader(&mut self, frame_id: &str, loader_id: Option<&str>) {
+        let Some(loader_id) = loader_id else {
+            return;
+        };
+        let previous = self
+            .frame_loader_ids
+            .insert(frame_id.to_string(), loader_id.to_string());
+        if previous
+            .as_deref()
+            .is_some_and(|previous| previous != loader_id)
+        {
+            self.invalidate_execution_contexts_for_frame(frame_id);
+        }
+    }
+
+    fn record_frame_swap(&mut self, frame_id: &str) {
+        self.invalidate_execution_contexts_for_frame(frame_id);
+        advance_lifetime_counter(&mut self.frame_ownership_generation);
     }
 
     fn frame_swap_event_completes_adoption(&self, frame_id: &str, event_session_id: &str) -> bool {
@@ -22013,6 +27740,18 @@ impl PageFrameState {
         }
     }
 
+    #[cfg(test)]
+    fn mark_iframe_session_ready_for_session(&mut self, frame_id: &str, session_id: &str) {
+        let Some(pin) = self
+            .session_pin_for_frame(frame_id)
+            .filter(|pin| pin.session_id == session_id)
+        else {
+            return;
+        };
+        self.iframe_sessions_routable.insert(session_id.to_string());
+        self.mark_iframe_session_ready(frame_id, &pin);
+    }
+
     fn mark_iframe_session_routable(
         &mut self,
         frame_id: &str,
@@ -22037,7 +27776,237 @@ impl PageFrameState {
         session_id == self.main_session_id || self.session_frames.contains_key(session_id)
     }
 
-    fn frame_tree_refresh_session_ids(&self) -> Vec<String> {
+    fn refresh_registration(&self, session_id: &str) -> Option<(Option<String>, u64)> {
+        self.owns_session(session_id).then(|| {
+            (
+                self.session_frames.get(session_id).cloned(),
+                self.frame_ownership_generation,
+            )
+        })
+    }
+
+    fn refresh_registration_is_current(
+        &self,
+        session_id: &str,
+        root_frame_id: Option<&str>,
+        ownership_generation: u64,
+        tree_generation: u64,
+    ) -> bool {
+        self.owns_session(session_id)
+            && self.session_frames.get(session_id).map(String::as_str) == root_frame_id
+            && self.frame_ownership_generation == ownership_generation
+            && self
+                .frame_tree_generations
+                .get(session_id)
+                .copied()
+                .unwrap_or(0)
+                == tree_generation
+    }
+
+    #[cfg(test)]
+    fn record_locator_resolution_reresolve(&mut self) {
+        advance_lifetime_counter(&mut self.locator_resolution_reresolve_count);
+    }
+    fn registered_root_sessions(&self) -> HashMap<String, String> {
+        self.session_frames
+            .iter()
+            .map(|(session_id, frame_id)| (frame_id.clone(), session_id.clone()))
+            .collect()
+    }
+
+    fn apply_authoritative_frame_tree(
+        &mut self,
+        refreshed_session_id: &str,
+        mut tree: AuthoritativeFrameTree,
+    ) -> AuthoritativeFrameTreeCommitEffects {
+        let ownership_generation_before = self.frame_ownership_generation;
+        let authoritative_frame_ids = tree.frames.keys().cloned().collect::<HashSet<_>>();
+        let mut removed_frame_ids = HashSet::new();
+        let mut pending_removals = self
+            .frame_sessions
+            .iter()
+            .filter_map(|(frame_id, session_id)| {
+                (session_id == refreshed_session_id && !authoritative_frame_ids.contains(frame_id))
+                    .then_some(frame_id.clone())
+            })
+            .collect::<Vec<_>>();
+        while let Some(frame_id) = pending_removals.pop() {
+            if authoritative_frame_ids.contains(&frame_id)
+                || !removed_frame_ids.insert(frame_id.clone())
+            {
+                continue;
+            }
+            if let Some(children) = self.child_order.get(&frame_id) {
+                pending_removals.extend(children.iter().cloned());
+            }
+        }
+
+        let removed_session_ids = self
+            .session_frames
+            .iter()
+            .filter_map(|(session_id, frame_id)| {
+                removed_frame_ids
+                    .contains(frame_id)
+                    .then_some(session_id.clone())
+            })
+            .collect::<HashSet<_>>();
+        let mut invalidated_frame_ids = removed_frame_ids.clone();
+        let mut dirty_session_ids = HashSet::new();
+
+        for frame_id in &removed_frame_ids {
+            if let Some(session_id) = self.frame_sessions.get(frame_id) {
+                if session_id != refreshed_session_id {
+                    dirty_session_ids.insert(session_id.clone());
+                }
+            }
+        }
+        for (frame_id, session_id) in &tree.frame_sessions {
+            if self.frame_sessions.get(frame_id) != Some(session_id) {
+                invalidated_frame_ids.insert(frame_id.clone());
+                if let Some(previous_session_id) = self.frame_sessions.get(frame_id) {
+                    if previous_session_id != refreshed_session_id {
+                        dirty_session_ids.insert(previous_session_id.clone());
+                    }
+                }
+            }
+        }
+        let mut removed_setup_generations = removed_frame_ids
+            .iter()
+            .filter_map(|frame_id| self.frame_attachment_generations.get(frame_id).copied())
+            .collect::<Vec<_>>();
+        for (frame_id, session_id) in &tree.frame_sessions {
+            if self
+                .frame_sessions
+                .get(frame_id)
+                .is_some_and(|previous_session_id| previous_session_id != session_id)
+            {
+                if let Some(generation) = self.frame_attachment_generations.get(frame_id).copied() {
+                    if !removed_setup_generations.contains(&generation) {
+                        removed_setup_generations.push(generation);
+                    }
+                }
+            }
+        }
+        for (frame_id, loader_id) in &tree.frame_loader_ids {
+            if self
+                .frame_loader_ids
+                .get(frame_id)
+                .is_some_and(|previous| previous != loader_id)
+            {
+                invalidated_frame_ids.insert(frame_id.clone());
+            }
+        }
+
+        // Rebuild every authoritative descendant edge in one pass. The root
+        // frame's incoming edge belongs to its parent session, so refreshing
+        // an OOPIF child session must preserve that cross-session edge.
+        // Existing foreign-session children omitted by this tree also remain.
+        for children in self.child_order.values_mut() {
+            children.retain(|child_id| {
+                !removed_frame_ids.contains(child_id)
+                    && (child_id == &tree.root_frame_id
+                        || !authoritative_frame_ids.contains(child_id))
+            });
+        }
+        self.child_order
+            .retain(|parent_id, _| !removed_frame_ids.contains(parent_id));
+        for (parent_id, mut children) in std::mem::take(&mut tree.child_order) {
+            if let Some(mut preserved_children) = self.child_order.remove(&parent_id) {
+                children.append(&mut preserved_children);
+            }
+            self.child_order.insert(parent_id, children);
+        }
+
+        for frame_id in &removed_frame_ids {
+            self.invalidate_frame_attachment(frame_id);
+        }
+        self.frames
+            .retain(|frame_id, _| !removed_frame_ids.contains(frame_id));
+        self.frame_sessions
+            .retain(|frame_id, _| !removed_frame_ids.contains(frame_id));
+        self.frame_loader_ids
+            .retain(|frame_id, _| !removed_frame_ids.contains(frame_id));
+        self.frame_session_errors
+            .retain(|frame_id, _| !removed_frame_ids.contains(frame_id));
+        self.session_frames
+            .retain(|_, frame_id| !removed_frame_ids.contains(frame_id));
+
+        for session_id in &removed_session_ids {
+            self.iframe_sessions_armed.remove(session_id);
+            self.iframe_sessions_ready.remove(session_id);
+            self.iframe_setup_started.remove(session_id);
+            self.page_domain_enabled_sessions.remove(session_id);
+            self.frame_tree_populated_sessions.remove(session_id);
+            self.frame_tree_dirty_sessions.remove(session_id);
+            self.frame_tree_generations.remove(session_id);
+            self.frame_invalidation_sequences.remove(session_id);
+        }
+
+        let session_roots = tree.session_roots.drain().collect::<Vec<_>>();
+        let root_frame_ids = session_roots
+            .iter()
+            .map(|(_, frame_id)| frame_id.clone())
+            .collect::<HashSet<_>>();
+        for (session_id, root_frame_id) in session_roots {
+            if session_id == self.main_session_id {
+                let ownership_changed = self
+                    .frame_sessions
+                    .insert(root_frame_id.clone(), session_id.clone())
+                    .as_deref()
+                    != Some(session_id.as_str());
+                if ownership_changed {
+                    self.invalidate_execution_contexts_for_frame(&root_frame_id);
+                    advance_lifetime_counter(&mut self.frame_ownership_generation);
+                }
+            } else {
+                self.record_session_for_frame(&root_frame_id, &session_id);
+            }
+        }
+        let mut descendant_ownership_changed = false;
+        for (frame_id, session_id) in tree.frame_sessions.drain() {
+            if root_frame_ids.contains(&frame_id) {
+                continue;
+            }
+            let ownership_changed = self
+                .frame_sessions
+                .insert(frame_id.clone(), session_id.clone())
+                .as_deref()
+                != Some(session_id.as_str());
+            if ownership_changed {
+                self.invalidate_execution_contexts_for_frame(&frame_id);
+                descendant_ownership_changed = true;
+            }
+        }
+        if descendant_ownership_changed {
+            advance_lifetime_counter(&mut self.frame_ownership_generation);
+        }
+        for (_, incoming) in tree.frames.drain() {
+            self.record_frame(
+                incoming.id,
+                incoming.parent_id,
+                incoming.name,
+                incoming.url,
+                incoming.session_id,
+            );
+        }
+        self.frame_loader_ids.extend(tree.frame_loader_ids.drain());
+        self.execution_contexts.retain(|(session_id, frame_id), _| {
+            !removed_session_ids.contains(session_id) && !invalidated_frame_ids.contains(frame_id)
+        });
+
+        for session_id in dirty_session_ids {
+            if self.owns_session(&session_id) {
+                self.mark_frame_cache_dirty(&session_id);
+            }
+        }
+        let ownership_changed = self.frame_ownership_generation != ownership_generation_before;
+        AuthoritativeFrameTreeCommitEffects {
+            ownership_changed,
+            removed_setup_generations,
+        }
+    }
+
+    fn session_ids(&self) -> Vec<String> {
         let mut sessions = vec![self.main_session_id.clone()];
         for session_id in self
             .session_frames
@@ -22052,9 +28021,20 @@ impl PageFrameState {
     }
 
     fn record_session_for_frame(&mut self, frame_id: &str, session_id: &str) -> FrameSessionPin {
-        self.frame_session_errors.remove(frame_id);
+        self.record_session_for_frame_at_sequence(frame_id, session_id, None)
+    }
+
+    fn record_session_for_frame_at_sequence(
+        &mut self,
+        frame_id: &str,
+        session_id: &str,
+        sequence: Option<u64>,
+    ) -> FrameSessionPin {
         let session_changed =
             self.frame_sessions.get(frame_id).map(String::as_str) != Some(session_id);
+        if session_changed {
+            self.frame_session_errors.remove(frame_id);
+        }
         let continues_swap = self
             .frame_swaps
             .get(frame_id)
@@ -22070,19 +28050,19 @@ impl PageFrameState {
             self.frame_attachment_generations
                 .insert(frame_id.to_string(), self.next_attachment_generation);
         }
-        if let Some(previous_session_id) = self
+        let previous_session_id = self
             .frame_sessions
-            .insert(frame_id.to_string(), session_id.to_string())
-        {
+            .insert(frame_id.to_string(), session_id.to_string());
+        if let Some(previous_session_id) = previous_session_id.as_deref() {
             if previous_session_id != session_id {
-                self.invalidate_iframe_session_markers(&previous_session_id);
+                self.invalidate_iframe_session_markers(previous_session_id);
                 if self
                     .session_frames
-                    .get(&previous_session_id)
+                    .get(previous_session_id)
                     .map(String::as_str)
                     == Some(frame_id)
                 {
-                    self.session_frames.remove(&previous_session_id);
+                    self.session_frames.remove(previous_session_id);
                 }
             }
         }
@@ -22102,6 +28082,7 @@ impl PageFrameState {
                     self.frame_attachment_generations.remove(&previous_frame_id);
                     self.frame_session_errors.remove(&previous_frame_id);
                     self.frame_swaps.remove(&previous_frame_id);
+                    self.invalidate_execution_contexts_for_frame(&previous_frame_id);
                 }
             }
         }
@@ -22120,6 +28101,19 @@ impl PageFrameState {
         if let Some(record) = self.frames.get_mut(frame_id) {
             record.session_id = Some(session_id.to_string());
         }
+        if session_changed {
+            self.invalidate_execution_contexts_for_frame(frame_id);
+            advance_lifetime_counter(&mut self.frame_ownership_generation);
+            if let Some(previous_session_id) = previous_session_id {
+                self.mark_frame_cache_dirty_at_sequence(&previous_session_id, sequence);
+                if previous_session_id != self.main_session_id
+                    && !self.session_frames.contains_key(&previous_session_id)
+                {
+                    self.forget_frame_session_cache(&previous_session_id);
+                }
+            }
+            self.mark_frame_cache_dirty_at_sequence(session_id, sequence);
+        }
         self.session_pin_for_frame(frame_id)
             .expect("recorded frame session must have an attachment generation")
     }
@@ -22133,10 +28127,13 @@ impl PageFrameState {
         }
         self.frame_swaps.remove(frame_id);
         self.frame_session_errors.remove(frame_id);
+        self.frame_loader_ids.remove(frame_id);
+        self.invalidate_execution_contexts_for_frame(frame_id);
         if let Some(record) = self.frames.get_mut(frame_id) {
             record.session_id = None;
         }
         let session_id = self.frame_sessions.remove(frame_id)?;
+        advance_lifetime_counter(&mut self.frame_ownership_generation);
         if self.session_frames.get(&session_id).map(String::as_str) == Some(frame_id) {
             self.session_frames.remove(&session_id);
         }
@@ -22146,11 +28143,18 @@ impl PageFrameState {
             .any(|owner| owner == &session_id)
         {
             self.invalidate_iframe_session_markers(&session_id);
+            if session_id != self.main_session_id {
+                self.forget_frame_session_cache(&session_id);
+            }
         }
         Some(session_id)
     }
 
-    fn remap_detached_session_ownership(&mut self, detached_session_id: &str) {
+    fn remap_detached_session_ownership(
+        &mut self,
+        detached_session_id: &str,
+        sequence: Option<u64>,
+    ) {
         let root_frame_id = self.session_frames.get(detached_session_id).cloned();
         let replacement_session_id = root_frame_id
             .as_deref()
@@ -22183,24 +28187,26 @@ impl PageFrameState {
         }
         self.session_frames.remove(detached_session_id);
         self.invalidate_iframe_session_markers(detached_session_id);
+        self.forget_frame_session_cache(detached_session_id);
+        self.mark_frame_cache_dirty_at_sequence(&replacement_session_id, sequence);
     }
 
-    fn mark_frame_swap_pending(&mut self, frame_id: &str, event_session_id: &str) {
+    fn mark_frame_swap_pending(&mut self, frame_id: &str, event_session_id: &str) -> Option<u64> {
         if self.frame_swap_event_completes_adoption(frame_id, event_session_id) {
             // The canonical frame record already represents the adopted child. There is no
             // parent-local frame-tree entry in this state to clear.
-            return;
+            return None;
         }
         let Some(session_id) = self.frame_sessions.get(frame_id).cloned() else {
-            return;
+            return None;
         };
         if session_id != event_session_id {
             // A stale non-owner event must never invalidate whichever session currently owns the
             // frame, even when it cannot be certified as the parent half of live-child adoption.
-            return;
+            return None;
         }
         let Some(generation) = self.frame_attachment_generations.remove(frame_id) else {
-            return;
+            return None;
         };
         self.next_attachment_generation = self
             .next_attachment_generation
@@ -22236,9 +28242,17 @@ impl PageFrameState {
             );
         }
         self.notify_session_update();
+        Some(generation)
     }
 
     fn detach_session(&mut self, detached_session_id: &str) {
+        self.detach_session_at_sequence(detached_session_id, None);
+    }
+
+    fn detach_session_at_sequence(&mut self, detached_session_id: &str, sequence: Option<u64>) {
+        for session_id in self.session_ids() {
+            self.mark_frame_cache_dirty_at_sequence(&session_id, sequence);
+        }
         if let Some(frame_id) = self.frame_swaps.iter().find_map(|(frame_id, swap)| {
             (!swap.successor_ready
                 && swap
@@ -22281,18 +28295,20 @@ impl PageFrameState {
                 // own root and other mappings. A same-ID successor is the sole exception: that
                 // generation is live ownership, not residue from the losing edge.
                 if !current_is_same_id_successor {
-                    self.remap_detached_session_ownership(detached_session_id);
+                    self.remap_detached_session_ownership(detached_session_id, sequence);
                 }
+                self.forget_frame_session_cache(detached_session_id);
                 self.notify_session_update();
                 return;
             }
             if current_is_same_id_successor {
                 self.invalidate_frame_attachment(&frame_id);
             }
+            self.forget_frame_session_cache(detached_session_id);
             self.notify_session_update();
             return;
         }
-        self.remap_detached_session_ownership(detached_session_id);
+        self.remap_detached_session_ownership(detached_session_id, sequence);
         self.notify_session_update();
     }
 
@@ -22304,6 +28320,11 @@ impl PageFrameState {
         url: Option<String>,
         event_session_id: String,
     ) {
+        let inferred_new_owner = !self.frame_sessions.contains_key(&frame_id)
+            && !self
+                .frame_swaps
+                .get(&frame_id)
+                .is_some_and(|swap| !swap.successor_ready);
         let session_id = if let Some(session_id) = self.frame_sessions.get(&frame_id) {
             Some(session_id.clone())
         } else if self
@@ -22356,6 +28377,10 @@ impl PageFrameState {
             entry.url_stamp = Some(metadata_stamp);
         }
         entry.session_id = session_id;
+
+        if inferred_new_owner {
+            advance_lifetime_counter(&mut self.frame_ownership_generation);
+        }
 
         if let Some(parent_id) = parent_id {
             let children = self.child_order.entry(parent_id).or_default();
@@ -22411,6 +28436,8 @@ impl PageFrameState {
             self.remove_frame_inner(&child, removed_generations);
         }
         self.frames.remove(frame_id);
+        self.frame_loader_ids.remove(frame_id);
+        self.invalidate_execution_contexts_for_frame(frame_id);
         if let Some(generation) = self.frame_attachment_generations.get(frame_id).copied() {
             removed_generations.push(generation);
         }
@@ -22433,6 +28460,8 @@ impl PageFrameState {
         self.notify_session_update();
         removed_generations
     }
+
+    #[cfg(test)]
 
     fn prune_frames_not_in(&mut self, authoritative_frame_ids: &HashSet<String>) -> Vec<u64> {
         let stale_frame_ids = self
@@ -22575,8 +28604,11 @@ impl PageInner {
     }
 
     fn frame_tree_payload(&self) -> Value {
+        // Page cache readers never nest these locks. Clone main_frame_id first,
+        // release it, then acquire frame_state.
+        let cached_root_id = self.main_frame_id.lock().unwrap().clone();
         let state = self.frame_state.lock().unwrap();
-        let root_id = self.main_frame_id.lock().unwrap().clone().or_else(|| {
+        let root_id = cached_root_id.or_else(|| {
             state
                 .frames
                 .values()
@@ -22977,6 +29009,10 @@ impl PyBrowser {
 
     fn sent_context_dispose_count(&self) -> u64 {
         self.inner.client.sent_context_dispose_count()
+    }
+
+    fn sent_get_frame_tree_count(&self) -> u64 {
+        self.inner.client.sent_get_frame_tree_count()
     }
 
     fn pending_command_count(&self) -> usize {
@@ -25251,6 +31287,30 @@ async fn evaluate_handle_expression_in_frame_context(
     Ok(serde_json::from_str::<Value>(&remote_json)?)
 }
 
+async fn call_expression_in_context_before(
+    client: &CdpClient,
+    session_id: &str,
+    context_id: Value,
+    expression: String,
+    deadline: OperationDeadline,
+) -> RwResult<Value> {
+    client
+        .send(
+            "Runtime.callFunctionOn",
+            json!({
+                "functionDeclaration": "function(__rustwrightExpression) { return (0, eval)(__rustwrightExpression); }",
+                "arguments": [{ "value": expression }],
+                "executionContextId": context_id,
+                "awaitPromise": true,
+                "returnByValue": false,
+                "userGesture": true,
+            }),
+            Some(session_id),
+            deadline.remaining()?,
+        )
+        .await
+}
+
 async fn create_isolated_world_for_frame(
     client: &CdpClient,
     session_id: &str,
@@ -25277,13 +31337,80 @@ async fn create_isolated_world_for_frame(
 #[derive(Clone)]
 struct LocatorSessionResolution {
     session_id: String,
+    // None preserves the current session's main world; Some pins an explicit frame hop.
     frame_id: Option<String>,
     locator_json: String,
+    ownership_generation: u64,
 }
 
 struct FrameOwnerResolution {
     frame_id: Option<String>,
     same_origin_accessible: bool,
+}
+
+fn locator_resolution_ownership_is_current(
+    page: &PageInner,
+    resolution: &LocatorSessionResolution,
+) -> bool {
+    let state = page.frame_state.lock().unwrap();
+    if state.frame_ownership_generation != resolution.ownership_generation {
+        return false;
+    }
+    resolution.session_id == state.main_session_id
+        || state
+            .session_frames
+            .get(&resolution.session_id)
+            .is_some_and(|frame_id| {
+                state.frame_sessions.get(frame_id).map(String::as_str)
+                    == Some(resolution.session_id.as_str())
+            })
+}
+
+fn frame_ownership_changed_error() -> RwError {
+    RwError::Cdp {
+        method: "Runtime.evaluate".to_string(),
+        message: "frame ownership changed during locator resolution".to_string(),
+    }
+}
+
+async fn execution_context_for_locator_resolution(
+    page: &PageInner,
+    resolution: &LocatorSessionResolution,
+    deadline: OperationDeadline,
+) -> RwResult<Value> {
+    if !locator_resolution_ownership_is_current(page, resolution) {
+        return Err(frame_ownership_changed_error());
+    }
+    let frame_id = resolution.frame_id.as_deref().ok_or_else(|| {
+        RwError::Message("locator frame execution context is unavailable".to_string())
+    })?;
+    if let Some(context_id) = page
+        .frame_state
+        .lock()
+        .unwrap()
+        .cached_execution_context(frame_id, &resolution.session_id)
+    {
+        return Ok(context_id);
+    }
+    let context_id = create_isolated_world_for_frame(
+        &page.browser.client,
+        &resolution.session_id,
+        frame_id,
+        deadline.remaining()?,
+    )
+    .await?;
+    if !locator_resolution_ownership_is_current(page, resolution) {
+        return Err(frame_ownership_changed_error());
+    }
+    let cached = page.frame_state.lock().unwrap().cache_execution_context(
+        frame_id,
+        &resolution.session_id,
+        context_id.clone(),
+    );
+    if !cached {
+        return Err(frame_ownership_changed_error());
+    }
+    Ok(context_id)
 }
 
 async fn evaluate_locator_resolution(
@@ -25293,48 +31420,107 @@ async fn evaluate_locator_resolution(
     setup_deadline: OperationDeadline,
     transport_slack: Duration,
 ) -> RwResult<String> {
-    let context_id = if let Some(frame_id) = &resolution.frame_id {
-        Some(
-            create_isolated_world_for_frame(
-                &page.browser.client,
-                &resolution.session_id,
-                frame_id,
-                setup_deadline.remaining()?,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-    let transport_deadline = if transport_slack.is_zero() {
-        setup_deadline
-    } else {
-        OperationDeadline::new(setup_deadline.remaining()?.saturating_add(transport_slack))
-    };
-    if let Some(context_id) = context_id {
-        evaluate_expression_in_context_before(
-            &page.browser.client,
-            &resolution.session_id,
-            resolution
-                .frame_id
-                .as_deref()
-                .map(|frame_id| format!("frame:{frame_id}"))
-                .as_deref(),
-            context_id,
-            expression,
-            transport_deadline,
-        )
-        .await
-    } else {
-        evaluate_expression_in_session_before(
+    if resolution.frame_id.is_none() {
+        if !locator_resolution_ownership_is_current(page, resolution) {
+            return Err(frame_ownership_changed_error());
+        }
+        let transport_deadline = if transport_slack.is_zero() {
+            setup_deadline
+        } else {
+            OperationDeadline::new(setup_deadline.remaining()?.saturating_add(transport_slack))
+        };
+        return evaluate_expression_in_session_before(
             &page.browser.client,
             &resolution.session_id,
             None,
             expression,
             transport_deadline,
         )
-        .await
+        .await;
     }
+
+    let context_id =
+        execution_context_for_locator_resolution(page, resolution, setup_deadline).await?;
+    // Page.createIsolatedWorld is awaited setup. Re-read the in-memory owner
+    // immediately before dispatch so a handoff applied during that roundtrip
+    // cannot send the action through the outgoing session.
+    if !locator_resolution_ownership_is_current(page, resolution) {
+        return Err(frame_ownership_changed_error());
+    }
+    let transport_deadline = if transport_slack.is_zero() {
+        setup_deadline
+    } else {
+        OperationDeadline::new(setup_deadline.remaining()?.saturating_add(transport_slack))
+    };
+    let result = evaluate_expression_in_context_before(
+        &page.browser.client,
+        &resolution.session_id,
+        resolution
+            .frame_id
+            .as_deref()
+            .map(|frame_id| format!("frame:{frame_id}"))
+            .as_deref(),
+        context_id.clone(),
+        expression,
+        transport_deadline,
+    )
+    .await;
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(is_locator_wait_context_loss)
+    {
+        page.frame_state
+            .lock()
+            .unwrap()
+            .invalidate_execution_context(&resolution.session_id, &context_id);
+    }
+    result
+}
+
+async fn evaluate_handle_locator_resolution(
+    page: &PageInner,
+    resolution: &LocatorSessionResolution,
+    expression: String,
+    deadline: OperationDeadline,
+) -> RwResult<Value> {
+    if resolution.frame_id.is_none() {
+        if !locator_resolution_ownership_is_current(page, resolution) {
+            return Err(frame_ownership_changed_error());
+        }
+        return evaluate_handle_expression_in_session(
+            &page.browser.client,
+            &resolution.session_id,
+            expression,
+            deadline,
+        )
+        .await;
+    }
+
+    let context_id = execution_context_for_locator_resolution(page, resolution, deadline).await?;
+    if !locator_resolution_ownership_is_current(page, resolution) {
+        return Err(frame_ownership_changed_error());
+    }
+    let result = call_expression_in_context_before(
+        &page.browser.client,
+        &resolution.session_id,
+        context_id.clone(),
+        expression,
+        deadline,
+    )
+    .await;
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(is_locator_wait_context_loss)
+    {
+        page.frame_state
+            .lock()
+            .unwrap()
+            .invalidate_execution_context(&resolution.session_id, &context_id);
+    }
+    let remote_json = runtime_result_to_remote_object(&result?)?;
+    Ok(serde_json::from_str::<Value>(&remote_json)?)
 }
 
 async fn evaluate_locator_for_page(
@@ -25345,9 +31531,24 @@ async fn evaluate_locator_for_page(
     timeout: Duration,
 ) -> RwResult<String> {
     let deadline = OperationDeadline::new(timeout);
-    let resolution = resolve_locator_session(Arc::clone(&page), &locator_json, deadline).await?;
-    let expression = locator_script(&resolution.locator_json, index, &body);
-    evaluate_locator_resolution(&page, &resolution, expression, deadline, Duration::ZERO).await
+    for attempt in 0..=1 {
+        let resolution =
+            resolve_locator_session(Arc::clone(&page), &locator_json, deadline).await?;
+        let expression = locator_script(&resolution.locator_json, index, &body);
+        match evaluate_locator_resolution(&page, &resolution, expression, deadline, Duration::ZERO)
+            .await
+        {
+            Err(error)
+                if attempt == 0
+                    && (is_frame_ownership_changed(&error)
+                        || is_locator_wait_context_loss(&error)) =>
+            {
+                continue;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("locator action performs at most one ownership retry")
 }
 
 const ACTION_RESOLUTION_RETRY_LIMIT: usize = 3;
@@ -26722,34 +32923,34 @@ async fn evaluate_locator_handle_for_page(
     timeout: Duration,
 ) -> RwResult<String> {
     let deadline = OperationDeadline::new(timeout);
-    let resolution = resolve_locator_session(Arc::clone(&page), &locator_json, deadline).await?;
-    let expression = locator_script(&resolution.locator_json, index, &body);
-    let mut remote = if let Some(frame_id) = resolution.frame_id {
-        evaluate_handle_expression_in_frame_context(
-            &page.browser.client,
-            &resolution.session_id,
-            &frame_id,
-            expression,
-            deadline,
-        )
-        .await?
-    } else {
-        evaluate_handle_expression_in_session(
-            &page.browser.client,
-            &resolution.session_id,
-            expression,
-            deadline,
-        )
-        .await?
-    };
-    if let Some(object) = remote.as_object_mut() {
-        object.insert(
-            "__rustwright_session_id".to_string(),
-            Value::String(resolution.session_id),
-        );
+    for attempt in 0..=1 {
+        let resolution =
+            resolve_locator_session(Arc::clone(&page), &locator_json, deadline).await?;
+        let expression = locator_script(&resolution.locator_json, index, &body);
+        let remote =
+            evaluate_handle_locator_resolution(&page, &resolution, expression, deadline).await;
+        let mut remote = match remote {
+            Err(error)
+                if attempt == 0
+                    && (is_frame_ownership_changed(&error)
+                        || is_locator_wait_context_loss(&error)) =>
+            {
+                continue;
+            }
+            result => result?,
+        };
+        if let Some(object) = remote.as_object_mut() {
+            object.insert(
+                "__rustwright_session_id".to_string(),
+                Value::String(resolution.session_id),
+            );
+        }
+        return Ok(remote.to_string());
     }
-    Ok(remote.to_string())
+    unreachable!("locator handle action performs at most one ownership retry")
 }
+
+const LOCATOR_RESOLUTION_RERESOLVE_LIMIT: usize = 2;
 
 async fn resolve_locator_session(
     page: Arc<PageInner>,
@@ -26790,56 +32991,155 @@ async fn resolve_locator_session_with_frame_mode(
     include_same_origin_frames: bool,
 ) -> RwResult<LocatorSessionResolution> {
     let original_spec: Value = serde_json::from_str(locator_json)?;
-    let _ = refresh_page_frame_tree(
-        &page,
-        deadline.remaining_capped(Duration::from_millis(250))?,
-    )
-    .await;
-    let mut session_id = page.session_id.clone();
-    let mut frame_id = None;
-    let mut spec = original_spec.clone();
-    let mut consumed_any_oopif = false;
+    for attempt in 0..=LOCATOR_RESOLUTION_RERESOLVE_LIMIT {
+        reconcile_frame_cache_invalidations(&page);
+        let mut session_id = page.session_id.clone();
+        let mut frame_id = None;
+        let mut execution_frame_id = None;
+        let mut spec = original_spec.clone();
+        let mut consumed_any_oopif = false;
+        let mut stale_session = None;
 
-    loop {
-        let (candidate_spec, nth_wrapper) = if let Some(base) = nth_base_with_leading_frame(&spec) {
-            (base, Some(spec.clone()))
-        } else {
-            (spec.clone(), None)
-        };
-        let Some((next_session_id, remaining_spec)) = resolve_next_oopif_frame(
-            Arc::clone(&page),
-            &session_id,
-            frame_id.as_deref(),
-            &candidate_spec,
-            deadline,
-            include_same_origin_frames,
-        )
-        .await?
-        else {
-            break;
-        };
-        session_id = next_session_id;
-        frame_id = remaining_spec.0;
-        spec = if let Some(mut wrapper) = nth_wrapper {
-            if let Some(object) = wrapper.as_object_mut() {
-                object.insert("base".to_string(), remaining_spec.1);
+        loop {
+            let (candidate_spec, nth_wrapper) =
+                if let Some(base) = nth_base_with_leading_frame(&spec) {
+                    (base, Some(spec.clone()))
+                } else {
+                    (spec.clone(), None)
+                };
+            let session_ready_for_refresh = {
+                let state = page.frame_state.lock().unwrap();
+                session_id == state.main_session_id
+                    || state.iframe_sessions_ready.contains(&session_id)
+            };
+            if session_ready_for_refresh {
+                if let Err(error) = ensure_frame_tree_session_after_reconcile(
+                    &page,
+                    &session_id,
+                    deadline,
+                    Duration::from_millis(250),
+                )
+                .await
+                {
+                    if !leading_frame_chain(&candidate_spec).is_empty() {
+                        if attempt < LOCATOR_RESOLUTION_RERESOLVE_LIMIT
+                            && is_locator_wait_context_loss(&error)
+                        {
+                            stale_session = Some((session_id.clone(), is_cdp_session_loss(&error)));
+                            break;
+                        }
+                        return Err(error);
+                    }
+                }
             }
-            wrapper
-        } else {
-            remaining_spec.1
-        };
-        consumed_any_oopif = true;
-    }
+            let next_frame = resolve_next_oopif_frame(
+                Arc::clone(&page),
+                &session_id,
+                frame_id.as_deref(),
+                &candidate_spec,
+                deadline,
+                include_same_origin_frames,
+            )
+            .await;
+            let next_frame = match next_frame {
+                Ok(next_frame) => next_frame,
+                Err(error)
+                    if attempt < LOCATOR_RESOLUTION_RERESOLVE_LIMIT
+                        && is_locator_wait_context_loss(&error) =>
+                {
+                    stale_session = Some((session_id.clone(), is_cdp_session_loss(&error)));
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            let Some((next_session_id, (next_frame_id, remaining_spec))) = next_frame else {
+                break;
+            };
+            let switched_sessions = next_session_id != session_id;
+            execution_frame_id = next_frame_id.clone();
+            session_id = next_session_id;
+            frame_id = if switched_sessions {
+                None
+            } else {
+                next_frame_id
+            };
+            spec = if let Some(mut wrapper) = nth_wrapper {
+                if let Some(object) = wrapper.as_object_mut() {
+                    object.insert("base".to_string(), remaining_spec);
+                }
+                wrapper
+            } else {
+                remaining_spec
+            };
+            consumed_any_oopif = true;
+        }
 
-    Ok(LocatorSessionResolution {
-        session_id,
-        frame_id,
-        locator_json: if consumed_any_oopif {
-            spec.to_string()
-        } else {
-            locator_json.to_string()
-        },
-    })
+        if let Some((stale_session_id, session_was_lost)) = stale_session {
+            // Resolution only reads frame-owner identity and origin access. It
+            // never dispatches the caller's locator body, so a structural
+            // context rejection cannot have executed user code. Re-resolving
+            // under the same operation deadline is therefore safe and bounded.
+            #[cfg(test)]
+            page.frame_state
+                .lock()
+                .unwrap()
+                .record_locator_resolution_reresolve();
+            if session_was_lost {
+                page.frame_state
+                    .lock()
+                    .unwrap()
+                    .detach_session(&stale_session_id);
+            } else {
+                page.frame_state
+                    .lock()
+                    .unwrap()
+                    .mark_frame_cache_dirty(&stale_session_id);
+                ensure_frame_tree_session_after_reconcile(
+                    &page,
+                    &stale_session_id,
+                    deadline,
+                    Duration::from_millis(250),
+                )
+                .await?;
+            }
+            continue;
+        }
+
+        let main_frame_id = consumed_any_oopif
+            .then(|| page.main_frame_id.lock().unwrap().clone())
+            .flatten();
+        let (frame_id, ownership_generation) = {
+            let state = page.frame_state.lock().unwrap();
+            let frame_id = if consumed_any_oopif {
+                execution_frame_id.or(frame_id).or_else(|| {
+                    if session_id == state.main_session_id {
+                        main_frame_id
+                    } else {
+                        state.session_frames.get(&session_id).cloned()
+                    }
+                })
+            } else {
+                None
+            };
+            (frame_id, state.frame_ownership_generation)
+        };
+        if consumed_any_oopif && frame_id.is_none() {
+            return Err(RwError::Message(
+                "locator frame execution context is unavailable".to_string(),
+            ));
+        }
+        return Ok(LocatorSessionResolution {
+            session_id,
+            frame_id,
+            locator_json: if consumed_any_oopif {
+                spec.to_string()
+            } else {
+                locator_json.to_string()
+            },
+            ownership_generation,
+        });
+    }
+    unreachable!("locator resolution exhausts its bounded stale-context re-resolve budget")
 }
 
 fn nth_base_with_leading_frame(spec: &Value) -> Option<Value> {
@@ -26881,7 +33181,7 @@ async fn resolve_next_oopif_frame(
             .and_then(Value::as_str)
             .unwrap_or("iframe,frame");
         let Some(owner) = describe_frame_owner(
-            &page.browser.client,
+            &page,
             current_session_id,
             current_frame_id,
             &owner_spec,
@@ -26894,6 +33194,10 @@ async fn resolve_next_oopif_frame(
         else {
             return Ok(None);
         };
+        // Cached ownership is only a routing hint. The final locator action is
+        // bound to the cached frame/session execution context, whose destruction
+        // provides the same structural stale-owner failure used by Playwright.
+        reconcile_frame_cache_invalidations(&page);
         let Some(frame_id) = owner.frame_id else {
             if owner.same_origin_accessible {
                 continue;
@@ -26906,10 +33210,9 @@ async fn resolve_next_oopif_frame(
             .get("inner")
             .cloned()
             .unwrap_or_else(|| json!({ "kind": "css", "selector": "*" }));
-        if let Some(mapped_session) =
-            frame_session_for_frame(&page, &frame_id, Some(current_session_id))?
-        {
-            return Ok(Some((mapped_session, (None, remaining))));
+        let mapped_session = frame_session_for_frame(&page, &frame_id, Some(current_session_id))?;
+        if let Some(mapped_session) = mapped_session.as_ref() {
+            return Ok(Some((mapped_session.clone(), (Some(frame_id), remaining))));
         }
         if owner.same_origin_accessible {
             if include_same_origin_frames {
@@ -26937,18 +33240,25 @@ async fn resolve_next_oopif_frame(
                 )
                 .await?
                 {
-                    return Ok(Some((attached_session_id, (None, remaining))));
+                    return Ok(Some((attached_session_id, (Some(frame_id), remaining))));
                 }
             }
             if let Some(attached_session_id) =
                 wait_for_frame_session(&page, &frame_id, Some(current_session_id), None, deadline)
                     .await?
             {
-                return Ok(Some((attached_session_id, (None, remaining))));
+                return Ok(Some((attached_session_id, (Some(frame_id), remaining))));
             }
             return Err(RwError::Message(
                 "iframe target attachment ended without a frame session".to_string(),
             ));
+        }
+
+        if let Some(mapped_session) = mapped_session {
+            page.frame_state
+                .lock()
+                .unwrap()
+                .detach_session(&mapped_session);
         }
 
         if session_owns_frame(
@@ -26968,7 +33278,7 @@ async fn resolve_next_oopif_frame(
             wait_for_frame_session(&page, &frame_id, Some(current_session_id), None, deadline)
                 .await?
         {
-            return Ok(Some((attached_session_id, (None, remaining))));
+            return Ok(Some((attached_session_id, (Some(frame_id), remaining))));
         }
         return Err(RwError::Message(
             "cross-origin iframe did not acquire an execution session".to_string(),
@@ -27183,7 +33493,7 @@ return frame;
 }
 
 async fn describe_frame_owner(
-    client: &CdpClient,
+    page: &Arc<PageInner>,
     session_id: &str,
     current_frame_id: Option<&str>,
     owner_spec: &Value,
@@ -27192,6 +33502,7 @@ async fn describe_frame_owner(
     selector_label: &str,
     deadline: OperationDeadline,
 ) -> RwResult<Option<FrameOwnerResolution>> {
+    let client = &page.browser.client;
     let body = frame_owner_resolution_body(frame_index, frame_strict);
     let owner_json = owner_spec.to_string();
     let expression = locator_script(&owner_json, 0, &body);
@@ -27217,9 +33528,6 @@ async fn describe_frame_owner(
     let Some(object_id) = remote.get("objectId").and_then(Value::as_str) else {
         return Ok(None);
     };
-    let same_origin_accessible = frame_owner_same_origin(client, session_id, object_id, deadline)
-        .await
-        .unwrap_or(false);
     let described = client
         .send(
             "DOM.describeNode",
@@ -27227,7 +33535,14 @@ async fn describe_frame_owner(
             Some(session_id),
             deadline.remaining()?,
         )
-        .await;
+        .await?;
+    let frame_id = described
+        .pointer("/node/frameId")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let same_origin_accessible = frame_owner_same_origin(client, session_id, object_id, deadline)
+        .await
+        .unwrap_or(false);
     if let Ok(remaining) = deadline.remaining_capped(Duration::from_secs(1)) {
         let _ = client
             .send(
@@ -27238,11 +33553,6 @@ async fn describe_frame_owner(
             )
             .await;
     }
-    let described = described?;
-    let frame_id = described
-        .pointer("/node/frameId")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
     Ok(Some(FrameOwnerResolution {
         frame_id,
         same_origin_accessible,
@@ -27607,6 +33917,29 @@ async fn page_goto_async(
         .to_string())
 }
 
+fn is_cdp_session_loss(error: &RwError) -> bool {
+    let message = match error {
+        RwError::Cdp { message, .. } => message.to_ascii_lowercase(),
+        _ => return false,
+    };
+    [
+        "session with given id not found",
+        "no session with given id",
+        "session is detached",
+        "session detached",
+    ]
+    .iter()
+    .any(|fragment| message.contains(fragment))
+}
+
+fn is_frame_ownership_changed(error: &RwError) -> bool {
+    matches!(
+        error,
+        RwError::Cdp { message, .. }
+            if message == "frame ownership changed during locator resolution"
+    )
+}
+
 async fn page_goto_observed_async(
     page: Arc<PageInner>,
     url: String,
@@ -27931,6 +34264,7 @@ fn is_locator_wait_context_loss(error: &RwError) -> bool {
         "no frame with given id",
         "cannot find frame with id",
         "frame was detached",
+        "frame ownership changed during locator resolution",
     ]
     .iter()
     .any(|fragment| message.contains(fragment))
@@ -34849,6 +41183,7 @@ impl RustwrightNavigationHarness {
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
             sent_context_dispose_count: AtomicU64::new(0),
+            sent_get_frame_tree_count: AtomicU64::new(0),
             alive: Arc::new(AtomicBool::new(true)),
             alive_tx,
         });
@@ -34874,11 +41209,12 @@ impl RustwrightNavigationHarness {
             session_id: "page-session".to_owned(),
             context_id: None,
             main_frame_id: Mutex::new(None),
+            navigation_transition_lock: Mutex::new(NavigationTransitionState::default()),
             frame_state: Mutex::new(PageFrameState::new("page-session".to_owned())),
             iframe_setup_tasks: IframeSetupTaskRegistry::default(),
             network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
             console_records: Mutex::new(ConsoleRecordStore::default()),
-            console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+            console_capture: ConsoleCaptureState::default(),
             console_replay_until_event_cursor: Mutex::new(HashMap::new()),
             observation_event_cursor: AtomicU64::new(0),
             native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
@@ -38905,7 +45241,7 @@ async fn attach_existing_page_unregistered(
     .await?;
     session_cleanup.set_session(session_id.clone());
     let session_guard = AttachedSessionGuard::new(session_cleanup);
-    let event_stream_start_cursor = browser.client.event_cursor();
+    let (page_events, event_stream_start_cursor) = browser.client.subscribe_with_cursor();
     initialize_attached_page_session(
         &browser.client,
         &session_id,
@@ -38913,7 +45249,6 @@ async fn attach_existing_page_unregistered(
         browser.startup_probe.as_deref(),
     )
     .await?;
-
     startup_timing::measure_phase_async(
         browser.startup_probe.as_deref(),
         startup_timing::Phase::PageStealth,
@@ -38940,15 +45275,16 @@ async fn attach_existing_page_unregistered(
                 session_id: session_id.clone(),
                 context_id,
                 main_frame_id: Mutex::new(None),
+                navigation_transition_lock: Mutex::new(NavigationTransitionState::default()),
                 frame_state: Mutex::new(PageFrameState::new(session_id.clone())),
                 iframe_setup_tasks: IframeSetupTaskRegistry::default(),
                 network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(
                     event_stream_start_cursor,
                 ))),
                 console_records: Mutex::new(ConsoleRecordStore::default()),
-                console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+                console_capture: ConsoleCaptureState::default(),
                 console_replay_until_event_cursor: Mutex::new(HashMap::new()),
-                observation_event_cursor: AtomicU64::new(0),
+                observation_event_cursor: AtomicU64::new(event_stream_start_cursor),
                 native_network_records: Mutex::new(NativeNetworkRecordStore::new(
                     browser.next_native_network_index.load(Ordering::SeqCst),
                 )),
@@ -38963,8 +45299,14 @@ async fn attach_existing_page_unregistered(
                 crashed: AtomicBool::new(false),
                 close_target_on_drop: AtomicBool::new(false),
             });
-            let _ = refresh_page_frame_tree(&page_inner, Duration::from_secs(5)).await;
-            spawn_page_oopif_event_listener(Arc::downgrade(&page_inner));
+            start_page_frame_cache_tracking_with_subscription(
+                &page_inner,
+                page_events,
+                event_stream_start_cursor,
+                &session_id,
+            );
+            let _ =
+                ensure_frame_tree_session(&page_inner, &session_id, Duration::from_secs(5)).await;
             Ok::<_, RwError>(page_inner)
         },
     )
@@ -39088,6 +45430,8 @@ async fn set_file_input_files_for_session(
         .map(|_| ())
 }
 
+#[cfg(test)]
+
 fn record_attached_iframe_session(
     page: &Arc<PageInner>,
     frame_id: &str,
@@ -39142,6 +45486,8 @@ fn claim_manual_attached_iframe_session(
     }
 }
 
+#[cfg(test)]
+
 fn register_attached_iframe_session(
     page: &Arc<PageInner>,
     frame_id: String,
@@ -39161,6 +45507,48 @@ fn register_attached_iframe_session(
     );
     spawn_attached_iframe_session_initialization(page, frame_id, session_pin.clone(), timeout);
     session_pin
+}
+
+fn register_attached_iframe_session_at_sequence(
+    page: Arc<PageInner>,
+    frame_id: String,
+    parent_frame_id: Option<String>,
+    parent_session_id: String,
+    child_session_id: String,
+    event_sequence: Option<u64>,
+    timeout: Duration,
+) -> RwResult<Option<FrameSessionPin>> {
+    let session_pin = {
+        let mut state = page.frame_state.lock().unwrap();
+        if !state.owns_session(&parent_session_id)
+            || !state.mark_frame_cache_dirty_at_sequence(&parent_session_id, event_sequence)
+        {
+            return Ok(None);
+        }
+        let previous_generation = state
+            .session_pin_for_frame(&frame_id)
+            .map(|pin| pin.generation);
+        let session_pin = state.record_session_for_frame_at_sequence(
+            &frame_id,
+            &child_session_id,
+            event_sequence,
+        );
+        state.record_frame(
+            frame_id.clone(),
+            parent_frame_id,
+            None,
+            None,
+            child_session_id,
+        );
+        drop(state);
+        if previous_generation.is_some_and(|generation| generation != session_pin.generation) {
+            page.iframe_setup_tasks
+                .abort_generations(previous_generation);
+        }
+        session_pin
+    };
+    spawn_attached_iframe_session_initialization(&page, frame_id, session_pin.clone(), timeout);
+    Ok(Some(session_pin))
 }
 
 const DEFAULT_ATTACHED_SESSION_DOMAINS: [&str; 3] = ["Page.enable", "DOM.enable", "Network.enable"];
@@ -39233,8 +45621,7 @@ fn enqueue_focus_emulation(
 }
 
 async fn enable_console_capture(page: &PageInner, timeout: Duration) -> RwResult<()> {
-    let mut capture = page.console_capture.lock().await;
-    capture.requested = true;
+    page.console_capture.requested.store(true, Ordering::SeqCst);
     let sessions = {
         let frame_state = page.frame_state.lock().unwrap();
         std::iter::once(page.session_id.clone())
@@ -39242,7 +45629,7 @@ async fn enable_console_capture(page: &PageInner, timeout: Duration) -> RwResult
             .collect::<HashSet<_>>()
     };
     for session_id in sessions {
-        enable_console_capture_for_session_locked(page, &session_id, timeout, &mut capture).await?;
+        enable_console_capture_for_session(page, &session_id, timeout).await?;
     }
     Ok(())
 }
@@ -39252,20 +45639,22 @@ async fn enable_console_capture_for_session_if_requested(
     session_id: &str,
     timeout: Duration,
 ) -> RwResult<()> {
-    let mut capture = page.console_capture.lock().await;
-    if !capture.requested {
+    if !page.console_capture.requested.load(Ordering::SeqCst) {
         return Ok(());
     }
-    enable_console_capture_for_session_locked(page, session_id, timeout, &mut capture).await
+    enable_console_capture_for_session(page, session_id, timeout).await
 }
 
-async fn enable_console_capture_for_session_locked(
+async fn enable_console_capture_for_session(
     page: &PageInner,
     session_id: &str,
     timeout: Duration,
-    capture: &mut ConsoleCaptureState,
 ) -> RwResult<()> {
-    if capture.enabled_sessions.contains(session_id) {
+    // Hold the enabled-session set across Runtime.enable. This makes first use
+    // single-flight and records the session before any later console_records()
+    // call can send the detectable command a second time.
+    let mut enabled_sessions = page.console_capture.enabled_sessions.lock().await;
+    if enabled_sessions.contains(session_id) {
         return Ok(());
     }
     let started = Instant::now();
@@ -39301,8 +45690,24 @@ async fn enable_console_capture_for_session_locked(
     if replay_windows.get(session_id) == Some(&replay_until) {
         replay_windows.remove(session_id);
     }
-    capture.enabled_sessions.insert(session_id.to_string());
+    enabled_sessions.insert(session_id.to_string());
     Ok(())
+}
+
+const ATTACHED_IFRAME_SETUP_RETRY_LIMIT: usize = 1;
+#[cfg(test)]
+const ATTACHED_IFRAME_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn is_transient_attached_session_setup_error(error: &RwError) -> bool {
+    matches!(
+        error,
+        RwError::Timeout(_)
+            | RwError::ConnectFailed
+            | RwError::Disconnected
+            | RwError::Io(_)
+            | RwError::Reqwest(_)
+            | RwError::WebSocket(_)
+    )
 }
 
 fn iframe_session_is_live(page: &PageInner, frame_id: &str, session_pin: &FrameSessionPin) -> bool {
@@ -39322,6 +45727,15 @@ fn spawn_attached_iframe_session_initialization(
     timeout: Duration,
 ) {
     if !iframe_session_is_live(page, &frame_id, &session_pin) {
+        return;
+    }
+    if page
+        .frame_state
+        .lock()
+        .unwrap()
+        .frame_session_errors
+        .contains_key(&frame_id)
+    {
         return;
     }
     let generation = session_pin.generation;
@@ -39368,7 +45782,21 @@ fn spawn_attached_iframe_session_initialization(
             }
             let client = Arc::clone(&page.browser.client);
             drop(page);
-            enable_page_iframe_auto_attach(&client, &session_pin.session_id, timeout).await?;
+            let mut attempt = 0;
+            loop {
+                match enable_page_iframe_auto_attach(&client, &session_pin.session_id, timeout)
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(error)
+                        if attempt < ATTACHED_IFRAME_SETUP_RETRY_LIMIT
+                            && is_transient_attached_session_setup_error(&error) =>
+                    {
+                        attempt += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
 
             let Some(page) = weak_page.upgrade() else {
                 return Ok(());
@@ -39449,7 +45877,13 @@ async fn setup_attached_iframe_session(
     drop(active_page);
     let child_session_id = &session_pin.session_id;
     enable_attached_session_domains(&client, child_session_id, Duration::from_secs(5)).await?;
-    ensure_live()?;
+    let active_page = ensure_live()?;
+    active_page
+        .frame_state
+        .lock()
+        .unwrap()
+        .mark_page_domain_enabled(child_session_id);
+    drop(active_page);
     enable_action_dispatch_binding_for_session(&client, child_session_id, Duration::from_secs(5))
         .await?;
     let active_page = ensure_live()?;
@@ -39480,47 +45914,210 @@ async fn setup_attached_iframe_session(
     .await?;
     drop(active_page);
     let active_page = ensure_live()?;
-    refresh_page_frame_tree(&active_page, Duration::from_secs(5)).await?;
+    ensure_frame_tree_session(&active_page, child_session_id, Duration::from_secs(5)).await?;
     ensure_live()?;
     Ok(())
 }
+
+#[cfg(test)]
+async fn setup_attached_iframe_session_with_timeout(
+    page: Arc<PageInner>,
+    frame_id: String,
+    child_session_id: String,
+    timeout: Duration,
+) -> RwResult<()> {
+    let client = Arc::clone(&page.browser.client);
+    enable_page_iframe_auto_attach(&client, &child_session_id, timeout).await?;
+    let pin = {
+        let mut state = page.frame_state.lock().unwrap();
+        let Some(pin) = state
+            .session_pin_for_frame(&frame_id)
+            .filter(|pin| pin.session_id == child_session_id)
+        else {
+            return Ok(());
+        };
+        let Some(_) = state.claim_iframe_session_setup(&frame_id, &pin) else {
+            return Ok(());
+        };
+        pin
+    };
+    try_join_all(
+        DEFAULT_ATTACHED_SESSION_DOMAINS
+            .into_iter()
+            .map(|method| client.send(method, json!({}), Some(&child_session_id), timeout)),
+    )
+    .await?;
+    {
+        let mut state = page.frame_state.lock().unwrap();
+        if !state.session_pin_still_owns_frame(&frame_id, &pin) {
+            return Ok(());
+        }
+        state.mark_page_domain_enabled(&child_session_id);
+    }
+    enable_file_chooser_intercept_for_session(&client, &child_session_id, timeout).await?;
+    install_stealth_defaults(&page.browser, &child_session_id).await?;
+    enable_console_capture_for_session_if_requested(&page, &child_session_id, timeout).await?;
+    Ok(())
+}
+
+fn arm_recovered_attached_iframe_session(
+    page: &Arc<PageInner>,
+    frame_id: String,
+    child_session_id: String,
+    timeout: Duration,
+) -> bool {
+    let session_pin = page
+        .frame_state
+        .lock()
+        .unwrap()
+        .session_pin_for_frame(&frame_id)
+        .filter(|pin| pin.session_id == child_session_id);
+    let Some(session_pin) = session_pin else {
+        return false;
+    };
+    if !iframe_session_is_live(page, &frame_id, &session_pin) {
+        return false;
+    }
+    spawn_attached_iframe_session_initialization(page, frame_id, session_pin, timeout);
+    true
+}
+
+#[cfg(test)]
+fn start_page_frame_cache_tracking(
+    page: &Arc<PageInner>,
+    event_cursor: u64,
+    page_session_id: &str,
+) {
+    let events = page.browser.client.subscribe();
+    start_page_frame_cache_tracking_with_subscription(page, events, event_cursor, page_session_id);
+}
+
+#[cfg(test)]
+fn start_page_frame_cache_tracking_without_listener(
+    page: &Arc<PageInner>,
+    event_cursor: u64,
+    page_session_id: &str,
+) {
+    initialize_page_frame_cache_tracking(page, event_cursor, page_session_id);
+}
+
+fn start_page_frame_cache_tracking_with_subscription(
+    page: &Arc<PageInner>,
+    events: broadcast::Receiver<Value>,
+    event_cursor: u64,
+    page_session_id: &str,
+) {
+    initialize_page_frame_cache_tracking(page, event_cursor, page_session_id);
+    spawn_page_sequence_gated_event_listener(Arc::downgrade(page), events);
+}
+
+fn initialize_page_frame_cache_tracking(
+    page: &Arc<PageInner>,
+    event_cursor: u64,
+    page_session_id: &str,
+) {
+    page.navigation_transition_lock
+        .lock()
+        .unwrap()
+        .initialize(event_cursor);
+    page.observation_event_cursor
+        .store(event_cursor, Ordering::SeqCst);
+    page.frame_state
+        .lock()
+        .unwrap()
+        .set_frame_event_cursor(event_cursor);
+    let mut state = page.frame_state.lock().unwrap();
+    state.mark_frame_event_listener_registered();
+    state.mark_page_domain_enabled(page_session_id);
+}
+
+fn cdp_event_sequence(event: &Value) -> Option<u64> {
+    event
+        .get("__rustwright_cdp_event_seq")
+        .and_then(Value::as_u64)
+}
+
+fn listener_sequence_has_gap(page: &PageInner, sequence: u64) -> bool {
+    page.navigation_transition_lock
+        .lock()
+        .unwrap()
+        .sequence_has_gap_before(sequence)
+}
+
+fn advance_contiguous_progress_after_live_event(page: &PageInner, sequence: u64) {
+    let mut navigation_transition = page.navigation_transition_lock.lock().unwrap();
+    if navigation_transition.advance_live(sequence) {
+        prune_page_navigation_epochs_to_contiguous_progress(page, &navigation_transition);
+    }
+}
+
+#[cfg(test)]
 
 fn spawn_page_oopif_event_listener(page: Weak<PageInner>) {
     let Some(initial_page) = page.upgrade() else {
         return;
     };
-    let (mut events, _) = initial_page.browser.client.subscribe_with_cursor();
-    let mut event_cursor = initial_page.event_stream_start_cursor;
-    initial_page
-        .observation_event_cursor
-        .store(event_cursor, Ordering::SeqCst);
-
+    let (events, live_event_cursor) = initial_page.browser.client.subscribe_with_cursor();
+    let event_cursor = initial_page
+        .event_stream_start_cursor
+        .min(live_event_cursor);
+    let page_session_id = initial_page.session_id.clone();
+    initialize_page_frame_cache_tracking(&initial_page, event_cursor, &page_session_id);
+    let replay_overflowed = initial_page
+        .browser
+        .client
+        .event_log
+        .lock()
+        .unwrap()
+        .oldest_seq()
+        > event_cursor;
+    if replay_overflowed {
+        let replay_page = Arc::clone(&initial_page);
+        tokio::spawn(async move {
+            let _ = reconcile_page_frame_tree_authoritatively(&replay_page).await;
+        });
+    } else {
+        reconcile_frame_cache_invalidations(&initial_page);
+    }
     drop(initial_page);
+    spawn_page_sequence_gated_event_listener(page, events);
+}
+
+fn advance_observation_event_cursor(page: &PageInner, cursor: u64) {
+    let previous = page
+        .observation_event_cursor
+        .fetch_max(cursor, Ordering::SeqCst);
+    let committed_cursor = previous.max(cursor);
+    page.console_replay_until_event_cursor
+        .lock()
+        .unwrap()
+        .retain(|_, replay_until| *replay_until == u64::MAX || committed_cursor < *replay_until);
+}
+
+fn spawn_page_sequence_gated_event_listener(
+    page: Weak<PageInner>,
+    mut events: broadcast::Receiver<Value>,
+) {
     tokio::spawn(async move {
         let Some(initial_page) = page.upgrade() else {
             return;
         };
-        let _ =
-            reconcile_page_oopif_events_after_lag(&initial_page, &mut events, &mut event_cursor)
-                .await;
         drop(initial_page);
         loop {
             let event = match events.recv().await {
-                Ok(event) => {
-                    event_cursor = event_cursor.wrapping_add(1);
-                    event
-                }
+                Ok(event) => event,
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let Some(page) = page.upgrade() else {
-                        break;
-                    };
-                    let _ = reconcile_page_oopif_events_after_lag(
-                        &page,
-                        &mut events,
-                        &mut event_cursor,
-                    )
-                    .await;
-
+                    if let Some(page) = page.upgrade() {
+                        #[cfg(test)]
+                        let replay_overflowed =
+                            page.browser.client.event_log.lock().unwrap().oldest_seq()
+                                > page.observation_event_cursor.load(Ordering::SeqCst);
+                        reconcile_frame_cache_invalidations_after_lag(&page);
+                        #[cfg(test)]
+                        if replay_overflowed {
+                            let _ = reconcile_page_frame_tree_authoritatively(&page).await;
+                        }
+                    }
                     continue;
                 }
                 Err(_) => break,
@@ -39531,18 +46128,28 @@ fn spawn_page_oopif_event_listener(page: Weak<PageInner>) {
             if page.lifecycle.is_closing_or_closed() {
                 break;
             }
-            handle_page_oopif_event(Arc::clone(&page), event, event_cursor).await;
-            page.observation_event_cursor
-                .store(event_cursor, Ordering::SeqCst);
-            page.console_replay_until_event_cursor
-                .lock()
-                .unwrap()
-                .retain(|_, replay_until| {
-                    *replay_until == u64::MAX || event_cursor < *replay_until
-                });
+            let event_sequence = cdp_event_sequence(&event);
+            if let Some(sequence) = event_sequence {
+                if sequence < page.observation_event_cursor.load(Ordering::SeqCst) {
+                    continue;
+                }
+                if listener_sequence_has_gap(&page, sequence) {
+                    reconcile_frame_cache_invalidations_after_lag(&page);
+                    if sequence < page.observation_event_cursor.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                }
+            }
+            handle_page_oopif_event(Arc::clone(&page), event).await;
+            if let Some(sequence) = event_sequence {
+                advance_contiguous_progress_after_live_event(&page, sequence);
+                advance_observation_event_cursor(&page, sequence.saturating_add(1));
+            }
         }
     });
 }
+
+#[cfg(test)]
 
 async fn reconcile_page_oopif_events_after_lag(
     page: &Arc<PageInner>,
@@ -39564,7 +46171,7 @@ async fn reconcile_page_oopif_events_after_lag(
             return Ok(());
         }
         let replay_cursor = seq.wrapping_add(1);
-        handle_page_oopif_event(Arc::clone(page), event, replay_cursor).await;
+        handle_page_oopif_event(Arc::clone(page), event).await;
         page.observation_event_cursor
             .store(replay_cursor, Ordering::SeqCst);
         page.console_replay_until_event_cursor
@@ -39577,6 +46184,8 @@ async fn reconcile_page_oopif_events_after_lag(
     }
     Ok(())
 }
+
+#[cfg(test)]
 
 async fn reconcile_page_frame_tree_authoritatively(page: &Arc<PageInner>) -> RwResult<()> {
     let mut last_error = None;
@@ -39635,16 +46244,15 @@ async fn reconcile_page_frame_tree_authoritatively(page: &Arc<PageInner>) -> RwR
     Err(RwError::Message(message))
 }
 
+#[cfg(test)]
+
 async fn reconcile_page_frame_tree_authoritatively_once(
     page: &Arc<PageInner>,
     timeout: Duration,
 ) -> RwResult<bool> {
     let (snapshot_generation, sessions) = {
         let state = page.frame_state.lock().unwrap();
-        (
-            state.next_attachment_generation,
-            state.frame_tree_refresh_session_ids(),
-        )
+        (state.next_attachment_generation, state.session_ids())
     };
     let deadline = OperationDeadline::new(timeout);
     let mut trees = Vec::with_capacity(sessions.len());
@@ -39715,6 +46323,9 @@ async fn reconcile_page_frame_tree_authoritatively_once(
         .abort_generations(removed_generations);
     Ok(true)
 }
+
+#[cfg(test)]
+
 fn cdp_error_reports_missing_session(error: &RwError) -> bool {
     let RwError::Cdp { message, .. } = error else {
         return false;
@@ -39724,6 +46335,8 @@ fn cdp_error_reports_missing_session(error: &RwError) -> bool {
         || message.contains("session not found")
         || message.contains("not attached to an active page")
 }
+
+#[cfg(test)]
 
 fn collect_authoritative_frame_ids(node: &Value, frame_ids: &mut HashSet<String>, depth: usize) {
     let Some(frame_id) = node.pointer("/frame/id").and_then(Value::as_str) else {
@@ -39738,6 +46351,8 @@ fn collect_authoritative_frame_ids(node: &Value, frame_ids: &mut HashSet<String>
         }
     }
 }
+
+#[cfg(test)]
 
 fn ingest_authoritative_frame_tree_node(
     state: &mut PageFrameState,
@@ -39776,20 +46391,151 @@ fn ingest_authoritative_frame_tree_node(
     }
 }
 
-async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value, event_cursor: u64) {
-    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
-    let capture_baseline_replay = event
-        .get("sessionId")
+#[derive(Debug)]
+enum AcceptedNavigationObservation {
+    Document { loader_id: Option<String> },
+    SameDocument,
+}
+
+// Callers hold main_frame_id before frame_state. The returned observation must
+// be recorded only after both guards are released.
+fn apply_accepted_frame_navigation_transition(
+    state: &mut PageFrameState,
+    main_frame_id: &mut Option<String>,
+    crashed: &AtomicBool,
+    page_session_id: &str,
+    event_session_id: &str,
+    event_sequence: Option<u64>,
+    frame: &Value,
+) -> Option<AcceptedNavigationObservation> {
+    let frame_id = frame.get("id").and_then(Value::as_str)?;
+    if !state.owns_session(event_session_id)
+        || !state.mark_frame_cache_dirty_at_sequence(event_session_id, event_sequence)
+    {
+        return None;
+    }
+    let parent_id = frame
+        .get("parentId")
         .and_then(Value::as_str)
-        .and_then(|session_id| {
-            page.console_replay_until_event_cursor
-                .lock()
-                .unwrap()
-                .get(session_id)
-                .copied()
-        })
-        .is_some_and(|replay_until| replay_until == u64::MAX || event_cursor <= replay_until);
-    record_page_observation_event(&page, &event, capture_baseline_replay);
+        .map(ToString::to_string);
+    let name = frame
+        .get("name")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let url = frame
+        .get("url")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let loader_id = frame
+        .get("loaderId")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let is_main_frame = parent_id.is_none() && event_session_id == page_session_id;
+    if is_main_frame {
+        *main_frame_id = Some(frame_id.to_string());
+        crashed.store(false, Ordering::SeqCst);
+    }
+    state.record_frame_loader(frame_id, loader_id.as_deref());
+    state.record_frame(
+        frame_id.to_string(),
+        parent_id,
+        name,
+        url,
+        event_session_id.to_string(),
+    );
+    is_main_frame.then_some(AcceptedNavigationObservation::Document { loader_id })
+}
+
+// Callers hold main_frame_id before frame_state. The returned observation must
+// be recorded only after both guards are released.
+fn apply_accepted_same_document_navigation_transition(
+    state: &mut PageFrameState,
+    main_frame_id: &Option<String>,
+    page_session_id: &str,
+    event_session_id: &str,
+    event_sequence: Option<u64>,
+    params: &Value,
+) -> Option<AcceptedNavigationObservation> {
+    let frame_id = params.get("frameId").and_then(Value::as_str)?;
+    if !state.owns_session(event_session_id)
+        || !state.mark_frame_cache_dirty_at_sequence(event_session_id, event_sequence)
+    {
+        return None;
+    }
+    let url = params
+        .get("url")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    state.record_frame(
+        frame_id.to_string(),
+        None,
+        None,
+        url,
+        event_session_id.to_string(),
+    );
+    (event_session_id == page_session_id && main_frame_id.as_deref() == Some(frame_id))
+        .then_some(AcceptedNavigationObservation::SameDocument)
+}
+
+fn record_accepted_navigation_observation(
+    page: &PageInner,
+    observation: AcceptedNavigationObservation,
+    event_sequence: Option<u64>,
+) {
+    let next_index = page
+        .browser
+        .next_native_network_index
+        .load(Ordering::SeqCst);
+    let (transition, epoch) = {
+        let mut network = page.native_network_records.lock().unwrap();
+        let transition = match observation {
+            AcceptedNavigationObservation::Document { loader_id } => {
+                network.begin_document_navigation(loader_id.as_deref(), next_index, event_sequence)
+            }
+            AcceptedNavigationObservation::SameDocument => {
+                network.begin_same_document_navigation(next_index, event_sequence)
+            }
+        };
+        (transition, network.navigation_epoch)
+    };
+    if let NavigationEpochTransition::Accepted { advanced } = transition {
+        let accepted = page
+            .console_records
+            .lock()
+            .unwrap()
+            .record_navigation(event_sequence, epoch);
+        debug_assert!(accepted);
+        let _ = advanced;
+    }
+}
+
+fn prune_page_navigation_epochs_to_contiguous_progress(
+    page: &PageInner,
+    navigation_transition: &NavigationTransitionState,
+) {
+    let Some(low_water_mark) = navigation_transition.contiguous_event_watermark else {
+        return;
+    };
+    page.native_network_records
+        .lock()
+        .unwrap()
+        .prune_navigation_epochs_through(low_water_mark);
+    page.console_records
+        .lock()
+        .unwrap()
+        .prune_navigation_epochs_through(low_water_mark);
+}
+
+async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
+    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+    let event_sequence = cdp_event_sequence(&event);
+    let is_page_navigation = matches!(
+        method,
+        "Page.frameNavigated" | "Page.navigatedWithinDocument"
+    );
+    if !is_page_navigation {
+        record_page_observation_event(&page, &event);
+    }
     if method == "Target.targetCrashed"
         && event.pointer("/params/targetId").and_then(Value::as_str)
             == Some(page.target_id.as_str())
@@ -39822,10 +46568,14 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value, event_curso
         return;
     }
     if method == "Target.attachedToTarget" {
-        let parent_session_id = event.get("sessionId").and_then(Value::as_str);
-        if !parent_session_id
-            .map(|session_id| page.frame_state.lock().unwrap().owns_session(session_id))
-            .unwrap_or(false)
+        let Some(parent_session_id) = event.get("sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        if !page
+            .frame_state
+            .lock()
+            .unwrap()
+            .owns_session(parent_session_id)
         {
             return;
         }
@@ -39869,15 +46619,22 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value, event_curso
             .get("url")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        let _ = register_attached_iframe_session(
-            &page,
+        if let Ok(Some(pin)) = register_attached_iframe_session_at_sequence(
+            Arc::clone(&page),
             frame_id.to_string(),
             parent_frame_id,
+            parent_session_id.to_string(),
             child_session_id.to_string(),
-            target_name,
-            target_url,
+            event_sequence,
             Duration::from_secs(5),
-        );
+        ) {
+            let mut state = page.frame_state.lock().unwrap();
+            if pin.session_id == child_session_id
+                && state.session_pin_still_owns_frame(frame_id, &pin)
+            {
+                state.seed_attached_frame_metadata(frame_id, &pin, target_name, target_url);
+            }
+        }
         return;
     }
 
@@ -39886,10 +46643,12 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value, event_curso
         else {
             return;
         };
-        let mut state = page.frame_state.lock().unwrap();
-        let generations = state.setup_generations_for_session(detached_session_id);
-        state.detach_session(detached_session_id);
-        drop(state);
+        let generations = {
+            let mut state = page.frame_state.lock().unwrap();
+            let generations = state.setup_generations_for_session(detached_session_id);
+            state.detach_session_at_sequence(detached_session_id, event_sequence);
+            generations
+        };
         page.iframe_setup_tasks.abort_generations(generations);
         return;
     }
@@ -39916,146 +46675,179 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value, event_curso
                 .get("parentFrameId")
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
-            page.frame_state.lock().unwrap().record_frame(
-                frame_id.to_string(),
-                parent_id,
-                None,
-                None,
-                event_session_id.to_string(),
-            );
+            let mut state = page.frame_state.lock().unwrap();
+            if state.mark_frame_cache_dirty_at_sequence(event_session_id, event_sequence) {
+                state.record_frame(
+                    frame_id.to_string(),
+                    parent_id,
+                    None,
+                    None,
+                    event_session_id.to_string(),
+                );
+            }
         }
         "Page.frameNavigated" => {
-            let frame = params.get("frame").unwrap_or(&Value::Null);
-            let Some(frame_id) = frame.get("id").and_then(Value::as_str) else {
-                return;
+            let _navigation_transition = page.navigation_transition_lock.lock().unwrap();
+            let observation = {
+                let mut main_frame_id = page.main_frame_id.lock().unwrap();
+                let mut state = page.frame_state.lock().unwrap();
+                apply_accepted_frame_navigation_transition(
+                    &mut state,
+                    &mut main_frame_id,
+                    &page.crashed,
+                    page.session_id.as_str(),
+                    event_session_id,
+                    event_sequence,
+                    params.get("frame").unwrap_or(&Value::Null),
+                )
             };
-            let parent_id = frame
-                .get("parentId")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            let name = frame
-                .get("name")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            let url = frame
-                .get("url")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            if parent_id.is_none() && event_session_id == page.session_id {
-                *page.main_frame_id.lock().unwrap() = Some(frame_id.to_string());
-                page.crashed.store(false, Ordering::SeqCst);
+            if let Some(observation) = observation {
+                record_accepted_navigation_observation(&page, observation, event_sequence);
             }
-            page.frame_state.lock().unwrap().record_frame(
-                frame_id.to_string(),
-                parent_id,
-                name,
-                url,
-                event_session_id.to_string(),
-            );
         }
         "Page.navigatedWithinDocument" => {
-            let Some(frame_id) = params.get("frameId").and_then(Value::as_str) else {
-                return;
+            let _navigation_transition = page.navigation_transition_lock.lock().unwrap();
+            let observation = {
+                let main_frame_id = page.main_frame_id.lock().unwrap();
+                let mut state = page.frame_state.lock().unwrap();
+                apply_accepted_same_document_navigation_transition(
+                    &mut state,
+                    &main_frame_id,
+                    page.session_id.as_str(),
+                    event_session_id,
+                    event_sequence,
+                    params,
+                )
             };
-            let url = params
-                .get("url")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            page.frame_state.lock().unwrap().record_frame(
-                frame_id.to_string(),
-                None,
-                None,
-                url,
-                event_session_id.to_string(),
-            );
+            if let Some(observation) = observation {
+                record_accepted_navigation_observation(&page, observation, event_sequence);
+            }
         }
         "Page.frameDetached" => {
             let reason = params.get("reason").and_then(Value::as_str).unwrap_or("");
-            if let Some(frame_id) = params.get("frameId").and_then(Value::as_str) {
-                if reason == "swap" {
-                    // A swap preserves the frame record while invalidating the losing session and
-                    // generation. Pinned waiters follow the next fully initialized attachment;
-                    // the old session's Target detach is therefore non-terminal until replacement.
-                    let mut state = page.frame_state.lock().unwrap();
-                    let generation = state.frame_attachment_generations.get(frame_id).copied();
-                    state.mark_frame_swap_pending(frame_id, event_session_id);
-                    let invalidated_generation = generation.filter(|generation| {
-                        state.frame_attachment_generations.get(frame_id) != Some(generation)
-                    });
-                    drop(state);
-                    page.iframe_setup_tasks
-                        .abort_generations(invalidated_generation);
-                } else {
-                    let generations = page.frame_state.lock().unwrap().remove_frame(frame_id);
-                    page.iframe_setup_tasks.abort_generations(generations);
+            let mut state = page.frame_state.lock().unwrap();
+            if state.mark_frame_cache_dirty_at_sequence(event_session_id, event_sequence) {
+                if let Some(frame_id) = params.get("frameId").and_then(Value::as_str) {
+                    if reason == "swap" {
+                        let removed_generation =
+                            state.mark_frame_swap_pending(frame_id, event_session_id);
+                        state.record_frame_swap(frame_id);
+                        drop(state);
+                        page.iframe_setup_tasks
+                            .abort_generations(removed_generation);
+                    } else {
+                        let removed_generations = state.remove_frame(frame_id);
+                        drop(state);
+                        page.iframe_setup_tasks
+                            .abort_generations(removed_generations);
+                    }
                 }
             }
+        }
+        "Runtime.executionContextDestroyed" => {
+            if let Some(context_id) = params.get("executionContextId") {
+                page.frame_state
+                    .lock()
+                    .unwrap()
+                    .invalidate_execution_context(event_session_id, context_id);
+            }
+        }
+        "Runtime.executionContextsCleared" => {
+            page.frame_state
+                .lock()
+                .unwrap()
+                .invalidate_execution_contexts_for_session(event_session_id);
         }
         _ => {}
     }
 }
 
-fn record_page_observation_event(page: &PageInner, event: &Value, capture_baseline_replay: bool) {
-    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+fn record_page_observation_event(page: &PageInner, event: &Value) {
+    record_page_observation_event_with_ownership(page, event, None);
+}
+
+fn record_page_observation_event_with_ownership(
+    page: &PageInner,
+    event: &Value,
+    replay_owned_session: Option<bool>,
+) {
+    let event_sequence = cdp_event_sequence(event);
+    let event_cursor = event_sequence.map(|sequence| sequence.saturating_add(1));
     let event_session_id = event.get("sessionId").and_then(Value::as_str);
+    let capture_baseline_replay = event_session_id
+        .and_then(|session_id| {
+            page.console_replay_until_event_cursor
+                .lock()
+                .unwrap()
+                .get(session_id)
+                .copied()
+        })
+        .is_some_and(|replay_until| {
+            replay_until == u64::MAX
+                || event_cursor.is_some_and(|event_cursor| event_cursor <= replay_until)
+        });
+    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
     let is_main_session = event_session_id == Some(page.session_id.as_str());
-    let owned_session = event_session_id
-        .is_some_and(|session_id| page.frame_state.lock().unwrap().owns_session(session_id));
+    let owned_session = replay_owned_session.unwrap_or_else(|| {
+        event_session_id
+            .is_some_and(|session_id| page.frame_state.lock().unwrap().owns_session(session_id))
+    });
     let next_index = page
         .browser
         .next_native_network_index
         .load(Ordering::SeqCst);
-    let advances_navigation = {
-        let mut network = page.native_network_records.lock().unwrap();
-        match method {
-            "Network.requestWillBeSent" if is_main_session => {
-                let frame_id = event.pointer("/params/frameId").and_then(Value::as_str);
-                let main_frame_id = page.main_frame_id.lock().unwrap().clone();
-                let is_main_document = event.pointer("/params/type").and_then(Value::as_str)
-                    == Some("Document")
-                    && frame_id.is_some()
-                    && main_frame_id
-                        .as_deref()
-                        .map_or(true, |main| frame_id == Some(main));
-                is_main_document
-                    && network.begin_document_navigation(
-                        event.pointer("/params/loaderId").and_then(Value::as_str),
-                        next_index,
-                    )
-            }
-            "Page.frameNavigated" if is_main_session => {
-                let frame = event.pointer("/params/frame");
-                frame.is_some_and(|frame| frame.get("parentId").is_none())
-                    && network.begin_document_navigation(
-                        frame
-                            .and_then(|frame| frame.get("loaderId"))
-                            .and_then(Value::as_str),
-                        next_index,
-                    )
-            }
-            "Page.navigatedWithinDocument" if is_main_session => {
-                let frame_id = event.pointer("/params/frameId").and_then(Value::as_str);
-                let is_main =
-                    frame_id.is_some() && page.main_frame_id.lock().unwrap().as_deref() == frame_id;
-                if is_main {
-                    network.begin_same_document_navigation(next_index);
-                }
-                is_main
-            }
-            _ => false,
-        }
+    let main_document = if method == "Network.requestWillBeSent"
+        && is_main_session
+        && event.pointer("/params/type").and_then(Value::as_str) == Some("Document")
+    {
+        event
+            .pointer("/params/frameId")
+            .and_then(Value::as_str)
+            .map(|frame_id| {
+                (
+                    frame_id,
+                    event.pointer("/params/loaderId").and_then(Value::as_str),
+                )
+            })
+    } else {
+        None
     };
-    if advances_navigation {
-        page.console_records.lock().unwrap().advance_navigation();
+    let mut accepted_document_navigation_epoch = None;
+    if let Some((frame_id, loader_id)) = main_document {
+        let _navigation_transition = page.navigation_transition_lock.lock().unwrap();
+        let main_frame_id = page.main_frame_id.lock().unwrap().clone();
+        if main_frame_id
+            .as_deref()
+            .map_or(true, |main| main == frame_id)
+        {
+            let (transition, epoch) = {
+                let mut network = page.native_network_records.lock().unwrap();
+                let transition =
+                    network.begin_document_navigation(loader_id, next_index, event_sequence);
+                (transition, network.navigation_epoch)
+            };
+            if let NavigationEpochTransition::Accepted { .. } = transition {
+                let accepted = page
+                    .console_records
+                    .lock()
+                    .unwrap()
+                    .record_navigation(event_sequence, epoch);
+                debug_assert!(accepted);
+                accepted_document_navigation_epoch = Some(epoch);
+            }
+        }
     }
 
-    if method == "Runtime.consoleAPICalled" && owned_session {
+    if method == "Runtime.consoleAPICalled"
+        && owned_session
+        && page.console_capture.requested.load(Ordering::SeqCst)
+    {
         if let Some(record) = native_console_record_from_event(event) {
             let mut console = page.console_records.lock().unwrap();
             if capture_baseline_replay {
                 console.push_capture_baseline(record);
             } else {
-                console.push(record);
+                console.push(record, event_sequence);
             }
         }
     }
@@ -40111,7 +46903,8 @@ fn record_page_observation_event(page: &PageInner, event: &Value, capture_baseli
                         .and_then(Value::as_str)
                         .map(ToString::to_string),
                     response_headers: Vec::new(),
-                    navigation_epoch: network.navigation_epoch,
+                    navigation_epoch: accepted_document_navigation_epoch
+                        .unwrap_or_else(|| network.epoch_for_observation(event_sequence)),
                     completed: false,
                 },
                 request_id: request_id.to_string(),
@@ -40234,7 +47027,7 @@ mod native_console_record_tests {
     fn console_ring_is_bounded_epoch_scoped_and_clearable() {
         let mut store = ConsoleRecordStore::default();
         for index in 0..=NATIVE_CONSOLE_RECORD_CAPACITY {
-            store.push(record(index.to_string()));
+            store.push(record(index.to_string()), None);
         }
         let first = store.read(false, false);
         assert_eq!(first.records.len(), NATIVE_CONSOLE_RECORD_CAPACITY);
@@ -40243,7 +47036,7 @@ mod native_console_record_tests {
         assert_eq!(first.navigation_epoch, 0);
 
         store.advance_navigation();
-        store.push(record("current"));
+        store.push(record("current"), None);
         let current = store.read(false, true);
         assert_eq!(current.records.len(), 1);
         assert_eq!(current.records[0].text, "current");
@@ -40370,6 +47163,7 @@ mod native_console_record_tests {
                 sent_runtime_enable_count: AtomicU64::new(0),
                 sent_target_close_count: AtomicU64::new(0),
                 sent_context_dispose_count: AtomicU64::new(0),
+                sent_get_frame_tree_count: AtomicU64::new(0),
                 alive: Arc::new(AtomicBool::new(true)),
                 alive_tx,
             }),
@@ -40392,11 +47186,12 @@ mod native_console_record_tests {
             session_id: "root-session".to_string(),
             context_id: None,
             main_frame_id: Mutex::new(None),
+            navigation_transition_lock: Mutex::new(NavigationTransitionState::default()),
             frame_state: Mutex::new(PageFrameState::new("root-session".to_string())),
             iframe_setup_tasks: IframeSetupTaskRegistry::default(),
             network_requests: Arc::new(Mutex::new(NetworkRequestStore::new(0))),
             console_records: Mutex::new(ConsoleRecordStore::default()),
-            console_capture: tokio::sync::Mutex::new(ConsoleCaptureState::default()),
+            console_capture: ConsoleCaptureState::default(),
             console_replay_until_event_cursor: Mutex::new(HashMap::new()),
             observation_event_cursor: AtomicU64::new(0),
             native_network_records: Mutex::new(NativeNetworkRecordStore::new(1)),
@@ -40632,14 +47427,18 @@ mod native_network_record_tests {
         }
 
         let first = store.read(false, false);
-        assert_eq!(first.records.len(), NATIVE_NETWORK_RECORD_CAPACITY);
-        assert_eq!(first.records[0].index, 2);
+        assert!(matches!(
+            store.begin_document_navigation(Some("loader-1"), 2_000, None),
+            NavigationEpochTransition::Accepted { advanced: true }
+        ));
+        assert!(matches!(
+            store.begin_document_navigation(Some("loader-1"), 2_001, None),
+            NavigationEpochTransition::Accepted { advanced: false }
+        ));
         assert_eq!(first.evicted, 1);
         assert_eq!(first.navigation_epoch, 0);
         assert_eq!(first.navigation_start_index, 1);
 
-        assert!(store.begin_document_navigation(Some("loader-1"), 2_000));
-        assert!(!store.begin_document_navigation(Some("loader-1"), 2_001));
         store.push(entry(2_000, "current", store.navigation_epoch));
         let current = store.read(false, true);
         assert_eq!(current.records.len(), 1);
@@ -40648,13 +47447,12 @@ mod native_network_record_tests {
         assert_eq!(current.navigation_start_index, 2_000);
         assert_eq!(current.evicted, 0);
         assert!(store.read(false, false).records.is_empty());
-
+        store.begin_same_document_navigation(3_000, None);
         let all = store.read(true, true);
         assert_eq!(all.records.len(), NATIVE_NETWORK_RECORD_CAPACITY - 1);
         assert_eq!(all.evicted, 2);
         assert!(store.read(true, false).records.is_empty());
 
-        store.begin_same_document_navigation(3_000);
         let same_document = store.read(false, false);
         assert_eq!(same_document.navigation_epoch, 2);
         assert_eq!(same_document.navigation_start_index, 3_000);
@@ -40750,80 +47548,636 @@ mod native_network_record_tests {
     }
 }
 
-async fn refresh_page_frame_tree(page: &Arc<PageInner>, timeout: Duration) -> RwResult<()> {
-    let deadline = OperationDeadline::new(timeout);
-    // A Routable OOPIF is safe for locator evaluation and input because focus
-    // emulation is already queued, but its remaining setup commands may still be
-    // awaiting replies. Refreshing its frame tree here would put locator resolution
-    // behind that setup. The attachment event already supplies the frame/parent
-    // mapping needed to enter the target, so only fully Ready children participate in
-    // the best-effort metadata refresh; resolution itself remains pinned to Routable.
-    let sessions = page
-        .frame_state
-        .lock()
-        .unwrap()
-        .frame_tree_refresh_session_ids();
-    for session_id in sessions {
-        let Ok(remaining) = deadline.remaining() else {
-            break;
-        };
-        let result = page
-            .browser
-            .client
-            .send("Page.getFrameTree", json!({}), Some(&session_id), remaining)
-            .await;
-        let Ok(tree) = result else {
+fn is_frame_cache_invalidation_event(event: &Value) -> bool {
+    matches!(
+        event.get("method").and_then(Value::as_str),
+        Some(
+            "Page.frameAttached"
+                | "Page.frameNavigated"
+                | "Page.navigatedWithinDocument"
+                | "Page.frameDetached"
+                | "Runtime.executionContextDestroyed"
+                | "Runtime.executionContextsCleared"
+                | "Target.attachedToTarget"
+                | "Target.detachedFromTarget"
+        )
+    )
+}
+
+#[derive(Debug)]
+struct RecoveredAttachedIframeSession {
+    frame_id: String,
+    child_session_id: String,
+}
+
+#[derive(Debug)]
+struct AcceptedNavigationObservationAtSequence {
+    sequence: u64,
+    observation: AcceptedNavigationObservation,
+}
+
+#[derive(Debug)]
+struct ReplayedPageObservation {
+    event: Value,
+    owned_session: bool,
+}
+
+#[derive(Debug, Default)]
+struct ReconciledFrameCacheInvalidations {
+    replay_cursor: u64,
+    recovered_sessions: Vec<RecoveredAttachedIframeSession>,
+    navigation_observations: Vec<AcceptedNavigationObservationAtSequence>,
+    replayed_page_observations: Vec<ReplayedPageObservation>,
+    removed_setup_generations: Vec<u64>,
+}
+
+fn reconcile_frame_cache_invalidations_locked(
+    state: &mut PageFrameState,
+    main_frame_id: &mut Option<String>,
+    crashed: &AtomicBool,
+    page_session_id: &str,
+    log: &CdpEventLog,
+    command_send_cursor: Option<u64>,
+    observation_replay_cursor: Option<u64>,
+) -> ReconciledFrameCacheInvalidations {
+    let mut reconciliation = ReconciledFrameCacheInvalidations::default();
+    let oldest_seq = log.oldest_seq();
+    if state.frame_event_cursor < oldest_seq
+        || command_send_cursor.is_some_and(|cursor| cursor < oldest_seq)
+    {
+        state.mark_all_frame_caches_dirty();
+    }
+    let frame_replay_cursor = state.frame_event_cursor;
+    let replay_start = observation_replay_cursor
+        .map(|cursor| cursor.min(frame_replay_cursor))
+        .unwrap_or(frame_replay_cursor);
+    for (sequence, event) in log.entries_since(replay_start) {
+        let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+        if observation_replay_cursor.is_some_and(|cursor| sequence >= cursor)
+            && !matches!(
+                method,
+                "Page.frameNavigated" | "Page.navigatedWithinDocument"
+            )
+        {
+            let owned_session = event
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .is_some_and(|session_id| state.owns_session(session_id));
+            reconciliation
+                .replayed_page_observations
+                .push(ReplayedPageObservation {
+                    event: event.clone(),
+                    owned_session,
+                });
+        }
+        if sequence < frame_replay_cursor || !is_frame_cache_invalidation_event(&event) {
             continue;
-        };
-        if let Some(root) = tree.get("frameTree") {
-            let mut visited = HashSet::new();
-            ingest_frame_tree_node(page, root, &session_id, &mut visited, 0);
+        }
+        let event_sequence = Some(sequence);
+        match method {
+            "Page.frameAttached" => {
+                let session_id = event.get("sessionId").and_then(Value::as_str);
+                let frame_id = event.pointer("/params/frameId").and_then(Value::as_str);
+                if let (Some(session_id), Some(frame_id)) = (session_id, frame_id) {
+                    if state.owns_session(session_id)
+                        && state.mark_frame_cache_dirty_at_sequence(session_id, event_sequence)
+                    {
+                        state.record_frame(
+                            frame_id.to_string(),
+                            event
+                                .pointer("/params/parentFrameId")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string),
+                            None,
+                            None,
+                            session_id.to_string(),
+                        );
+                    }
+                }
+            }
+            "Page.frameNavigated" => {
+                if let Some(session_id) = event.get("sessionId").and_then(Value::as_str) {
+                    if let Some(observation) = apply_accepted_frame_navigation_transition(
+                        state,
+                        main_frame_id,
+                        crashed,
+                        page_session_id,
+                        session_id,
+                        event_sequence,
+                        event.pointer("/params/frame").unwrap_or(&Value::Null),
+                    ) {
+                        reconciliation.navigation_observations.push(
+                            AcceptedNavigationObservationAtSequence {
+                                sequence,
+                                observation,
+                            },
+                        );
+                    }
+                }
+            }
+            "Page.navigatedWithinDocument" => {
+                if let Some(session_id) = event.get("sessionId").and_then(Value::as_str) {
+                    if let Some(observation) = apply_accepted_same_document_navigation_transition(
+                        state,
+                        main_frame_id,
+                        page_session_id,
+                        session_id,
+                        event_sequence,
+                        event.get("params").unwrap_or(&Value::Null),
+                    ) {
+                        reconciliation.navigation_observations.push(
+                            AcceptedNavigationObservationAtSequence {
+                                sequence,
+                                observation,
+                            },
+                        );
+                    }
+                }
+            }
+            "Page.frameDetached" => {
+                if let Some(session_id) = event.get("sessionId").and_then(Value::as_str) {
+                    if state.owns_session(session_id) {
+                        let applied =
+                            state.mark_frame_cache_dirty_at_sequence(session_id, event_sequence);
+                        if applied {
+                            if let Some(frame_id) =
+                                event.pointer("/params/frameId").and_then(Value::as_str)
+                            {
+                                if event.pointer("/params/reason").and_then(Value::as_str)
+                                    == Some("swap")
+                                {
+                                    reconciliation.removed_setup_generations.extend(
+                                        state.mark_frame_swap_pending(frame_id, session_id),
+                                    );
+                                    state.record_frame_swap(frame_id);
+                                } else {
+                                    reconciliation
+                                        .removed_setup_generations
+                                        .extend(state.remove_frame(frame_id));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "Runtime.executionContextDestroyed" => {
+                if let (Some(session_id), Some(context_id)) = (
+                    event.get("sessionId").and_then(Value::as_str),
+                    event.pointer("/params/executionContextId"),
+                ) {
+                    state.invalidate_execution_context(session_id, context_id);
+                }
+            }
+            "Runtime.executionContextsCleared" => {
+                if let Some(session_id) = event.get("sessionId").and_then(Value::as_str) {
+                    state.invalidate_execution_contexts_for_session(session_id);
+                }
+            }
+            "Target.attachedToTarget" => {
+                let parent_session_id = event.get("sessionId").and_then(Value::as_str);
+                let target_info = event.pointer("/params/targetInfo").unwrap_or(&Value::Null);
+                if parent_session_id.is_some_and(|session_id| state.owns_session(session_id))
+                    && target_info.get("type").and_then(Value::as_str) == Some("iframe")
+                {
+                    if let Some(parent_session_id) = parent_session_id {
+                        if !state
+                            .mark_frame_cache_dirty_at_sequence(parent_session_id, event_sequence)
+                        {
+                            continue;
+                        }
+                    }
+                    if let (Some(frame_id), Some(child_session_id)) = (
+                        target_info.get("targetId").and_then(Value::as_str),
+                        event.pointer("/params/sessionId").and_then(Value::as_str),
+                    ) {
+                        let parent_frame_id = target_info
+                            .get("parentFrameId")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string);
+                        let mapping_was_present =
+                            state.session_still_owns_frame(frame_id, child_session_id);
+                        let previous_generation = state
+                            .session_pin_for_frame(frame_id)
+                            .map(|pin| pin.generation);
+                        let session_pin = state.record_session_for_frame_at_sequence(
+                            frame_id,
+                            child_session_id,
+                            event_sequence,
+                        );
+                        if previous_generation
+                            .is_some_and(|generation| generation != session_pin.generation)
+                        {
+                            reconciliation
+                                .removed_setup_generations
+                                .extend(previous_generation);
+                        }
+                        state.record_frame(
+                            frame_id.to_string(),
+                            parent_frame_id,
+                            None,
+                            None,
+                            child_session_id.to_string(),
+                        );
+                        if !mapping_was_present {
+                            reconciliation.recovered_sessions.push(
+                                RecoveredAttachedIframeSession {
+                                    frame_id: frame_id.to_string(),
+                                    child_session_id: child_session_id.to_string(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            "Target.detachedFromTarget" => {
+                if let Some(detached_session_id) =
+                    event.pointer("/params/sessionId").and_then(Value::as_str)
+                {
+                    reconciliation
+                        .removed_setup_generations
+                        .extend(state.setup_generations_for_session(detached_session_id));
+                    state.detach_session_at_sequence(detached_session_id, event_sequence);
+                }
+            }
+            _ => {}
         }
     }
+    state.frame_event_cursor = log.cursor();
+    reconciliation.replay_cursor = state.frame_event_cursor;
+    reconciliation.recovered_sessions.retain(|session| {
+        state.session_still_owns_frame(&session.frame_id, &session.child_session_id)
+    });
+    reconciliation
+}
+
+fn record_reconciled_navigation_observations(
+    page: &PageInner,
+    observations: Vec<AcceptedNavigationObservationAtSequence>,
+) {
+    let mut previous_sequence = None;
+    for observation in observations {
+        debug_assert!(
+            previous_sequence.is_none_or(|previous| previous < observation.sequence),
+            "reconciled navigation observations must remain in event sequence order"
+        );
+        previous_sequence = Some(observation.sequence);
+        record_accepted_navigation_observation(
+            page,
+            observation.observation,
+            Some(observation.sequence),
+        );
+    }
+}
+
+fn record_replayed_page_observations(page: &PageInner, observations: Vec<ReplayedPageObservation>) {
+    for observation in observations {
+        record_page_observation_event_with_ownership(
+            page,
+            &observation.event,
+            Some(observation.owned_session),
+        );
+    }
+}
+
+fn arm_recovered_attached_iframe_sessions(
+    page: &Arc<PageInner>,
+    recovered_sessions: Vec<RecoveredAttachedIframeSession>,
+) {
+    for session in recovered_sessions {
+        let _ = arm_recovered_attached_iframe_session(
+            page,
+            session.frame_id,
+            session.child_session_id,
+            Duration::from_secs(5),
+        );
+    }
+}
+
+fn reconcile_frame_cache_invalidations(page: &Arc<PageInner>) {
+    reconcile_frame_cache_invalidations_impl(page, false);
+}
+
+fn reconcile_frame_cache_invalidations_after_lag(page: &Arc<PageInner>) {
+    reconcile_frame_cache_invalidations_impl(page, true);
+}
+
+fn reconcile_frame_cache_invalidations_impl(page: &Arc<PageInner>, listener_gap: bool) {
+    reconcile_frame_cache_invalidations_impl_with_hook(page, listener_gap, || {});
+}
+
+fn reconcile_frame_cache_invalidations_impl_with_hook(
+    page: &Arc<PageInner>,
+    listener_gap: bool,
+    replay_started: impl FnOnce(),
+) {
+    // Serializing gate commit through post-lock observation prevents a newer
+    // live navigation from overtaking a replayed observation. The same guard
+    // owns the one contiguous progress watermark.
+    let mut navigation_transition = page.navigation_transition_lock.lock().unwrap();
+    // Global page cache lock order: event_log -> main_frame_id -> frame_state.
+    let (reconciliation, unknown_gap_boundary) = {
+        let log = page.browser.client.event_log.lock().unwrap();
+        replay_started();
+        let mut main_frame_id = page.main_frame_id.lock().unwrap();
+        let mut state = page.frame_state.lock().unwrap();
+        let oldest_sequence = log.oldest_seq();
+        let unknown_gap_boundary = navigation_transition
+            .has_unreplayable_gap(oldest_sequence)
+            .then(|| oldest_sequence - 1);
+        if listener_gap {
+            state.mark_all_frame_caches_dirty();
+        }
+        let reconciliation = reconcile_frame_cache_invalidations_locked(
+            &mut state,
+            &mut main_frame_id,
+            &page.crashed,
+            page.session_id.as_str(),
+            &log,
+            None,
+            listener_gap.then(|| page.observation_event_cursor.load(Ordering::SeqCst)),
+        );
+        (reconciliation, unknown_gap_boundary)
+    };
+    if let Some(sequence) = unknown_gap_boundary {
+        // The bounded log can no longer replay every uncovered listener event.
+        // Place the conservative boundary immediately before the oldest
+        // retained event so that event and all later observations are not
+        // attributed to the document from before the unknown gap.
+        record_accepted_navigation_observation(
+            page,
+            AcceptedNavigationObservation::Document { loader_id: None },
+            Some(sequence),
+        );
+    }
+    let replay_cursor = reconciliation.replay_cursor;
+    record_reconciled_navigation_observations(page, reconciliation.navigation_observations);
+    navigation_transition.advance_reconciled(replay_cursor);
+    drop(navigation_transition);
+    record_replayed_page_observations(page, reconciliation.replayed_page_observations);
+    if listener_gap {
+        advance_observation_event_cursor(page, replay_cursor);
+    }
+    page.iframe_setup_tasks
+        .abort_generations(reconciliation.removed_setup_generations);
+    arm_recovered_attached_iframe_sessions(page, reconciliation.recovered_sessions);
+}
+
+fn materialize_authoritative_frame_tree(
+    root: &Value,
+    refreshed_session_id: &str,
+    registered_root_sessions: &HashMap<String, String>,
+) -> Option<AuthoritativeFrameTree> {
+    let mut tree = AuthoritativeFrameTree {
+        root_frame_id: String::new(),
+        frames: HashMap::new(),
+        child_order: HashMap::new(),
+        frame_loader_ids: HashMap::new(),
+        frame_sessions: HashMap::new(),
+        session_roots: HashMap::new(),
+    };
+    let mut visited = HashSet::new();
+    let root_frame_id = materialize_authoritative_frame_node(
+        &mut tree,
+        root,
+        refreshed_session_id,
+        registered_root_sessions,
+        &mut visited,
+        0,
+    )?;
+    tree.root_frame_id = root_frame_id.clone();
+    tree.session_roots
+        .insert(refreshed_session_id.to_string(), root_frame_id);
+    Some(tree)
+}
+
+fn materialize_authoritative_frame_node(
+    tree: &mut AuthoritativeFrameTree,
+    node: &Value,
+    refreshed_session_id: &str,
+    registered_root_sessions: &HashMap<String, String>,
+    visited: &mut HashSet<String>,
+    depth: usize,
+) -> Option<String> {
+    let frame = node.get("frame")?;
+    let frame_id = frame.get("id").and_then(Value::as_str)?;
+    if depth >= MAX_FRAME_TREE_DEPTH || !visited.insert(frame_id.to_string()) {
+        return None;
+    }
+    let preserved_session_id = (depth > 0)
+        .then(|| registered_root_sessions.get(frame_id))
+        .flatten()
+        .filter(|session_id| session_id.as_str() != refreshed_session_id)
+        .cloned();
+    let session_id = preserved_session_id
+        .clone()
+        .unwrap_or_else(|| refreshed_session_id.to_string());
+    tree.frames.insert(
+        frame_id.to_string(),
+        AuthoritativeFrameRecord {
+            id: frame_id.to_string(),
+            parent_id: frame
+                .get("parentId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            name: frame
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            url: frame
+                .get("url")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            session_id: session_id.clone(),
+        },
+    );
+    tree.frame_sessions
+        .insert(frame_id.to_string(), session_id.clone());
+    if let Some(loader_id) = frame.get("loaderId").and_then(Value::as_str) {
+        tree.frame_loader_ids
+            .insert(frame_id.to_string(), loader_id.to_string());
+    }
+    if let Some(preserved_session_id) = preserved_session_id {
+        tree.session_roots
+            .insert(preserved_session_id, frame_id.to_string());
+        return Some(frame_id.to_string());
+    }
+
+    let mut child_ids = Vec::new();
+    if let Some(children) = node.get("childFrames").and_then(Value::as_array) {
+        child_ids.reserve(children.len());
+        for child in children {
+            if let Some(child_id) = materialize_authoritative_frame_node(
+                tree,
+                child,
+                refreshed_session_id,
+                registered_root_sessions,
+                visited,
+                depth + 1,
+            ) {
+                child_ids.push(child_id);
+            }
+        }
+    }
+    tree.child_order.insert(frame_id.to_string(), child_ids);
+    Some(frame_id.to_string())
+}
+
+async fn refresh_frame_tree_session_locked(
+    page: &Arc<PageInner>,
+    session_id: &str,
+    generation: u64,
+    timeout: Duration,
+) -> RwResult<()> {
+    let Some((registered_root, ownership_generation, registered_root_sessions)) = ({
+        let state = page.frame_state.lock().unwrap();
+        state
+            .refresh_registration(session_id)
+            .map(|(registered_root, ownership_generation)| {
+                (
+                    registered_root,
+                    ownership_generation,
+                    state.registered_root_sessions(),
+                )
+            })
+    }) else {
+        return Ok(());
+    };
+    let (response, command_send_cursor) = page
+        .browser
+        .client
+        .send_with_event_cursor("Page.getFrameTree", json!({}), Some(session_id), timeout)
+        .await?;
+    let Some(root) = response.get("frameTree") else {
+        return Ok(());
+    };
+    let Some(tree) =
+        materialize_authoritative_frame_tree(root, session_id, &registered_root_sessions)
+    else {
+        return Ok(());
+    };
+    if registered_root
+        .as_deref()
+        .is_some_and(|registered_root| registered_root != tree.root_frame_id)
+    {
+        return Ok(());
+    }
+
+    // Commit lock order is event_log -> main_frame_id -> frame_state. Holding
+    // event_log prevents a transport event from being inserted between the
+    // cursor barrier and the generation/registration recheck.
+    let root_frame_id = tree.root_frame_id.clone();
+    let navigation_transition = page.navigation_transition_lock.lock().unwrap();
+    let (reconciliation, authoritative_effects) = {
+        let event_log = page.browser.client.event_log.lock().unwrap();
+        let mut main_frame_id = page.main_frame_id.lock().unwrap();
+        let mut state = page.frame_state.lock().unwrap();
+        let reconciliation = reconcile_frame_cache_invalidations_locked(
+            &mut state,
+            &mut main_frame_id,
+            &page.crashed,
+            page.session_id.as_str(),
+            &event_log,
+            Some(command_send_cursor),
+            None,
+        );
+        let authoritative_effects = if state.refresh_registration_is_current(
+            session_id,
+            registered_root.as_deref(),
+            ownership_generation,
+            generation,
+        ) {
+            let effects = state.apply_authoritative_frame_tree(session_id, tree);
+            if effects.ownership_changed {
+                state.notify_session_update();
+            }
+            state.mark_frame_tree_refreshed(session_id, generation);
+            if session_id == page.session_id {
+                *main_frame_id = Some(root_frame_id);
+            }
+            effects
+        } else {
+            AuthoritativeFrameTreeCommitEffects::default()
+        };
+        (reconciliation, authoritative_effects)
+    };
+    record_reconciled_navigation_observations(page, reconciliation.navigation_observations);
+    drop(navigation_transition);
+    page.iframe_setup_tasks.abort_generations(
+        reconciliation
+            .removed_setup_generations
+            .into_iter()
+            .chain(authoritative_effects.removed_setup_generations),
+    );
+    arm_recovered_attached_iframe_sessions(page, reconciliation.recovered_sessions);
     Ok(())
 }
 
-fn ingest_frame_tree_node(
+async fn ensure_frame_tree_session(
     page: &Arc<PageInner>,
-    node: &Value,
     session_id: &str,
-    visited: &mut HashSet<String>,
-    depth: usize,
-) {
-    let frame = node.get("frame").unwrap_or(&Value::Null);
-    let Some(frame_id) = frame.get("id").and_then(Value::as_str) else {
-        return;
-    };
-    if depth >= MAX_FRAME_TREE_DEPTH || !visited.insert(frame_id.to_string()) {
-        return;
-    }
-    let parent_id = frame
-        .get("parentId")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    let name = frame
-        .get("name")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    let url = frame
-        .get("url")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    if parent_id.is_none() && session_id == page.session_id {
-        *page.main_frame_id.lock().unwrap() = Some(frame_id.to_string());
-    }
-    page.frame_state.lock().unwrap().record_frame(
-        frame_id.to_string(),
-        parent_id,
-        name,
-        url,
-        session_id.to_string(),
-    );
-    if let Some(children) = node.get("childFrames").and_then(Value::as_array) {
-        for child in children {
-            ingest_frame_tree_node(page, child, session_id, visited, depth + 1);
+    timeout: Duration,
+) -> RwResult<()> {
+    reconcile_frame_cache_invalidations(page);
+    let deadline = OperationDeadline::new(timeout);
+    ensure_frame_tree_session_after_reconcile(page, session_id, deadline, timeout).await
+}
+
+async fn ensure_frame_tree_session_after_reconcile(
+    page: &Arc<PageInner>,
+    session_id: &str,
+    deadline: OperationDeadline,
+    command_timeout_cap: Duration,
+) -> RwResult<()> {
+    let refresh_lock = {
+        let state = page.frame_state.lock().unwrap();
+        if state.frame_cache_refresh_generation(session_id).is_none() {
+            return Ok(());
         }
+        Arc::clone(&state.frame_tree_refresh_lock)
+    };
+    let _refresh_guard = tokio::time::timeout(deadline.remaining()?, refresh_lock.lock_owned())
+        .await
+        .map_err(|_| {
+            RwError::Timeout(deadline.timeout.as_millis().min(u128::from(u64::MAX)) as u64)
+        })?;
+    let generation = page
+        .frame_state
+        .lock()
+        .unwrap()
+        .frame_cache_refresh_generation(session_id);
+    let Some(generation) = generation else {
+        return Ok(());
+    };
+    refresh_frame_tree_session_locked(
+        page,
+        session_id,
+        generation,
+        deadline.remaining_capped(command_timeout_cap)?,
+    )
+    .await
+}
+
+async fn refresh_page_frame_tree(page: &Arc<PageInner>, timeout: Duration) -> RwResult<()> {
+    reconcile_frame_cache_invalidations(page);
+    let deadline = OperationDeadline::new(timeout);
+    let refresh_lock = Arc::clone(&page.frame_state.lock().unwrap().frame_tree_refresh_lock);
+    let _refresh_guard = tokio::time::timeout(deadline.remaining()?, refresh_lock.lock_owned())
+        .await
+        .map_err(|_| RwError::Timeout(timeout.as_millis().min(u128::from(u64::MAX)) as u64))?;
+    let sessions = page.frame_state.lock().unwrap().session_ids();
+    for session_id in sessions {
+        let generation = page
+            .frame_state
+            .lock()
+            .unwrap()
+            .frame_cache_refresh_generation(&session_id);
+        let Some(generation) = generation else {
+            continue;
+        };
+        let remaining = deadline.remaining()?;
+        let _ = refresh_frame_tree_session_locked(page, &session_id, generation, remaining).await;
     }
+    Ok(())
 }
 
 async fn install_stealth_defaults(browser: &BrowserInner, session_id: &str) -> RwResult<()> {
