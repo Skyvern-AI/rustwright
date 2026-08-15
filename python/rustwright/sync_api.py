@@ -3092,12 +3092,12 @@ def _file_chooser_upload_paths(files: Any, temporary_directories: list[tempfile.
 
 
 def _contains_file_payload(files: Any) -> bool:
-    if isinstance(files, dict):
+    if isinstance(files, (dict, bytes, bytearray)):
         return True
-    if files is None or isinstance(files, (str, Path, bytes, bytearray)):
+    if files is None or isinstance(files, (str, Path)):
         return False
     try:
-        return any(isinstance(item, dict) for item in files)
+        return any(isinstance(item, (dict, bytes, bytearray)) for item in files)
     except TypeError:
         return False
 
@@ -3406,6 +3406,48 @@ def _wait_for_url_timeout_error(timeout_ms: float) -> TimeoutError:
 
 def _method_timeout_error(method: str, timeout_ms: float) -> TimeoutError:
     return TimeoutError(f"{method}: Timeout {_format_timeout_value(timeout_ms)}ms exceeded.")
+
+def _file_chooser_deadline(timeout_ms: float) -> float:
+    return float("inf") if timeout_ms == 0 else time.monotonic() + timeout_ms / 1000
+
+
+def _file_chooser_remaining_ms(deadline: float, timeout_ms: float) -> float:
+    if math.isinf(deadline):
+        return 0.0
+    remaining_ms = (deadline - time.monotonic()) * 1000
+    if remaining_ms <= 0:
+        raise _method_timeout_error("FileChooser.set_files", timeout_ms)
+    return max(remaining_ms, 1.0)
+
+
+def _file_chooser_cleanup_timeout_ms(deadline: float) -> Optional[float]:
+    if math.isinf(deadline):
+        return 1_000.0
+    remaining_ms = (deadline - time.monotonic()) * 1000
+    # Rust floors positive sub-millisecond command timeouts to 1 ms. Skip the
+    # release instead of exceeding the operation deadline; teardown reclaims it.
+    if remaining_ms < 1.0:
+        return None
+    return min(remaining_ms, 1_000.0)
+
+
+def _file_chooser_directory_inventory(
+    directories: list[Path],
+    *,
+    deadline: float,
+    timeout_ms: float,
+) -> list[str]:
+    expected_files: list[str] = []
+    for directory in directories:
+        _file_chooser_remaining_ms(deadline, timeout_ms)
+        for child in directory.rglob("*"):
+            _file_chooser_remaining_ms(deadline, timeout_ms)
+            is_file = child.is_file()
+            _file_chooser_remaining_ms(deadline, timeout_ms)
+            if is_file:
+                expected_files.append(f"{directory.name}/{child.relative_to(directory).as_posix()}")
+    _file_chooser_remaining_ms(deadline, timeout_ms)
+    return expected_files
 
 
 def _resolve_url_match_base(base_url: Optional[str], expected: Any) -> Any:
@@ -9637,8 +9679,22 @@ class ConsoleMessage(_EventEmitter):
         self.type = str(payload.get("type") or "log")
         self.text = str(payload.get("text") or "")
         self.timestamp = float(payload.get("timestamp") or time.time() * 1000)
+        owner_frame = None
+        if page is not None and worker is None:
+            session_id = payload.get("session_id")
+            execution_context_id = payload.get("execution_context_id")
+            if session_id is not None and execution_context_id is not None:
+                try:
+                    frame_id = page._core.execution_context_frame_id(
+                        str(session_id),
+                        str(execution_context_id),
+                    )
+                    if frame_id:
+                        owner_frame = page._frame_for_id(str(frame_id))
+                except (AttributeError, Error):
+                    owner_frame = None
         self.args = [
-            JSHandle(page or worker, _console_arg_handle_payload(arg))
+            JSHandle(page or worker, _console_arg_handle_payload(arg), owner_frame=owner_frame)
             for arg in list(payload.get("args") or [])
         ]
         location = payload.get("location")
@@ -9732,6 +9788,7 @@ class FileChooser(_EventEmitter):
         self._frame_id = str(payload.get("frame_id") or "")
         self._backend_node_id = int(payload.get("backend_node_id") or 0)
         self._mode = str(payload.get("mode") or "")
+        self._session_id = str(payload.get("session_id") or "")
         self._temporary_upload_dirs: list[tempfile.TemporaryDirectory[str]] = []
 
     def is_multiple(self) -> bool:
@@ -9741,59 +9798,228 @@ class FileChooser(_EventEmitter):
     def page(self) -> "Page":
         return self._page
 
+    def _resolve_backend_node_element(
+        self,
+        *,
+        method: str,
+        command_timeout_ms: float,
+        mutation: bool,
+    ) -> "ElementHandle":
+        core_session = (
+            _call_with_method_prefix(
+                method,
+                self._page._core.cdp_session_for_id,
+                self._session_id,
+            )
+            if self._session_id
+            else _call_with_method_prefix(method, self._page._core.cdp_session)
+        )
+        payload = json.loads(
+            _call_with_method_prefix(
+                method,
+                core_session.send,
+                "DOM.resolveNode",
+                json.dumps({"backendNodeId": self._backend_node_id}),
+                command_timeout_ms,
+            )
+        )
+        remote = payload.get("object")
+        if not isinstance(remote, dict) or not remote.get("objectId"):
+            raise Error(f"{method}: Element is not attached to the DOM")
+        class_name = remote.get("className")
+        if remote.get("subtype") != "node" and not (
+            isinstance(class_name, str) and class_name.endswith("Element")
+        ):
+            raise Error(f"{method}: JSHandle is not an Element")
+        if self._session_id:
+            remote["__rustwright_session_id"] = self._session_id
+        if self._frame_id:
+            remote["__rustwright_realm_identity"] = f"frame:{self._frame_id}"
+        owner_frame = (
+            self._page.main_frame
+            if mutation or not self._frame_id
+            else self._page._frame_for_id(self._frame_id)
+        )
+        handle = JSHandle(self._page, remote, owner_frame=owner_frame)
+        return ElementHandle(owner_frame.locator("*").nth(0), handle=handle)
+
+    def _mutation_element(self, *, deadline: float, timeout_ms: float) -> "ElementHandle":
+        command_timeout_ms = _file_chooser_remaining_ms(deadline, timeout_ms)
+        try:
+            if self._backend_node_id:
+                return self._resolve_backend_node_element(
+                    method="FileChooser.set_files",
+                    command_timeout_ms=command_timeout_ms,
+                    mutation=True,
+                )
+            locator = self._page.locator("input[type=file]").first
+            handle = locator._evaluate_handle_with_method(
+                "(element) => element",
+                timeout=command_timeout_ms,
+                method="FileChooser.set_files",
+            )
+            return ElementHandle(locator, handle=handle)
+        except TimeoutError:
+            raise _method_timeout_error("FileChooser.set_files", timeout_ms) from None
+
+    def _dispose_mutation_element(self, element: "ElementHandle", *, deadline: float) -> None:
+        cleanup_timeout_ms = _file_chooser_cleanup_timeout_ms(deadline)
+        if cleanup_timeout_ms is None:
+            return
+        try:
+            element._dispose_with_timeout(cleanup_timeout_ms)
+        except Exception:
+            # This release is best-effort and must not replace the set_files result.
+            pass
+
     @property
     def element(self) -> "ElementHandle":
         if self._backend_node_id:
-            handle: Optional[JSHandle] = None
             try:
-                session = CDPSession(_call(self._page._core.cdp_session))
-                payload = session.send("DOM.resolveNode", {"backendNodeId": self._backend_node_id})
-                remote = payload.get("object")
-                if isinstance(remote, dict):
-                    handle = JSHandle(self._page, remote)
-                    element = handle.as_element()
-                    if element is not None:
-                        handle = None
-                        return element
+                return self._resolve_backend_node_element(
+                    method="FileChooser.element",
+                    command_timeout_ms=30_000.0,
+                    mutation=False,
+                )
             except Exception:
                 pass
-            finally:
-                if handle is not None:
-                    handle.dispose()
-        handle = _element_handle_from_locator(self._page.locator("input[type=file]").first)
-        return handle
+        return _element_handle_from_locator(self._page.locator("input[type=file]").first)
 
     def set_files(self, files: Any, *, timeout: Optional[float] = None, no_wait_after: Optional[bool] = None) -> None:
         timeout_ms = _default_timeout_for_method(self._page, timeout, method="FileChooser.set_files")
+        deadline = _file_chooser_deadline(timeout_ms)
         upload_files = files
         if files is not None and not isinstance(files, (str, Path, bytes, bytearray, dict)):
             try:
                 upload_files = list(files)
             except TypeError:
                 upload_files = files
+        _file_chooser_remaining_ms(deadline, timeout_ms)
         if _contains_file_payload(upload_files):
             payloads = _file_payloads(upload_files)
+            _file_chooser_remaining_ms(deadline, timeout_ms)
             if len(payloads) > 1 and not self.is_multiple():
                 raise Error("FileChooser.set_files: Error: Non-multiple file input can only accept single file")
-            element = self.element
-            locator = element._live_locator("set_input_files")
-            assert locator is not None
-            locator._set_input_files_impl(
-                "FileChooser.set_files",
-                upload_files,
-                timeout=timeout_ms,
-                no_wait_after=no_wait_after,
-            )
+            element = self._mutation_element(deadline=deadline, timeout_ms=timeout_ms)
+            try:
+                try:
+                    element._evaluate_with_timeout(
+                        """(input, payloads) => {
+                        if (!(input instanceof HTMLInputElement) || input.type !== 'file')
+                            throw new Error('Element is not a file input');
+                        const transfer = new DataTransfer();
+                        for (const payload of payloads) {
+                          const binary = atob(payload.buffer || '');
+                          const bytes = new Uint8Array(binary.length);
+                          for (let index = 0; index < binary.length; index++)
+                            bytes[index] = binary.charCodeAt(index);
+                          transfer.items.add(new File(
+                            [bytes],
+                            payload.name || 'file',
+                            { type: payload.mime_type || '' },
+                          ));
+                        }
+                        input.files = transfer.files;
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                        input.dispatchEvent(new Event('change', { bubbles: true }));
+                        }""",
+                        payloads,
+                        timeout_ms=_file_chooser_remaining_ms(deadline, timeout_ms),
+                        method="FileChooser.set_files",
+                    )
+                except TimeoutError:
+                    raise _method_timeout_error("FileChooser.set_files", timeout_ms) from None
+            finally:
+                self._dispose_mutation_element(element, deadline=deadline)
             return
         paths = _file_chooser_upload_paths(upload_files, self._temporary_upload_dirs)
+        _file_chooser_remaining_ms(deadline, timeout_ms)
         if len(paths) > 1 and not self.is_multiple():
             raise Error("FileChooser.set_files: Error: Non-multiple file input can only accept single file")
-        _call(
-            self._page._core.set_file_input_files,
-            self._backend_node_id,
-            json_module_dumps(paths),
-            timeout_ms,
-        )
+        if not paths:
+            element = self._mutation_element(deadline=deadline, timeout_ms=timeout_ms)
+            try:
+                try:
+                    element._evaluate_with_timeout(
+                        """input => {
+                        input.files = new DataTransfer().files;
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                        input.dispatchEvent(new Event('change', { bubbles: true }));
+                        }""",
+                        timeout_ms=_file_chooser_remaining_ms(deadline, timeout_ms),
+                        method="FileChooser.set_files",
+                    )
+                except TimeoutError:
+                    raise _method_timeout_error("FileChooser.set_files", timeout_ms) from None
+            finally:
+                self._dispose_mutation_element(element, deadline=deadline)
+            return
+        try:
+            _call_with_method_prefix(
+                "FileChooser.set_files",
+                self._page._core.set_file_input_files,
+                self._backend_node_id,
+                json_module_dumps(paths),
+                _file_chooser_remaining_ms(deadline, timeout_ms),
+                self._session_id or None,
+            )
+        except TimeoutError:
+            raise _method_timeout_error("FileChooser.set_files", timeout_ms) from None
+        directories: list[Path] = []
+        for path in paths:
+            _file_chooser_remaining_ms(deadline, timeout_ms)
+            candidate = Path(path)
+            is_directory = candidate.is_dir()
+            _file_chooser_remaining_ms(deadline, timeout_ms)
+            if is_directory:
+                directories.append(candidate)
+        if directories:
+            expected_files = _file_chooser_directory_inventory(
+                directories,
+                deadline=deadline,
+                timeout_ms=timeout_ms,
+            )
+            ready_expression = """(input, expected) => {
+            const actual = new Map();
+            for (const file of input.files) {
+              const path = file.webkitRelativePath;
+              actual.set(path, (actual.get(path) || 0) + 1);
+            }
+            return input.files.length === expected.length && expected.every(value => {
+              const count = actual.get(value) || 0;
+              if (!count) return false;
+              actual.set(value, count - 1);
+              return true;
+            });
+            }"""
+        else:
+            expected_files = []
+            for path in paths:
+                _file_chooser_remaining_ms(deadline, timeout_ms)
+                expected_files.append(Path(path).name)
+            ready_expression = """(input, expected) => {
+            const actual = Array.from(input.files, file => file.name);
+            return actual.length === expected.length
+              && actual.every((value, index) => value === expected[index]);
+            }"""
+        element = self._mutation_element(deadline=deadline, timeout_ms=timeout_ms)
+        try:
+            while True:
+                try:
+                    ready = element._evaluate_with_timeout(
+                        ready_expression,
+                        expected_files,
+                        timeout_ms=_file_chooser_remaining_ms(deadline, timeout_ms),
+                        method="FileChooser.set_files",
+                    )
+                except TimeoutError:
+                    raise _method_timeout_error("FileChooser.set_files", timeout_ms) from None
+                if ready:
+                    return
+                _file_chooser_remaining_ms(deadline, timeout_ms)
+                _sleep_until_next_poll(deadline)
+        finally:
+            self._dispose_mutation_element(element, deadline=deadline)
 
 
 class JSHandle(_EventEmitter):
@@ -9802,11 +10028,30 @@ class JSHandle(_EventEmitter):
         self._payload = payload
         self._object_id = payload.get("objectId")
         self._session_id = payload.get("__rustwright_session_id")
+        self._realm_identity_override = payload.get("__rustwright_realm_identity")
         self._owner_frame = owner_frame
         self._disposed = False
 
     def _session_args(self) -> tuple[str, ...]:
         return () if self._session_id is None else (str(self._session_id),)
+
+    def _realm_identity(self) -> Optional[str]:
+        if self._realm_identity_override is not None:
+            return str(self._realm_identity_override)
+        if self._owner_frame is not None:
+            frame_id = getattr(self._owner_frame, "_frame_id", None)
+            if frame_id:
+                return f"frame:{frame_id}"
+        target_id = getattr(self._page, "_target_id", None)
+        if target_id:
+            return f"worker:{target_id}"
+        return None
+
+    def _serialized_owner_args(self) -> tuple[Any, ...]:
+        realm_identity = self._realm_identity()
+        if self._session_id is None:
+            return () if self._owner_frame is None else (None, realm_identity)
+        return (str(self._session_id), realm_identity)
 
     def _preview(self) -> str:
         if self._payload.get("subtype") == "node":
@@ -9848,7 +10093,7 @@ class JSHandle(_EventEmitter):
                         self._page._core.js_handle_json_value,
                         self._object_id,
                         self._page._default_timeout,
-                        *self._session_args(),
+                        *self._serialized_owner_args(),
                     )
                 )
             )
@@ -9871,7 +10116,7 @@ class JSHandle(_EventEmitter):
                 None,
                 True,
                 self._page._default_timeout if timeout_ms is None else timeout_ms,
-                *self._session_args(),
+                *self._serialized_owner_args(),
             )
             return bool(_decode_json_result(json.loads(result)))
         if self._payload.get("type") == "undefined" or self._payload.get("subtype") == "null":
@@ -9950,8 +10195,17 @@ class JSHandle(_EventEmitter):
         except Error:
             return None
 
-    def _evaluate_with_method(self, expression: str, arg: Any = None, *, method: str) -> Any:
+    def _evaluate_with_method(
+        self,
+        expression: str,
+        arg: Any = None,
+        *,
+        method: str,
+        timeout_ms: Optional[float] = None,
+    ) -> Any:
         expression = _normalize_string_option(expression, method=method, name="expression")
+        if arg is not None:
+            _ensure_evaluate_argument_context(self._page, self._owner_frame, arg, method=method)
         if hasattr(self._page, "_mark_history_events_may_arrive"):
             self._page._mark_history_events_may_arrive()
         if not self._object_id:
@@ -9976,8 +10230,8 @@ class JSHandle(_EventEmitter):
                     _evaluate_handle_argument_function(expression),
                     json_module_dumps(prepared.cdp_arguments()),
                     True,
-                    None,
-                    *self._session_args(),
+                    timeout_ms,
+                    *self._serialized_owner_args(),
                 )
                 return _decode_json_result(json.loads(result))
             finally:
@@ -9991,8 +10245,8 @@ class JSHandle(_EventEmitter):
             expression,
             arg_json,
             True,
-            None,
-            *self._session_args(),
+            timeout_ms,
+            *self._serialized_owner_args(),
         )
         return _decode_json_result(json.loads(result))
 
@@ -10002,6 +10256,8 @@ class JSHandle(_EventEmitter):
 
     def _evaluate_handle_with_method(self, expression: str, arg: Any = None, *, method: str) -> "JSHandle":
         expression = _normalize_string_option(expression, method=method, name="expression")
+        if arg is not None:
+            _ensure_evaluate_argument_context(self._page, self._owner_frame, arg, method=method)
         if hasattr(self._page, "_mark_history_events_may_arrive"):
             self._page._mark_history_events_may_arrive()
         if not self._object_id:
@@ -10028,7 +10284,7 @@ class JSHandle(_EventEmitter):
                         json_module_dumps(prepared.cdp_arguments()),
                         False,
                         None,
-                        *self._session_args(),
+                        *self._serialized_owner_args(),
                     )
                 )
                 return JSHandle(self._page, payload, owner_frame=self._owner_frame)
@@ -10045,7 +10301,7 @@ class JSHandle(_EventEmitter):
                 arg_json,
                 False,
                 None,
-                *self._session_args(),
+                *self._serialized_owner_args(),
             )
         )
         return JSHandle(self._page, payload, owner_frame=self._owner_frame)
@@ -10054,17 +10310,20 @@ class JSHandle(_EventEmitter):
         self._ensure_not_disposed("evaluate_handle")
         return self._evaluate_handle_with_method(expression, arg, method="JSHandle.evaluate_handle")
 
-    def dispose(self) -> None:
+    def _dispose_with_timeout(self, timeout_ms: Optional[float]) -> None:
         if self._disposed:
             return
         if self._object_id:
             _call(
                 self._page._core.js_handle_dispose,
                 self._object_id,
-                None,
+                timeout_ms,
                 *self._session_args(),
             )
         self._disposed = True
+
+    def dispose(self) -> None:
+        self._dispose_with_timeout(None)
 
 
 def json_module_dumps(value: Any) -> str:
@@ -13478,6 +13737,10 @@ class Frame(_EventEmitter):
         self._uses_direct_evaluation = False
         self._child_frame_cache: list["Frame"] = []
 
+    def _raise_if_detached(self, method: str) -> None:
+        if self.is_detached():
+            raise Error(f"{method}: Frame was detached")
+
     def _remember_child_frame(self, frame: "Frame") -> None:
         if all(existing is not frame for existing in self._child_frame_cache):
             self._child_frame_cache.append(frame)
@@ -13774,7 +14037,15 @@ class Frame(_EventEmitter):
         return _element_handle_from_locator(locator.nth(0)) if attached else None
 
     def evaluate(self, expression: str, arg: Any = None) -> Any:
+        self._raise_if_detached("Frame.evaluate")
         expression = _normalize_string_option(expression, method="Frame.evaluate", name="expression")
+        if arg is not None:
+            _ensure_evaluate_argument_context(
+                self._page,
+                self,
+                arg,
+                method="Frame.evaluate",
+            )
         self._page._mark_request_cookie_sync_required()
         self._page._mark_history_events_may_arrive()
         if self._is_main:
@@ -13808,6 +14079,23 @@ class Frame(_EventEmitter):
             if result is not None:
                 self._uses_direct_evaluation = True
                 return _decode_json_result(json.loads(result))
+        if arg is not None and _argument_contains_handle(arg):
+            prepared = _prepare_evaluate_argument(self._page, arg)
+            try:
+                anchor = prepared.handles[0]
+                result = _call_with_method_prefix(
+                    "Frame.evaluate",
+                    self._page._core.js_handle_evaluate_with_call_arguments,
+                    anchor._object_id,
+                    _evaluate_argument_function(expression),
+                    json_module_dumps(prepared.cdp_arguments()),
+                    True,
+                    None,
+                    *anchor._serialized_owner_args(),
+                )
+                return _decode_json_result(json.loads(result))
+            finally:
+                prepared.dispose_temporaries()
         if self._frame_spec is not None:
             return self.locator(":root")._evaluate_with_method(
                 """(el, payload) => {
@@ -13860,11 +14148,38 @@ class Frame(_EventEmitter):
         )
 
     def evaluate_handle(self, expression: str, arg: Any = None) -> JSHandle:
+        self._raise_if_detached("Frame.evaluate_handle")
         expression = _normalize_string_option(expression, method="Frame.evaluate_handle", name="expression")
+        if arg is not None:
+            _ensure_evaluate_argument_context(
+                self._page,
+                self,
+                arg,
+                method="Frame.evaluate_handle",
+            )
         self._page._mark_request_cookie_sync_required()
         self._page._mark_history_events_may_arrive()
         if self._is_main:
             return self._page._evaluate_handle_with_timeout(expression, arg, method="Frame.evaluate_handle")
+        if arg is not None and _argument_contains_handle(arg):
+            prepared = _prepare_evaluate_argument(self._page, arg)
+            try:
+                anchor = prepared.handles[0]
+                payload = json.loads(
+                    _call_with_method_prefix(
+                        "Frame.evaluate_handle",
+                        self._page._core.js_handle_evaluate_with_call_arguments,
+                        anchor._object_id,
+                        _evaluate_argument_function(expression),
+                        json_module_dumps(prepared.cdp_arguments()),
+                        False,
+                        None,
+                        *anchor._serialized_owner_args(),
+                    )
+                )
+                return JSHandle(self._page, payload, owner_frame=self)
+            finally:
+                prepared.dispose_temporaries()
         handle = self.locator(":root")._evaluate_handle_with_method(
             """(el, payload) => {
             const [expression, arg] = payload;
@@ -17503,6 +17818,8 @@ class Page:
 
     def _evaluate_with_method(self, expression: str, arg: Any = None, *, method: str) -> Any:
         expression = _normalize_string_option(expression, method=method, name="expression")
+        if arg is not None:
+            _ensure_evaluate_argument_context(self, self._main_frame, arg, method=method)
         self._mark_request_cookie_sync_required()
         self._mark_history_events_may_arrive()
         console_marker = self._console_dispatch_marker_if_listening()
@@ -17562,6 +17879,8 @@ class Page:
         method: str = "Page.evaluate_handle",
     ) -> JSHandle:
         expression = _normalize_string_option(expression, method=method, name="expression")
+        if arg is not None:
+            _ensure_evaluate_argument_context(self, self._main_frame, arg, method=method)
         self._mark_request_cookie_sync_required()
         self._mark_history_events_may_arrive()
         command_timeout = timeout_ms
@@ -17578,7 +17897,7 @@ class Page:
                         command_timeout,
                     )
                 )
-                return JSHandle(self, payload)
+                return JSHandle(self, payload, owner_frame=self._main_frame)
             finally:
                 prepared.dispose_temporaries()
         arg = prepared.value if prepared is not None else arg
@@ -17592,7 +17911,7 @@ class Page:
                 command_timeout,
             )
         )
-        return JSHandle(self, payload)
+        return JSHandle(self, payload, owner_frame=self._main_frame)
 
     def evaluate_handle(self, expression: str, arg: Any = None) -> JSHandle:
         return self._evaluate_handle_with_timeout(expression, arg)
@@ -21690,6 +22009,12 @@ return null;
             f"timed out waiting for locator to be editable while trying to {action}; {detail}"
         )
 
+    def _owner_frame(self) -> Frame:
+        frame_spec = _frame_scope_spec_from_element_spec(self._spec)
+        if frame_spec is None:
+            return self._page.main_frame
+        return self._page._frame_from_spec(frame_spec)
+
     def _evaluate_with_method(
         self,
         expression: str,
@@ -21757,7 +22082,7 @@ return __rw_fn(el, __rw_arg);
                 self._page._default_timeout if timeout is None else timeout,
             )
         )
-        return JSHandle(self._page, payload)
+        return JSHandle(self._page, payload, owner_frame=self._owner_frame())
 
     def evaluate_handle(self, expression: str, arg: Any = None, *, timeout: Optional[float] = None) -> JSHandle:
         return self._evaluate_handle_with_method(expression, arg, timeout=timeout, method="Locator.evaluate_handle")
@@ -24687,6 +25012,29 @@ class ElementHandle(_EventEmitter):
             raise TargetClosedError(f"ElementHandle.dispatch_event: {_TARGET_CLOSED_MESSAGE}")
         self._locator.dispatch_event(type, event_init)
 
+    def _evaluate_with_timeout(
+        self,
+        expression: str,
+        arg: Any = None,
+        *,
+        timeout_ms: float,
+        method: str,
+    ) -> Any:
+        self._ensure_not_disposed("evaluate")
+        if self._handle is not None and not self._handle._disposed:
+            return self._handle._evaluate_with_method(
+                expression,
+                arg,
+                method=method,
+                timeout_ms=timeout_ms,
+            )
+        return self._locator._evaluate_with_method(
+            expression,
+            arg,
+            timeout=timeout_ms,
+            method=method,
+        )
+
     def evaluate(self, expression: str, arg: Any = None) -> Any:
         self._ensure_not_disposed("evaluate")
         if self._handle is not None and not self._handle._disposed:
@@ -25208,15 +25556,15 @@ class ElementHandle(_EventEmitter):
         return frame
 
     def owner_frame(self) -> Frame:
-        frame_spec = _frame_scope_spec_from_element_spec(self._locator._spec)
-        if frame_spec is None:
-            return self._locator._page.main_frame
-        return self._locator._page._frame_from_spec(frame_spec)
+        return self._locator._owner_frame()
+
+    def _dispose_with_timeout(self, timeout_ms: Optional[float]) -> None:
+        if self._handle is not None:
+            self._handle._dispose_with_timeout(timeout_ms)
+        self._disposed = True
 
     def dispose(self) -> None:
-        if self._handle is not None:
-            self._handle.dispose()
-        self._disposed = True
+        self._dispose_with_timeout(None)
 
 
 _EVALUATE_HANDLE_MARKER = "__rustwright_handle_index__"
@@ -25241,6 +25589,54 @@ class _PreparedEvaluateArgument:
                 handle.dispose()
             except Error:
                 pass
+
+
+def _same_evaluate_frame(left: Any, right: Any) -> bool:
+    if left is right:
+        return True
+    if left is None or right is None:
+        return False
+    left_id = getattr(left, "_frame_id", None)
+    right_id = getattr(right, "_frame_id", None)
+    return bool(left_id and right_id and left_id == right_id)
+
+
+def _ensure_evaluate_argument_context(
+    expected_owner: Any,
+    expected_frame: Optional[Any],
+    arg: Any,
+    *,
+    method: str,
+) -> None:
+    def validate(value: Any) -> None:
+        handle: Optional[JSHandle] = None
+        actual_owner: Any = None
+        owner_frame: Optional[Any] = None
+        if isinstance(value, JSHandle):
+            handle = value
+            actual_owner = value._page
+            owner_frame = value._owner_frame
+        elif isinstance(value, ElementHandle):
+            handle = value._handle
+            actual_owner = handle._page if handle is not None else value._locator._page
+            owner_frame = value.owner_frame()
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                validate(item)
+            return
+        elif isinstance(value, dict):
+            for item in value.values():
+                validate(item)
+            return
+        else:
+            return
+
+        if actual_owner is not expected_owner:
+            raise Error(f"{method}: JSHandles can be evaluated only in the context they were created!")
+        if owner_frame is not None and not _same_evaluate_frame(owner_frame, expected_frame):
+            raise Error(f"{method}: JSHandles can be evaluated only in the context they were created!")
+
+    validate(arg)
 
 
 def _prepare_evaluate_argument(page: "Page", arg: Any) -> _PreparedEvaluateArgument:
@@ -26620,6 +27016,8 @@ class Worker(_EventEmitter):
     def evaluate(self, expression: str, arg: Any = None) -> Any:
         if self._core is None:
             raise Error("worker is not attached")
+        if arg is not None:
+            _ensure_evaluate_argument_context(self, None, arg, method="Worker.evaluate")
         prepared = _prepare_evaluate_argument(self, arg) if arg is not None else None
         if prepared is not None and prepared.has_handles:
             try:
@@ -26641,6 +27039,8 @@ class Worker(_EventEmitter):
     def evaluate_handle(self, expression: str, arg: Any = None) -> JSHandle:
         if self._core is None:
             raise Error("worker is not attached")
+        if arg is not None:
+            _ensure_evaluate_argument_context(self, None, arg, method="Worker.evaluate_handle")
         prepared = _prepare_evaluate_argument(self, arg) if arg is not None else None
         if prepared is not None and prepared.has_handles:
             try:
