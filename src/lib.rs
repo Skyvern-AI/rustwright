@@ -7017,6 +7017,20 @@ multiline-compatible = """4.5.6"""
     }
 
     #[test]
+    fn chromium_keychain_defaults_honor_user_override_filtering() {
+        let ignored = vec![
+            "--password-store".to_string(),
+            "--use-mock-keychain".to_string(),
+        ];
+
+        assert!(launch_default_arg_ignored(
+            "--password-store=basic",
+            &ignored
+        ));
+        assert!(launch_default_arg_ignored("--use-mock-keychain", &ignored));
+    }
+
+    #[test]
     fn chromium_launch_failure_message_includes_stderr_tail() {
         let stderr = NamedTempFile::new().unwrap();
         fs::write(
