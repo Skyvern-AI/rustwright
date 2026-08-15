@@ -21,6 +21,7 @@ import os
 import re
 import shlex
 import shutil
+import select
 import socket
 import ssl
 import subprocess
@@ -46,6 +47,32 @@ rustwright.enable_playwright_compat()
 
 
 ONE_PIXEL_GIF_BYTES = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==")
+UNSUPPORTED_CONNECT = (
+    "BrowserType.connect: Rustwright does not support the Playwright wire protocol "
+    "(playwright run-server or BrowserType.launchServer). Use "
+    "chromium.connect_over_cdp() with a raw Chromium CDP endpoint such as "
+    "http://browser:9222. See "
+    "https://github.com/Skyvern-AI/rustwright/blob/main/docs/REMOTE_BROWSERS.md"
+)
+DEFINITIVE_PLAYWRIGHT_DISCOVERY = (
+    "BrowserType.connect_over_cdp: This endpoint speaks the Playwright wire protocol, "
+    "not CDP. Point chromium.connect_over_cdp() at a raw Chromium CDP endpoint such as "
+    "http://browser:9222. See "
+    "https://github.com/Skyvern-AI/rustwright/blob/main/docs/REMOTE_BROWSERS.md"
+)
+SUSPECTED_PLAYWRIGHT_REPLY = (
+    "BrowserType.connect_over_cdp: The endpoint's first response resembles the "
+    "Playwright wire protocol, not CDP. Rustwright cannot determine the protocol "
+    "conclusively for a direct WebSocket URL. Use an HTTP discovery URL or a raw "
+    "Chromium CDP endpoint. See "
+    "https://github.com/Skyvern-AI/rustwright/blob/main/docs/REMOTE_BROWSERS.md"
+)
+REMOTE_DISCOVERY_FAILED = (
+    "BrowserType.connect_over_cdp: Remote browser discovery failed. The endpoint "
+    "exposed neither raw CDP at /json/version nor Playwright discovery at /json. See "
+    "https://github.com/Skyvern-AI/rustwright/blob/main/docs/REMOTE_BROWSERS.md"
+)
+SAFE_CONNECT_FAILED = "BrowserType.connect_over_cdp: CDP connection failed"
 
 
 @pytest.fixture(scope="session")
@@ -87,6 +114,387 @@ def runtime_state_test_data(page: Any) -> dict[str, Any]:
 
 def _serve_forever_fast(server: ThreadingHTTPServer) -> None:
     server.serve_forever(poll_interval=0.01)
+
+def _start_remote_http_fixture(responder):
+    requests: list[tuple[str, dict[str, str]]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            headers = {name.lower(): value for name, value in self.headers.items()}
+            requests.append((self.path, headers))
+            response = responder(self.path, headers, len(requests))
+            if response is None:
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.connection.close()
+                return
+            status, content_type, body, delay = response
+            if delay:
+                time.sleep(delay)
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=_serve_forever_fast, args=(server,), daemon=True)
+    thread.start()
+    host, port = server.server_address
+    return server, f"http://{host}:{port}", requests
+
+
+def _read_websocket_text(connection: socket.socket) -> str:
+    header = connection.recv(2)
+    if len(header) != 2:
+        raise AssertionError("missing WebSocket frame header")
+    length = header[1] & 0x7F
+    if length == 126:
+        length = int.from_bytes(connection.recv(2), "big")
+    elif length == 127:
+        length = int.from_bytes(connection.recv(8), "big")
+    mask = connection.recv(4) if header[1] & 0x80 else b""
+    payload = bytearray()
+    while len(payload) < length:
+        chunk = connection.recv(length - len(payload))
+        if not chunk:
+            raise AssertionError("WebSocket frame ended early")
+        payload.extend(chunk)
+    if mask:
+        for index in range(len(payload)):
+            payload[index] ^= mask[index % 4]
+    return payload.decode("utf-8")
+
+
+def _send_websocket_json(connection: socket.socket, payload: dict[str, Any]) -> None:
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    if len(body) < 126:
+        header = bytes((0x81, len(body)))
+    elif len(body) <= 0xFFFF:
+        header = bytes((0x81, 126)) + len(body).to_bytes(2, "big")
+    else:
+        header = bytes((0x81, 127)) + len(body).to_bytes(8, "big")
+    connection.sendall(header + body)
+
+
+def _start_websocket_reply_fixture(
+    reply_payloads, *, handshake_delay: float = 0, reply_delay: float = 0
+):
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    host, port = listener.getsockname()
+    requests: list[str] = []
+
+    def serve():
+        try:
+            connection, _ = listener.accept()
+        except OSError:
+            return
+        with connection:
+            connection.settimeout(3)
+            chunks = bytearray()
+            while b"\r\n\r\n" not in chunks:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    return
+                chunks.extend(chunk)
+            request = chunks.decode("iso-8859-1")
+            requests.append(request)
+            key = next(
+                line.split(":", 1)[1].strip()
+                for line in request.splitlines()
+                if line.lower().startswith("sec-websocket-key:")
+            )
+            accept = base64.b64encode(
+                hashlib.sha1(
+                    (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+                ).digest()
+            ).decode("ascii")
+            if handshake_delay:
+                time.sleep(handshake_delay)
+            connection.sendall(
+                (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                ).encode("ascii")
+            )
+            command = json.loads(_read_websocket_text(connection))
+            if reply_delay:
+                time.sleep(reply_delay)
+            try:
+                for payload in reply_payloads(command):
+                    _send_websocket_json(connection, payload)
+            except OSError:
+                pass
+            time.sleep(0.05)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return f"ws://{host}:{port}/devtools/browser/test", requests, listener
+
+def _start_tls_cdp_proxy(
+    upstream_endpoint: str,
+    tmp_path: Path,
+    *,
+    broken_handshake: bool = False,
+):
+    ca_cert_path = tmp_path / "cdp-wss-ca-cert.pem"
+    ca_key_path = tmp_path / "cdp-wss-ca-key.pem"
+    cert_path = tmp_path / "cdp-wss-cert.pem"
+    key_path = tmp_path / "cdp-wss-key.pem"
+    csr_path = tmp_path / "cdp-wss.csr"
+    extensions_path = tmp_path / "cdp-wss-extensions.cnf"
+    extensions_path.write_text(
+        "subjectAltName=IP:127.0.0.1,DNS:localhost\n"
+        "basicConstraints=critical,CA:FALSE\n"
+        "keyUsage=critical,digitalSignature,keyEncipherment\n"
+        "extendedKeyUsage=serverAuth\n"
+    )
+    commands = [
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(ca_key_path),
+            "-out",
+            str(ca_cert_path),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=Rustwright Test CA",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+        ],
+        [
+            "openssl",
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(key_path),
+            "-out",
+            str(csr_path),
+            "-subj",
+            "/CN=localhost",
+        ],
+        [
+            "openssl",
+            "x509",
+            "-req",
+            "-in",
+            str(csr_path),
+            "-CA",
+            str(ca_cert_path),
+            "-CAkey",
+            str(ca_key_path),
+            "-CAcreateserial",
+            "-out",
+            str(cert_path),
+            "-days",
+            "1",
+            "-extfile",
+            str(extensions_path),
+        ],
+    ]
+    for command in commands:
+        proc = subprocess.run(command, text=True, capture_output=True, timeout=10)
+        if proc.returncode != 0:
+            pytest.skip(f"openssl could not create a local TLS certificate: {proc.stderr or proc.stdout}")
+
+    parsed = urlparse(upstream_endpoint)
+    assert parsed.scheme == "ws"
+    assert parsed.hostname is not None
+    assert parsed.port is not None
+    upstream_address = (parsed.hostname, parsed.port)
+    upstream_host = f"{parsed.hostname}:{parsed.port}"
+    request_target = parsed.path or "/"
+    if parsed.query:
+        request_target += f"?{parsed.query}"
+
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    host, port = listener.getsockname()
+    requests: list[str] = []
+    errors: list[str] = []
+
+    def serve() -> None:
+        try:
+            connection, _ = listener.accept()
+        except OSError:
+            return
+        try:
+            with server_context.wrap_socket(connection, server_side=True) as tls_connection:
+                tls_connection.settimeout(2)
+                request = bytearray()
+                while b"\r\n\r\n" not in request:
+                    chunk = tls_connection.recv(4096)
+                    if not chunk:
+                        raise AssertionError("TLS CDP client closed before WebSocket Upgrade")
+                    request.extend(chunk)
+                request_text = request.decode("iso-8859-1")
+                requests.append(request_text)
+                if broken_handshake:
+                    key = next(
+                        line.split(":", 1)[1].strip()
+                        for line in request_text.splitlines()
+                        if line.lower().startswith("sec-websocket-key:")
+                    )
+                    accept = base64.b64encode(
+                        hashlib.sha1(
+                            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+                        ).digest()
+                    ).decode("ascii")
+                    tls_connection.sendall(
+                        (
+                            "HTTP/1.1 101 Switching Protocols\r\n"
+                            f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                        ).encode("ascii")
+                    )
+                    return
+                with socket.create_connection(upstream_address, timeout=2) as upstream:
+                    rewritten_lines = []
+                    for line in request_text.split("\r\n"):
+                        if line.lower().startswith("host:"):
+                            rewritten_lines.append(f"Host: {upstream_host}")
+                        else:
+                            rewritten_lines.append(line)
+                    upstream.sendall("\r\n".join(rewritten_lines).encode("iso-8859-1"))
+                    tls_connection.settimeout(None)
+                    upstream.settimeout(None)
+                    while True:
+                        readable, _, _ = select.select([tls_connection, upstream], [], [], 0.1)
+                        if not readable:
+                            continue
+                        for source in readable:
+                            target = upstream if source is tls_connection else tls_connection
+                            try:
+                                chunk = source.recv(65536)
+                            except OSError:
+                                return
+                            if not chunk:
+                                return
+                            try:
+                                target.sendall(chunk)
+                            except OSError:
+                                return
+        except Exception as error:
+            errors.append(repr(error))
+            connection.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    endpoint = f"wss://{host}:{port}{request_target}"
+    return endpoint, ca_cert_path.read_text(), requests, errors, listener, thread
+
+
+def _surface_connection_error(
+    surface: str,
+    browser_name: str,
+    method: str,
+    endpoint,
+    **kwargs,
+) -> str:
+    module = importlib.import_module(surface)
+    manager_name = "async_playwright" if surface.endswith("async_api") else "sync_playwright"
+    manager = getattr(module, manager_name)
+    if surface.endswith("async_api"):
+
+        async def run() -> str:
+            try:
+                async with manager() as playwright_instance:
+                    await getattr(getattr(playwright_instance, browser_name), method)(endpoint, **kwargs)
+            except module.Error as error:
+                return str(error)
+            raise AssertionError("connection unexpectedly succeeded")
+
+        return asyncio.run(run())
+
+    try:
+        with manager() as playwright_instance:
+            getattr(getattr(playwright_instance, browser_name), method)(endpoint, **kwargs)
+    except module.Error as error:
+        return str(error)
+    raise AssertionError("connection unexpectedly succeeded")
+
+CONNECT_BOUNDARY_NAMES = (
+    "DNS resolution",
+    "discovery HTTP request",
+    "WebSocket connector",
+    "native connect binding",
+)
+
+
+def _require_connect_test_support():
+    from rustwright import _rustwright
+
+    required = (
+        "_test_connect_over_cdp",
+        "_test_set_connect_options",
+        "_test_reset_connect_boundary_counters",
+        "_test_connect_boundary_counters",
+    )
+    missing = [name for name in required if not hasattr(_rustwright, name)]
+    if missing:
+        pytest.skip(
+            "requires a test-support wheel: "
+            "`maturin develop --features test-support`; "
+            f"missing {', '.join(missing)}"
+        )
+    return _rustwright
+
+
+def _connect_boundary_counters() -> dict[str, int]:
+    _rustwright = _require_connect_test_support()
+    return dict(zip(CONNECT_BOUNDARY_NAMES, _rustwright._test_connect_boundary_counters()))
+
+
+def _arm_browser_type_connect_no_io_sentinels(monkeypatch) -> Counter:
+    _rustwright = _require_connect_test_support()
+    _rustwright._test_reset_connect_boundary_counters()
+    native_calls: Counter = Counter()
+
+    def fail_native_connect(*_args, **_kwargs):
+        native_calls["native connect monkeypatch"] += 1
+        raise AssertionError("BrowserType.connect crossed the native connect binding")
+
+    monkeypatch.setattr(_rustwright, "connect_over_cdp", fail_native_connect)
+    return native_calls
+
+
+def _assert_browser_type_connect_did_not_cross_io(native_calls: Counter) -> None:
+    assert native_calls == Counter(), f"native sentinel calls: {native_calls}"
+    counters = _connect_boundary_counters()
+    expected = {boundary: 0 for boundary in CONNECT_BOUNDARY_NAMES}
+    assert counters == expected, f"Rust connect boundary counters changed: {counters}"
 
 
 def png_size(data: bytes) -> tuple[int, int]:
@@ -2878,20 +3286,155 @@ def test_evaluate_runtime_probe_matches_playwright_classification(page):
     assert page.evaluate("(function() { 'use strict'; return this === undefined; })") is True
 
 
-def test_chromium_connect_uses_direct_cdp_endpoint(playwright):
+def test_chromium_connect_over_cdp_uses_direct_cdp_endpoint(playwright):
     launched = playwright.chromium.launch(headless=True)
     connected = None
     try:
-        connected = playwright.chromium.connect(launched._ws_endpoint, slow_mo=12)
+        connected = playwright.chromium.connect_over_cdp(launched._ws_endpoint, slow_mo=12)
         assert connected._slow_mo_ms == 12
         page = connected.new_page()
         page.set_content("<title>Connected</title>")
         assert page.title() == "Connected"
+        connected.close()
+        assert not connected.is_connected()
     finally:
         if connected is not None:
             connected.close()
-        else:
-            launched.close()
+        launched.close()
+
+def test_chromium_connect_over_cdp_wss_rejects_untrusted_private_ca(
+    playwright,
+    tmp_path: Path,
+):
+    launched = playwright.chromium.launch(headless=True)
+    listener = None
+    thread = None
+    try:
+        endpoint, _cert_pem, requests, _server_errors, listener, thread = _start_tls_cdp_proxy(
+            launched._ws_endpoint, tmp_path
+        )
+        with pytest.raises(Error) as exc:
+            playwright.chromium.connect_over_cdp(endpoint, timeout=2_000)
+        assert str(exc.value) == SAFE_CONNECT_FAILED
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert requests == []
+    finally:
+        if listener is not None:
+            listener.close()
+        if thread is not None:
+            thread.join(timeout=2)
+        launched.close()
+
+
+def test_connect_test_options_are_consumed_by_preflight_rejection(
+    playwright,
+    tmp_path: Path,
+):
+    _rustwright = _require_connect_test_support()
+    launched = playwright.chromium.launch(headless=True)
+    listener = None
+    thread = None
+    try:
+        endpoint, cert_pem, requests, _server_errors, listener, thread = _start_tls_cdp_proxy(
+            launched._ws_endpoint, tmp_path
+        )
+        _rustwright._test_set_connect_options(None, cert_pem)
+        with pytest.raises(Error) as invalid_exc:
+            playwright.chromium.connect_over_cdp("ftp://127.0.0.1:1", timeout=2_000)
+        assert (
+            str(invalid_exc.value)
+            == "BrowserType.connect_over_cdp: CDP endpoint must use ws, wss, http, or https"
+        )
+
+        with pytest.raises(Error) as exc:
+            playwright.chromium.connect_over_cdp(endpoint, timeout=2_000)
+        assert str(exc.value) == SAFE_CONNECT_FAILED
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert requests == []
+    finally:
+        if listener is not None:
+            listener.close()
+        if thread is not None:
+            thread.join(timeout=2)
+        launched.close()
+
+
+def test_chromium_connect_over_cdp_wss_runs_complete_flow_without_http_discovery(
+    playwright,
+    tmp_path: Path,
+):
+    _rustwright = _require_connect_test_support()
+    launched = playwright.chromium.launch(headless=True)
+    connected = None
+    listener = None
+    thread = None
+    try:
+        endpoint, cert_pem, requests, server_errors, listener, thread = _start_tls_cdp_proxy(
+            launched._ws_endpoint, tmp_path
+        )
+        stages: list[str] = []
+        _rustwright._test_set_connect_options(
+            lambda stage, _remaining: stages.append(stage),
+            cert_pem,
+        )
+        connected = playwright.chromium.connect_over_cdp(endpoint, timeout=2_000)
+        page = connected.new_page()
+        page.set_content("<title>Secure CDP</title>")
+        assert page.title() == "Secure CDP"
+        assert stages == ["Upgrade", "Target.setAutoAttach"]
+
+        connected.close()
+        assert not connected.is_connected()
+        assert launched.is_connected()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        request_lines = [request.splitlines()[0] for request in requests]
+        expected_target = urlparse(launched._ws_endpoint).path
+        assert request_lines == [f"GET {expected_target} HTTP/1.1"]
+        assert all("/json" not in request_line for request_line in request_lines)
+        assert sum("upgrade: websocket" in request.lower() for request in requests) == 1
+        assert server_errors == []
+    finally:
+        if connected is not None:
+            connected.close()
+        if listener is not None:
+            listener.close()
+        if thread is not None:
+            thread.join(timeout=2)
+        launched.close()
+
+
+def test_chromium_connect_over_cdp_wss_rejects_incomplete_upgrade_response(
+    playwright,
+    tmp_path: Path,
+):
+    _rustwright = _require_connect_test_support()
+    launched = playwright.chromium.launch(headless=True)
+    listener = None
+    thread = None
+    try:
+        endpoint, cert_pem, requests, server_errors, listener, thread = _start_tls_cdp_proxy(
+            launched._ws_endpoint,
+            tmp_path,
+            broken_handshake=True,
+        )
+        _rustwright._test_set_connect_options(None, cert_pem)
+        with pytest.raises(Error) as exc:
+            playwright.chromium.connect_over_cdp(endpoint, timeout=2_000)
+        assert str(exc.value) == SAFE_CONNECT_FAILED
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert len(requests) == 1
+        assert "sec-websocket-key:" in requests[0].lower()
+        assert server_errors == []
+    finally:
+        if listener is not None:
+            listener.close()
+        if thread is not None:
+            thread.join(timeout=2)
+        launched.close()
 
 
 def test_chromium_connect_over_cdp_adopts_default_context_pages_and_disconnects_only(playwright):
@@ -2948,7 +3491,7 @@ def test_chromium_connect_over_cdp_forwards_headers(playwright):
     websocket_listener.bind(("127.0.0.1", 0))
     websocket_listener.listen(1)
     websocket_host, websocket_port = websocket_listener.getsockname()
-    http_seen: list[str | None] = []
+    http_seen: list[tuple[str, str | None]] = []
     websocket_seen: list[str] = []
 
     def websocket_server():
@@ -2975,7 +3518,7 @@ def test_chromium_connect_over_cdp_forwards_headers(playwright):
             pass
 
         def do_GET(self):
-            http_seen.append(self.headers.get("X-CDP-Test"))
+            http_seen.append((self.path, self.headers.get("Authorization")))
             body = json.dumps(
                 {
                     "webSocketDebuggerUrl": (
@@ -2997,15 +3540,19 @@ def test_chromium_connect_over_cdp_forwards_headers(playwright):
     ws_thread.start()
 
     try:
-        with pytest.raises(Error):
+        with pytest.raises(Error) as exc:
             playwright.chromium.connect_over_cdp(
                 f"http://{http_host}:{http_port}",
-                headers={"X-CDP-Test": "seen"},
+                headers={"Authorization": "Bearer forwarding-secret"},
                 timeout=1_000,
             )
-        assert wait_until(lambda: http_seen)[0] == "seen"
+        assert wait_until(lambda: http_seen) == [
+            ("/json/version", "Bearer forwarding-secret")
+        ]
         raw_websocket_request = wait_until(lambda: websocket_seen)[0].lower()
-        assert "x-cdp-test: seen" in raw_websocket_request
+        assert "authorization: bearer forwarding-secret" in raw_websocket_request
+        assert str(exc.value) == SAFE_CONNECT_FAILED
+        assert "forwarding-secret" not in str(exc.value)
     finally:
         http_server.shutdown()
         http_server.server_close()
@@ -3084,10 +3631,7 @@ def test_chromium_connect_over_cdp_http_status_error_matches_playwright(playwrig
         http_server.shutdown()
         http_server.server_close()
 
-    assert str(exc.value).splitlines()[0] == (
-        "BrowserType.connect_over_cdp: Unexpected status 500 when connecting to "
-        f"{endpoint}/json/version/."
-    )
+    assert str(exc.value) == REMOTE_DISCOVERY_FAILED
 
 
 def test_chromium_connect_over_cdp_websocket_status_error_matches_playwright(playwright):
@@ -3120,10 +3664,10 @@ def test_chromium_connect_over_cdp_websocket_status_error_matches_playwright(pla
         http_server.shutdown()
         http_server.server_close()
 
-    lines = str(exc.value).splitlines()
-    assert lines[0] == f"BrowserType.connect_over_cdp: WebSocket error: {endpoint} 502 Bad Gateway"
-    assert lines[1] == body.decode("utf-8")
-    assert f"  - <ws unexpected response> {endpoint} 502 Bad Gateway" in lines
+    message = str(exc.value)
+    assert message == SAFE_CONNECT_FAILED
+    assert endpoint not in message
+    assert body.decode("utf-8") not in message
 
 
 def test_chromium_connect_option_validation_matches_playwright(playwright):
@@ -3150,6 +3694,704 @@ def test_chromium_connect_option_validation_matches_playwright(playwright):
     assert str(expose_exc.value).splitlines()[0] == (
         "BrowserType.connect: expose_network: expected string, got number"
     )
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "rustwright.sync_api",
+        "rustwright.async_api",
+        "playwright.sync_api",
+        "playwright.async_api",
+    ],
+)
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "ws://127.0.0.1:1/devtools/browser/test",
+        "http://127.0.0.1:1",
+    ],
+)
+@pytest.mark.parametrize("engine_name", ["chromium", "firefox", "webkit"])
+def test_browser_type_connect_unsupported_message_matrix(
+    monkeypatch, surface: str, engine_name: str, endpoint: str
+):
+    calls = _arm_browser_type_connect_no_io_sentinels(monkeypatch)
+    assert (
+        _surface_connection_error(
+            surface,
+            engine_name,
+            "connect",
+            endpoint,
+        )
+        == UNSUPPORTED_CONNECT
+    )
+    _assert_browser_type_connect_did_not_cross_io(calls)
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "kwargs", "expected"),
+    [
+        (123, {}, "BrowserType.connect: endpoint: expected string, got number"),
+        (
+            "ws://127.0.0.1:1/devtools/browser/test",
+            {"slow_mo": True},
+            "BrowserType.connect: slow_mo: expected float, got boolean",
+        ),
+        (
+            "ws://127.0.0.1:1/devtools/browser/test",
+            {"timeout": "10"},
+            "BrowserType.connect: timeout: expected float, got string",
+        ),
+        (
+            "ws://127.0.0.1:1/devtools/browser/test",
+            {"expose_network": 1},
+            "BrowserType.connect: expose_network: expected string, got number",
+        ),
+        (
+            "ws://127.0.0.1:1/devtools/browser/test",
+            {"headers": {1: "value"}},
+            "BrowserType.connect: headers[0].name: expected string, got number",
+        ),
+        (
+            "ws://127.0.0.1:1/devtools/browser/test",
+            {"headers": {"Authorization": 1}},
+            "BrowserType.connect: headers[0].value: expected string, got number",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "rustwright.sync_api",
+        "rustwright.async_api",
+        "playwright.sync_api",
+        "playwright.async_api",
+    ],
+)
+@pytest.mark.parametrize("engine_name", ["chromium", "firefox", "webkit"])
+def test_browser_type_connect_validation_precedes_unsupported_without_io(
+    monkeypatch,
+    endpoint,
+    kwargs: dict[str, Any],
+    expected: str,
+    surface: str,
+    engine_name: str,
+):
+    calls = _arm_browser_type_connect_no_io_sentinels(monkeypatch)
+    assert (
+        _surface_connection_error(surface, engine_name, "connect", endpoint, **kwargs)
+        == expected
+    )
+    _assert_browser_type_connect_did_not_cross_io(calls)
+
+
+def test_connect_over_cdp_http_raw_cdp_uses_json_version_only(playwright):
+    launched = playwright.chromium.launch(headless=True)
+    connected = None
+
+    def responder(path, _headers, _count):
+        assert path == "/json/version"
+        return (
+            200,
+            "application/json",
+            json.dumps({"webSocketDebuggerUrl": launched._ws_endpoint}),
+            0,
+        )
+
+    server, endpoint, requests = _start_remote_http_fixture(responder)
+    try:
+        connected = playwright.chromium.connect_over_cdp(endpoint)
+        page = connected.new_page()
+        page.set_content("<title>HTTP discovery</title>")
+        assert page.title() == "HTTP discovery"
+        assert [path for path, _ in requests] == ["/json/version"]
+    finally:
+        if connected is not None:
+            connected.close()
+        launched.close()
+        server.shutdown()
+        server.server_close()
+
+def test_connect_boundary_counters_cover_public_http_discovery(playwright):
+    _rustwright = _require_connect_test_support()
+    launched = playwright.chromium.launch(headless=True)
+    connected = None
+
+    def responder(path, _headers, _count):
+        assert path == "/json/version"
+        return (
+            200,
+            "application/json",
+            json.dumps({"webSocketDebuggerUrl": launched._ws_endpoint}),
+            0,
+        )
+
+    server, endpoint, requests = _start_remote_http_fixture(responder)
+    _rustwright._test_reset_connect_boundary_counters()
+    try:
+        connected = playwright.chromium.connect_over_cdp(endpoint)
+        assert [path for path, _ in requests] == ["/json/version"]
+        assert _connect_boundary_counters() == {
+            "DNS resolution": 2,
+            "discovery HTTP request": 1,
+            "WebSocket connector": 1,
+            "native connect binding": 1,
+        }
+    finally:
+        if connected is not None:
+            connected.close()
+        launched.close()
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    "version_body",
+    [
+        "Running",
+        json.dumps({"Browser": "Chromium"}),
+    ],
+)
+def test_connect_over_cdp_http_playwright_discovery_is_definitive(version_body: str):
+    def responder(path, _headers, _count):
+        if path == "/json/version":
+            return 200, "application/json", version_body, 0
+        assert path == "/json"
+        return 200, "application/json", json.dumps({"wsEndpointPath": "/"}), 0
+
+    server, endpoint, requests = _start_remote_http_fixture(responder)
+    try:
+        assert (
+            _surface_connection_error(
+                "rustwright.sync_api",
+                "chromium",
+                "connect_over_cdp",
+                endpoint,
+                timeout=1_000,
+            )
+            == DEFINITIVE_PLAYWRIGHT_DISCOVERY
+        )
+        assert [path for path, _ in requests] == ["/json/version", "/json"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_connect_over_cdp_http_malformed_discovery_is_neutral():
+    def responder(path, _headers, _count):
+        body = "{" if path == "/json/version" else json.dumps(["wrong shape"])
+        return 200, "application/json", body, 0
+
+    server, endpoint, requests = _start_remote_http_fixture(responder)
+    try:
+        assert (
+            _surface_connection_error(
+                "rustwright.sync_api",
+                "chromium",
+                "connect_over_cdp",
+                endpoint,
+                timeout=1_000,
+            )
+            == REMOTE_DISCOVERY_FAILED
+        )
+        assert [path for path, _ in requests] == ["/json/version", "/json"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    ("first_response", "second_response", "expected"),
+    [
+        (
+            None,
+            (200, "application/json", json.dumps({"wsEndpointPath": "/"}), 0),
+            DEFINITIVE_PLAYWRIGHT_DISCOVERY,
+        ),
+        (
+            None,
+            (502, "text/plain", "proxy secret", 0),
+            REMOTE_DISCOVERY_FAILED,
+        ),
+        (
+            (500, "text/plain", "first secret", 0),
+            None,
+            REMOTE_DISCOVERY_FAILED,
+        ),
+    ],
+)
+def test_connect_over_cdp_http_transport_failures_follow_ordered_classifier(
+    first_response, second_response, expected: str
+):
+    def responder(path, _headers, _count):
+        return first_response if path == "/json/version" else second_response
+
+    server, endpoint, requests = _start_remote_http_fixture(responder)
+    try:
+        assert (
+            _surface_connection_error(
+                "rustwright.sync_api",
+                "chromium",
+                "connect_over_cdp",
+                endpoint,
+                timeout=1_000,
+            )
+            == expected
+        )
+        assert [path for path, _ in requests] == ["/json/version", "/json"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_connect_over_cdp_http_mixed_401_forwards_headers_and_detects_playwright():
+    secret = "Bearer discovery-secret"
+
+    def responder(path, headers, _count):
+        assert headers["authorization"] == secret
+        if path == "/json/version":
+            return 401, "text/plain", "unauthorized", 0
+        return 200, "application/json", json.dumps({"wsEndpointPath": "/"}), 0
+
+    server, endpoint, requests = _start_remote_http_fixture(responder)
+    try:
+        message = _surface_connection_error(
+            "rustwright.sync_api",
+            "chromium",
+            "connect_over_cdp",
+            endpoint,
+            timeout=1_000,
+            headers={"Authorization": secret},
+        )
+        assert message == DEFINITIVE_PLAYWRIGHT_DISCOVERY
+        assert [path for path, _ in requests] == ["/json/version", "/json"]
+        assert secret not in message
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "rustwright.sync_api",
+        "rustwright.async_api",
+        "playwright.sync_api",
+        "playwright.async_api",
+    ],
+)
+def test_connect_over_cdp_http_two_401_bodies_are_neutral_and_redacted(surface: str):
+    secrets = {
+        "authorization": "Bearer authorization-secret",
+        "proxy-authorization": "Basic proxy-secret",
+        "cookie": "session=cookie-secret",
+    }
+    body = "https://user:password@upstream.invalid/?token=body-secret"
+
+    def responder(_path, headers, _count):
+        for name, value in secrets.items():
+            assert headers[name] == value
+        return 401, "text/plain", body, 0
+
+    server, endpoint, requests = _start_remote_http_fixture(responder)
+    try:
+        message = _surface_connection_error(
+            surface,
+            "chromium",
+            "connect_over_cdp",
+            endpoint,
+            timeout=1_000,
+            headers={
+                "Authorization": secrets["authorization"],
+                "Proxy-Authorization": secrets["proxy-authorization"],
+                "Cookie": secrets["cookie"],
+            },
+        )
+        assert message == REMOTE_DISCOVERY_FAILED
+        assert len(requests) == 2
+        for secret in [*secrets.values(), body, "body-secret", "password"]:
+            assert secret not in message
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    ("input_suffix", "expected_paths"),
+    [
+        (
+            "/tenant/root?token=query-secret",
+            [
+                "/tenant/root/json/version?token=query-secret",
+                "/tenant/root/json?token=query-secret",
+            ],
+        ),
+        (
+            "/tenant/root/json/version?token=query-secret",
+            [
+                "/tenant/root/json/version?token=query-secret",
+                "/tenant/root/json?token=query-secret",
+            ],
+        ),
+        (
+            "/tenant/root/json?token=query-secret",
+            [
+                "/tenant/root/json/version?token=query-secret",
+                "/tenant/root/json?token=query-secret",
+            ],
+        ),
+        (
+            "/tenant/root/json/version",
+            [
+                "/tenant/root/json/version",
+                "/tenant/root/json",
+            ],
+        ),
+        (
+            "/tenant/root/json",
+            [
+                "/tenant/root/json/version",
+                "/tenant/root/json",
+            ],
+        ),
+    ],
+)
+def test_connect_over_cdp_http_derives_routes_with_path_query_and_suffix(
+    input_suffix: str, expected_paths: list[str]
+):
+    def responder(_path, _headers, _count):
+        return 200, "application/json", "{}", 0
+
+    server, endpoint, requests = _start_remote_http_fixture(responder)
+    try:
+        message = _surface_connection_error(
+            "rustwright.sync_api",
+            "chromium",
+            "connect_over_cdp",
+            endpoint + input_suffix,
+            timeout=1_000,
+        )
+        assert message == REMOTE_DISCOVERY_FAILED
+        assert [path for path, _ in requests] == expected_paths
+        assert "query-secret" not in message
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_connect_over_cdp_http_deadline_is_shared_across_both_routes():
+    def responder(path, _headers, _count):
+        delay = 0.12 if path == "/json/version" else 0.20
+        return 200, "application/json", "{}", delay
+
+    server, endpoint, requests = _start_remote_http_fixture(responder)
+    started = time.monotonic()
+    try:
+        with sync_playwright() as playwright_instance:
+            with pytest.raises(TimeoutError):
+                playwright_instance.chromium.connect_over_cdp(endpoint, timeout=250)
+        elapsed = time.monotonic() - started
+        assert 0.20 <= elapsed < 0.36
+        assert [path for path, _ in requests] == ["/json/version", "/json"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_connect_over_cdp_http_deadline_continues_through_upgrade_and_setup(playwright):
+    launched = playwright.chromium.launch(headless=True)
+    connected = None
+
+    def responder(path, _headers, _count):
+        assert path == "/json/version"
+        return (
+            200,
+            "application/json",
+            json.dumps({"webSocketDebuggerUrl": launched._ws_endpoint}),
+            0.10,
+        )
+
+    server, endpoint, requests = _start_remote_http_fixture(responder)
+    started = time.monotonic()
+    try:
+        connected = playwright.chromium.connect_over_cdp(endpoint, timeout=1_000)
+        assert time.monotonic() - started < 1.0
+        assert [path for path, _ in requests] == ["/json/version"]
+    finally:
+        if connected is not None:
+            connected.close()
+        launched.close()
+        server.shutdown()
+        server.server_close()
+
+
+def test_connect_over_cdp_http_deadline_expires_across_discovery_upgrade_and_setup():
+    from rustwright import _rustwright
+
+    stage_budgets: list[tuple[str, float]] = []
+
+    def observe_stage(stage: str, remaining: float) -> None:
+        stage_budgets.append((stage, remaining))
+
+
+    def replies(command):
+        return [{"id": command["id"], "result": {}}]
+
+    websocket_endpoint, websocket_requests, listener = _start_websocket_reply_fixture(
+        replies,
+        handshake_delay=0.05,
+        reply_delay=0.30,
+    )
+
+    def responder(path, _headers, _count):
+        assert path == "/json/version"
+        return (
+            200,
+            "application/json",
+            json.dumps({"webSocketDebuggerUrl": websocket_endpoint}),
+            0.05,
+        )
+
+    server, endpoint, requests = _start_remote_http_fixture(responder)
+    _rustwright = _require_connect_test_support()
+    _rustwright._test_set_connect_options(observe_stage)
+    started = time.monotonic()
+    try:
+        with sync_playwright() as playwright_instance:
+            with pytest.raises(TimeoutError):
+                playwright_instance.chromium.connect_over_cdp(endpoint, timeout=250)
+        elapsed = time.monotonic() - started
+        assert 0.20 <= elapsed < 0.30
+        assert [path for path, _ in requests] == ["/json/version"]
+        assert len(websocket_requests) == 1
+        assert [stage for stage, _ in stage_budgets] == [
+            "Upgrade",
+            "Target.setAutoAttach",
+        ]
+        upgrade_budget = stage_budgets[0][1]
+        setup_budget = stage_budgets[1][1]
+        assert 0 < upgrade_budget < 0.225
+        assert 0 < setup_budget < upgrade_budget - 0.025
+    finally:
+        listener.close()
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "rustwright.sync_api",
+        "rustwright.async_api",
+        "playwright.sync_api",
+        "playwright.async_api",
+    ],
+)
+def test_connect_over_cdp_definitive_error_matches_all_public_surfaces(surface: str):
+    def responder(path, _headers, _count):
+        if path == "/json/version":
+            return 200, "text/plain", "Running", 0
+        return 200, "application/json", json.dumps({"wsEndpointPath": "/"}), 0
+
+    server, endpoint, requests = _start_remote_http_fixture(responder)
+    try:
+        assert (
+            _surface_connection_error(
+                surface,
+                "chromium",
+                "connect_over_cdp",
+                endpoint,
+                timeout=1_000,
+            )
+            == DEFINITIVE_PLAYWRIGHT_DISCOVERY
+        )
+        assert len(requests) == 2
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "rustwright.sync_api",
+        "rustwright.async_api",
+        "playwright.sync_api",
+        "playwright.async_api",
+    ],
+)
+def test_connect_over_cdp_suspected_error_matches_all_public_surfaces(surface: str):
+    nested_secret = "gateway-secret-must-not-leak"
+
+    def replies(command):
+        return [
+            {
+                "id": command["id"],
+                "error": {"error": {"message": nested_secret}},
+            }
+        ]
+
+    endpoint, requests, listener = _start_websocket_reply_fixture(replies)
+    try:
+        message = _surface_connection_error(
+            surface,
+            "chromium",
+            "connect_over_cdp",
+            endpoint,
+            timeout=1_000,
+        )
+        assert message == SUSPECTED_PLAYWRIGHT_REPLY
+        assert "resembles" in message
+        assert "speaks the Playwright" not in message
+        assert nested_secret not in message
+        assert len(requests) == 1
+    finally:
+        listener.close()
+
+
+def test_connect_over_cdp_valid_cdp_event_disarms_suspected_protocol_heuristic():
+    nested_secret = "late-nested-secret"
+
+    def replies(command):
+        return [
+            {"method": "Target.targetCreated", "params": {"targetInfo": {}}},
+            {
+                "id": command["id"],
+                "error": {"error": {"message": nested_secret}},
+            },
+        ]
+
+    endpoint, requests, listener = _start_websocket_reply_fixture(replies)
+    try:
+        message = _surface_connection_error(
+            "rustwright.sync_api",
+            "chromium",
+            "connect_over_cdp",
+            endpoint,
+            timeout=1_000,
+        )
+        assert message == SAFE_CONNECT_FAILED
+        assert "Playwright wire protocol" not in message
+        assert nested_secret not in message
+        assert len(requests) == 1
+    finally:
+        listener.close()
+
+
+@pytest.mark.parametrize(
+    "surface",
+    ["rustwright.sync_api", "rustwright.async_api"],
+)
+def test_connect_over_cdp_upgrade_rejection_redacts_url_userinfo_query_and_body(
+    surface: str,
+):
+    body = "user:password token=query-secret authorization=Bearer body-secret"
+    request_count = 0
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            nonlocal request_count
+            request_count += 1
+            self.send_response(502)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body.encode("utf-8"))
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=_serve_forever_fast, args=(server,), daemon=True)
+    thread.start()
+    host, port = server.server_address
+    endpoint = f"ws://user:password@{host}:{port}/socket?token=query-secret"
+    try:
+        message = _surface_connection_error(
+            surface,
+            "chromium",
+            "connect_over_cdp",
+            endpoint,
+            timeout=1_000,
+            headers={
+                "Authorization": "Bearer authorization-secret",
+                "Proxy-Authorization": "Basic proxy-secret",
+                "Cookie": "session=cookie-secret",
+            },
+        )
+        assert message == SAFE_CONNECT_FAILED
+        assert request_count == 1
+        for secret in [
+            endpoint,
+            "user",
+            "password",
+            "query-secret",
+            "authorization-secret",
+            "proxy-secret",
+            "cookie-secret",
+            "body-secret",
+        ]:
+            assert secret not in message
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "rustwright.sync_api",
+        "rustwright.async_api",
+        "playwright.sync_api",
+        "playwright.async_api",
+    ],
+)
+def test_connect_over_cdp_empty_upgrade_rejection_never_falls_back_to_get(surface: str):
+    sentinel = "fallback-get-secret-sentinel"
+    requests: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            requests.append(self.path)
+            if len(requests) == 1:
+                self.send_response(502)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                return
+            body = sentinel.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=_serve_forever_fast, args=(server,), daemon=True)
+    thread.start()
+    host, port = server.server_address
+    endpoint = f"ws://{host}:{port}/socket"
+    try:
+        message = _surface_connection_error(
+            surface,
+            "chromium",
+            "connect_over_cdp",
+            endpoint,
+            timeout=1_000,
+        )
+        assert message == SAFE_CONNECT_FAILED
+        assert requests == ["/socket"]
+        assert sentinel not in message
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_browser_close_is_idempotent_and_emits_disconnected_once(playwright):
@@ -29293,7 +30535,7 @@ def test_new_context_success_artifacts_are_discarded(new_context):
     assert not list(output_dir.glob("**/videos/*"))
 
 
-def test_pytest_plugin_connect_options_use_browser_type_connect(tmp_path: Path):
+def test_pytest_plugin_connect_options_use_browser_type_connect_over_cdp(tmp_path: Path):
     test_file = tmp_path / "test_plugin_connect_options.py"
     test_file.write_text(
         """
@@ -29318,7 +30560,7 @@ class FakeBrowserType:
         self.launch_calls.append(kwargs)
         return self.browser
 
-    def connect(self, **kwargs):
+    def connect_over_cdp(self, **kwargs):
         self.connect_calls.append(kwargs)
         return self.browser
 
@@ -29334,19 +30576,19 @@ def browser_type():
 @pytest.fixture(scope="session")
 def connect_options():
     return {
-        "endpoint": "ws://127.0.0.1:9222/devtools/browser/test",
+        "endpoint_url": "ws://127.0.0.1:9222/devtools/browser/test",
         "headers": {"x-test": "yes"},
         "slow_mo": 17,
     }
 
 
-def test_launch_browser_uses_connect(launch_browser):
+def test_launch_browser_uses_connect_over_cdp(launch_browser):
     browser = launch_browser(headless=False)
     assert browser is FAKE_BROWSER_TYPE.browser
     assert FAKE_BROWSER_TYPE.launch_calls == []
     assert FAKE_BROWSER_TYPE.connect_calls == [
         {
-            "endpoint": "ws://127.0.0.1:9222/devtools/browser/test",
+            "endpoint_url": "ws://127.0.0.1:9222/devtools/browser/test",
             "headers": {"x-test": "yes"},
             "slow_mo": 17,
         }
@@ -34008,7 +35250,7 @@ def test_browser_bind_returns_direct_cdp_endpoint(playwright):
         result = launched.bind("local-session", host="127.0.0.1", port=0)
         assert result == {"endpoint": launched._ws_endpoint}
 
-        connected = playwright.chromium.connect(result["endpoint"])
+        connected = playwright.chromium.connect_over_cdp(result["endpoint"])
         page = connected.new_page()
         page.set_content("<title>Bound</title>")
         assert page.title() == "Bound"

@@ -873,6 +873,57 @@ def test_conftest_pytest_plugins_alias_collects(tmp_path):
     assert "ScopeMismatch" not in result.stdout + result.stderr
 
 
+
+def test_opt_in_playwright_connect_uses_exact_unsupported_contract_sync_and_async():
+    report = _run_probe(
+        """
+        import asyncio
+        import json
+
+        import rustwright
+
+        rustwright.enable_playwright_compat()
+        from playwright.async_api import async_playwright
+        from playwright.sync_api import sync_playwright
+
+        expected = (
+            "BrowserType.connect: Rustwright does not support the Playwright wire protocol "
+            "(playwright run-server or BrowserType.launchServer). Use "
+            "chromium.connect_over_cdp() with a raw Chromium CDP endpoint such as "
+            "http://browser:9222. See "
+            "https://github.com/Skyvern-AI/rustwright/blob/main/docs/REMOTE_BROWSERS.md"
+        )
+
+        sync_messages = {}
+        with sync_playwright() as playwright:
+            for name in ("chromium", "firefox", "webkit"):
+                try:
+                    getattr(playwright, name).connect("ws://127.0.0.1:1/devtools/browser/test")
+                except Exception as error:
+                    sync_messages[name] = str(error)
+
+        async def collect_async():
+            messages = {}
+            async with async_playwright() as playwright:
+                for name in ("chromium", "firefox", "webkit"):
+                    try:
+                        await getattr(playwright, name).connect(
+                            "ws://127.0.0.1:1/devtools/browser/test"
+                        )
+                    except Exception as error:
+                        messages[name] = str(error)
+            return messages
+
+        print(json.dumps({
+            "expected": expected,
+            "sync": sync_messages,
+            "async": asyncio.run(collect_async()),
+        }, sort_keys=True))
+        """
+    )
+    expected = report["expected"]
+    assert report["sync"] == {name: expected for name in ("chromium", "firefox", "webkit")}
+    assert report["async"] == {name: expected for name in ("chromium", "firefox", "webkit")}
 def test_conftest_root_pytest_plugin_alias_collects(tmp_path):
     conftest = tmp_path / "conftest.py"
     conftest.write_text(
