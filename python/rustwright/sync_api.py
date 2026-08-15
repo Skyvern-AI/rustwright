@@ -792,14 +792,14 @@ const hiddenByClosedDetails = node => {
   }
   return false;
 };
-const isHiddenForAria = node => {
+const isHiddenForAria = (node, style) => {
   if (!node || node.nodeType !== 1) return true;
   if (node.hasAttribute('hidden')) return true;
   if (String(node.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return true;
   if (hiddenByClosedDetails(node)) return true;
   const view = (node.ownerDocument && node.ownerDocument.defaultView) || window;
-  const style = view.getComputedStyle(node);
-  return style.display === 'none' || style.visibility === 'hidden';
+  const computedStyle = style || view.getComputedStyle(node);
+  return computedStyle.display === 'none' || computedStyle.visibility === 'hidden';
 };
 const textValue = value => normalize(String(value ?? ''));
 const rawScalar = value => {
@@ -818,10 +818,34 @@ const yamlScalar = value => {
   if (/^".*"$/.test(normalized)) return normalized;
   return needsQuotedYamlScalar(normalized) ? JSON.stringify(normalized) : normalized;
 };
-const urlScalar = value => {
-  const normalized = textValue(value);
-  if (!normalized) return JSON.stringify(normalized);
-  return normalized.startsWith('#') ? JSON.stringify(normalized) : normalized;
+const yamlEscapeValueIfNeeded = value => {
+  const raw = String(value ?? '');
+  if (!yamlStringNeedsQuotes(raw)) return raw;
+  return '"' + raw.replace(/[\\"\x00-\x1f\x7f-\x9f]/g, char => {
+    if (char === '\\') return '\\\\';
+    if (char === '"') return '\\"';
+    if (char === '\b') return '\\b';
+    if (char === '\f') return '\\f';
+    if (char === '\n') return '\\n';
+    if (char === '\r') return '\\r';
+    if (char === '\t') return '\\t';
+    return '\\x' + char.charCodeAt(0).toString(16).padStart(2, '0');
+  }) + '"';
+};
+const yamlStringNeedsQuotes = value => {
+  const raw = String(value ?? '');
+  if (!raw) return true;
+  if (/^\s|\s$/.test(raw)) return true;
+  if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(raw)) return true;
+  if (/^-/.test(raw)) return true;
+  if (/[\n:](\s|$)/.test(raw)) return true;
+  if (/\s#/.test(raw)) return true;
+  if (/[\n\r]/.test(raw)) return true;
+  if (/^[&*\],?!>|@"'#%]/.test(raw)) return true;
+  if (/[{}`]/.test(raw)) return true;
+  if (/^\[/.test(raw)) return true;
+  if (!isNaN(Number(raw)) || ['y', 'n', 'yes', 'no', 'true', 'false', 'on', 'off', 'null'].includes(raw.toLowerCase())) return true;
+  return false;
 };
 const roleValueLabelPattern = /^[a-z]+(?: "[^"]*")?(?: \[[^\]]+\])*: /;
 const yamlLabel = value => {
@@ -835,20 +859,33 @@ const ownText = node => Array.from(node.childNodes || [])
   .filter(Boolean)
   .join(' ');
 const quoted = value => JSON.stringify(textValue(value));
+const quotedName = value => {
+  const normalized = textValue(value);
+  return normalized.startsWith('/') && normalized.endsWith('/') ? normalized : JSON.stringify(normalized);
+};
 const snapshotDescendantText = (node, root) => {
   if (!node) return '';
   if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
-  if (node.nodeType !== Node.ELEMENT_NODE || (node !== root && isHiddenForAria(node))) return '';
+  if (node.nodeType !== Node.ELEMENT_NODE) return '';
   const tag = node.tagName || '';
-  if (tag === 'IMG') return node.getAttribute('alt') || node.getAttribute('title') || '';
-  if (String(tag).toLowerCase() === 'svg') {
-    const title = node.querySelector('title');
-    return title ? title.textContent || '' : node.getAttribute('title') || '';
+  const view = (node.ownerDocument && node.ownerDocument.defaultView) || window;
+  const style = node === root ? null : view.getComputedStyle(node);
+  const hidden = node !== root && isHiddenForAria(node, style);
+  let text = '';
+  if (!hidden) {
+    if (tag === 'IMG') text = node.getAttribute('alt') || node.getAttribute('title') || '';
+    else if (String(tag).toLowerCase() === 'svg') {
+      const title = node.querySelector('title');
+      text = title ? title.textContent || '' : node.getAttribute('title') || '';
+    } else if (String(node.getAttribute('role') || '').trim().split(/\s+/).filter(Boolean)[0] === 'img') {
+      text = node.getAttribute('aria-label') || node.getAttribute('title') || '';
+    } else {
+      text = Array.from(node.childNodes || []).map(child => snapshotDescendantText(child, root)).join('');
+    }
   }
-  if (String(node.getAttribute('role') || '').trim().split(/\s+/).filter(Boolean)[0] === 'img') {
-    return node.getAttribute('aria-label') || node.getAttribute('title') || '';
-  }
-  return Array.from(node.childNodes || []).map(child => snapshotDescendantText(child, root)).join(' ');
+  if (node === root) return text;
+  const display = style.display || 'inline';
+  return display !== 'inline' || tag === 'BR' ? ` ${text} ` : text;
 };
 const labelText = node => {
   if (!node) return '';
@@ -1345,7 +1382,7 @@ const snapshotNodes = (node, depth) => {
 
   let label = role;
   if (name && !textSemanticRoles.has(role)) {
-    label += ` ${quoted(name)}`;
+    label += ` ${quotedName(name)}`;
   }
   label += stateSuffix(node, role);
   if (value) {
@@ -1360,7 +1397,7 @@ const snapshotNodes = (node, depth) => {
     if (node.hasAttribute('href')) {
       const href = node.getAttribute('href') || '';
       if (!result[0].label.endsWith(':')) result[0].label += ':';
-      result[0].children = [{ kind: 'text', text: `/url: ${urlScalar(href)}` }, ...result[0].children];
+      result[0].children = [{ kind: 'text', text: `/url: ${yamlEscapeValueIfNeeded(href)}` }, ...result[0].children];
     }
   }
   return result;
@@ -20548,7 +20585,7 @@ try {
     @functools.lru_cache(maxsize=1)
     def _aria_snapshot_helper_function_script() -> str:
         prelude = r"""
-const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+const normalize = value => String(value ?? '').replace(/[\u200b\u00ad]/g, '').replace(/\s+/g, ' ').trim();
 const referencedText = (el, attribute) => {
   const doc = el.ownerDocument || document;
   const referencedControlText = node => {
@@ -20941,7 +20978,7 @@ return true;
     @functools.lru_cache(maxsize=64)
     def _fast_simple_role_script(action_body: str) -> str:
         return f"""(payload) => {{
-const normalize = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
+const normalize = value => String(value ?? '').replace(/[\\u200b\\u00ad]/g, '').replace(/\\s+/g, ' ').trim();
 const includesText = (value, needle, exact) => {{
   const raw = String(value ?? '');
   if (needle && typeof needle === 'object' && needle.kind === 'regex') {{
@@ -21041,36 +21078,42 @@ const referencedText = (el, attribute) => {{
     }})
     .join(' ');
 }};
-const hiddenForName = (node, root) => {{
+const hiddenForName = (node, root, style) => {{
   if (!node || node.nodeType !== 1 || node === root) return false;
   if (node.hasAttribute('hidden')) return true;
   if (String(node.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return true;
-  const view = (node.ownerDocument && node.ownerDocument.defaultView) || window;
-  const style = view.getComputedStyle(node);
   return style.visibility === 'hidden' || style.display === 'none';
 }};
 const descendantText = (node, root) => {{
   if (!node) return '';
   if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
-  if (node.nodeType !== Node.ELEMENT_NODE || hiddenForName(node, root)) return '';
+  if (node.nodeType !== Node.ELEMENT_NODE) return '';
   const tag = node.tagName || '';
-  const type = String(node.getAttribute('type') || '').toLowerCase();
-  if (tag === 'IMG') return node.getAttribute('alt') || node.getAttribute('title') || '';
-  if (String(tag).toLowerCase() === 'svg') {{
-    const title = node.querySelector('title');
-    return title ? title.textContent || '' : '';
+  const view = (node.ownerDocument && node.ownerDocument.defaultView) || window;
+  const style = node === root ? null : view.getComputedStyle(node);
+  const hidden = hiddenForName(node, root, style);
+  let text = '';
+  if (!hidden) {{
+    const type = String(node.getAttribute('type') || '').toLowerCase();
+    if (tag === 'IMG') text = node.getAttribute('alt') || node.getAttribute('title') || '';
+    else if (String(tag).toLowerCase() === 'svg') {{
+      const title = node.querySelector('title');
+      text = title ? title.textContent || '' : '';
+    }} else if (explicitRoleOf(node) === 'img') {{
+      text = node.getAttribute('aria-label') || node.getAttribute('title') || '';
+    }} else if (tag === 'INPUT' && type === 'image') {{
+      text = node.getAttribute('alt') || node.getAttribute('title') || 'Submit';
+    }} else if (tag === 'INPUT' && type === 'file') {{
+      text = 'Choose File';
+    }} else if (tag === 'INPUT' && ['button', 'submit', 'reset'].includes(type)) {{
+      text = node.value || node.getAttribute('title') || (type === 'submit' ? 'Submit' : type === 'reset' ? 'Reset' : '');
+    }} else {{
+      text = Array.from(node.childNodes || []).map(child => descendantText(child, root)).join('');
+    }}
   }}
-  if (explicitRoleOf(node) === 'img') return node.getAttribute('aria-label') || node.getAttribute('title') || '';
-  if (tag === 'INPUT' && type === 'image') return node.getAttribute('alt') || node.getAttribute('title') || 'Submit';
-  if (tag === 'INPUT' && type === 'file') return 'Choose File';
-  if (tag === 'INPUT' && ['button', 'submit', 'reset'].includes(type)) {{
-    if (node.value) return node.value;
-    if (node.getAttribute('title')) return node.getAttribute('title') || '';
-    if (type === 'submit') return 'Submit';
-    if (type === 'reset') return 'Reset';
-    return '';
-  }}
-  return Array.from(node.childNodes || []).map(child => descendantText(child, root)).join(' ');
+  if (node === root) return text;
+  const display = style.display || 'inline';
+  return display !== 'inline' || tag === 'BR' ? ` ${{text}} ` : text;
 }};
 const explicitAccessibleName = el => normalize(referencedText(el, 'aria-labelledby') || el.getAttribute('aria-label') || '');
 const presentationalRoleOf = el => {{
@@ -21636,7 +21679,7 @@ try {{
   for (const el of allElements) {{
     if (el.shadowRoot) return {{ ok: false, type: 'fallback' }};
   }}
-  const normalize = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
+  const normalize = value => String(value ?? '').replace(/[\\u200b\\u00ad]/g, '').replace(/\\s+/g, ' ').trim();
   const elementText = node => {{
     if (!node) return '';
     if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
@@ -21659,8 +21702,8 @@ try {{
     regex = new RegExp(String(matcher.pattern || ''), String(matcher.flags || ''));
   }}
   const matchesText = text => {{
+    if (regex) return regex.test(text);
     const normalized = normalize(text);
-    if (regex) return regex.test(normalized);
     const needle = normalize(matcher);
     if (payload.exact) return normalized === needle;
     return normalized.toLowerCase().includes(needle.toLowerCase());
@@ -22966,7 +23009,7 @@ return ['text', 'search', 'url', 'tel', 'email', 'password', 'number'].includes(
         }
         result = self._evaluate_simple_css_fast_path(
             """(payload) => {
-const normalize = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
+const normalize = value => String(value ?? '').replace(/[\\u200b\\u00ad]/g, '').replace(/\\s+/g, ' ').trim();
 const includesText = (value, needle, exact) => {
   const left = normalize(value);
   const right = normalize(needle);
@@ -23150,7 +23193,7 @@ const allElements = document.querySelectorAll('*');
 for (let i = 0; i < allElements.length; i++) {{
   if (allElements[i].shadowRoot) return {{ ok: false, type: 'fallback' }};
 }}
-const normalize = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
+const normalize = value => String(value ?? '').replace(/[\\u200b\\u00ad]/g, '').replace(/\\s+/g, ' ').trim();
 const includesText = (value, needle, exact) => {{
   const raw = String(value ?? '');
   if (needle && typeof needle === 'object' && needle.kind === 'regex') {{
@@ -23277,10 +23320,9 @@ const allElements = document.querySelectorAll('*');
 for (let i = 0; i < allElements.length; i++) {{
   if (allElements[i].shadowRoot) return {{ ok: false, type: 'fallback' }};
 }}
-const normalize = value => String(value ?? '').replace(/\\s+/g, ' ').trim();
 const includesText = (value, needle, exact) => {{
-  const left = normalize(value);
-  const right = normalize(needle);
+  const left = String(value ?? '');
+  const right = String(needle ?? '');
   return exact ? left === right : left.toLowerCase().includes(right.toLowerCase());
 }};
 const visible = el => {{

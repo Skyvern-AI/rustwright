@@ -13,6 +13,7 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ### Fixed
 
+- Fixed `get_by_role()` accessible-name matching over nested content and `get_by_label()` zero-width normalization to match upstream Playwright.
 - Fixed sync and async `Page` objects to support Playwright-compatible context managers that close the page on exit.
 - Fixed `enable_playwright_compat()` on installations without the optional pytest development dependency. `enable_playwright_compat()` now returns a `PlaywrightCompatEnableResult` describing what was registered instead of `None`.
 

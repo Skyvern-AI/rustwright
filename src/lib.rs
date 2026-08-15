@@ -633,7 +633,7 @@ return new Promise(resolve => {
 "#;
 const LOCATOR_ASSERTION_PROBE_TEMPLATE: &str = r#"
 const matcher = __MATCHER__;
-const normalizeAssertionText = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+const normalizeAssertionText = value => String(value ?? '').replace(/[\u200b\u00ad]/g, '').replace(/\s+/g, ' ').trim();
 const assertionRegExp = expected => {
   try {
     let flags = String(expected.flags || '');
@@ -46905,7 +46905,7 @@ fn fast_css_locator_script(
 "#
     } else if needs_common_accessibility {
         r#"
-  const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+  const normalize = value => String(value ?? '').replace(/[\u200b\u00ad]/g, '').replace(/\s+/g, ' ').trim();
   const fastAccessibilityKnownRoles = new Set([
     'alert', 'alertdialog', 'application', 'article', 'banner', 'blockquote', 'button',
     'caption', 'cell', 'checkbox', 'code', 'columnheader', 'combobox', 'complementary',
@@ -46925,36 +46925,42 @@ fn fast_css_locator_script(
     }
     return '';
   };
-  const hiddenForName = (node, root) => {
+  const hiddenForName = (node, root, style) => {
     if (!node || node.nodeType !== 1 || node === root) return false;
     if (node.hasAttribute('hidden')) return true;
     if (String(node.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return true;
-    const view = (node.ownerDocument && node.ownerDocument.defaultView) || window;
-    const style = view.getComputedStyle(node);
     return style.visibility === 'hidden' || style.display === 'none';
   };
   const descendantText = (node, root) => {
     if (!node) return '';
     if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
-    if (node.nodeType !== Node.ELEMENT_NODE || hiddenForName(node, root)) return '';
+    if (node.nodeType !== Node.ELEMENT_NODE) return '';
     const tag = node.tagName || '';
-    const type = String(node.getAttribute('type') || '').toLowerCase();
-    if (tag === 'IMG') return node.getAttribute('alt') || node.getAttribute('title') || '';
-    if (String(tag).toLowerCase() === 'svg') {
-      const title = node.querySelector('title');
-      return title ? title.textContent || '' : node.getAttribute('title') || '';
+    const view = (node.ownerDocument && node.ownerDocument.defaultView) || window;
+    const style = node === root ? null : view.getComputedStyle(node);
+    const hidden = hiddenForName(node, root, style);
+    let text = '';
+    if (!hidden) {
+      const type = String(node.getAttribute('type') || '').toLowerCase();
+      if (tag === 'IMG') text = node.getAttribute('alt') || node.getAttribute('title') || '';
+      else if (String(tag).toLowerCase() === 'svg') {
+        const title = node.querySelector('title');
+        text = title ? title.textContent || '' : node.getAttribute('title') || '';
+      } else if (explicitRoleOf(node) === 'img') {
+        text = node.getAttribute('aria-label') || node.getAttribute('title') || '';
+      } else if (tag === 'INPUT' && type === 'image') {
+        text = node.getAttribute('alt') || node.getAttribute('title') || 'Submit';
+      } else if (tag === 'INPUT' && type === 'file') {
+        text = 'Choose File';
+      } else if (tag === 'INPUT' && ['button', 'submit', 'reset'].includes(type)) {
+        text = node.value || node.getAttribute('title') || (type === 'submit' ? 'Submit' : type === 'reset' ? 'Reset' : '');
+      } else {
+        text = Array.from(node.childNodes || []).map(child => descendantText(child, root)).join('');
+      }
     }
-    if (explicitRoleOf(node) === 'img') return node.getAttribute('aria-label') || node.getAttribute('title') || '';
-    if (tag === 'INPUT' && type === 'image') return node.getAttribute('alt') || node.getAttribute('title') || 'Submit';
-    if (tag === 'INPUT' && type === 'file') return 'Choose File';
-    if (tag === 'INPUT' && ['button', 'submit', 'reset'].includes(type)) {
-      if (node.value) return node.value;
-      if (node.getAttribute('title')) return node.getAttribute('title') || '';
-      if (type === 'submit') return 'Submit';
-      if (type === 'reset') return 'Reset';
-      return '';
-    }
-    return Array.from(node.childNodes || []).map(child => descendantText(child, root)).join(' ');
+    if (node === root) return text;
+    const display = style.display || 'inline';
+    return display !== 'inline' || tag === 'BR' ? ` ${text} ` : text;
   };
   const referencedText = (el, attribute) => {
     const doc = el.ownerDocument || document;
@@ -47040,37 +47046,43 @@ fn fast_css_locator_script(
     }
     return '';
   };
-  const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
-  const hiddenForName = (node, root) => {
+  const normalize = value => String(value ?? '').replace(/[\u200b\u00ad]/g, '').replace(/\s+/g, ' ').trim();
+  const hiddenForName = (node, root, style) => {
     if (!node || node.nodeType !== 1 || node === root) return false;
     if (node.hasAttribute('hidden')) return true;
     if (String(node.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return true;
-    const view = (node.ownerDocument && node.ownerDocument.defaultView) || window;
-    const style = view.getComputedStyle(node);
     return style.visibility === 'hidden' || style.display === 'none';
   };
   const descendantText = (node, root) => {
     if (!node) return '';
     if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
-    if (node.nodeType !== Node.ELEMENT_NODE || hiddenForName(node, root)) return '';
+    if (node.nodeType !== Node.ELEMENT_NODE) return '';
     const tag = node.tagName || '';
-    const type = String(node.getAttribute('type') || '').toLowerCase();
-    if (tag === 'IMG') return node.getAttribute('alt') || node.getAttribute('title') || '';
-    if (String(tag).toLowerCase() === 'svg') {
-      const title = node.querySelector('title');
-      return title ? title.textContent || '' : '';
+    const view = (node.ownerDocument && node.ownerDocument.defaultView) || window;
+    const style = node === root ? null : view.getComputedStyle(node);
+    const hidden = hiddenForName(node, root, style);
+    let text = '';
+    if (!hidden) {
+      const type = String(node.getAttribute('type') || '').toLowerCase();
+      if (tag === 'IMG') text = node.getAttribute('alt') || node.getAttribute('title') || '';
+      else if (String(tag).toLowerCase() === 'svg') {
+        const title = node.querySelector('title');
+        text = title ? title.textContent || '' : node.getAttribute('title') || '';
+      } else if (explicitRoleOf(node) === 'img') {
+        text = node.getAttribute('aria-label') || node.getAttribute('title') || '';
+      } else if (tag === 'INPUT' && type === 'image') {
+        text = node.getAttribute('alt') || node.getAttribute('title') || 'Submit';
+      } else if (tag === 'INPUT' && type === 'file') {
+        text = 'Choose File';
+      } else if (tag === 'INPUT' && ['button', 'submit', 'reset'].includes(type)) {
+        text = node.value || node.getAttribute('title') || (type === 'submit' ? 'Submit' : type === 'reset' ? 'Reset' : '');
+      } else {
+        text = Array.from(node.childNodes || []).map(child => descendantText(child, root)).join('');
+      }
     }
-    if (explicitRoleOf(node) === 'img') return node.getAttribute('aria-label') || node.getAttribute('title') || '';
-    if (tag === 'INPUT' && type === 'image') return node.getAttribute('alt') || node.getAttribute('title') || 'Submit';
-    if (tag === 'INPUT' && type === 'file') return 'Choose File';
-    if (tag === 'INPUT' && ['button', 'submit', 'reset'].includes(type)) {
-      if (node.value) return node.value;
-      if (node.getAttribute('title')) return node.getAttribute('title') || '';
-      if (type === 'submit') return 'Submit';
-      if (type === 'reset') return 'Reset';
-      return '';
-    }
-    return Array.from(node.childNodes || []).map(child => descendantText(child, root)).join(' ');
+    if (node === root) return text;
+    const display = style.display || 'inline';
+    return display !== 'inline' || tag === 'BR' ? ` ${text} ` : text;
   };
   const referencedText = (el, attribute) => {
     const doc = el.ownerDocument || document;
@@ -47376,7 +47388,7 @@ fn locator_script_for_root(
   const index = __INDEX__;
   const locatorRoot = __LOCATOR_ROOT__;
 
-  const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+  const normalize = value => String(value ?? '').replace(/[\u200b\u00ad]/g, '').replace(/\s+/g, ' ').trim();
   const includesText = (value, needle, exact) => {
     const raw = String(value ?? '');
     if (needle && typeof needle === 'object' && needle.kind === 'regex') {
@@ -47388,6 +47400,14 @@ fn locator_script_for_root(
     }
     const left = normalize(raw);
     const right = normalize(needle);
+    return exact ? left === right : left.toLowerCase().includes(right.toLowerCase());
+  };
+  const includesRawText = (value, needle, exact) => {
+    if (needle && typeof needle === 'object' && needle.kind === 'regex') {
+      return includesText(value, needle, exact);
+    }
+    const left = String(value ?? '');
+    const right = String(needle ?? '');
     return exact ? left === right : left.toLowerCase().includes(right.toLowerCase());
   };
   const isEmptyStringTextMatcher = needle => (
@@ -47517,40 +47537,42 @@ fn locator_script_for_root(
       })
       .join(' ');
   };
-  const hiddenForName = (node, root) => {
+  const hiddenForName = (node, root, style) => {
     if (!node || node.nodeType !== 1 || node === root) return false;
     if (node.hasAttribute('hidden')) return true;
     if (String(node.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return true;
-    const view = (node.ownerDocument && node.ownerDocument.defaultView) || window;
-    const style = view.getComputedStyle(node);
     return style.visibility === 'hidden' || style.display === 'none';
   };
   const descendantText = (node, root) => {
     if (!node) return '';
     if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
-    if (node.nodeType !== Node.ELEMENT_NODE || hiddenForName(node, root)) return '';
+    if (node.nodeType !== Node.ELEMENT_NODE) return '';
     const tag = node.tagName || '';
-    const type = String(node.getAttribute('type') || '').toLowerCase();
-    if (tag === 'IMG') return node.getAttribute('alt') || node.getAttribute('title') || '';
-    if (String(tag).toLowerCase() === 'svg') {
-      const title = node.querySelector('title');
-      return title ? title.textContent || '' : '';
+    const view = (node.ownerDocument && node.ownerDocument.defaultView) || window;
+    const style = node === root ? null : view.getComputedStyle(node);
+    const hidden = hiddenForName(node, root, style);
+    let text = '';
+    if (!hidden) {
+      const type = String(node.getAttribute('type') || '').toLowerCase();
+      if (tag === 'IMG') text = node.getAttribute('alt') || node.getAttribute('title') || '';
+      else if (String(tag).toLowerCase() === 'svg') {
+        const title = node.querySelector('title');
+        text = title ? title.textContent || '' : '';
+      } else if (explicitRoleOf(node) === 'img') {
+        text = node.getAttribute('aria-label') || node.getAttribute('title') || '';
+      } else if (tag === 'INPUT' && type === 'image') {
+        text = node.getAttribute('alt') || node.getAttribute('title') || 'Submit';
+      } else if (tag === 'INPUT' && type === 'file') {
+        text = 'Choose File';
+      } else if (tag === 'INPUT' && ['button', 'submit', 'reset'].includes(type)) {
+        text = node.value || node.getAttribute('title') || (type === 'submit' ? 'Submit' : type === 'reset' ? 'Reset' : '');
+      } else {
+        text = Array.from(node.childNodes || []).map(child => descendantText(child, root)).join('');
+      }
     }
-    if (explicitRoleOf(node) === 'img') return node.getAttribute('aria-label') || node.getAttribute('title') || '';
-    if (tag === 'INPUT' && type === 'image') {
-      return node.getAttribute('alt') || node.getAttribute('title') || 'Submit';
-    }
-    if (tag === 'INPUT' && type === 'file') {
-      return 'Choose File';
-    }
-    if (tag === 'INPUT' && ['button', 'submit', 'reset'].includes(type)) {
-      if (node.value) return node.value;
-      if (node.getAttribute('title')) return node.getAttribute('title') || '';
-      if (type === 'submit') return 'Submit';
-      if (type === 'reset') return 'Reset';
-      return '';
-    }
-    return Array.from(node.childNodes || []).map(child => descendantText(child, root)).join(' ');
+    if (node === root) return text;
+    const display = style.display || 'inline';
+    return display !== 'inline' || tag === 'BR' ? ` ${text} ` : text;
   };
   const explicitAccessibleName = el => normalize(referencedText(el, 'aria-labelledby') || el.getAttribute('aria-label') || '');
   const computeAccessibleName = el => {
@@ -48154,13 +48176,13 @@ fn locator_script_for_root(
       return element ? [element] : [];
     }
     if (current.kind === 'placeholder') {
-      return queryAllDeep(root, '[placeholder]').filter(el => includesText(el.getAttribute('placeholder'), current.value, current.exact));
+      return queryAllDeep(root, '[placeholder]').filter(el => includesRawText(el.getAttribute('placeholder'), current.value, current.exact));
     }
     if (current.kind === 'alt') {
-      return queryAllDeep(root, '[alt]').filter(el => includesText(el.getAttribute('alt'), current.value, current.exact));
+      return queryAllDeep(root, '[alt]').filter(el => includesRawText(el.getAttribute('alt'), current.value, current.exact));
     }
     if (current.kind === 'title') {
-      return queryAllDeep(root, '[title]').filter(el => includesText(el.getAttribute('title'), current.value, current.exact));
+      return queryAllDeep(root, '[title]').filter(el => includesRawText(el.getAttribute('title'), current.value, current.exact));
     }
     if (current.kind === 'label') {
       const labelledByMatches = el => {
