@@ -13,6 +13,7 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ### Fixed
 
+- Fixed sync and async `Page` objects to support Playwright-compatible context managers that close the page on exit.
 - Fixed `enable_playwright_compat()` on installations without the optional pytest development dependency. `enable_playwright_compat()` now returns a `PlaywrightCompatEnableResult` describing what was registered instead of `None`.
 
 ## [0.2.0] - 2026-08-03

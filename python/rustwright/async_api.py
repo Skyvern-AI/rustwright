@@ -10,7 +10,8 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from types import TracebackType
+from typing import Any, Callable, Optional, Type, Union
 
 from . import _rustwright
 from .sync_api import (
@@ -2316,6 +2317,17 @@ class AsyncBrowserContext(_AsyncBrowserContextGeneratedMixin, _AsyncWrapper):
 
 
 class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
+    async def __aenter__(self) -> "AsyncPage":
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> None:
+        await self.close()
+
     def __init__(self, sync_obj: Any):
         super().__init__(sync_obj)
         sync_obj = self._sync
