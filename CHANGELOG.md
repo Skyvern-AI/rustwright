@@ -4,6 +4,19 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ## [Unreleased]
 
+### Breaking
+
+- **Release target: 0.3.0.** `BrowserType.connect()` no longer forwards raw-CDP
+  endpoints to `connect_over_cdp()`. It now rejects every endpoint before
+  network I/O because Rustwright does not implement Playwright wire. Migrate
+  sync code from `chromium.connect(endpoint)` to
+  `chromium.connect_over_cdp(endpoint)`. Migrate async code from
+  `await chromium.connect(endpoint)` to
+  `await chromium.connect_over_cdp(endpoint)`. Services that use
+  `playwright run-server` or `BrowserType.launchServer()` must change to a raw
+  Chromium CDP service. See
+  [`docs/REMOTE_BROWSERS.md`](docs/REMOTE_BROWSERS.md).
+
 ### Changed
 
 - Reduced steady-state object-valued `evaluate()` results to one browser-protocol command after per-realm serializer setup; the first call in a new or recreated realm re-establishes that setup.
