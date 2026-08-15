@@ -14,6 +14,8 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+#[cfg(feature = "test-support")]
+use std::sync::LazyLock;
 #[cfg(feature = "python")]
 use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -35,7 +37,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::uri::PathAndQuery;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Uri};
-use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
 mod startup_timing;
@@ -44,6 +46,14 @@ mod telemetry;
 pub type RwResult<T> = Result<T, RwError>;
 type CdpPendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<RwResult<Value>>>>>;
 type CdpOutstandingMap = Arc<Mutex<HashMap<u64, CdpOutstandingCommand>>>;
+#[cfg(feature = "test-support")]
+static CONNECT_DNS_RESOLUTION_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "test-support")]
+static CONNECT_DISCOVERY_REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "test-support")]
+static CONNECT_WEBSOCKET_CONNECTOR_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "test-support")]
+static CONNECT_NATIVE_BINDING_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// A thread-safe cancellation signal for synchronous facade operations.
 ///
@@ -2411,12 +2421,38 @@ pub enum ActionabilityError {
     Detached,
 }
 
+/// Definitive evidence that a remote endpoint uses an unsupported protocol.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum RemoteProtocolEvidence {
+    #[error(
+        "This endpoint speaks the Playwright wire protocol, not CDP. Point chromium.connect_over_cdp() at a raw Chromium CDP endpoint such as http://browser:9222. See https://github.com/Skyvern-AI/rustwright/blob/main/docs/REMOTE_BROWSERS.md"
+    )]
+    PlaywrightHttpDiscovery,
+}
+
+/// A protocol shape that is suggestive but not conclusive.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum RemoteProtocolSuspicion {
+    #[error(
+        "The endpoint's first response resembles the Playwright wire protocol, not CDP. Rustwright cannot determine the protocol conclusively for a direct WebSocket URL. Use an HTTP discovery URL or a raw Chromium CDP endpoint. See https://github.com/Skyvern-AI/rustwright/blob/main/docs/REMOTE_BROWSERS.md"
+    )]
+    PlaywrightLikeFirstReply,
+}
+
 #[derive(Debug, Error)]
 pub enum RwError {
     #[error("{0}")]
     Message(String),
     #[error("CDP connection failed")]
     ConnectFailed,
+    #[error("{0}")]
+    UnsupportedRemoteProtocol(RemoteProtocolEvidence),
+    #[error("{0}")]
+    RemoteProtocolSuspected(RemoteProtocolSuspicion),
+    #[error(
+        "Remote browser discovery failed. The endpoint exposed neither raw CDP at /json/version nor Playwright discovery at /json. See https://github.com/Skyvern-AI/rustwright/blob/main/docs/REMOTE_BROWSERS.md"
+    )]
+    RemoteDiscoveryFailed,
     #[error("Protocol error ({method}): {message}")]
     Cdp { method: String, message: String },
     #[error("timed out after {0} ms")]
@@ -17380,6 +17416,305 @@ multiline-compatible = """4.5.6"""
 
         assert!(error.to_string().contains("duplicate field"));
     }
+    #[test]
+    fn remote_discovery_url_derivation_preserves_query_and_removes_known_suffix() {
+        for endpoint in [
+            "http://example.test/tenant/root?token=secret",
+            "http://example.test/tenant/root/json/version?token=secret",
+            "http://example.test/tenant/root/json?token=secret",
+        ] {
+            let (version, json) = remote_discovery_urls(endpoint).unwrap();
+            assert_eq!(
+                version.as_str(),
+                "http://example.test/tenant/root/json/version?token=secret"
+            );
+            assert_eq!(
+                json.as_str(),
+                "http://example.test/tenant/root/json?token=secret"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_websocket_endpoint_resolution_performs_no_http_discovery() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for endpoint in [
+            "ws://127.0.0.1:1/devtools/browser/test",
+            "wss://example.test/devtools/browser/test",
+        ] {
+            let resolved = runtime
+                .block_on(resolve_ws_endpoint(
+                    endpoint,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    &[],
+                ))
+                .unwrap();
+            assert_eq!(resolved, endpoint);
+        }
+    }
+
+    #[test]
+    fn nested_first_reply_constructs_only_the_suspected_protocol_variant() {
+        let pending: CdpPendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, receiver) = oneshot::channel();
+        pending.lock().unwrap().insert(1, sender);
+        let detector = AtomicBool::new(true);
+        let (events, _) = broadcast::channel(4);
+        dispatch_cdp_payload_with_diagnostics(
+            json!({
+                "id": 1,
+                "error": {"error": {"message": "remote secret"}}
+            }),
+            pending,
+            Arc::new(Mutex::new(HashMap::new())),
+            events,
+            Arc::new(Mutex::new(CdpEventLog::new())),
+            Arc::new(Mutex::new(CdpTrafficLog::new())),
+            Arc::new(Mutex::new(CdpRuntimeState::new(None))),
+            Some(&detector),
+        );
+        let error = receiver.blocking_recv().unwrap().unwrap_err();
+        assert!(matches!(
+            &error,
+            RwError::RemoteProtocolSuspected(RemoteProtocolSuspicion::PlaywrightLikeFirstReply)
+        ));
+        assert!(!matches!(&error, RwError::UnsupportedRemoteProtocol(_)));
+        assert!(!error.to_string().contains("remote secret"));
+    }
+
+    #[test]
+    fn valid_cdp_event_disarms_nested_reply_protocol_detection() {
+        let pending: CdpPendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let outstanding: CdpOutstandingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, receiver) = oneshot::channel();
+        pending.lock().unwrap().insert(1, sender);
+        let detector = AtomicBool::new(true);
+        let (events, _) = broadcast::channel(4);
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let traffic_log = Arc::new(Mutex::new(CdpTrafficLog::new()));
+        dispatch_cdp_payload_with_diagnostics(
+            json!({"method": "Target.targetCreated", "params": {}}),
+            Arc::clone(&pending),
+            Arc::clone(&outstanding),
+            events.clone(),
+            Arc::clone(&event_log),
+            Arc::clone(&traffic_log),
+            Arc::new(Mutex::new(CdpRuntimeState::new(None))),
+            Some(&detector),
+        );
+        dispatch_cdp_payload_with_diagnostics(
+            json!({
+                "id": 1,
+                "error": {"error": {"message": "late remote secret"}}
+            }),
+            pending,
+            outstanding,
+            events,
+            event_log,
+            traffic_log,
+            Arc::new(Mutex::new(CdpRuntimeState::new(None))),
+            Some(&detector),
+        );
+        let error = receiver.blocking_recv().unwrap().unwrap_err();
+        assert!(matches!(&error, RwError::Message(message) if message == "unknown CDP error"));
+        assert!(!error.to_string().contains("late remote secret"));
+    }
+
+    #[test]
+    fn normal_cdp_error_shape_keeps_ordinary_message_for_command_wrapping() {
+        let pending: CdpPendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, receiver) = oneshot::channel();
+        pending.lock().unwrap().insert(1, sender);
+        let detector = AtomicBool::new(true);
+        let (events, _) = broadcast::channel(4);
+        dispatch_cdp_payload_with_diagnostics(
+            json!({"id": 1, "error": {"message": "ordinary CDP failure"}}),
+            pending,
+            Arc::new(Mutex::new(HashMap::new())),
+            events,
+            Arc::new(Mutex::new(CdpEventLog::new())),
+            Arc::new(Mutex::new(CdpTrafficLog::new())),
+            Arc::new(Mutex::new(CdpRuntimeState::new(None))),
+            Some(&detector),
+        );
+        let error = receiver.blocking_recv().unwrap().unwrap_err();
+        assert!(matches!(
+            &error,
+            RwError::Message(message) if message == "ordinary CDP failure"
+        ));
+    }
+
+    #[test]
+    fn typed_remote_protocol_messages_are_exact_and_do_not_include_peer_text() {
+        assert_eq!(
+            RwError::UnsupportedRemoteProtocol(
+                RemoteProtocolEvidence::PlaywrightHttpDiscovery
+            )
+            .to_string(),
+            "This endpoint speaks the Playwright wire protocol, not CDP. Point chromium.connect_over_cdp() at a raw Chromium CDP endpoint such as http://browser:9222. See https://github.com/Skyvern-AI/rustwright/blob/main/docs/REMOTE_BROWSERS.md"
+        );
+        assert_eq!(
+            RwError::RemoteProtocolSuspected(
+                RemoteProtocolSuspicion::PlaywrightLikeFirstReply
+            )
+            .to_string(),
+            "The endpoint's first response resembles the Playwright wire protocol, not CDP. Rustwright cannot determine the protocol conclusively for a direct WebSocket URL. Use an HTTP discovery URL or a raw Chromium CDP endpoint. See https://github.com/Skyvern-AI/rustwright/blob/main/docs/REMOTE_BROWSERS.md"
+        );
+        assert_eq!(
+            RwError::RemoteDiscoveryFailed.to_string(),
+            "Remote browser discovery failed. The endpoint exposed neither raw CDP at /json/version nor Playwright discovery at /json. See https://github.com/Skyvern-AI/rustwright/blob/main/docs/REMOTE_BROWSERS.md"
+        );
+    }
+
+    #[test]
+    fn native_connection_boundary_redacts_upgrade_url_headers_and_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_server = Arc::clone(&requests);
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            requests_server.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 4096];
+            let _ = connection.read(&mut request);
+            let body = b"user:password token=query-secret header-secret";
+            write!(
+                connection,
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            connection.write_all(body).unwrap();
+        });
+        let endpoint = format!("ws://user:password@{address}/socket?token=query-secret");
+        let error = match rustwright_connect_over_cdp(
+            &endpoint,
+            &[
+                (
+                    "Authorization".to_string(),
+                    "Bearer header-secret".to_string(),
+                ),
+                (
+                    "Proxy-Authorization".to_string(),
+                    "Basic proxy-auth-native-sentinel-4f91c7".to_string(),
+                ),
+                ("Cookie".to_string(), "session=cookie-secret".to_string()),
+            ],
+            Duration::from_secs(1),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("upgrade rejection unexpectedly connected"),
+        };
+        server.join().unwrap();
+        assert!(matches!(&error, RwError::ConnectFailed));
+        let message = error.to_string();
+        for secret in [
+            endpoint.as_str(),
+            "user",
+            "password",
+            "query-secret",
+            "header-secret",
+            "proxy-auth-native-sentinel-4f91c7",
+            "cookie-secret",
+        ] {
+            assert!(!message.contains(secret));
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn native_empty_upgrade_rejection_performs_no_fallback_get() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_server = Arc::clone(&requests);
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            requests_server.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 4096];
+            let _ = connection.read(&mut request);
+            connection
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            drop(connection);
+
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut fallback, _)) => {
+                        requests_server.fetch_add(1, Ordering::SeqCst);
+                        let _ = fallback.read(&mut request);
+                        let sentinel = b"native-fallback-secret-sentinel";
+                        write!(
+                            fallback,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            sentinel.len()
+                        )
+                        .unwrap();
+                        fallback.write_all(sentinel).unwrap();
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fallback accept failed: {error}"),
+                }
+            }
+        });
+        let endpoint = format!("ws://{address}/socket");
+        let error = match rustwright_connect_over_cdp(&endpoint, &[], Duration::from_secs(1)) {
+            Err(error) => error,
+            Ok(_) => panic!("upgrade rejection unexpectedly connected"),
+        };
+        server.join().unwrap();
+        assert!(matches!(&error, RwError::ConnectFailed));
+        assert!(!error
+            .to_string()
+            .contains("native-fallback-secret-sentinel"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn typed_protocol_errors_bypass_cdp_message_wrapping() {
+        let definitive = wrap_cdp_command_error(
+            "Target.setAutoAttach",
+            RwError::UnsupportedRemoteProtocol(RemoteProtocolEvidence::PlaywrightHttpDiscovery),
+        );
+        assert!(matches!(
+            &definitive,
+            RwError::UnsupportedRemoteProtocol(RemoteProtocolEvidence::PlaywrightHttpDiscovery)
+        ));
+
+        let suspected = wrap_cdp_command_error(
+            "Target.setAutoAttach",
+            RwError::RemoteProtocolSuspected(RemoteProtocolSuspicion::PlaywrightLikeFirstReply),
+        );
+        assert!(matches!(
+            &suspected,
+            RwError::RemoteProtocolSuspected(RemoteProtocolSuspicion::PlaywrightLikeFirstReply)
+        ));
+
+        let ordinary = wrap_cdp_command_error(
+            "Target.setAutoAttach",
+            RwError::Message("ordinary failure".to_string()),
+        );
+        assert!(matches!(
+            &ordinary,
+            RwError::Cdp { method, message }
+                if method == "Target.setAutoAttach" && message == "ordinary failure"
+        ));
+        assert_eq!(
+            ordinary.to_string(),
+            "Protocol error (Target.setAutoAttach): ordinary failure"
+        );
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -18330,6 +18665,16 @@ struct CdpSendOutcome {
     write_status: TransportWriteStatus,
 }
 
+fn wrap_cdp_command_error(method: &str, error: RwError) -> RwError {
+    match error {
+        RwError::Message(message) => RwError::Cdp {
+            method: method.to_string(),
+            message,
+        },
+        other => other,
+    }
+}
+
 struct CdpEventLog {
     next_seq: u64,
     events: VecDeque<(u64, Value)>,
@@ -18431,77 +18776,6 @@ impl CdpEventLog {
     }
 }
 
-fn format_websocket_status(status: tokio_tungstenite::tungstenite::http::StatusCode) -> String {
-    match status.canonical_reason() {
-        Some(reason) if !reason.is_empty() => format!("{} {}", status.as_u16(), reason),
-        _ => status.as_u16().to_string(),
-    }
-}
-
-fn websocket_endpoint_as_http_url(ws_endpoint: &str) -> Option<String> {
-    ws_endpoint
-        .strip_prefix("ws://")
-        .map(|rest| format!("http://{rest}"))
-        .or_else(|| {
-            ws_endpoint
-                .strip_prefix("wss://")
-                .map(|rest| format!("https://{rest}"))
-        })
-}
-
-async fn fetch_websocket_http_error_body(
-    ws_endpoint: &str,
-    headers: &[(String, String)],
-) -> Option<Vec<u8>> {
-    let http_endpoint = websocket_endpoint_as_http_url(ws_endpoint)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(1_000))
-        .no_proxy()
-        .build()
-        .ok()?;
-    let mut request = client.get(http_endpoint);
-    for (name, value) in headers {
-        request = request.header(name, value);
-    }
-    let response = request.send().await.ok()?;
-    let body = response.bytes().await.ok()?;
-    if body.is_empty() {
-        None
-    } else {
-        Some(body.to_vec())
-    }
-}
-
-fn cdp_websocket_connect_error(
-    ws_endpoint: &str,
-    error: WsError,
-    fallback_body: Option<Vec<u8>>,
-) -> RwError {
-    match error {
-        WsError::Http(response) => {
-            let status_text = format_websocket_status(response.status());
-            let mut message = format!("WebSocket error: {ws_endpoint} {status_text}");
-            let response_body = response
-                .body()
-                .as_ref()
-                .filter(|body| !body.is_empty())
-                .map(|body| body.as_slice())
-                .or_else(|| fallback_body.as_deref());
-            if let Some(body) = response_body {
-                message.push('\n');
-                message.push_str(&String::from_utf8_lossy(body));
-            }
-            message.push_str("\nCall log:");
-            message.push_str(&format!("\n  - <ws connecting> {ws_endpoint}"));
-            message.push_str(&format!(
-                "\n  - <ws unexpected response> {ws_endpoint} {status_text}"
-            ));
-            RwError::Message(message)
-        }
-        other => RwError::WebSocket(other),
-    }
-}
-
 fn dispatch_cdp_payload_with_diagnostics(
     mut payload: Value,
     pending: CdpPendingMap,
@@ -18510,6 +18784,7 @@ fn dispatch_cdp_payload_with_diagnostics(
     event_log: Arc<Mutex<CdpEventLog>>,
     traffic_log: Arc<Mutex<CdpTrafficLog>>,
     runtime_state: Arc<Mutex<CdpRuntimeState>>,
+    playwright_like_first_reply: Option<&AtomicBool>,
 ) {
     if let Some(id) = payload.get("id").and_then(Value::as_u64) {
         let sender = pending.lock().unwrap().remove(&id);
@@ -18522,14 +18797,35 @@ fn dispatch_cdp_payload_with_diagnostics(
                 command.as_ref(),
             ));
         if let Some(sender) = sender {
+            let detector_armed =
+                playwright_like_first_reply.is_some_and(|detector| detector.load(Ordering::SeqCst));
             let result = if let Some(error) = payload.get("error") {
-                let message = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown CDP error")
-                    .to_string();
-                Err(RwError::Message(message))
+                let normal_cdp_message = error.get("message").and_then(Value::as_str);
+                let nested_message = error
+                    .get("error")
+                    .and_then(|nested| nested.get("message"))
+                    .and_then(Value::as_str);
+                if detector_armed && normal_cdp_message.is_none() && nested_message.is_some() {
+                    if let Some(detector) = playwright_like_first_reply {
+                        detector.store(false, Ordering::SeqCst);
+                    }
+                    Err(RwError::RemoteProtocolSuspected(
+                        RemoteProtocolSuspicion::PlaywrightLikeFirstReply,
+                    ))
+                } else {
+                    if let Some(detector) = playwright_like_first_reply {
+                        detector.store(false, Ordering::SeqCst);
+                    }
+                    Err(RwError::Message(
+                        normal_cdp_message
+                            .unwrap_or("unknown CDP error")
+                            .to_string(),
+                    ))
+                }
             } else {
+                if let Some(detector) = playwright_like_first_reply {
+                    detector.store(false, Ordering::SeqCst);
+                }
                 Ok(payload
                     .as_object_mut()
                     .and_then(|object| object.remove("result"))
@@ -18539,6 +18835,12 @@ fn dispatch_cdp_payload_with_diagnostics(
         }
     } else {
         runtime_state.lock().unwrap().observe_event(&payload);
+        if payload.get("guid").is_none() && payload.get("method").and_then(Value::as_str).is_some()
+        {
+            if let Some(detector) = playwright_like_first_reply {
+                detector.store(false, Ordering::SeqCst);
+            }
+        }
         traffic_log
             .lock()
             .unwrap()
@@ -18564,6 +18866,7 @@ fn dispatch_cdp_payload(
         event_log,
         Arc::new(Mutex::new(CdpTrafficLog::new())),
         Arc::new(Mutex::new(CdpRuntimeState::new(None))),
+        None,
     );
 }
 
@@ -18759,12 +19062,54 @@ impl CdpClient {
     }
 
     async fn connect(ws_endpoint: &str) -> RwResult<Arc<Self>> {
-        Self::connect_with_headers(ws_endpoint, &[]).await
+        Self::connect_with_headers_and_protocol_detection(ws_endpoint, &[], false).await
     }
 
-    async fn connect_with_headers(
+    async fn connect_with_headers_and_protocol_detection(
         ws_endpoint: &str,
         headers: &[(String, String)],
+        detect_playwright_like_first_reply: bool,
+    ) -> RwResult<Arc<Self>> {
+        #[cfg(feature = "test-support")]
+        {
+            return Self::connect_with_headers_protocol_detection_inner(
+                ws_endpoint,
+                headers,
+                detect_playwright_like_first_reply,
+                None,
+            )
+            .await;
+        }
+        #[cfg(not(feature = "test-support"))]
+        Self::connect_with_headers_protocol_detection_inner(
+            ws_endpoint,
+            headers,
+            detect_playwright_like_first_reply,
+        )
+        .await
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn connect_with_headers_protocol_detection_and_test_ca(
+        ws_endpoint: &str,
+        headers: &[(String, String)],
+        detect_playwright_like_first_reply: bool,
+        test_ca_pem: Option<&str>,
+    ) -> RwResult<Arc<Self>> {
+        Self::connect_with_headers_protocol_detection_inner(
+            ws_endpoint,
+            headers,
+            detect_playwright_like_first_reply,
+            test_ca_pem,
+        )
+        .await
+    }
+
+    async fn connect_with_headers_protocol_detection_inner(
+        ws_endpoint: &str,
+        headers: &[(String, String)],
+        detect_playwright_like_first_reply: bool,
+        #[cfg(feature = "test-support")] test_ca_pem: Option<&str>,
     ) -> RwResult<Arc<Self>> {
         let mut request = ws_endpoint.into_client_request()?;
         ensure_ws_request_path(&mut request);
@@ -18777,30 +19122,76 @@ impl CdpClient {
             })?;
             request.headers_mut().insert(header_name, header_value);
         }
-        let (mut stream, _) = match connect_async(request).await {
-            Ok(result) => result,
-            Err(error) => {
-                let fallback_body = match &error {
-                    WsError::Http(response)
-                        if response
-                            .body()
-                            .as_ref()
-                            .map_or(true, |body| body.is_empty()) =>
-                    {
-                        fetch_websocket_http_error_body(ws_endpoint, headers).await
-                    }
-                    _ => None,
-                };
-                return Err(cdp_websocket_connect_error(
-                    ws_endpoint,
-                    error,
-                    fallback_body,
-                ));
+
+        #[cfg(feature = "test-support")]
+        {
+            CONNECT_WEBSOCKET_CONNECTOR_COUNT.fetch_add(1, Ordering::SeqCst);
+            CONNECT_DNS_RESOLUTION_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+
+        #[cfg(feature = "test-support")]
+        if request.uri().scheme_str() == Some("wss") {
+            if let Some(test_ca_pem) = test_ca_pem {
+                use rustls_pki_types::pem::PemObject as _;
+
+                let host = request
+                    .uri()
+                    .host()
+                    .ok_or(RwError::ConnectFailed)?
+                    .to_string();
+                let port = request.uri().port_u16().unwrap_or(443);
+                let tcp_stream = tokio::net::TcpStream::connect((host.as_str(), port))
+                    .await
+                    .map_err(|_| RwError::ConnectFailed)?;
+                let _ = tcp_stream.set_nodelay(true);
+
+                let certificates =
+                    rustls_pki_types::CertificateDer::pem_slice_iter(test_ca_pem.as_bytes())
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| RwError::ConnectFailed)?;
+                if certificates.is_empty() {
+                    return Err(RwError::ConnectFailed);
+                }
+                let mut root_store = rustls::RootCertStore::empty();
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                for certificate in certificates {
+                    root_store
+                        .add(certificate)
+                        .map_err(|_| RwError::ConnectFailed)?;
+                }
+                let tls_config = rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth();
+                let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
+                let (stream, _) = tokio_tungstenite::client_async_tls_with_config(
+                    request,
+                    tcp_stream,
+                    None,
+                    Some(connector),
+                )
+                .await
+                .map_err(|_| RwError::ConnectFailed)?;
+                return Self::from_websocket_stream(stream, detect_playwright_like_first_reply)
+                    .await;
             }
-        };
+        }
+
+        let (mut stream, _) = connect_async(request)
+            .await
+            .map_err(|_| RwError::ConnectFailed)?;
         if let MaybeTlsStream::Plain(tcp_stream) = stream.get_mut() {
             let _ = tcp_stream.set_nodelay(true);
         }
+        Self::from_websocket_stream(stream, detect_playwright_like_first_reply).await
+    }
+
+    async fn from_websocket_stream<S>(
+        stream: tokio_tungstenite::WebSocketStream<S>,
+        detect_playwright_like_first_reply: bool,
+    ) -> RwResult<Arc<Self>>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let (mut write, mut read) = stream.split();
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<CdpOutgoing>();
         let pending: CdpPendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -18815,6 +19206,9 @@ impl CdpClient {
         let traffic_log = Arc::new(Mutex::new(CdpTrafficLog::new()));
         let traffic_log_writer = Arc::clone(&traffic_log);
         let traffic_log_reader = Arc::clone(&traffic_log);
+        let playwright_like_first_reply =
+            detect_playwright_like_first_reply.then(|| Arc::new(AtomicBool::new(true)));
+        let playwright_like_first_reply_reader = playwright_like_first_reply.clone();
         let (serializer_release_tx, serializer_release_rx) = mpsc::unbounded_channel();
         let runtime_state = Arc::new(Mutex::new(CdpRuntimeState::new(Some(
             serializer_release_tx,
@@ -18895,6 +19289,7 @@ impl CdpClient {
                     Arc::clone(&event_log_reader),
                     Arc::clone(&traffic_log_reader),
                     Arc::clone(&runtime_state_reader),
+                    playwright_like_first_reply_reader.as_deref(),
                 );
             }
             alive_reader.store(false, Ordering::SeqCst);
@@ -19032,6 +19427,7 @@ impl CdpClient {
                     Arc::clone(&event_log_dispatcher),
                     Arc::clone(&traffic_log_dispatcher),
                     Arc::clone(&runtime_state_dispatcher),
+                    None,
                 );
             }
             alive_dispatcher.store(false, Ordering::SeqCst);
@@ -19388,13 +19784,7 @@ impl CdpClient {
         self.record_sent_command(method);
 
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => result.map_err(|error| match error {
-                RwError::Message(message) => RwError::Cdp {
-                    method: method.to_string(),
-                    message,
-                },
-                other => other,
-            }),
+            Ok(Ok(result)) => result.map_err(|error| wrap_cdp_command_error(method, error)),
             Ok(Err(_)) => Err(RwError::Disconnected),
             Err(_) => Err(RwError::Timeout(timeout.as_millis() as u64)),
         }
@@ -34193,6 +34583,57 @@ fn launch_chromium_async(py: Python<'_>, options_json: &str) -> PyResult<Py<PyAn
     )
 }
 
+#[cfg(feature = "test-support")]
+type ConnectStageObserver = Arc<dyn Fn(&'static str, Duration) + Send + Sync>;
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Default)]
+struct ConnectTestOptions {
+    observer: Option<ConnectStageObserver>,
+    tls_ca_pem: Option<String>,
+}
+
+#[cfg(feature = "test-support")]
+impl ConnectTestOptions {
+    fn observe(&self, stage: &'static str, remaining: Duration) {
+        if let Some(observer) = &self.observer {
+            observer(stage, remaining);
+        }
+    }
+}
+
+// This test-only one-shot slot does not support concurrent arm-and-connect
+// sequences. Test helpers must serialize each arm with its matching connect.
+#[cfg(feature = "test-support")]
+static CONNECT_TEST_OPTIONS: LazyLock<Mutex<Option<ConnectTestOptions>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+#[cfg(feature = "test-support")]
+fn install_connect_test_options(options: ConnectTestOptions) {
+    let mut slot = CONNECT_TEST_OPTIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = Some(options);
+}
+
+#[cfg(feature = "test-support")]
+fn take_connect_test_options() -> Option<ConnectTestOptions> {
+    CONNECT_TEST_OPTIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+#[cfg(feature = "test-support")]
+fn connect_stage_observer(observer: Option<Py<PyAny>>) -> Option<ConnectStageObserver> {
+    observer.map(|observer| {
+        Arc::new(move |stage: &'static str, remaining: Duration| {
+            Python::attach(|py| {
+                let _ = observer.call1(py, (stage, remaining.as_secs_f64()));
+            });
+        }) as ConnectStageObserver
+    })
+}
+
 #[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (endpoint, timeout_ms=None, headers_json=None))]
@@ -34202,21 +34643,72 @@ fn connect_over_cdp(
     timeout_ms: Option<f64>,
     headers_json: Option<&str>,
 ) -> PyResult<PyBrowser> {
+    #[cfg(feature = "test-support")]
+    CONNECT_NATIVE_BINDING_COUNT.fetch_add(1, Ordering::SeqCst);
     let timeout = BrowserInner::command_timeout(timeout_ms);
     let headers = parse_header_pairs(headers_json).map_err(py_err)?;
     let endpoint = endpoint.to_string();
     let inner = py
-        .detach(move || connect_browser_over_cdp(endpoint, headers, timeout))
+        .detach(move || connect_browser_over_cdp_sanitized(endpoint, headers, timeout, None))
         .map_err(py_err)?;
     Ok(PyBrowser { inner })
 }
 
-fn connect_browser_over_cdp(
-    endpoint: String,
-    headers: Vec<(String, String)>,
-    timeout: Duration,
-) -> RwResult<Arc<BrowserInner>> {
-    connect_browser_over_cdp_cancelable(endpoint, headers, timeout, None)
+#[cfg(feature = "test-support")]
+#[pyfunction(name = "_test_set_connect_options")]
+#[pyo3(signature = (observer=None, ca_pem=None))]
+fn test_set_connect_options(observer: Option<Py<PyAny>>, ca_pem: Option<&str>) {
+    install_connect_test_options(ConnectTestOptions {
+        observer: connect_stage_observer(observer),
+        tls_ca_pem: ca_pem.map(str::to_string),
+    });
+}
+
+#[cfg(feature = "test-support")]
+#[pyfunction(name = "_test_connect_over_cdp")]
+#[pyo3(signature = (endpoint, observer, timeout_ms=None, headers_json=None, ca_pem=None))]
+fn test_connect_over_cdp(
+    py: Python<'_>,
+    endpoint: &str,
+    observer: Py<PyAny>,
+    timeout_ms: Option<f64>,
+    headers_json: Option<&str>,
+    ca_pem: Option<&str>,
+) -> PyResult<PyBrowser> {
+    let timeout = BrowserInner::command_timeout(timeout_ms);
+    let headers = parse_header_pairs(headers_json).map_err(py_err)?;
+    let endpoint = endpoint.to_string();
+    let options = ConnectTestOptions {
+        observer: connect_stage_observer(Some(observer)),
+        tls_ca_pem: ca_pem.map(str::to_string),
+    };
+    let inner = py
+        .detach(move || {
+            install_connect_test_options(options);
+            connect_browser_over_cdp_sanitized(endpoint, headers, timeout, None)
+        })
+        .map_err(py_err)?;
+    Ok(PyBrowser { inner })
+}
+
+#[cfg(feature = "test-support")]
+#[pyfunction(name = "_test_reset_connect_boundary_counters")]
+fn test_reset_connect_boundary_counters() {
+    CONNECT_DNS_RESOLUTION_COUNT.store(0, Ordering::SeqCst);
+    CONNECT_DISCOVERY_REQUEST_COUNT.store(0, Ordering::SeqCst);
+    CONNECT_WEBSOCKET_CONNECTOR_COUNT.store(0, Ordering::SeqCst);
+    CONNECT_NATIVE_BINDING_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(feature = "test-support")]
+#[pyfunction(name = "_test_connect_boundary_counters")]
+fn test_connect_boundary_counters() -> (u64, u64, u64, u64) {
+    (
+        CONNECT_DNS_RESOLUTION_COUNT.load(Ordering::SeqCst),
+        CONNECT_DISCOVERY_REQUEST_COUNT.load(Ordering::SeqCst),
+        CONNECT_WEBSOCKET_CONNECTOR_COUNT.load(Ordering::SeqCst),
+        CONNECT_NATIVE_BINDING_COUNT.load(Ordering::SeqCst),
+    )
 }
 
 fn connect_browser_over_cdp_cancelable(
@@ -34224,27 +34716,58 @@ fn connect_browser_over_cdp_cancelable(
     headers: Vec<(String, String)>,
     timeout: Duration,
     cancel: Option<CancelToken>,
+    started: Instant,
+    #[cfg(feature = "test-support")] test_options: Option<&ConnectTestOptions>,
 ) -> RwResult<Arc<BrowserInner>> {
-    let started = Instant::now();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(2)
         .build()
         .map_err(|error| RwError::Message(error.to_string()))?;
+    let initial_remaining = timeout.saturating_sub(started.elapsed());
+    if initial_remaining.is_zero() {
+        return Err(RwError::Timeout(duration_millis_u64(timeout)));
+    }
+    let deadline = tokio::time::Instant::now() + initial_remaining;
+    let detect_playwright_like_first_reply =
+        endpoint.starts_with("ws://") || endpoint.starts_with("wss://");
     let connect = async {
-        let ws_endpoint = resolve_ws_endpoint(&endpoint, timeout, &headers).await?;
-        let client = CdpClient::connect_with_headers(&ws_endpoint, &headers).await?;
+        let ws_endpoint = resolve_ws_endpoint(&endpoint, deadline, timeout, &headers).await?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(RwError::Timeout(duration_millis_u64(timeout)));
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(options) = test_options {
+            options.observe("Upgrade", remaining);
+        }
+        #[cfg(feature = "test-support")]
+        let websocket_connect = CdpClient::connect_with_headers_protocol_detection_and_test_ca(
+            &ws_endpoint,
+            &headers,
+            detect_playwright_like_first_reply,
+            test_options.and_then(|options| options.tls_ca_pem.as_deref()),
+        );
+        #[cfg(not(feature = "test-support"))]
+        let websocket_connect = CdpClient::connect_with_headers_and_protocol_detection(
+            &ws_endpoint,
+            &headers,
+            detect_playwright_like_first_reply,
+        );
+        let client = tokio::time::timeout(remaining, websocket_connect)
+            .await
+            .map_err(|_| RwError::Timeout(duration_millis_u64(timeout)))??;
         Ok::<_, RwError>((ws_endpoint, client))
     };
-    let (ws_endpoint, client) = runtime.block_on(cancelable(cancel.clone(), async {
-        tokio::time::timeout(timeout, connect)
-            .await
-            .map_err(|_| RwError::Timeout(duration_millis_u64(timeout)))?
-    }))?;
-    let remaining = timeout.saturating_sub(started.elapsed());
+    let (ws_endpoint, client) = runtime.block_on(cancelable(cancel.clone(), connect))?;
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
         client.close();
         return Err(RwError::Timeout(duration_millis_u64(timeout)));
+    }
+    #[cfg(feature = "test-support")]
+    if let Some(options) = test_options {
+        options.observe("Target.setAutoAttach", remaining);
     }
     if let Err(error) = start_service_worker_stealth_auto_attach_cancelable(
         &runtime,
@@ -34952,12 +35475,15 @@ pub fn rustwright_connect_over_cdp(
 }
 
 /// Attach to a CDP endpoint with an optional cancellation signal.
-pub fn rustwright_connect_over_cdp_with_cancel(
-    endpoint: &str,
-    headers: &[(String, String)],
+fn connect_browser_over_cdp_sanitized(
+    endpoint: String,
+    headers: Vec<(String, String)>,
     timeout: Duration,
-    cancel: Option<&CancelToken>,
-) -> RwResult<RustwrightBrowser> {
+    cancel: Option<CancelToken>,
+) -> RwResult<Arc<BrowserInner>> {
+    #[cfg(feature = "test-support")]
+    let test_options = take_connect_test_options();
+    let started = Instant::now();
     if timeout.is_zero() {
         return Err(RwError::InvalidInput(
             "CDP timeout must be greater than zero".to_string(),
@@ -34971,7 +35497,7 @@ pub fn rustwright_connect_over_cdp_with_cancel(
             "CDP endpoint must use ws, wss, http, or https".to_string(),
         ));
     }
-    for (name, value) in headers {
+    for (name, value) in &headers {
         if HeaderName::from_bytes(name.as_bytes()).is_err() || HeaderValue::from_str(value).is_err()
         {
             return Err(RwError::InvalidInput(
@@ -34979,18 +35505,45 @@ pub fn rustwright_connect_over_cdp_with_cancel(
             ));
         }
     }
-    match connect_browser_over_cdp_cancelable(
+    #[cfg(feature = "test-support")]
+    let result = connect_browser_over_cdp_cancelable(
+        endpoint,
+        headers,
+        timeout,
+        cancel,
+        started,
+        test_options.as_ref(),
+    );
+    #[cfg(not(feature = "test-support"))]
+    let result = connect_browser_over_cdp_cancelable(endpoint, headers, timeout, cancel, started);
+    match result {
+        Ok(inner) => Ok(inner),
+        Err(
+            error @ (RwError::Timeout(_)
+            | RwError::Cancelled
+            | RwError::InvalidInput(_)
+            | RwError::UnsupportedRemoteProtocol(_)
+            | RwError::RemoteProtocolSuspected(_)
+            | RwError::RemoteDiscoveryFailed),
+        ) => Err(error),
+        Err(_) => Err(RwError::ConnectFailed),
+    }
+}
+
+/// Attach to a CDP endpoint with an optional cancellation signal.
+pub fn rustwright_connect_over_cdp_with_cancel(
+    endpoint: &str,
+    headers: &[(String, String)],
+    timeout: Duration,
+    cancel: Option<&CancelToken>,
+) -> RwResult<RustwrightBrowser> {
+    connect_browser_over_cdp_sanitized(
         endpoint.to_string(),
         headers.to_vec(),
         timeout,
         cancel.cloned(),
-    ) {
-        Ok(inner) => Ok(RustwrightBrowser { inner }),
-        Err(error @ (RwError::Timeout(_) | RwError::Cancelled | RwError::InvalidInput(_))) => {
-            Err(error)
-        }
-        Err(_) => Err(RwError::ConnectFailed),
-    }
+    )
+    .map(|inner| RustwrightBrowser { inner })
 }
 
 pub fn rustwright_chromium_executable_path() -> Option<String> {
@@ -41504,7 +42057,14 @@ async fn poll_ws_endpoint(
             )));
         }
         let request_timeout = std::cmp::min(Duration::from_secs(2), deadline - now);
-        match resolve_ws_endpoint(version_url, request_timeout, &[]).await {
+        match resolve_ws_endpoint(
+            version_url,
+            tokio::time::Instant::now() + request_timeout,
+            request_timeout,
+            &[],
+        )
+        .await
+        {
             Ok(endpoint) => return Ok(endpoint),
             Err(error) => {
                 if tokio::time::Instant::now() >= deadline {
@@ -41649,44 +42209,117 @@ fn parse_header_pairs(headers_json: Option<&str>) -> RwResult<Vec<(String, Strin
         .collect()
 }
 
+fn remote_discovery_urls(endpoint: &str) -> RwResult<(reqwest::Url, reqwest::Url)> {
+    let mut base = reqwest::Url::parse(endpoint)
+        .map_err(|_| RwError::InvalidInput("CDP endpoint URL is invalid".to_string()))?;
+    if !matches!(base.scheme(), "http" | "https") || !base.has_host() {
+        return Err(RwError::InvalidInput(
+            "CDP endpoint URL is invalid".to_string(),
+        ));
+    }
+    base.set_fragment(None);
+    let path = base.path().trim_end_matches('/');
+    let base_path = path
+        .strip_suffix("/json/version")
+        .or_else(|| path.strip_suffix("/json"))
+        .unwrap_or(path)
+        .to_string();
+    let route_path = |suffix: &str| {
+        if base_path.is_empty() || base_path == "/" {
+            format!("/{suffix}")
+        } else {
+            format!("{base_path}/{suffix}")
+        }
+    };
+    let mut version_url = base.clone();
+    version_url.set_path(&route_path("json/version"));
+    let mut json_url = base;
+    json_url.set_path(&route_path("json"));
+    Ok((version_url, json_url))
+}
+
+async fn fetch_remote_discovery_json(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    headers: &[(String, String)],
+    deadline: tokio::time::Instant,
+    timeout: Duration,
+) -> RwResult<Option<Value>> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(RwError::Timeout(duration_millis_u64(timeout)));
+    }
+    let request = async {
+        let mut request = client.get(url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        #[cfg(feature = "test-support")]
+        {
+            CONNECT_DISCOVERY_REQUEST_COUNT.fetch_add(1, Ordering::SeqCst);
+            CONNECT_DNS_RESOLUTION_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(_) => return None,
+        };
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json::<Value>().await.ok()
+    };
+    tokio::time::timeout(remaining, request)
+        .await
+        .map_err(|_| RwError::Timeout(duration_millis_u64(timeout)))
+}
+
+fn valid_websocket_debugger_url(payload: &Value) -> Option<String> {
+    let value = payload.get("webSocketDebuggerUrl")?.as_str()?;
+    if value.is_empty() {
+        return None;
+    }
+    let url = reqwest::Url::parse(value).ok()?;
+    (matches!(url.scheme(), "ws" | "wss") && url.has_host()).then(|| value.to_string())
+}
+
 async fn resolve_ws_endpoint(
     endpoint: &str,
+    deadline: tokio::time::Instant,
     timeout: Duration,
     headers: &[(String, String)],
 ) -> RwResult<String> {
     if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
         return Ok(endpoint.to_string());
     }
-    let version_url = if endpoint.ends_with("/json/version") {
-        endpoint.to_string()
-    } else {
-        format!("{}/json/version", endpoint.trim_end_matches('/'))
-    };
+    let (version_url, json_url) = remote_discovery_urls(endpoint)?;
     let client = reqwest::Client::builder()
-        .timeout(timeout)
         .no_proxy()
-        .build()?;
-    let mut request = client.get(&version_url);
-    for (name, value) in headers {
-        request = request.header(name, value);
+        .build()
+        .map_err(|_| RwError::ConnectFailed)?;
+
+    if let Some(payload) =
+        fetch_remote_discovery_json(&client, version_url, headers, deadline, timeout).await?
+    {
+        if let Some(ws_endpoint) = valid_websocket_debugger_url(&payload) {
+            return Ok(ws_endpoint);
+        }
     }
-    let response = request.send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(RwError::Message(format!(
-            "Unexpected status {} when connecting to {}/.",
-            status.as_u16(),
-            version_url.trim_end_matches('/')
-        )));
+
+    if let Some(payload) =
+        fetch_remote_discovery_json(&client, json_url, headers, deadline, timeout).await?
+    {
+        if payload
+            .get("wsEndpointPath")
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.is_empty())
+        {
+            return Err(RwError::UnsupportedRemoteProtocol(
+                RemoteProtocolEvidence::PlaywrightHttpDiscovery,
+            ));
+        }
     }
-    let payload: Value = response.json().await?;
-    payload
-        .get("webSocketDebuggerUrl")
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .ok_or_else(|| {
-            RwError::Message("CDP endpoint did not return webSocketDebuggerUrl".to_string())
-        })
+
+    Err(RwError::RemoteDiscoveryFailed)
 }
 
 fn pick_unused_port() -> RwResult<u16> {
@@ -48333,6 +48966,17 @@ fn _rustwright(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(launch_chromium, module)?)?;
     module.add_function(wrap_pyfunction!(launch_chromium_async, module)?)?;
     module.add_function(wrap_pyfunction!(connect_over_cdp, module)?)?;
+    #[cfg(feature = "test-support")]
+    module.add_function(wrap_pyfunction!(test_connect_over_cdp, module)?)?;
+    #[cfg(feature = "test-support")]
+    module.add_function(wrap_pyfunction!(test_set_connect_options, module)?)?;
+    #[cfg(feature = "test-support")]
+    module.add_function(wrap_pyfunction!(
+        test_reset_connect_boundary_counters,
+        module
+    )?)?;
+    #[cfg(feature = "test-support")]
+    module.add_function(wrap_pyfunction!(test_connect_boundary_counters, module)?)?;
     module.add_function(wrap_pyfunction!(chromium_executable_path, module)?)?;
     module.add(
         "_LOCATOR_TARGET_STATE_TEMPLATE",
