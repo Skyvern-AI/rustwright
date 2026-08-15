@@ -1685,6 +1685,15 @@ def oopif_test_server():
                     """
                 )
                 return
+            if path == "/oopif-descendant-ab-top":
+                self._send_html(
+                    f"""
+                    <!doctype html>
+                    <iframe id="child" src="http://b.test:{port}/oopif-descendant-outer"
+                        style="position:absolute;left:140px;top:90px;width:560px;height:360px;border:0"></iframe>
+                    """
+                )
+                return
             if path == "/oopif-descendant-top":
                 self._send_html(
                     f"""
@@ -1713,6 +1722,7 @@ def oopif_test_server():
                     <style>html,body { margin: 0 } button { width: 110px; height: 44px }</style>
                     <button id="leaf-button" style="position:absolute;left:20px;top:20px"
                         onclick="document.body.dataset.leaf = 'yes'; document.body.dataset.trusted = String(event.isTrusted)">Leaf</button>
+                    <input id="leaf-input" aria-label="Leaf input">
                     """
                 )
                 return
@@ -1808,6 +1818,7 @@ def oopif_test_server():
             "top": f"http://127.0.0.1:{port}",
             "frame": f"http://a.localhost:{port}",
             "frame_b": f"http://b.localhost:{port}",
+            "a_test": f"http://a.test:{port}",
         }
     finally:
         server.shutdown()
@@ -20227,6 +20238,20 @@ def test_nested_cross_origin_oopif_frame_locator(page, oopif_test_server):
     assert any(frame.url.endswith("/oopif-inner") for frame in page.frames)
 
 
+def test_nested_cross_origin_oopif_frame_locator_page_frames_uses_warm_event_cache(
+    page, browser, oopif_test_server
+):
+    page.goto(f"{oopif_test_server['top']}/oopif-nested-top")
+    nested = page.frame_locator("#outer").frame_locator("#inner")
+    assert nested.locator("#nested-value").inner_text() == "Nested OOPIF text"
+
+    frame_tree_commands = browser._core.sent_get_frame_tree_count()
+    frames = page.frames
+
+    assert any(frame.url.endswith("/oopif-inner") for frame in frames)
+    assert browser._core.sent_get_frame_tree_count() == frame_tree_commands
+
+
 def test_forced_site_isolation_oopif_uses_iframe_target_session(playwright, oopif_test_server):
     browser = playwright.chromium.launch(headless=True, args=["--site-per-process"])
     try:
@@ -20666,6 +20691,33 @@ def test_forced_isolation_oopif_same_origin_descendant_uses_target_root_coordina
         assert leaf.locator("body").evaluate("body => body.dataset.leaf") == "yes"
         assert leaf.locator("body").evaluate("body => body.dataset.trusted") == "true"
         assert outer.locator("body").evaluate("body => body.dataset.decoy") is None
+    finally:
+        browser.close()
+
+def test_forced_isolation_oopif_same_origin_descendant_fill_uses_oopif_context(
+    playwright, oopif_test_server
+):
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--site-per-process",
+            "--host-resolver-rules=MAP a.test 127.0.0.1, MAP b.test 127.0.0.1",
+        ],
+    )
+    try:
+        page = browser.new_page()
+        page.goto(f"{oopif_test_server['a_test']}/oopif-descendant-ab-top")
+        targets = page.context.new_cdp_session(page).send("Target.getTargets")["targetInfos"]
+        assert any(
+            target.get("type") == "iframe"
+            and target.get("url", "").startswith("http://b.test:")
+            for target in targets
+        )
+
+        leaf = page.frame_locator("#child").frame_locator("#leaf")
+        leaf.locator("#leaf-input").fill("x")
+
+        assert leaf.locator("#leaf-input").input_value() == "x"
     finally:
         browser.close()
 
