@@ -21,6 +21,19 @@ import_mind2web = load_tool("import_mind2web", "tools/import_mind2web.py")
 run_mind2web_benchmark = load_tool("run_mind2web_benchmark", "tools/run_mind2web_benchmark.py")
 
 
+def test_raw_cdp_adapter_spawn_uses_mock_keychain():
+    source = run_mind2web_benchmark.node_raw_cdp_adapter_code()
+    spawn_argv = source.split("const browser = spawn(executable, [", 1)[1].split(
+        "], { stdio: 'ignore' });", 1
+    )[0]
+
+    password_store = spawn_argv.index("'--password-store=basic',")
+    mock_keychain = spawn_argv.index("'--use-mock-keychain',")
+    about_blank = spawn_argv.index("'about:blank',")
+    assert password_store < about_blank
+    assert mock_keychain < about_blank
+
+
 def test_manifest_task_can_include_executable_action_fixture(tmp_path):
     source = tmp_path / "mind2web.json"
     source.write_text("[]", encoding="utf-8")

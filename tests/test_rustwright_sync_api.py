@@ -78,6 +78,13 @@ def data_url(html: str) -> str:
     return f"data:text/html;charset=utf-8,{quote(html)}"
 
 
+def runtime_state_test_data(page: Any) -> dict[str, Any]:
+    hook = getattr(page._core, "_runtime_state_test_hook", None)
+    if hook is None:
+        pytest.skip("rustwright core was built without the test-support feature")
+    return json.loads(hook())
+
+
 def _serve_forever_fast(server: ThreadingHTTPServer) -> None:
     server.serve_forever(poll_interval=0.01)
 
@@ -1107,6 +1114,23 @@ def oopif_test_server():
             origin_127 = f"http://127.0.0.1:{port}"
             origin_localhost = f"http://localhost:{port}"
             path = self.path.split("?", 1)[0]
+            if path == "/oopif-file-chooser-top":
+                self._send_html(
+                    f"""
+                    <!doctype html>
+                    <input id="main-upload" type="file">
+                    <iframe id="child" src="http://b.test:{port}/oopif-file-chooser-child"></iframe>
+                    """
+                )
+                return
+            if path == "/oopif-file-chooser-child":
+                self._send_html(
+                    """
+                    <!doctype html>
+                    <input id="upload" type="file">
+                    """
+                )
+                return
             if path == "/oopif-top":
                 self._send_html(
                     f"""
@@ -3750,12 +3774,19 @@ def test_page_errors_history_does_not_enable_runtime(playwright):
     browser = playwright.chromium.launch(headless=True)
     try:
         page = browser.new_page()
-        page.goto(data_url("<main>page error history</main>"))
-        assert browser._core.sent_runtime_enable_count() == 0
-
-        page.evaluate(
-            "() => setTimeout(() => { throw new Error('passive page error without runtime'); }, 0)"
+        page.goto(
+            data_url(
+                """
+                <main>page error history</main>
+                <script>
+                setTimeout(() => {
+                  throw new Error('passive page error without runtime');
+                }, 0);
+                </script>
+                """
+            )
         )
+        assert browser._core.sent_runtime_enable_count() == 0
 
         errors = wait_until(lambda: [str(error) for error in page.page_errors()] or None)
         assert "passive page error without runtime" in errors
@@ -9342,6 +9373,259 @@ def test_evaluate_expression_function_and_arg(page):
     assert page.evaluate("() => ({ ok: true, items: [1, 2, 3] })") == {"ok": True, "items": [1, 2, 3]}
 
 
+def test_evaluate_serializer_wrappers_do_not_leak_bindings(page):
+    page.set_content("<iframe name='child' srcdoc='<main id=\"child\">child</main>'></iframe><main id='page'>page</main>")
+    frame = wait_until(lambda: page.frame(name="child"))
+    handle = page.evaluate_handle("() => ({ value: 1 })")
+    try:
+        assert page.evaluate("() => typeof __rw_value") == "undefined"
+        assert frame.evaluate("() => typeof __rw_value") == "undefined"
+        assert handle.evaluate("(value) => typeof __rw_args") == "undefined"
+        assert page.locator("#page").evaluate("(element) => typeof __rw_args") == "undefined"
+    finally:
+        handle.dispose()
+
+
+def test_page_evaluate_with_multiple_handle_arguments_preserves_global_this(page):
+    first = page.evaluate_handle("() => ({ name: 'first' })")
+    second = page.evaluate_handle("() => ({ name: 'second' })")
+    try:
+        expression = (
+            "(arg) => this === window && "
+            "arg.left.name + ':' + arg.right.name === arg.expected"
+        )
+        assert page.evaluate(
+            expression,
+            {"left": first, "right": second, "expected": "first:second"},
+        )
+        assert page.evaluate(
+            expression,
+            {"left": second, "right": first, "expected": "second:first"},
+        )
+    finally:
+        first.dispose()
+        second.dispose()
+
+
+def test_evaluate_rejects_foreign_context_handles_like_playwright(page):
+    page.set_content("<iframe name='child' srcdoc='<main>child</main>'></iframe>")
+    child = wait_until(lambda: page.frame(name="child"))
+    page_handle = page.evaluate_handle("() => ({ realm: 'page' })")
+    child_handle = child.evaluate_handle("() => ({ realm: 'child' })")
+    try:
+        assert page.main_frame.evaluate("value => value.realm", page_handle) == "page"
+        assert child.evaluate("value => value.realm", child_handle) == "child"
+
+        with pytest.raises(Error) as page_error:
+            page.evaluate("value => value.realm", child_handle)
+        assert str(page_error.value) == (
+            "Page.evaluate: JSHandles can be evaluated only in the context they were created!"
+        )
+
+        with pytest.raises(Error) as frame_error:
+            child.evaluate("value => value.realm", page_handle)
+        assert str(frame_error.value) == (
+            "Frame.evaluate: JSHandles can be evaluated only in the context they were created!"
+        )
+
+        with page.expect_worker() as worker_info:
+            page.evaluate(
+                """() => {
+                globalThis.__rustwrightWorker = new Worker(URL.createObjectURL(
+                  new Blob(['onmessage = () => postMessage(1)'], {type: 'text/javascript'})
+                ));
+                }"""
+            )
+        worker = worker_info.value
+        with pytest.raises(Error) as worker_error:
+            worker.evaluate("value => value.realm", page_handle)
+        assert str(worker_error.value) == (
+            "Worker.evaluate: JSHandles can be evaluated only in the context they were created!"
+        )
+    finally:
+        child_handle.dispose()
+        page_handle.dispose()
+
+def test_console_handles_keep_their_execution_realm(page):
+    messages = []
+    page.on("console", messages.append)
+
+    page.evaluate("() => console.log({x: 13})")
+    main_handle = wait_until(lambda: messages[-1].args[0] if messages else None)
+    assert page.evaluate("(value) => value.x", main_handle) == 13
+
+    page.set_content("<iframe name='child' srcdoc='<main>child</main>'></iframe>")
+    child = wait_until(lambda: page.frame(name="child"))
+    child.evaluate("() => console.log({x: 23})")
+    child_handle = wait_until(
+        lambda: messages[-1].args[0]
+        if messages and messages[-1].args and messages[-1].args[0] is not main_handle
+        else None
+    )
+    assert child.evaluate("(value) => value.x", child_handle) == 23
+    with pytest.raises(Error) as exc_info:
+        page.evaluate("(value) => value.x", child_handle)
+    assert str(exc_info.value) == (
+        "Page.evaluate: JSHandles can be evaluated only in the context they were created!"
+    )
+
+
+def test_removed_iframe_evaluate_realms_do_not_accumulate(page):
+    page.set_content("<main>serializer cleanup</main>")
+    assert page.evaluate("() => ({ warm: true })") == {"warm": True}
+    baseline = runtime_state_test_data(page)
+    tracked_sizes = (
+        "serializers",
+        "serializer_install_locks",
+        "serializer_generations",
+        "execution_realms",
+        "frame_loaders",
+    )
+
+    for index in range(8):
+        frame_name = f"serializer-child-{index}"
+        page.evaluate(
+            """name => {
+            const iframe = document.createElement('iframe');
+            iframe.name = name;
+            document.body.appendChild(iframe);
+            }""",
+            frame_name,
+        )
+        time.sleep(0.1)
+        iframe = page.query_selector(f"iframe[name='{frame_name}']")
+        assert iframe is not None
+        frame = wait_until(iframe.content_frame)
+        assert frame.evaluate("index => ({ index })", index) == {"index": index}
+
+        page.evaluate("name => document.querySelector(`iframe[name='${name}']`).remove()", frame_name)
+
+        def cleaned_state():
+            state = runtime_state_test_data(page)
+            return state if all(state[key] == baseline[key] for key in tracked_sizes) else None
+
+        state = wait_until(cleaned_state)
+        assert state["release_object_count"] == baseline["release_object_count"]
+
+
+
+def test_evaluate_serializer_argument_does_not_change_user_arguments_length(page):
+    handle = page.evaluate_handle("() => ({ value: 1 })")
+    try:
+        assert page.evaluate("function(value) { return arguments.length; }", handle) == 1
+    finally:
+        handle.dispose()
+
+
+def test_evaluate_user_error_matching_old_serializer_marker_executes_once(page):
+    page.evaluate("() => { globalThis.__rustwrightEvaluateRuns = 0; }")
+    with pytest.raises(Error) as exc_info:
+        page.evaluate(
+            """() => {
+            globalThis.__rustwrightEvaluateRuns += 1;
+            throw new Error('__rustwright value serializer is not defined__');
+            }"""
+        )
+    assert "__rustwright value serializer is not defined__" in str(exc_info.value)
+    assert page.evaluate("() => globalThis.__rustwrightEvaluateRuns") == 1
+
+
+def test_evaluate_serializer_handle_is_not_page_visible_or_spoofable(page):
+    assert page.evaluate(
+        """() => Object.getOwnPropertySymbols(globalThis).some(
+        symbol => Symbol.keyFor(symbol) === '__rustwright_value_serializer_v1__'
+        )"""
+    ) is False
+    assert page.evaluate("() => ({ answer: 42 })") == {"answer": 42}
+    page.evaluate(
+        r"""() => {
+        globalThis[Symbol.for("__rustwright_value_serializer_v1__")] = value => ({
+          __rustwright_cdp_object__: 1,
+          entries: { spoofed: true },
+        });
+        }"""
+    )
+    assert page.evaluate("() => ({ answer: 42 })") == {"answer": 42}
+
+
+def test_evaluate_custom_prepare_stack_trace_uses_cdp_exception_details(page):
+    expression = r"""() => {
+      Error.prepareStackTrace = () => "CUSTOM\n    at app.js:500:9";
+      throw new Error("boom");
+    }"""
+    with pytest.raises(Error) as exc_info:
+        page.evaluate(expression)
+    assert str(exc_info.value) == "Page.evaluate: Error: boom\n    at app.js:500:9"
+
+
+def test_evaluate_assigned_error_stack_uses_cdp_exception_details(page):
+    expression = r"""() => {
+      const error = new Error("boom");
+      error.stack = "CUSTOM\n    at app.js:500:9";
+      throw error;
+    }"""
+    with pytest.raises(Error) as exc_info:
+        page.evaluate(expression)
+    assert str(exc_info.value) == "Page.evaluate: Error: boom\n    at app.js:500:9"
+
+def test_evaluate_does_not_read_properties_from_thrown_values(page):
+    page.evaluate("() => { globalThis.__rustwrightStackGetterRead = false; }")
+    with pytest.raises(Error) as getter_error:
+        page.evaluate(
+            """() => {
+            const thrown = {
+              marker: 'original',
+              get stack() {
+                globalThis.__rustwrightStackGetterRead = true;
+                throw new Error('stack getter ran');
+              }
+            };
+            throw thrown;
+            }"""
+        )
+    assert str(getter_error.value).splitlines()[0] == "Page.evaluate: Object"
+    assert page.evaluate("() => globalThis.__rustwrightStackGetterRead") is False
+
+    with pytest.raises(Error) as forged_error:
+        page.evaluate("() => { throw {stack: 'forged', marker: 'original'}; }")
+    assert str(forged_error.value).splitlines()[0] == "Page.evaluate: Object"
+
+
+def test_evaluate_keeps_user_frame_with_wrapper_name_substring(page):
+    with pytest.raises(Error) as exc_info:
+        page.evaluate(
+            """() => {
+            function user__rustwright_evaluate_wrapper__helper() {
+              throw new Error('user frame');
+            }
+            user__rustwright_evaluate_wrapper__helper();
+            }"""
+        )
+    assert "at user__rustwright_evaluate_wrapper__helper" in str(exc_info.value)
+
+def test_evaluate_keeps_user_frame_with_exact_wrapper_name(page):
+    with pytest.raises(Error) as exc_info:
+        page.evaluate(
+            """() => {
+            function __rustwright_evaluate_wrapper__() {
+              throw new Error('exact user frame');
+            }
+            __rustwright_evaluate_wrapper__();
+            }"""
+        )
+
+    wrapper_frames = [
+        line
+        for line in str(exc_info.value).splitlines()
+        if "at __rustwright_evaluate_wrapper__" in line
+        or "at Object.__rustwright_evaluate_wrapper__" in line
+    ]
+    assert len(wrapper_frames) == 1
+    assert "at __rustwright_evaluate_wrapper__" in wrapper_frames[0]
+
+
+
+
 def test_evaluate_can_reinject_declaration_helper_script(page):
     script = """
     // Skyvern helper prelude comment
@@ -9382,6 +9666,92 @@ def test_evaluate_can_reinject_declaration_helper_script(page):
     assert page.evaluate("async () => await __rustwrightAsyncSmokeHelper()") == "chromium"
     assert page.evaluate("() => __rustwrightOuterSmokeHelper()") == "nested"
     assert page.evaluate("() => typeof __rustwrightNestedSmokeHelper") == "undefined"
+
+
+def test_declaration_helper_keeps_script_goal_semantics(page):
+    script = """
+    const __rwScriptLexical = "visible-to-helper";
+    var __rwScriptVar = 41;
+    function __rwScriptHelper() {
+        return `${__rwScriptLexical}:${__rwScriptVar + 1}`;
+    }
+    """
+
+    assert page.evaluate(script) is None
+    assert page.evaluate("() => globalThis.__rwScriptVar") == 41
+    assert page.evaluate("() => __rwScriptHelper()") == "visible-to-helper:42"
+
+    with pytest.raises(Error) as exc_info:
+        page.evaluate(
+            "const sentinel = 1; function __rwReturnProbe() { return sentinel; } return 2;"
+        )
+    assert str(exc_info.value) == "Page.evaluate: SyntaxError: Illegal return statement"
+
+
+def test_evaluate_error_stacks_match_baseline(page):
+    assert page.evaluate("0") == 0
+
+    expected = {
+        "() => { throw new Error('boom') }": (
+            "Page.evaluate: Error: boom\n"
+            "    at __rw_fn (<anonymous>:1:47)\n"
+            "    at <anonymous>:1:82\n"
+            "    at <anonymous>:1:95"
+        ),
+        "throw new Error('boom')": (
+            "Page.evaluate: Error: boom\n"
+            "    at eval (eval at <anonymous> (:13:32), <anonymous>:1:7)\n"
+            "    at eval (<anonymous>)\n"
+            "    at <anonymous>:13:32\n"
+            "    at <anonymous>:19:3"
+        ),
+    }
+    for expression, baseline_error in expected.items():
+        with pytest.raises(Error) as exc_info:
+            page.evaluate(expression)
+        assert str(exc_info.value) == baseline_error
+
+
+def test_evaluate_serializer_cache_recovers_after_navigation(page):
+    assert page.evaluate("1") == 1
+    page.goto("data:text/html,<title>new context</title><main>ready</main>")
+    assert page.evaluate("() => ({ value: 2 })") == {"value": 2}
+
+def test_evaluate_context_destroyed_after_dispatch_does_not_execute_twice(page, http_server):
+    page.goto(f"{http_server}/page")
+    page.evaluate("() => localStorage.removeItem('__rustwrightBeaconCount')")
+
+    with pytest.raises(Error) as exc_info:
+        page.evaluate(
+            """() => {
+            const key = '__rustwrightBeaconCount';
+            localStorage.setItem(key, String(Number(localStorage.getItem(key) || 0) + 1));
+            location.href = '/page?after-beacon=1';
+            return new Promise(() => {});
+            }"""
+        )
+
+    assert str(exc_info.value).splitlines()[0] == (
+        "Page.evaluate: Execution context was destroyed, most likely because of a navigation."
+    )
+    page.wait_for_url("**/page?after-beacon=1")
+    assert page.evaluate("() => Number(localStorage.getItem('__rustwrightBeaconCount'))") == 1
+
+
+
+def test_detached_frame_evaluate_and_evaluate_handle_match_playwright(page):
+    page.set_content("<iframe name='child' srcdoc='<main>child</main>'></iframe>")
+    child = wait_until(lambda: page.frame(name="child"))
+    page.locator("iframe").evaluate("(element) => element.remove()")
+    wait_until(child.is_detached)
+
+    with pytest.raises(Error) as evaluate_error:
+        child.evaluate("1")
+    assert str(evaluate_error.value) == "Frame.evaluate: Frame was detached"
+
+    with pytest.raises(Error) as handle_error:
+        child.evaluate_handle("1")
+    assert str(handle_error.value) == "Frame.evaluate_handle: Frame was detached"
 
 
 def test_frame_evaluate_can_reinject_declaration_helper_script(page):
@@ -18480,6 +18850,94 @@ def test_forced_site_isolation_oopif_uses_iframe_target_session(playwright, oopi
     finally:
         browser.close()
 
+def test_forced_site_isolation_oopif_file_chooser_uses_child_session(
+    playwright, oopif_test_server, tmp_path: Path
+):
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--site-per-process",
+            "--no-proxy-server",
+            "--host-resolver-rules=MAP a.test 127.0.0.1, MAP b.test 127.0.0.1",
+        ],
+    )
+    try:
+        page = browser.new_page()
+        page.goto(f"{oopif_test_server['a_test']}/oopif-file-chooser-top")
+        targets = page.context.new_cdp_session(page).send("Target.getTargets")["targetInfos"]
+        assert any(
+            target.get("type") == "iframe"
+            and target.get("url", "").startswith("http://b.test:")
+            for target in targets
+        )
+        upload = tmp_path / "oopif-child.txt"
+        upload.write_text("child file body", encoding="utf-8")
+
+
+        with page.expect_file_chooser() as chooser_info:
+            page.frame_locator("#child").locator("#upload").click()
+
+        chooser = chooser_info.value
+        assert chooser.page is page
+        assert chooser.element.evaluate("element => element.id") == "upload"
+        chooser.set_files(str(upload))
+        assert chooser.element.evaluate(
+            """async element => ({
+                name: element.files[0].name,
+                content: await element.files[0].text(),
+            })"""
+        ) == {"name": "oopif-child.txt", "content": "child file body"}
+    finally:
+        browser.close()
+
+def test_stale_oopif_file_chooser_clear_does_not_mutate_main_frame_input(
+    playwright, oopif_test_server, tmp_path: Path
+):
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--site-per-process",
+            "--no-proxy-server",
+            "--host-resolver-rules=MAP a.test 127.0.0.1, MAP b.test 127.0.0.1",
+        ],
+    )
+    try:
+        page = browser.new_page()
+        page.goto(f"{oopif_test_server['a_test']}/oopif-file-chooser-top")
+        target_session = page.context.new_cdp_session(page)
+        assert any(
+            target.get("type") == "iframe"
+            and target.get("url", "").startswith("http://b.test:")
+            for target in target_session.send("Target.getTargets")["targetInfos"]
+        )
+
+        with page.expect_file_chooser() as chooser_info:
+            page.frame_locator("#child").locator("#upload").click()
+        chooser = chooser_info.value
+
+        main_upload = tmp_path / "main-frame.txt"
+        main_upload.write_text("main frame body", encoding="utf-8")
+        page.locator("#main-upload").set_input_files(main_upload)
+        page.locator("#child").evaluate("element => element.remove()")
+        wait_until(
+            lambda: not any(
+                target.get("type") == "iframe"
+                and target.get("url", "").startswith("http://b.test:")
+                for target in target_session.send("Target.getTargets")["targetInfos"]
+            )
+        )
+
+        with pytest.raises(Error):
+            chooser.set_files([], timeout=500)
+        assert page.evaluate(
+            """async () => ({
+                name: document.querySelector('#main-upload').files[0].name,
+                content: await document.querySelector('#main-upload').files[0].text(),
+            })"""
+        ) == {"name": "main-frame.txt", "content": "main frame body"}
+    finally:
+        browser.close()
+
 
 def test_forced_site_isolation_real_oopif_process_swap_routes_each_input(
     playwright, oopif_test_server
@@ -19379,6 +19837,237 @@ def test_expect_file_chooser_sets_files(page, tmp_path: Path):
     assert page.evaluate("async () => await document.querySelector('#file').files[0].text()") == "chosen"
 
 
+def test_file_chooser_path_upload_supports_directory_multiple_and_clear(
+    page, tmp_path: Path
+):
+    directory = tmp_path / "folder"
+    directory.mkdir()
+    (directory / "root.txt").write_text("root body", encoding="utf-8")
+    nested = directory / "nested"
+    nested.mkdir()
+    (nested / "child.txt").write_text("child body", encoding="utf-8")
+    first = tmp_path / "first.txt"
+    first.write_text("first body", encoding="utf-8")
+    second = tmp_path / "second.txt"
+    second.write_text("second body", encoding="utf-8")
+    page.set_content(
+        """
+        <input id="directory" type="file" webkitdirectory>
+        <input id="multiple" type="file" multiple>
+        """
+    )
+
+    with page.expect_file_chooser() as directory_info:
+        page.locator("#directory").click()
+    directory_info.value.set_files(directory)
+    assert page.evaluate(
+        """async () => Promise.all(
+        Array.from(document.querySelector('#directory').files)
+          .map(async file => ({
+            path: file.webkitRelativePath,
+            content: await file.text(),
+          }))
+        ).then(files => files.sort((left, right) => left.path.localeCompare(right.path)))"""
+    ) == [
+        {"path": "folder/nested/child.txt", "content": "child body"},
+        {"path": "folder/root.txt", "content": "root body"},
+    ]
+
+    with page.expect_file_chooser() as multiple_info:
+        page.locator("#multiple").click()
+    chooser = multiple_info.value
+    chooser.set_files([first, second])
+    assert page.evaluate(
+        """async () => Promise.all(
+        Array.from(document.querySelector('#multiple').files)
+          .map(async file => ({ name: file.name, content: await file.text() }))
+        )"""
+    ) == [
+        {"name": "first.txt", "content": "first body"},
+        {"name": "second.txt", "content": "second body"},
+    ]
+
+    chooser.set_files([])
+    assert page.evaluate("() => document.querySelector('#multiple').files.length") == 0
+
+
+def test_file_chooser_directory_upload_uses_one_operation_deadline(
+    page, tmp_path: Path, monkeypatch
+):
+    directory = tmp_path / "slow-directory"
+    directory.mkdir()
+    for index in range(100):
+        (directory / f"{index:03}.txt").write_text("", encoding="utf-8")
+    page.set_content("<input id='directory' type='file' webkitdirectory>")
+    with page.expect_file_chooser() as chooser_info:
+        page.locator("#directory").click()
+
+    original_rglob = Path.rglob
+    traversed = 0
+
+    def slow_rglob(path: Path, pattern: str):
+        nonlocal traversed
+        for child in original_rglob(path, pattern):
+            time.sleep(0.02)
+            traversed += 1
+            yield child
+
+    monkeypatch.setattr(Path, "rglob", slow_rglob)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError) as exc_info:
+        chooser_info.value.set_files(directory, timeout=300)
+    elapsed = time.monotonic() - started
+
+    assert traversed > 0
+    assert elapsed < 0.8
+    assert str(exc_info.value).splitlines()[0] == "FileChooser.set_files: Timeout 300ms exceeded."
+
+
+@pytest.mark.parametrize("blocked_access", ["payload", "clear", "probe"])
+def test_file_chooser_evaluation_timeout_does_not_run_unbudgeted_handle_cleanup(
+    page, tmp_path: Path, blocked_access: str
+):
+    page.set_content("<input id='file' type='file' multiple>")
+    with page.expect_file_chooser() as chooser_info:
+        page.locator("#file").click()
+    chooser = chooser_info.value
+    page.evaluate(
+        """blockedAccess => {
+        const input = document.querySelector('#file');
+        const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files');
+        const block = () => {
+          const until = performance.now() + 4000;
+          while (performance.now() < until) {}
+        };
+        Object.defineProperty(input, 'files', {
+          configurable: true,
+          get() {
+            if (blockedAccess === 'probe') block();
+            return descriptor.get.call(this);
+          },
+          set(value) {
+            if (blockedAccess !== 'probe') block();
+            descriptor.set.call(this, value);
+          },
+        });
+        }""",
+        blocked_access,
+    )
+
+    upload = tmp_path / "blocked.txt"
+    upload.write_text("blocked", encoding="utf-8")
+    files: Any
+    if blocked_access == "payload":
+        files = {"name": "payload.txt", "mime_type": "text/plain", "buffer": b"payload"}
+    elif blocked_access == "clear":
+        files = []
+    else:
+        files = upload
+
+    original_core = page._core
+    cleanup_timeouts: list[float | None] = []
+
+    class CleanupFailureCore:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(original_core, name)
+
+        def js_handle_dispose(
+            self,
+            object_id: str,
+            timeout_ms: float | None,
+            *session_args: str,
+        ) -> None:
+            cleanup_timeouts.append(timeout_ms)
+            if timeout_ms is None:
+                time.sleep(3.1)
+            raise RuntimeError("Target closed during cleanup")
+
+    page._core = CleanupFailureCore()
+    started = time.monotonic()
+    try:
+        with pytest.raises(Error) as exc_info:
+            chooser.set_files(files, timeout=300)
+    finally:
+        page._core = original_core
+    elapsed = time.monotonic() - started
+
+    expected = "FileChooser.set_files: Timeout 300ms exceeded."
+    failures = []
+    if elapsed >= 3:
+        failures.append(f"call took {elapsed:.3f}s")
+    if not isinstance(exc_info.value, TimeoutError) or str(exc_info.value).splitlines()[0] != expected:
+        failures.append(f"raised {type(exc_info.value).__name__}: {exc_info.value}")
+    assert not failures, "; ".join(failures)
+    assert cleanup_timeouts == []
+
+
+def test_file_chooser_path_upload_targets_input_inside_closed_shadow_root(
+    page, tmp_path: Path
+):
+    upload = tmp_path / "closed-shadow.txt"
+    upload.write_text("closed shadow body", encoding="utf-8")
+    page.set_content(
+        """
+        <div id="host"></div>
+        <script>
+        {
+          const root = document.querySelector('#host').attachShadow({mode: 'closed'});
+          const input = document.createElement('input');
+          input.type = 'file';
+          root.appendChild(input);
+          window.openClosedShadowChooser = () => input.click();
+          window.readClosedShadowFile = async () => ({
+            name: input.files[0].name,
+            content: await input.files[0].text(),
+          });
+        }
+        </script>
+        """
+    )
+
+    with page.expect_file_chooser() as chooser_info:
+        page.evaluate("() => window.openClosedShadowChooser()")
+    chooser_info.value.set_files(upload)
+
+    assert page.evaluate("() => window.readClosedShadowFile()") == {
+        "name": "closed-shadow.txt",
+        "content": "closed shadow body",
+    }
+
+def test_file_chooser_elements_keep_main_and_iframe_realms(page):
+    page.set_content(
+        """
+        <input id="main-upload" type="file">
+        <iframe name="child" srcdoc="<input id='child-upload' type='file'>"></iframe>
+        """
+    )
+    child = wait_until(lambda: page.frame(name="child"))
+
+    with page.expect_file_chooser() as main_info:
+        page.locator("#main-upload").click()
+    main_chooser = main_info.value
+    assert main_chooser.element.evaluate(
+        "element => ({ id: element.id, owner: element.ownerDocument === document })"
+    ) == {"id": "main-upload", "owner": True}
+
+    with page.expect_file_chooser() as child_info:
+        child.locator("#child-upload").click()
+    child_chooser = child_info.value
+    assert child_chooser.element.evaluate(
+        "element => ({ id: element.id, owner: element.ownerDocument === document })"
+    ) == {"id": "child-upload", "owner": True}
+
+    state = runtime_state_test_data(page)
+    main_realm = f"frame:{page.main_frame._frame_id}"
+    child_realm = f"frame:{child._frame_id}"
+    serializer_realms = {
+        realm.split("|", 1)[1]
+        for realm in state["serializer_realms"]
+    }
+    assert {main_realm, child_realm}.issubset(serializer_realms)
+
+
+
 def test_file_chooser_set_files_payload_and_timeout_validation_matches_playwright(page):
     from benchmarks.automation_cases import file_chooser_set_files_payload_and_timeout_validation_matches_playwright
 
@@ -19909,6 +20598,36 @@ def test_expect_worker_captures_and_evaluates_dedicated_worker(page):
     assert worker.evaluate("(arg) => arg.base.answer + arg.extra.add", {"base": handle, "extra": extra}) == 46
     nested = handle.evaluate_handle("(value, arg) => ({ total: value.answer + arg.extra.add })", {"extra": extra})
     assert nested.json_value() == {"total": 46}
+    assert worker.evaluate("() => typeof __rw_value") == "undefined"
+    assert handle.evaluate("(value) => typeof __rw_args") == "undefined"
+
+    expression = (
+        "(arg) => this === self && "
+        "arg.left[arg.leftKey] === arg.leftValue && "
+        "arg.right[arg.rightKey] === arg.rightValue"
+    )
+    assert worker.evaluate(
+        expression,
+        {
+            "left": handle,
+            "leftKey": "answer",
+            "leftValue": 41,
+            "right": extra,
+            "rightKey": "add",
+            "rightValue": 5,
+        },
+    )
+    assert worker.evaluate(
+        expression,
+        {
+            "left": extra,
+            "leftKey": "add",
+            "leftValue": 5,
+            "right": handle,
+            "rightKey": "answer",
+            "rightValue": 41,
+        },
+    )
     nested.dispose()
     extra.dispose()
     mapped.dispose()
@@ -22299,7 +23018,9 @@ def test_page_errors_support_navigation_filter(page):
     before = "sync error before navigation filter"
     after = "sync error after navigation filter"
     page.set_content("<main>page error filter</main>")
-    page.evaluate("(text) => setTimeout(() => { throw new Error(text); }, 0)", before)
+    page.add_script_tag(
+        content=f"setTimeout(() => {{ throw new Error({json.dumps(before)}); }}, 0)"
+    )
     wait_until(lambda: before in [str(error) for error in page.page_errors(filter="all")])
 
     page.goto(

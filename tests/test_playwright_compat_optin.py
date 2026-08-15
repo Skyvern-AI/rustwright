@@ -1,14 +1,35 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
+
+import pytest
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_PYTHON_ROOT = _REPO_ROOT / "python"
+_PYTEST_ALIASES = [
+    "pytest_playwright",
+    "playwright.pytest_plugin",
+    "patchright.pytest_plugin",
+    "pytest_playwright.pytest_playwright",
+]
 
 
-def _run_probe(source: str) -> dict[str, object]:
+def _run_probe(source: str, *, no_site_packages: bool = False) -> dict[str, object]:
+    command = [sys.executable]
+    if no_site_packages:
+        command.append("-S")
+    command.extend(["-c", textwrap.dedent(source)])
+    env = dict(os.environ)
+    if no_site_packages:
+        env["PYTHONPATH"] = str(_PYTHON_ROOT)
     result = subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(source)],
+        command,
+        env=env,
         text=True,
         capture_output=True,
         check=True,
@@ -38,52 +59,13 @@ def test_rustwright_import_does_not_install_legacy_aliases():
     report = _run_probe(
         """
         import importlib
-        import importlib.util
         import json
-        import pathlib
         import sys
 
         legacy_roots = ["playwright", "patchright", "cloakbrowser", "pytest_playwright"]
         before = {name: name in sys.modules for name in legacy_roots}
-
         import rustwright
-
         after_rustwright = {name: name in sys.modules for name in legacy_roots}
-
-        def root_probe(name):
-            spec = importlib.util.find_spec(name)
-            if spec is None:
-                return {"status": "missing", "origin": None, "rustwright_backed": False}
-            paths = []
-            if spec.origin:
-                paths.append(pathlib.Path(spec.origin))
-            for location in spec.submodule_search_locations or []:
-                package = pathlib.Path(location)
-                paths.extend(
-                    candidate
-                    for candidate in [
-                        package / "__init__.py",
-                        package / "sync_api.py",
-                        package / "async_api.py",
-                        package / "pytest_playwright.py",
-                    ]
-                    if candidate.exists()
-                )
-            rustwright_backed = False
-            for path in paths:
-                try:
-                    if "rustwright" in path.read_text(encoding="utf-8"):
-                        rustwright_backed = True
-                        break
-                except OSError:
-                    pass
-            return {
-                "status": "present",
-                "origin": spec.origin,
-                "rustwright_backed": rustwright_backed,
-            }
-
-        probes = {name: root_probe(name) for name in legacy_roots}
 
         compat_sync = importlib.import_module("rustwright._compat.playwright.sync_api")
         native_sync = importlib.import_module("rustwright.sync_api")
@@ -94,26 +76,102 @@ def test_rustwright_import_does_not_install_legacy_aliases():
             "after_rustwright": after_rustwright,
             "after_direct_compat": after_direct_compat,
             "direct_compat_identity": compat_sync.sync_playwright is native_sync.sync_playwright,
-            "probes": probes,
-            "rustwright_all": sorted(name for name in rustwright.__all__ if name.endswith("playwright_compat")),
+            "rustwright_all": sorted(
+                name for name in rustwright.__all__ if name.endswith("playwright_compat")
+            ),
         }, sort_keys=True))
         """
     )
 
-    assert report["before"] == {
+    expected_roots = {
         "playwright": False,
         "patchright": False,
         "cloakbrowser": False,
         "pytest_playwright": False,
     }
-    assert report["after_rustwright"] == report["before"]
-    assert report["after_direct_compat"] == report["before"]
+    assert report["before"] == expected_roots
+    assert report["after_rustwright"] == expected_roots
+    assert report["after_direct_compat"] == expected_roots
     assert report["direct_compat_identity"] is True
-    assert report["rustwright_all"] == ["disable_playwright_compat", "enable_playwright_compat"]
-    assert not any(item["rustwright_backed"] for item in report["probes"].values())
+    assert report["rustwright_all"] == [
+        "disable_playwright_compat",
+        "enable_playwright_compat",
+    ]
 
 
-def test_enable_playwright_compat_installs_and_removes_aliases():
+def test_clean_python_without_pytest_enables_core_aliases_only():
+    report = _run_probe(
+        """
+        import importlib
+        import importlib.util
+        import json
+        import sys
+
+        assert importlib.util.find_spec("pytest") is None
+        import rustwright
+
+        result = rustwright.enable_playwright_compat()
+        playwright_sync = importlib.import_module("playwright.sync_api")
+        try:
+            importlib.import_module("pytest_playwright")
+        except ModuleNotFoundError as error:
+            missing_plugin = error.name
+        else:
+            missing_plugin = None
+
+        print(json.dumps({
+            "core_identity": playwright_sync.sync_playwright is rustwright.sync_playwright,
+            "missing_plugin": missing_plugin,
+            "pytest_loaded": "pytest" in sys.modules,
+            "registered_aliases": list(result.registered_aliases),
+            "skipped_aliases": list(result.skipped_aliases),
+            "plugin_targets_loaded": sorted(
+                name for name in sys.modules
+                if name.startswith("rustwright._compat.pytest_playwright")
+                or name.endswith(".pytest_plugin")
+            ),
+        }, sort_keys=True))
+        """,
+        no_site_packages=True,
+    )
+
+    assert report["core_identity"] is True
+    assert report["missing_plugin"] == "pytest_playwright"
+    assert report["pytest_loaded"] is False
+    assert report["skipped_aliases"] == _PYTEST_ALIASES
+    assert "playwright.sync_api" in report["registered_aliases"]
+    assert report["plugin_targets_loaded"] == []
+
+
+def test_enable_disable_leave_sys_meta_path_untouched():
+    report = _run_probe(
+        """
+        import json
+        import sys
+
+        import rustwright
+
+        before = list(sys.meta_path)
+        rustwright.enable_playwright_compat()
+        after_enable = list(sys.meta_path)
+        rustwright.disable_playwright_compat()
+        after_disable = list(sys.meta_path)
+
+        print(json.dumps({
+            "enable_unchanged": len(before) == len(after_enable) and all(
+                left is right for left, right in zip(before, after_enable)
+            ),
+            "disable_unchanged": len(before) == len(after_disable) and all(
+                left is right for left, right in zip(before, after_disable)
+            ),
+        }, sort_keys=True))
+        """
+    )
+
+    assert report == {"disable_unchanged": True, "enable_unchanged": True}
+
+
+def test_pytest_playwright_callback_type_export_is_eager_and_exact():
     report = _run_probe(
         """
         import importlib
@@ -121,81 +179,492 @@ def test_enable_playwright_compat_installs_and_removes_aliases():
         import sys
 
         import rustwright
-        import rustwright.async_api as native_async
-        import rustwright.sync_api as native_sync
 
         rustwright.enable_playwright_compat()
-        rustwright.enable_playwright_compat()
+        package = importlib.import_module("pytest_playwright")
+        implementation_name = "rustwright._compat.pytest_playwright.pytest_playwright"
+        callback = package.CreateContextCallback
 
-        playwright_sync = importlib.import_module("playwright.sync_api")
-        playwright_async = importlib.import_module("playwright.async_api")
-        playwright_errors = importlib.import_module("playwright._impl._errors")
-        patchright_sync = importlib.import_module("patchright.sync_api")
-        patchright_async = importlib.import_module("patchright.async_api")
-        cloakbrowser = importlib.import_module("cloakbrowser")
-        pytest_playwright = importlib.import_module("pytest_playwright.pytest_playwright")
+        from rustwright.pytest_plugin import CreateContextCallback
 
-        marker = playwright_sync.backend_marker("playwright.sync_api")
-        installed = {
-            "playwright": sys.modules["playwright"].__name__,
-            "playwright.sync_api": sys.modules["playwright.sync_api"].__name__,
-            "patchright.sync_api": sys.modules["patchright.sync_api"].__name__,
-            "cloakbrowser": sys.modules["cloakbrowser"].__name__,
-            "pytest_playwright.pytest_playwright": sys.modules["pytest_playwright.pytest_playwright"].__name__,
+        print(json.dumps({
+            "implementation_loaded": implementation_name in sys.modules,
+            "is_exact_protocol": callback is CreateContextCallback,
+            "is_protocol": callback._is_protocol,
+            "has_viewport_annotation": "viewport" in callback.__call__.__annotations__,
+        }, sort_keys=True))
+        """
+    )
+
+    assert report == {
+        "has_viewport_annotation": True,
+        "implementation_loaded": True,
+        "is_exact_protocol": True,
+        "is_protocol": True,
+    }
+
+
+def test_pytest_playwright_callback_static_type_export(tmp_path, monkeypatch):
+    pytest.importorskip(
+        "mypy",
+        reason=(
+            "mypy is optional; install mypy and rerun this test to check the"
+            " static type export"
+        ),
+    )
+    from mypy import api as mypy_api
+
+    probe = tmp_path / "callback_type_probe.py"
+    probe.write_text(
+        textwrap.dedent(
+            """
+            from rustwright._compat.pytest_playwright import CreateContextCallback
+
+            def use_callback(callback: CreateContextCallback) -> None:
+                reveal_type(callback)
+                reveal_type(callback(viewport={"width": 1280, "height": 720}))
+            """
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MYPYPATH", str(_PYTHON_ROOT))
+
+    stdout, stderr, status = mypy_api.run(
+        ["--strict", "--no-error-summary", str(probe)]
+    )
+
+    assert status == 0, stdout + stderr
+    revealed = [line for line in stdout.splitlines() if "Revealed type is" in line]
+    assert any("CreateContextCallback" in line for line in revealed), stdout
+    assert any("BrowserContext" in line for line in revealed), stdout
+    assert not any("Any" in line or "builtins.object" in line for line in revealed)
+
+
+def test_enable_disable_two_cycles_restore_aliases_and_reload_child():
+    report = _run_probe(
+        """
+        import importlib
+        import json
+        import sys
+
+        import rustwright
+
+        tracked = [
+            "playwright",
+            "playwright.sync_api",
+            "patchright",
+            "patchright.async_api",
+            "cloakbrowser",
+            "pytest_playwright",
+            "playwright.pytest_plugin",
+            "patchright.pytest_plugin",
+            "pytest_playwright.pytest_playwright",
+        ]
+        cycles = []
+        for _ in range(2):
+            result = rustwright.enable_playwright_compat()
+            child = importlib.import_module("playwright.sync_api")
+            target = importlib.import_module("rustwright._compat.playwright.sync_api")
+            reloaded = importlib.reload(child)
+            cycles.append({
+                "all_registered": all(name in sys.modules for name in tracked),
+                "child_is_target": child is target,
+                "reload_identity": reloaded is child,
+                "registered_result": all(
+                    name in result.registered_aliases for name in tracked
+                ),
+                "skipped": list(result.skipped_aliases),
+            })
+            rustwright.disable_playwright_compat()
+            cycles[-1]["all_restored"] = not any(
+                name in sys.modules for name in tracked
+            )
+
+        print(json.dumps({"cycles": cycles}, sort_keys=True))
+        """
+    )
+
+    assert report["cycles"] == [
+        {
+            "all_registered": True,
+            "all_restored": True,
+            "child_is_target": True,
+            "registered_result": True,
+            "reload_identity": True,
+            "skipped": [],
+        },
+        {
+            "all_registered": True,
+            "all_restored": True,
+            "child_is_target": True,
+            "registered_result": True,
+            "reload_identity": True,
+            "skipped": [],
+        },
+    ]
+
+
+def test_enable_import_failure_leaves_aliases_and_state_unchanged():
+    report = _run_probe(
+        """
+        import importlib
+        import json
+        import sys
+        from types import ModuleType
+
+        import pytest
+        import rustwright
+        import rustwright._compat as compat
+
+        canonical_root = importlib.import_module("rustwright._compat.playwright")
+        foreign_root = ModuleType("playwright")
+        foreign_child = ModuleType("playwright.sync_api")
+        sentinel = object()
+        foreign_root.sync_api = sentinel
+        sys.modules["playwright"] = foreign_root
+        sys.modules["playwright.sync_api"] = foreign_child
+
+        aliases = [
+            name for name, _target in compat._CORE_ALIASES + compat._PYTEST_ALIASES
+        ]
+        missing = object()
+        alias_snapshot = {
+            name: sys.modules.get(name, missing)
+            for name in aliases
         }
-        identities = {
-            "playwright_sync": playwright_sync.sync_playwright is native_sync.sync_playwright,
-            "playwright_async": playwright_async.async_playwright is native_async.async_playwright,
-            "playwright_errors": playwright_errors.Error is native_sync.Error,
-            "patchright_sync": patchright_sync.sync_playwright is native_sync.sync_playwright,
-            "patchright_async": patchright_async.async_playwright is native_async.async_playwright,
-            "cloakbrowser": callable(cloakbrowser.launch_async),
-            "pytest_playwright": pytest_playwright.CreateContextCallback.__name__ == "CreateContextCallback",
+        state_snapshot = {
+            "enabled": compat._ENABLED,
+            "pytest_enabled": compat._PYTEST_ALIASES_ENABLED,
+            "result": compat._LAST_ENABLE_RESULT,
+            "modules": dict(compat._PREVIOUS_MODULES),
+            "attributes": dict(compat._PREVIOUS_PARENT_ATTRIBUTES),
         }
+        real_import_module = importlib.import_module
 
+        def failing_import_module(name, *args, **kwargs):
+            if name == "rustwright._compat.playwright._impl._api_structures":
+                raise RuntimeError("injected target import failure")
+            return real_import_module(name, *args, **kwargs)
+
+        compat.importlib.import_module = failing_import_module
+        try:
+            rustwright.enable_playwright_compat()
+        except RuntimeError as error:
+            failure = str(error)
+        else:
+            failure = None
+
+        print(json.dumps({
+            "aliases_unchanged": all(
+                sys.modules.get(name, missing) is module
+                for name, module in alias_snapshot.items()
+            ),
+            "canonical_root_preserved": (
+                sys.modules.get("rustwright._compat.playwright") is canonical_root
+            ),
+            "failure": failure,
+            "parent_unchanged": foreign_root.sync_api is sentinel,
+            "partial_canonical_import_preserved": (
+                "rustwright._compat.playwright.__main__" in sys.modules
+            ),
+            "pytest_preserved": sys.modules.get("pytest") is pytest,
+            "state_unchanged": (
+                compat._ENABLED is state_snapshot["enabled"]
+                and compat._PYTEST_ALIASES_ENABLED is state_snapshot["pytest_enabled"]
+                and compat._LAST_ENABLE_RESULT is state_snapshot["result"]
+                and compat._PREVIOUS_MODULES == state_snapshot["modules"]
+                and compat._PREVIOUS_PARENT_ATTRIBUTES == state_snapshot["attributes"]
+            ),
+        }, sort_keys=True))
+        """
+    )
+
+    assert report == {
+        "aliases_unchanged": True,
+        "canonical_root_preserved": True,
+        "failure": "injected target import failure",
+        "parent_unchanged": True,
+        "partial_canonical_import_preserved": True,
+        "pytest_preserved": True,
+        "state_unchanged": True,
+    }
+
+
+def test_enable_rollback_restores_modules_and_parent_attributes():
+    report = _run_probe(
+        """
+        import json
+        import sys
+        from types import ModuleType
+
+        import rustwright
+        import rustwright._compat as compat
+
+        foreign_root = ModuleType("playwright")
+        foreign_impl = ModuleType("playwright._impl")
+        foreign_child = ModuleType("playwright._impl._api_structures")
+        foreign_root._impl = foreign_impl
+        foreign_impl._api_structures = foreign_child
+        sys.modules["playwright"] = foreign_root
+        sys.modules["playwright._impl"] = foreign_impl
+        sys.modules["playwright._impl._api_structures"] = foreign_child
+        sentinel = object()
+        observed = {}
+
+        def fail_publish(event, alias_name=None):
+            if event == "enable-after-import":
+                canonical_parent = sys.modules[
+                    "rustwright._compat.playwright._impl"
+                ]
+                canonical_parent._api_structures = sentinel
+                observed["parent"] = canonical_parent
+                observed["target"] = sys.modules[
+                    "rustwright._compat.playwright._impl._api_structures"
+                ]
+            if (
+                event == "enable-after-alias-publish"
+                and alias_name == "playwright._impl._api_structures"
+            ):
+                observed["child_was_published"] = (
+                    sys.modules.get(alias_name) is observed["target"]
+                )
+                observed["parent_was_replaced"] = (
+                    observed["parent"]._api_structures is observed["target"]
+                )
+                raise RuntimeError("injected publish failure")
+
+        compat._compat_transaction_hook = fail_publish
+        try:
+            rustwright.enable_playwright_compat()
+        except RuntimeError as error:
+            failure = str(error)
+        else:
+            failure = None
+
+        print(json.dumps({
+            "child_restored": (
+                sys.modules.get("playwright._impl._api_structures")
+                is foreign_child
+            ),
+            "child_was_published": observed.get("child_was_published", False),
+            "enabled": compat._ENABLED,
+            "failure": failure,
+            "impl_restored": sys.modules.get("playwright._impl") is foreign_impl,
+            "parent_restored": observed["parent"]._api_structures is sentinel,
+            "parent_was_replaced": observed.get("parent_was_replaced", False),
+            "root_restored": sys.modules.get("playwright") is foreign_root,
+            "unpublished_absent": "playwright.async_api" not in sys.modules,
+        }, sort_keys=True))
+        """
+    )
+
+    assert report == {
+        "child_restored": True,
+        "child_was_published": True,
+        "enabled": False,
+        "failure": "injected publish failure",
+        "impl_restored": True,
+        "parent_restored": True,
+        "parent_was_replaced": True,
+        "root_restored": True,
+        "unpublished_absent": True,
+    }
+
+
+def test_concurrent_double_enable_is_deterministic():
+    report = _run_probe(
+        """
+        import json
+        import sys
+        import threading
+
+        import rustwright
+        import rustwright._compat as compat
+
+        imported = threading.Barrier(2)
+        errors = []
+        results = []
+
+        def transaction_hook(event, alias_name=None):
+            if event == "enable-after-import":
+                imported.wait(timeout=10)
+
+        compat._compat_transaction_hook = transaction_hook
+
+        def enable():
+            try:
+                results.append(rustwright.enable_playwright_compat())
+            except BaseException as error:
+                errors.append(repr(error))
+
+        threads = [threading.Thread(target=enable), threading.Thread(target=enable)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+
+        aliases = [name for name, _target in compat._CORE_ALIASES + compat._PYTEST_ALIASES]
+        enabled_consistently = (
+            compat._ENABLED
+            and len(results) == 2
+            and results[0] == results[1]
+            and all(name in sys.modules for name in aliases)
+        )
         rustwright.disable_playwright_compat()
+
+        print(json.dumps({
+            "all_threads_finished": not any(thread.is_alive() for thread in threads),
+            "enabled_consistently": enabled_consistently,
+            "errors": errors,
+            "restored": not any(name in sys.modules for name in aliases),
+        }, sort_keys=True))
+        """
+    )
+
+    assert report == {
+        "all_threads_finished": True,
+        "enabled_consistently": True,
+        "errors": [],
+        "restored": True,
+    }
+
+
+def test_reenable_upgrades_skipped_pytest_aliases_and_restores_baseline():
+    report = _run_probe(
+        """
+        import importlib.util
+        import json
+        import sys
+        from types import ModuleType
+
+        import rustwright
+        import rustwright._compat as compat
+
+        canonical_playwright = importlib.import_module(
+            "rustwright._compat.playwright"
+        )
+        importlib.import_module("rustwright._compat.playwright.sync_api")
+        canonical_playwright_attribute = object()
+        canonical_playwright.sync_api = canonical_playwright_attribute
+
+        foreign_playwright = ModuleType("playwright")
+        foreign_playwright_child = ModuleType("playwright.sync_api")
+        foreign_pytest_playwright = ModuleType("pytest_playwright")
+        foreign_pytest_child = ModuleType(
+            "pytest_playwright.pytest_playwright"
+        )
+        playwright_attribute = object()
+        pytest_attribute = object()
+        foreign_playwright.sync_api = playwright_attribute
+        foreign_pytest_playwright.pytest_playwright = pytest_attribute
+        sys.modules["playwright"] = foreign_playwright
+        sys.modules["playwright.sync_api"] = foreign_playwright_child
+        sys.modules["pytest_playwright"] = foreign_pytest_playwright
+        sys.modules["pytest_playwright.pytest_playwright"] = foreign_pytest_child
+
+        aliases = [
+            name for name, _target in compat._CORE_ALIASES + compat._PYTEST_ALIASES
+        ]
+        missing = object()
+        module_snapshot = {
+            name: sys.modules.get(name, missing)
+            for name in aliases
+        }
+
+        real_find_spec = importlib.util.find_spec
+        pytest_available = False
+
+        def conditional_find_spec(name, *args, **kwargs):
+            if name == "pytest" and not pytest_available:
+                return None
+            return real_find_spec(name, *args, **kwargs)
+
+        compat.importlib.util.find_spec = conditional_find_spec
+        first = rustwright.enable_playwright_compat()
+        core_root = sys.modules["playwright"]
+        before_upgrade = {
+            "core_root_replaced": core_root is not foreign_playwright,
+            "core_parent_attribute_replaced": (
+                canonical_playwright.sync_api is not canonical_playwright_attribute
+            ),
+            "pytest_loaded": "pytest" in sys.modules,
+            "pytest_root_preserved": (
+                sys.modules["pytest_playwright"] is foreign_pytest_playwright
+            ),
+            "skipped": list(first.skipped_aliases),
+        }
+
+        pytest_available = True
+        second = rustwright.enable_playwright_compat()
+        after_upgrade = {
+            "core_root_unchanged": sys.modules["playwright"] is core_root,
+            "pytest_loaded": "pytest" in sys.modules,
+            "pytest_root_replaced": (
+                sys.modules["pytest_playwright"] is not foreign_pytest_playwright
+            ),
+            "pytest_aliases_registered": all(
+                sys.modules.get(name) is not module_snapshot[name]
+                for name, _target in compat._PYTEST_ALIASES
+            ),
+            "skipped": list(second.skipped_aliases),
+        }
         rustwright.disable_playwright_compat()
         after_disable = {
-            name: name in sys.modules
-            for name in [
-                "playwright",
-                "playwright.sync_api",
-                "patchright",
-                "patchright.sync_api",
-                "cloakbrowser",
-                "pytest_playwright",
-                "pytest_playwright.pytest_playwright",
-            ]
+            "all_module_identities_restored": all(
+                sys.modules.get(name, missing) is module
+                for name, module in module_snapshot.items()
+            ),
+            "canonical_playwright_attribute_restored": (
+                canonical_playwright.sync_api is canonical_playwright_attribute
+            ),
+            "playwright_attribute_restored": (
+                foreign_playwright.sync_api is playwright_attribute
+            ),
+            "pytest_attribute_restored": (
+                foreign_pytest_playwright.pytest_playwright is pytest_attribute
+            ),
+            "state_disabled": (
+                not compat._ENABLED
+                and not compat._PYTEST_ALIASES_ENABLED
+                and not compat._PREVIOUS_MODULES
+                and not compat._PREVIOUS_PARENT_ATTRIBUTES
+            ),
         }
 
         print(json.dumps({
-            "installed": installed,
-            "identities": identities,
-            "marker": marker,
+            "before_upgrade": before_upgrade,
+            "after_upgrade": after_upgrade,
             "after_disable": after_disable,
         }, sort_keys=True))
         """
     )
 
-    assert report["installed"] == {
-        "playwright": "rustwright._compat.playwright",
-        "playwright.sync_api": "rustwright._compat.playwright.sync_api",
-        "patchright.sync_api": "rustwright._compat.patchright.sync_api",
-        "cloakbrowser": "rustwright._compat.cloakbrowser",
-        "pytest_playwright.pytest_playwright": "rustwright._compat.pytest_playwright.pytest_playwright",
+    assert report == {
+        "after_disable": {
+            "canonical_playwright_attribute_restored": True,
+            "all_module_identities_restored": True,
+            "playwright_attribute_restored": True,
+            "pytest_attribute_restored": True,
+            "state_disabled": True,
+        },
+        "after_upgrade": {
+            "core_root_unchanged": True,
+            "pytest_aliases_registered": True,
+            "pytest_loaded": True,
+            "pytest_root_replaced": True,
+            "skipped": [],
+        },
+        "before_upgrade": {
+            "core_parent_attribute_replaced": True,
+            "core_root_replaced": True,
+            "pytest_loaded": False,
+            "pytest_root_preserved": True,
+            "skipped": _PYTEST_ALIASES,
+        },
     }
-    assert all(report["identities"].values())
-    assert report["marker"]["implementation"] == "rustwright"
-    assert report["marker"]["api_module"] == "playwright.sync_api"
-    assert report["marker"]["api_package"] == "playwright"
-    assert not any(report["after_disable"].values())
 
 
 def test_enable_playwright_compat_covers_private_import_paths():
-    # Real-world libraries import Playwright's private modules directly
-    # (generated sync/async classes, API structures, error types). Those paths
-    # must resolve under the compat aliases with identity to Rustwright's own
-    # classes, or migrations crash at import time before any test runs.
     report = _run_probe(
         """
         import json
@@ -234,28 +703,25 @@ def test_enable_playwright_compat_covers_private_import_paths():
         """
     )
 
-    assert report["sync_generated_page"] is True
-    assert report["async_generated_page"] is True
-    assert report["patchright_generated_page"] is True
-    assert report["viewport_size"] is True
-    assert report["patchright_viewport_size"] is True
-    assert report["geolocation"] is True
-    assert report["storage_state"] is True
-    assert report["target_closed_error"] is True
+    for identity in [
+        "sync_generated_page",
+        "async_generated_page",
+        "patchright_generated_page",
+        "viewport_size",
+        "patchright_viewport_size",
+        "geolocation",
+        "storage_state",
+        "target_closed_error",
+    ]:
+        assert report[identity] is True
     assert "sameSite" in report["set_cookie_param_keys"]
     assert "certPath" in report["client_certificate_keys"]
 
 
 def test_browser_context_args_fixture_is_session_scoped():
-    # pytest-playwright's documented pattern is a session-scoped
-    # browser_context_args override in conftest.py. If the plugin defines the
-    # fixture function-scoped, every test using that pattern dies with
-    # ScopeMismatch at collection.
     import rustwright.pytest_plugin as plugin
 
     fixture = plugin.browser_context_args
-    # pytest < 8.4 stores the marker on the function; >= 8.4 wraps the
-    # function in a FixtureFunctionDefinition carrying the marker.
     marker = getattr(fixture, "_pytestfixturefunction", None) or getattr(
         fixture, "_fixture_function_marker", None
     )
@@ -263,43 +729,84 @@ def test_browser_context_args_fixture_is_session_scoped():
     assert marker.scope == "session"
 
 
-def _run_pytest(tmp_path, target, *extra_args, env=None):
+def _run_compat_pytest(tmp_path, target, plugin_name, *extra_args, env=None):
+    compat_env = dict(os.environ if env is None else env)
+    compat_env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    plugin_args = [] if plugin_name is None else ["-p", plugin_name]
     return subprocess.run(
         [
             sys.executable,
-            "-m",
-            "pytest",
+            "-c",
+            (
+                "import rustwright; "
+                "rustwright.enable_playwright_compat(); "
+                "from pytest import console_main; "
+                "raise SystemExit(console_main())"
+            ),
             str(target),
             "-p",
             "no:cacheprovider",
             "-q",
             *extra_args,
-            *_plugin_args(),
+            *plugin_args,
         ],
         cwd=tmp_path,
-        env=env,
+        env=compat_env,
         text=True,
         capture_output=True,
+        check=False,
     )
 
 
-def test_pytest_plugin_tolerates_foreign_option_registration(tmp_path):
-    # pytest-base-url (and pytest-playwright) register --base-url/--browser
-    # too. `-p` plugins register before setuptools entry points, so a foreign
-    # plugin passed with `-p` claims the option strings first — exactly the
-    # load order that made rustwright's own registration abort pytest startup
-    # with "option names already added". Rustwright must tolerate the
-    # collision and read the surviving registration through its fallbacks.
-    import os
+@pytest.mark.parametrize(
+    "plugin_name",
+    [
+        "playwright.pytest_plugin",
+        "patchright.pytest_plugin",
+        "pytest_playwright.pytest_playwright",
+    ],
+)
+def test_pytest_loads_each_eager_plugin_alias(tmp_path, plugin_name):
+    test_file = tmp_path / "test_alias_plugin.py"
+    test_file.write_text(
+        textwrap.dedent(
+            """
+            def test_alias_plugin_fixture(browser_context_args):
+                assert isinstance(browser_context_args, dict)
+            """
+        ),
+        encoding="utf-8",
+    )
 
+    result = _run_compat_pytest(tmp_path, test_file, plugin_name)
+    assert result.returncode == 0, f"{plugin_name}\n{result.stdout}{result.stderr}"
+    assert "1 passed" in result.stdout, result.stdout
+
+
+def test_pytest_loads_root_plugin_alias(tmp_path):
+    test_file = tmp_path / "test_root_alias_plugin.py"
+    test_file.write_text(
+        textwrap.dedent(
+            """
+            def test_root_alias_plugin_fixture(browser_context_args):
+                assert isinstance(browser_context_args, dict)
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_compat_pytest(tmp_path, test_file, "pytest_playwright")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout, result.stdout
+
+
+def test_pytest_plugin_tolerates_foreign_option_registration(tmp_path):
     foreign = tmp_path / "foreign_options_plugin.py"
     foreign.write_text(
         textwrap.dedent(
             """
             def pytest_addoption(parser):
                 parser.addoption("--base-url", default=None, help="foreign base url")
-                # Scalar (non-append) on purpose: the fallback read must not
-                # iterate a foreign string value character by character.
                 parser.addoption("--browser", default=None, help="foreign browser")
             """
         ),
@@ -319,9 +826,10 @@ def test_pytest_plugin_tolerates_foreign_option_registration(tmp_path):
     )
     env = dict(os.environ)
     env["PYTHONPATH"] = str(tmp_path) + os.pathsep + env.get("PYTHONPATH", "")
-    result = _run_pytest(
+    result = _run_compat_pytest(
         tmp_path,
         test_file,
+        "patchright.pytest_plugin",
         "-p",
         "foreign_options_plugin",
         "--browser",
@@ -330,19 +838,17 @@ def test_pytest_plugin_tolerates_foreign_option_registration(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "already added" not in result.stderr
-    # The scalar foreign value must yield exactly one parametrization.
     assert "1 passed" in result.stdout, result.stdout
 
 
-def test_session_scoped_browser_context_args_override_collects(tmp_path):
-    # Regression test for the exact ScopeMismatch failure mode: a conftest
-    # override declared session-scoped (pytest-playwright's documented
-    # pattern) must collect and run against the plugin's fixture graph.
+def test_conftest_pytest_plugins_alias_collects(tmp_path):
     conftest = tmp_path / "conftest.py"
     conftest.write_text(
         textwrap.dedent(
             """
             import pytest
+
+            pytest_plugins = ["playwright.pytest_plugin"]
 
             @pytest.fixture(scope="session")
             def browser_context_args(browser_context_args):
@@ -361,6 +867,29 @@ def test_session_scoped_browser_context_args_override_collects(tmp_path):
         ),
         encoding="utf-8",
     )
-    result = _run_pytest(tmp_path, test_file)
+    result = _run_compat_pytest(tmp_path, test_file, None)
     assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
     assert "ScopeMismatch" not in result.stdout + result.stderr
+
+
+def test_conftest_root_pytest_plugin_alias_collects(tmp_path):
+    conftest = tmp_path / "conftest.py"
+    conftest.write_text(
+        'pytest_plugins = ["pytest_playwright"]\n',
+        encoding="utf-8",
+    )
+    test_file = tmp_path / "test_root_scope.py"
+    test_file.write_text(
+        textwrap.dedent(
+            """
+            def test_root_fixture_available(browser_context_args):
+                assert isinstance(browser_context_args, dict)
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_compat_pytest(tmp_path, test_file, None)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
