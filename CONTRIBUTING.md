@@ -48,6 +48,13 @@ iterating:
 pytest tests/test_rustwright_sync_api.py -k "launch_goto_title_and_url or click_updates_dom or fill_sets_value_and_dispatches_events or frame_locator_scopes_locators_to_iframe_content"
 ```
 
+The connect test-support cases require a feature-enabled native extension:
+
+```bash
+maturin develop --features test-support
+pytest tests/test_rustwright_sync_api.py -k "test_connect_test_options_are_consumed_by_preflight_rejection or test_chromium_connect_over_cdp_wss_rejects_untrusted_private_ca or test_chromium_connect_over_cdp_wss_runs_complete_flow_without_http_discovery or test_chromium_connect_over_cdp_wss_rejects_incomplete_upgrade_response or test_browser_type_connect_unsupported_message_matrix or test_browser_type_connect_validation_precedes_unsupported_without_io or test_connect_boundary_counters_cover_public_http_discovery"
+```
+
 For a broader local smoke before opening a PR:
 
 ```bash

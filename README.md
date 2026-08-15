@@ -233,6 +233,12 @@ Rustwright drives browsers — but you still need somewhere to run them. Skyvern
 
 Each session returns a `browser_address` CDP endpoint that Rustwright connects to like any remote Chromium (sessions bill while open).
 
+Use `chromium.connect_over_cdp()` for every remote Chromium connection.
+`BrowserType.connect()` is not a CDP alias and does not support Playwright
+`run-server` endpoints. See the [remote-browser guide](docs/REMOTE_BROWSERS.md)
+for migration steps, endpoint diagnostics, security guidance, and the pinned
+Open WebUI compose recipe.
+
 **Get started:**
 
 1. Make an account at [app.skyvern.com](https://app.skyvern.com)

@@ -10791,24 +10791,23 @@ class BrowserType(_EventEmitter):
         timeout: Optional[float] = None,
         expose_network: Optional[str] = None,
     ) -> "Browser":
-        if self.name != "chromium":
-            raise Error(f"{self.name} connect is not implemented; Rustwright currently supports Chromium over CDP")
         method = "BrowserType.connect"
-        endpoint = _normalize_string_option(endpoint, method=method, name="endpoint")
+        _normalize_string_option(endpoint, method=method, name="endpoint")
         if slow_mo is not None:
             _normalize_float_option(slow_mo, method=method, name="slow_mo")
         if timeout is not None:
             _normalize_float_option(timeout, method=method, name="timeout")
         if expose_network is not None:
             _normalize_string_option(expose_network, method=method, name="expose_network")
-        try:
-            return self.connect_over_cdp(endpoint, headers=headers, slow_mo=slow_mo, timeout=timeout)
-        except Error as exc:
-            message = str(exc)
-            prefix = "BrowserType.connect_over_cdp: "
-            if message.startswith(prefix):
-                raise Error(f"{method}: {message[len(prefix):]}") from None
-            raise
+        if headers is not None:
+            _normalize_connect_headers(headers, method=method)
+        raise Error(
+            f"{method}: Rustwright does not support the Playwright wire protocol "
+            "(playwright run-server or BrowserType.launchServer). Use "
+            "chromium.connect_over_cdp() with a raw Chromium CDP endpoint such as "
+            "http://browser:9222. See "
+            "https://github.com/Skyvern-AI/rustwright/blob/main/docs/REMOTE_BROWSERS.md"
+        )
 
 
 class Playwright(_EventEmitter):

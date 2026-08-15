@@ -1000,12 +1000,15 @@ dependencies = [
  "libc",
  "pyo3",
  "reqwest",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

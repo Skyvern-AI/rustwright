@@ -4,6 +4,12 @@ Rustwright is an alpha, not a complete Playwright replacement.
 
 - Chromium only. Firefox and WebKit entry points currently raise unsupported
   browser errors.
+- Playwright wire endpoints from `playwright run-server` and
+  `BrowserType.launchServer()` are unsupported. Remote Chromium requires raw
+  CDP through `chromium.connect_over_cdp()`. HTTP discovery can identify a
+  Playwright endpoint definitively. Direct WebSocket detection is heuristic
+  and can only report that the first reply resembles Playwright wire. See
+  [`docs/REMOTE_BROWSERS.md`](docs/REMOTE_BROWSERS.md).
 - Behavioral parity is not fully proven. Rustwright exposes a broad
   Playwright-shaped API, but API-surface coverage is not the same as complete
   browser behavior parity.

@@ -301,7 +301,7 @@ def launch_browser(
 ) -> Callable[..., Browser]:
     def launch(**kwargs: Any) -> Browser:
         if connect_options:
-            return browser_type.connect(**connect_options)
+            return browser_type.connect_over_cdp(**connect_options)
         options = dict(browser_type_launch_args)
         options.update(kwargs)
         return browser_type.launch(**options)
