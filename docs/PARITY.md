@@ -40,8 +40,8 @@ Legend: ✅ present and statically resolved in a registered parity case; 🟡 pr
 | `Playwright.stop` | method | 🟡 present, not exercised | 🟡 present, not exercised |
 | `Playwright.webkit` | property | 🟡 present, not exercised | 🟡 present, not exercised |
 | `PlaywrightContextManager.start` | method | 🟡 present, not exercised | 🟡 present, not exercised |
-| `BrowserType.connect` | method | 🟡 present, not exercised | 🟡 present, not exercised |
-| `BrowserType.connect_over_cdp` | method | ✅ present + exercised | 🟡 present, not exercised |
+| `BrowserType.connect` | method | 🟡 present, intentionally unsupported | 🟡 present, intentionally unsupported |
+| `BrowserType.connect_over_cdp` | method | ✅ present + exercised | ✅ present + exercised |
 | `BrowserType.executable_path` | property | ✅ present + exercised | 🟡 present, not exercised |
 | `BrowserType.launch` | method | ✅ present + exercised | 🟡 present, not exercised |
 | `BrowserType.launch_persistent_context` | method | ✅ present + exercised | 🟡 present, not exercised |
