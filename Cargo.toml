@@ -18,6 +18,9 @@ resolver = "2"
 [features]
 default = ["python"]
 python = ["dep:pyo3"]
+# Internal runtime-state probes for explicit test-wheel builds only.
+# Default and release wheel builds must not enable this feature.
+test-support = ["python"]
 
 [lib]
 name = "_rustwright"

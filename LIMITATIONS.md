@@ -19,5 +19,14 @@ Rustwright is an alpha, not a complete Playwright replacement.
   about 2 of 4 targets. Rustwright does not promise undetectability.
 - Drop-in compatibility import names are intended to be opt-in for the public
   alpha. The final compatibility-mode API is being finalized separately.
+- Chromium security-masks window `ErrorEvent` detail (`message='Script error.'`,
+  `error=null`) for asynchronous callbacks created by inspector-compiled
+  `Runtime.callFunctionOn` declarations. With `Runtime.enable` disabled
+  (Rustwright's stealth default), passive page-error history does not promise
+  full detail for errors thrown by evaluate-created async callbacks.
+  Same-origin, same-document page-authored scripts retain full detail. Standard
+  web-platform cross-origin masking still applies to external scripts loaded
+  without CORS. Subscribing to the `pageerror` event enables the Runtime domain
+  and provides full detail for evaluate-created asynchronous callbacks.
 - The implementation still has large monolithic files. A module split is
   planned before beta.

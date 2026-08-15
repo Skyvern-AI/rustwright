@@ -6,6 +6,8 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ### Changed
 
+- Reduced steady-state object-valued `evaluate()` results to one browser-protocol command after per-realm serializer setup; the first call in a new or recreated realm re-establishes that setup.
+- Passive page-error history now records page-authored errors without enabling Chromium's `Runtime` domain; `LIMITATIONS.md` documents the full-detail limitation for evaluate-created asynchronous callbacks.
 - Verified support for standard CPython 3.9 through 3.14 and CPython 3.15.0rc1. Python 3.15 support remains pre-release, and CI tracks 3.15-dev until GA.
 - Added a public failure and retry contract for browser actions. Rust, Python, and MCP callers can inspect the failure phase, target kind, command-write status, and retry safety. A tracked input command with unknown delivery now raises `UnknownOutcomeError` in Python and is never reported as safe to retry. Other bindings keep their existing error types and receive a clear diagnostic message.
 

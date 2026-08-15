@@ -4292,7 +4292,9 @@ def page_event_waiters_reject_on_page_crash(page):
 @case
 def page_errors_history_and_clear(page):
     page.set_content("<main>page error history</main>")
-    page.evaluate("() => setTimeout(() => { throw new Error('parity page boom'); }, 0)")
+    page.add_script_tag(
+        content="setTimeout(() => { throw new Error('parity page boom'); }, 0)"
+    )
 
     deadline = time.monotonic() + 3
     errors = []
@@ -4313,7 +4315,9 @@ def page_errors_since_navigation_filter(page):
     after = "page error after navigation filter"
     after_set_content = "page error after set content filter"
     page.set_content("<main>page error filter</main>")
-    page.evaluate("(text) => setTimeout(() => { throw new Error(text); }, 0)", before)
+    page.add_script_tag(
+        content=f"setTimeout(() => {{ throw new Error({json.dumps(before)}); }}, 0)"
+    )
 
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
