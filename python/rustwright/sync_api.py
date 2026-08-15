@@ -31,7 +31,8 @@ from http.cookiejar import Cookie as CookieJarCookie, CookieJar
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Pattern, TypedDict, Union, get_type_hints
+from types import TracebackType
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Pattern, Type, TypedDict, Union, get_type_hints
 from urllib import error as url_error
 from urllib import parse as url_parse
 from urllib import request as url_request
@@ -15316,6 +15317,17 @@ class Page:
                 name="rustwright-page-events",
             )
             self._event_pump_thread.start()
+
+    def __enter__(self) -> "Page":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        _traceback: Optional[TracebackType],
+    ) -> None:
+        self.close()
 
     def _slow_mo(self) -> None:
         if self._slow_mo_ms > 0:
