@@ -3161,7 +3161,7 @@ mod tests {
     }
 
     impl InputCdpPeer {
-        async fn next_command(&mut self) -> Value {
+        async fn next_protocol_command(&mut self) -> Value {
             let outgoing = match self.write_rx.recv().await {
                 Some(outgoing) => outgoing,
                 None if self.allow_close => {
@@ -3179,6 +3179,15 @@ mod tests {
                 CdpOutgoing::Close => panic!("unexpected transport close"),
             };
             let command = serde_json::from_str::<Value>(&payload).expect("valid CDP command");
+            let evaluation_source = match command["method"].as_str() {
+                Some("Runtime.evaluate") => command["params"]["expression"].as_str().unwrap_or(""),
+                Some("Runtime.callFunctionOn") => command["params"]["functionDeclaration"]
+                    .as_str()
+                    .unwrap_or(""),
+                _ => "",
+            };
+            let installing_serializer =
+                evaluation_source.contains("__rustwright_serializer_factory__");
             let delete_raw_down = command["method"] == "Input.dispatchKeyEvent"
                 && command["params"]["type"] == "rawKeyDown"
                 && command["params"]["key"] == "Delete";
@@ -3205,8 +3214,18 @@ mod tests {
                     json!({ "frameTree": { "frame": { "id": "test-frame" } } })
                 }
                 Some("Page.createIsolatedWorld") => json!({ "executionContextId": 1 }),
-                Some("Runtime.evaluate") => {
-                    let expression = command["params"]["expression"].as_str().unwrap_or("");
+                Some("Runtime.evaluate") | Some("Runtime.callFunctionOn")
+                    if installing_serializer =>
+                {
+                    json!({
+                        "result": {
+                            "type": "object",
+                            "objectId": "input-serializer",
+                        }
+                    })
+                }
+                Some("Runtime.evaluate") | Some("Runtime.callFunctionOn") => {
+                    let expression = evaluation_source;
                     let value = if expression.contains("doc.activeElement !== fallback") {
                         Value::Bool(!self.focus_target)
                     } else if let Some(fill_value) = &self.fill_value {
@@ -3290,7 +3309,9 @@ mod tests {
                 }
                 _ => json!({}),
             };
-            let response_delay = if self.fill_guard_lost
+            let response_delay = if installing_serializer {
+                None
+            } else if self.fill_guard_lost
                 && self.delay_resolution_after_guard_loss
                 && command["method"] == "Page.getFrameTree"
             {
@@ -3301,11 +3322,7 @@ mod tests {
             if let Some(delay) = response_delay {
                 tokio::time::sleep(delay).await;
             }
-            let response = if command["method"] == "Runtime.evaluate"
-                && command["params"]["expression"]
-                    .as_str()
-                    .is_some_and(|expression| expression.contains("fallback.focus();"))
-            {
+            let response = if evaluation_source.contains("fallback.focus();") {
                 self.focus_response_error_after_execution
                     .take()
                     .map_or_else(
@@ -3315,10 +3332,8 @@ mod tests {
             } else {
                 json!({ "id": command["id"], "result": result })
             };
-            if let Some(expression) = command["params"]["expression"]
-                .as_str()
-                .filter(|expression| expression.contains("commitment: 'commencing'"))
-            {
+            if evaluation_source.contains("commitment: 'commencing'") {
+                let expression = evaluation_source;
                 let dispatch_id = action_dispatch_string_literal(expression, "dispatchId");
                 let token = action_dispatch_string_literal(expression, "token");
                 let payload = json!({
@@ -3350,6 +3365,26 @@ mod tests {
             );
             command
         }
+        async fn next_command(&mut self) -> Value {
+            loop {
+                let mut command = self.next_protocol_command().await;
+                let source = command["params"]["expression"]
+                    .as_str()
+                    .or_else(|| command["params"]["functionDeclaration"].as_str())
+                    .unwrap_or("");
+                if source.contains("__rustwright_serializer_factory__") {
+                    continue;
+                }
+                if command["method"] == "Runtime.callFunctionOn"
+                    && source.contains("__rustwright_evaluate_wrapper__")
+                {
+                    let source = source.to_string();
+                    command["method"] = Value::String("Runtime.evaluate".to_string());
+                    command["params"]["expression"] = Value::String(source);
+                }
+                return command;
+            }
+        }
 
         async fn commands(&mut self, count: usize) -> Vec<Value> {
             let mut commands = Vec::with_capacity(count);
@@ -3377,6 +3412,7 @@ mod tests {
             events: events.clone(),
             event_log: Arc::clone(&event_log),
             traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -4960,7 +4996,7 @@ multiline-compatible = """4.5.6"""
                 matches!(
                     &result,
                     Err(RwError::Cdp { method, message })
-                        if method == "Runtime.evaluate" && message == FOCUS_ERROR
+                        if method == "Runtime.callFunctionOn" && message == FOCUS_ERROR
                 ),
                 "{entry_path:?}: {result:?}"
             );
@@ -5173,6 +5209,7 @@ multiline-compatible = """4.5.6"""
             events: events.clone(),
             event_log: Arc::clone(&event_log),
             traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -5242,6 +5279,14 @@ multiline-compatible = """4.5.6"""
                         }
                         "Page.createIsolatedWorld" => json!({ "executionContextId": 1 }),
                         "Runtime.evaluate" => {
+                            json!({
+                                "result": {
+                                    "type": "object",
+                                    "objectId": "typing-serializer",
+                                }
+                            })
+                        }
+                        "Runtime.callFunctionOn" => {
                             json!({ "result": { "type": "boolean", "value": true } })
                         }
                         "Input.dispatchKeyEvent" => json!({}),
@@ -5312,6 +5357,7 @@ multiline-compatible = """4.5.6"""
             events: events.clone(),
             event_log: Arc::clone(&event_log),
             traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -5422,6 +5468,7 @@ multiline-compatible = """4.5.6"""
             events: events.clone(),
             event_log: Arc::clone(&event_log),
             traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -5820,6 +5867,7 @@ multiline-compatible = """4.5.6"""
             events: events.clone(),
             event_log: Arc::clone(&event_log),
             traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -5897,6 +5945,7 @@ multiline-compatible = """4.5.6"""
             events,
             event_log,
             traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -5997,6 +6046,7 @@ multiline-compatible = """4.5.6"""
                 events,
                 event_log: Arc::new(Mutex::new(CdpEventLog::new())),
                 traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+                runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
                 next_id: AtomicU64::new(1),
                 sent_runtime_enable_count: AtomicU64::new(0),
                 sent_target_close_count: AtomicU64::new(0),
@@ -7014,6 +7064,20 @@ multiline-compatible = """4.5.6"""
 
         assert!(args.iter().any(|arg| arg == "--password-store=basic"));
         assert!(args.iter().any(|arg| arg == "--use-mock-keychain"));
+    }
+
+    #[test]
+    fn chromium_keychain_defaults_honor_user_override_filtering() {
+        let ignored = vec![
+            "--password-store".to_string(),
+            "--use-mock-keychain".to_string(),
+        ];
+
+        assert!(launch_default_arg_ignored(
+            "--password-store=basic",
+            &ignored
+        ));
+        assert!(launch_default_arg_ignored("--use-mock-keychain", &ignored));
     }
 
     #[test]
@@ -8667,6 +8731,7 @@ multiline-compatible = """4.5.6"""
                     events,
                     event_log: Arc::new(Mutex::new(CdpEventLog::new())),
                     traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+                    runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
                     next_id: AtomicU64::new(1),
                     sent_runtime_enable_count: AtomicU64::new(0),
                     sent_target_close_count: AtomicU64::new(0),
@@ -8734,6 +8799,7 @@ multiline-compatible = """4.5.6"""
                 events,
                 event_log: Arc::new(Mutex::new(CdpEventLog::new())),
                 traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+                runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
                 next_id: AtomicU64::new(1),
                 sent_runtime_enable_count: AtomicU64::new(0),
                 sent_target_close_count: AtomicU64::new(0),
@@ -8819,6 +8885,7 @@ multiline-compatible = """4.5.6"""
             events: events.clone(),
             event_log: Arc::clone(&event_log),
             traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -8896,6 +8963,7 @@ multiline-compatible = """4.5.6"""
             events: events.clone(),
             event_log: Arc::clone(&event_log),
             traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -8980,6 +9048,7 @@ multiline-compatible = """4.5.6"""
             events: events.clone(),
             event_log: Arc::clone(&event_log),
             traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -9054,6 +9123,7 @@ multiline-compatible = """4.5.6"""
             events,
             event_log: Arc::new(Mutex::new(CdpEventLog::new())),
             traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -9228,6 +9298,7 @@ multiline-compatible = """4.5.6"""
                 events,
                 event_log: Arc::new(Mutex::new(CdpEventLog::new())),
                 traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+                runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
                 next_id: AtomicU64::new(1),
                 sent_runtime_enable_count: AtomicU64::new(0),
                 sent_target_close_count: AtomicU64::new(0),
@@ -9959,11 +10030,10 @@ multiline-compatible = """4.5.6"""
                 .await
                 .expect("timed out waiting for CDP test command")
                 .expect("CDP test command");
-            let command: Value = match outgoing {
+            match outgoing {
                 CdpOutgoing::Text { payload, .. } => serde_json::from_str(&payload).unwrap(),
                 CdpOutgoing::Close => panic!("unexpected transport close"),
-            };
-            command
+            }
         }
 
         async fn next_command(&mut self, expected_method: &str) -> Value {
@@ -9990,11 +10060,32 @@ multiline-compatible = """4.5.6"""
             );
         }
 
+        fn reply_error_with_code(&self, command: &Value, code: i64, message: &str) {
+            dispatch_cdp_payload(
+                json!({
+                    "id": command["id"],
+                    "error": { "code": code, "message": message },
+                }),
+                Arc::clone(&self.pending),
+                self.events.clone(),
+                Arc::clone(&self.event_log),
+            );
+        }
+
         async fn reply_next(&mut self, expected_method: &str, result: Value) {
             let command = self.next_command(expected_method).await;
             self.reply(&command, result);
         }
 
+        fn observe_runtime_event(&self, event: &Value) {
+            self.page
+                .browser
+                .client
+                .runtime_state
+                .lock()
+                .unwrap()
+                .observe_event(event);
+        }
         async fn reply_action_dispatch_binding(&mut self, expected_session_id: &str) {
             let binding = self.next_command("Runtime.addBinding").await;
             assert_eq!(binding["sessionId"], expected_session_id);
@@ -10004,8 +10095,8 @@ multiline-compatible = """4.5.6"""
             );
             self.reply(&binding, json!({}));
         }
-
         fn emit(&self, event: Value) {
+            self.observe_runtime_event(&event);
             dispatch_cdp_payload(
                 event,
                 Arc::clone(&self.pending),
@@ -10032,6 +10123,7 @@ multiline-compatible = """4.5.6"""
             events: events.clone(),
             event_log: Arc::clone(&event_log),
             traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -11721,6 +11813,31 @@ multiline-compatible = """4.5.6"""
                                         &command,
                                         json!({ "result": { "type": "object", "objectId": "frame-button" } }),
                                     );
+                                }
+                            }
+                            "Runtime.callFunctionOn"
+                                if session_id == Some("click-child-session") =>
+                            {
+                                let function = command["params"]["functionDeclaration"]
+                                    .as_str()
+                                    .expect("function declaration");
+                                if function.contains("__rustwright_serializer_factory__") {
+                                    harness.reply(
+                                        &command,
+                                        json!({
+                                            "result": {
+                                                "type": "object",
+                                                "objectId": "frame-serializer",
+                                            }
+                                        }),
+                                    );
+                                } else if function.contains("receives_events") {
+                                    harness.reply(
+                                        &command,
+                                        json!({ "result": { "type": "object", "value": actionable } }),
+                                    );
+                                } else {
+                                    panic!("unexpected frame function: {function}");
                                 }
                             }
                             "DOM.getBoxModel" => harness.reply(
@@ -13975,13 +14092,29 @@ multiline-compatible = """4.5.6"""
             futures_util::poll!(&mut operation),
             std::task::Poll::Pending
         ));
-        let snapshot = harness.next_command("Runtime.evaluate").await;
-        assert_eq!(
-            snapshot
-                .pointer("/params/expression")
-                .and_then(Value::as_str),
-            Some("document.body.textContent")
+        let serializer = harness.next_command("Runtime.evaluate").await;
+        assert!(serializer
+            .pointer("/params/expression")
+            .and_then(Value::as_str)
+            .is_some_and(|expression| expression.contains("__rustwright_serializer_factory__")));
+        harness.reply(
+            &serializer,
+            json!({
+                "result": {
+                    "type": "object",
+                    "objectId": "goto-snapshot-serializer",
+                }
+            }),
         );
+        assert!(matches!(
+            futures_util::poll!(&mut operation),
+            std::task::Poll::Pending
+        ));
+        let snapshot = harness.next_command("Runtime.callFunctionOn").await;
+        assert!(snapshot
+            .pointer("/params/functionDeclaration")
+            .and_then(Value::as_str)
+            .is_some_and(|function| function.contains("document.body.textContent")));
         harness.reply(
             &snapshot,
             json!({ "result": { "type": "string", "value": "Goto complete" } }),
@@ -14145,13 +14278,29 @@ multiline-compatible = """4.5.6"""
             futures_util::poll!(&mut operation),
             std::task::Poll::Pending
         ));
-        let snapshot = harness.next_command("Runtime.evaluate").await;
-        assert_eq!(
-            snapshot
-                .pointer("/params/expression")
-                .and_then(Value::as_str),
-            Some("document.body.textContent")
+        let serializer = harness.next_command("Runtime.evaluate").await;
+        assert!(serializer
+            .pointer("/params/expression")
+            .and_then(Value::as_str)
+            .is_some_and(|expression| expression.contains("__rustwright_serializer_factory__")));
+        harness.reply(
+            &serializer,
+            json!({
+                "result": {
+                    "type": "object",
+                    "objectId": "reload-snapshot-serializer",
+                }
+            }),
         );
+        assert!(matches!(
+            futures_util::poll!(&mut operation),
+            std::task::Poll::Pending
+        ));
+        let snapshot = harness.next_command("Runtime.callFunctionOn").await;
+        assert!(snapshot
+            .pointer("/params/functionDeclaration")
+            .and_then(Value::as_str)
+            .is_some_and(|function| function.contains("document.body.textContent")));
         harness.reply(
             &snapshot,
             json!({ "result": { "type": "string", "value": "Status waiting" } }),
@@ -14882,6 +15031,17 @@ multiline-compatible = """4.5.6"""
                         json!({
                             "result": {
                                 "type": "object",
+                                "objectId": "dialog-action-serializer",
+                            }
+                        }),
+                    )
+                    .await;
+                harness
+                    .reply_next(
+                        "Runtime.callFunctionOn",
+                        json!({
+                            "result": {
+                                "type": "object",
                                 "value": {
                                     "count": 1,
                                     "strict_violation": false,
@@ -15057,9 +15217,20 @@ multiline-compatible = """4.5.6"""
                 Some("frame-main")
             );
             harness.reply(&utility_world, json!({ "executionContextId": 1 }));
+            harness
+                .reply_next(
+                    "Runtime.evaluate",
+                    json!({
+                        "result": {
+                            "type": "object",
+                            "objectId": "public-action-serializer",
+                        }
+                    }),
+                )
+                .await;
 
             if matches!(action, PublicSettledAction::Scroll) {
-                let dispatch = harness.next_command("Runtime.evaluate").await;
+                let dispatch = harness.next_command("Runtime.callFunctionOn").await;
                 assert!(
                     harness.events.receiver_count() >= 1,
                     "scroll settlement must subscribe before its dispatch"
@@ -15079,7 +15250,7 @@ multiline-compatible = """4.5.6"""
 
             harness
                 .reply_next(
-                    "Runtime.evaluate",
+                    "Runtime.callFunctionOn",
                     json!({
                         "result": {
                             "type": "object",
@@ -15135,7 +15306,7 @@ multiline-compatible = """4.5.6"""
                 harness.reply(&utility_world, json!({ "executionContextId": 3 }));
                 harness
                     .reply_next(
-                        "Runtime.evaluate",
+                        "Runtime.callFunctionOn",
                         json!({
                             "result": {
                                 "type": "string",
@@ -15180,7 +15351,7 @@ multiline-compatible = """4.5.6"""
                 harness.reply(&utility_world, json!({ "executionContextId": 4 }));
                 harness
                     .reply_next(
-                        "Runtime.evaluate",
+                        "Runtime.callFunctionOn",
                         json!({ "result": { "type": "boolean", "value": true } }),
                     )
                     .await;
@@ -15211,6 +15382,597 @@ multiline-compatible = """4.5.6"""
         ] {
             run_public_settled_action(action);
         }
+    }
+
+    #[tokio::test]
+    async fn evaluate_data_result_is_one_runtime_command_and_handle_path_is_unchanged() {
+        let mut harness = navigation_test_harness(4);
+
+        let client = Arc::clone(&harness.page.browser.client);
+        let warmup = tokio::spawn(async move {
+            evaluate_expression_in_session_before(
+                &client,
+                "page-session",
+                None,
+                make_evaluate_expression("0", None),
+                OperationDeadline::new(Duration::from_secs(1)),
+            )
+            .await
+        });
+        let install_command = harness.next_command("Runtime.evaluate").await;
+        assert_eq!(install_command["params"]["returnByValue"], false);
+        assert_eq!(
+            install_command["params"]["expression"],
+            format!("({})()", runtime_value_serializer_factory())
+        );
+        harness.reply(
+            &install_command,
+            json!({
+                "result": {
+                    "type": "function",
+                    "objectId": "serializer-main",
+                },
+            }),
+        );
+        let warmup_command = harness.next_command("Runtime.callFunctionOn").await;
+        assert_eq!(warmup_command["params"]["objectId"], "serializer-main");
+        assert_eq!(
+            warmup_command["params"]["arguments"],
+            json!([{ "objectId": "serializer-main" }])
+        );
+        harness.reply(
+            &warmup_command,
+            json!({ "result": { "type": "number", "value": 0 } }),
+        );
+        assert_eq!(warmup.await.unwrap().unwrap(), "0");
+
+        let client = Arc::clone(&harness.page.browser.client);
+        let object_evaluate = tokio::spawn(async move {
+            evaluate_expression_in_session_before(
+                &client,
+                "page-session",
+                None,
+                "({ answer: 42 })".to_string(),
+                OperationDeadline::new(Duration::from_secs(1)),
+            )
+            .await
+        });
+        let object_command = harness.next_command("Runtime.callFunctionOn").await;
+        assert_eq!(object_command["params"]["objectId"], "serializer-main");
+        assert_eq!(object_command["params"]["returnByValue"], true);
+        assert_eq!(
+            object_command["params"]["arguments"],
+            json!([{ "objectId": "serializer-main" }])
+        );
+        assert_eq!(
+            object_command["params"]["functionDeclaration"],
+            serialize_evaluate_result_function("({ answer: 42 })")
+        );
+        assert!(object_command["params"]["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains("__rustwright_evaluate_wrapper__"));
+        assert!(!object_command["params"]["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains(RUNTIME_VALUE_SERIALIZER));
+        harness.reply(
+            &object_command,
+            json!({
+                "result": {
+                    "type": "object",
+                    "value": {
+                        "__rustwright_cdp_object__": 1,
+                        "entries": { "answer": 42 },
+                    },
+                },
+            }),
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), object_evaluate)
+                .await
+                .expect("steady object evaluate should finish after one Runtime reply")
+                .unwrap()
+                .unwrap(),
+            json!({
+                "__rustwright_cdp_object__": 1,
+                "entries": { "answer": 42 },
+            })
+            .to_string()
+        );
+        assert!(matches!(
+            harness.write_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let client = Arc::clone(&harness.page.browser.client);
+        let primitive_evaluate = tokio::spawn(async move {
+            evaluate_expression_in_session_before(
+                &client,
+                "page-session",
+                None,
+                make_evaluate_expression("1", None),
+                OperationDeadline::new(Duration::from_secs(1)),
+            )
+            .await
+        });
+        let primitive_command = harness.next_command("Runtime.callFunctionOn").await;
+        assert_eq!(primitive_command["params"]["objectId"], "serializer-main");
+        assert_eq!(
+            primitive_command["params"]["arguments"],
+            json!([{ "objectId": "serializer-main" }])
+        );
+        harness.reply(
+            &primitive_command,
+            json!({ "result": { "type": "number", "value": 1 } }),
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), primitive_evaluate)
+                .await
+                .expect("primitive evaluate should keep its one-command path")
+                .unwrap()
+                .unwrap(),
+            "1"
+        );
+        assert!(matches!(
+            harness.write_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let page = Arc::clone(&harness.page);
+        let call_function_evaluate = tokio::spawn(async move {
+            evaluate_locator_for_element_handle(
+                page,
+                "element-handle-1".to_string(),
+                Some("page-session".to_string()),
+                r##"{"kind":"css","selector":"#target"}"##.to_string(),
+                0,
+                "return { answer: 42 };".to_string(),
+                Duration::from_secs(1),
+                true,
+                false,
+                Duration::ZERO,
+            )
+            .await
+        });
+        let call_function_command = harness.next_command("Runtime.callFunctionOn").await;
+        assert_eq!(
+            call_function_command["params"]["objectId"],
+            "element-handle-1"
+        );
+        assert_eq!(
+            call_function_command["params"]["arguments"],
+            json!([{ "objectId": "serializer-main" }])
+        );
+        assert!(call_function_command["params"]["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains("__rustwright_evaluate_wrapper__"));
+        assert!(!call_function_command["params"]["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains(RUNTIME_VALUE_SERIALIZER));
+        harness.reply(
+            &call_function_command,
+            json!({
+                "result": {
+                    "type": "object",
+                    "value": {
+                        "__rustwright_cdp_object__": 1,
+                        "entries": { "answer": 42 },
+                    },
+                },
+            }),
+        );
+        assert_eq!(
+            call_function_evaluate.await.unwrap().unwrap(),
+            json!({
+                "__rustwright_cdp_object__": 1,
+                "entries": { "answer": 42 },
+            })
+            .to_string()
+        );
+
+        let client = Arc::clone(&harness.page.browser.client);
+        let handle_evaluate = tokio::spawn(async move {
+            evaluate_handle_expression_in_session(
+                &client,
+                "page-session",
+                "globalThis".to_string(),
+                OperationDeadline::new(Duration::from_secs(1)),
+            )
+            .await
+        });
+        let handle_command = harness.next_command("Runtime.evaluate").await;
+        assert_eq!(handle_command["params"]["returnByValue"], false);
+        assert_eq!(handle_command["params"]["expression"], "globalThis");
+        harness.reply(
+            &handle_command,
+            json!({ "result": { "type": "object", "objectId": "remote-handle-1" } }),
+        );
+        assert_eq!(
+            handle_evaluate.await.unwrap().unwrap(),
+            json!({ "type": "object", "objectId": "remote-handle-1" })
+        );
+        assert!(matches!(
+            harness.write_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn declaration_helper_user_wrapper_name_survives_inline_exception_conversion() {
+        let mut harness = navigation_test_harness(4);
+        let client = Arc::clone(&harness.page.browser.client);
+        let source = concat!(
+            "const marker = 1; function __rustwright_evaluate_wrapper__() {",
+            " throw new Error('user boom');",
+            " } __rustwright_evaluate_wrapper__();"
+        );
+        let expression = make_evaluate_expression(source, None);
+        assert!(is_script_goal_evaluate_expression(&expression));
+        let evaluate = tokio::spawn(async move {
+            evaluate_expression_in_session_before(
+                &client,
+                "page-session",
+                None,
+                expression,
+                OperationDeadline::new(Duration::from_secs(1)),
+            )
+            .await
+        });
+        let command = harness.next_command("Runtime.evaluate").await;
+        let description = concat!(
+            "Error: user boom\n",
+            "    at __rustwright_evaluate_wrapper__ (<anonymous>:2:9)\n",
+            "    at caller (https://example.test/app.js:7:3)"
+        );
+        harness.reply(
+            &command,
+            json!({
+                "exceptionDetails": {
+                    "scriptId": "user-script",
+                    "exception": { "description": description },
+                    "stackTrace": {
+                        "callFrames": [{
+                            "functionName": "__rustwright_evaluate_wrapper__",
+                            "scriptId": "user-script",
+                            "url": "",
+                            "lineNumber": 1,
+                            "columnNumber": 8,
+                        }],
+                    },
+                },
+                "result": { "type": "object", "subtype": "error" },
+            }),
+        );
+
+        assert_eq!(
+            evaluate.await.unwrap().unwrap_err().to_string(),
+            description
+        );
+    }
+
+    #[tokio::test]
+    async fn serializer_cache_is_one_install_per_realm_across_new_handles() {
+        let mut harness = navigation_test_harness(4);
+        let client = Arc::clone(&harness.page.browser.client);
+        let realm = client.serializer_realm_key("page-session", Some("frame:main"));
+
+        for index in 0..8 {
+            let client = Arc::clone(&client);
+            let realm = realm.clone();
+            let object_id = format!("handle-{index}");
+            let call = tokio::spawn(async move {
+                call_function_with_serialized_result_before(
+                    &client,
+                    &realm,
+                    &object_id,
+                    "function() { return this.value; }",
+                    None,
+                    OperationDeadline::new(Duration::from_secs(1)),
+                )
+                .await
+            });
+            if index == 0 {
+                let install = harness.next_command("Runtime.callFunctionOn").await;
+                assert_eq!(install["params"]["objectId"], "handle-0");
+                assert!(install["params"]["functionDeclaration"]
+                    .as_str()
+                    .unwrap()
+                    .contains("__rustwright_serializer_factory__"));
+                harness.reply(
+                    &install,
+                    json!({
+                        "result": {
+                            "type": "function",
+                            "objectId": "realm-serializer",
+                        },
+                    }),
+                );
+            }
+            let command = harness.next_command("Runtime.callFunctionOn").await;
+            assert_eq!(command["params"]["objectId"], format!("handle-{index}"));
+            assert_eq!(
+                command["params"]["arguments"],
+                json!([{ "objectId": "realm-serializer" }])
+            );
+            harness.reply(
+                &command,
+                json!({ "result": { "type": "number", "value": index } }),
+            );
+            assert_eq!(
+                call.await.unwrap().unwrap()["result"]["value"],
+                json!(index)
+            );
+        }
+
+        assert_eq!(client.runtime_state.lock().unwrap().serializers.len(), 1);
+        assert_eq!(
+            client
+                .runtime_state
+                .lock()
+                .unwrap()
+                .serializer_install_locks
+                .len(),
+            1
+        );
+        assert!(matches!(
+            harness.write_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn detached_realm_cannot_commit_in_flight_serializer_install() {
+        let mut harness = navigation_test_harness(4);
+        let client = Arc::clone(&harness.page.browser.client);
+
+        for index in 0..8 {
+            let realm =
+                client.serializer_realm_key("page-session", Some(&format!("frame:child-{index}")));
+            let install_client = Arc::clone(&client);
+            let install_realm = realm.clone();
+            let install = tokio::spawn(async move {
+                serializer_for_realm(
+                    &install_client,
+                    &install_realm,
+                    None,
+                    None,
+                    OperationDeadline::new(Duration::from_secs(1)),
+                )
+                .await
+            });
+            let install_command = harness.next_command("Runtime.evaluate").await;
+            harness.reply(
+                &install_command,
+                json!({
+                    "result": {
+                        "type": "function",
+                        "objectId": format!("invalidated-serializer-{index}"),
+                    },
+                }),
+            );
+            // The current-thread test runtime does not resume the install task until
+            // this test yields, so the detach deterministically wins the commit.
+            harness.observe_runtime_event(&json!({
+                "method": "Target.detachedFromTarget",
+                "params": { "sessionId": "page-session" },
+            }));
+            {
+                let state = client.runtime_state.lock().unwrap();
+                assert!(!state.serializer_generations.contains_key(&realm));
+                assert!(state.serializer_install_locks.is_empty());
+            }
+
+            assert_eq!(
+                install.await.unwrap().unwrap_err().to_string(),
+                "Execution context was destroyed, most likely because of a navigation."
+            );
+            let state = client.runtime_state.lock().unwrap();
+            assert!(state.serializers.is_empty());
+            assert!(
+                state.serializer_install_locks.is_empty(),
+                "cycle {index} retained an install lock"
+            );
+            assert!(
+                state.serializer_generations.is_empty(),
+                "cycle {index} retained a serializer generation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_serializer_install_removes_exact_install_lock() {
+        let mut harness = navigation_test_harness(4);
+        let client = Arc::clone(&harness.page.browser.client);
+        let realm = client.serializer_realm_key("page-session", Some("frame:main"));
+        let install_client = Arc::clone(&client);
+        let install_realm = realm.clone();
+        let install = tokio::spawn(async move {
+            serializer_for_realm(
+                &install_client,
+                &install_realm,
+                None,
+                None,
+                OperationDeadline::new(Duration::from_secs(1)),
+            )
+            .await
+        });
+        let install_command = harness.next_command("Runtime.evaluate").await;
+        harness.reply_error_with_code(&install_command, -32_000, "serializer install failed");
+
+        assert!(install.await.unwrap().is_err());
+        let state = client.runtime_state.lock().unwrap();
+        assert!(state.serializer_install_locks.is_empty());
+        assert!(state.serializer_generations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serializer_navigation_eviction_releases_live_object() {
+        let mut harness = navigation_test_harness(4);
+        let client = Arc::clone(&harness.page.browser.client);
+        let (release_tx, release_rx) = mpsc::unbounded_channel();
+        client.runtime_state.lock().unwrap().release_tx = Some(release_tx);
+        spawn_serializer_release_pump(release_rx, client.write_tx.clone());
+        let realm = client.serializer_realm_key("page-session", Some("frame:main"));
+        let (generation, install_lock) = client.serializer_install_lock(&realm);
+        {
+            let _install_guard = install_lock.lock().await;
+            assert!(client.remember_serializer(
+                &realm,
+                generation,
+                &install_lock,
+                "live-serializer".to_string(),
+                Some("7".to_string()),
+            ));
+        }
+
+        harness.observe_runtime_event(&json!({
+            "method": "Page.frameNavigated",
+            "sessionId": "page-session",
+            "params": { "frame": { "id": "main", "loaderId": "loader-a" } }
+        }));
+        harness.observe_runtime_event(&json!({
+            "method": "Page.frameNavigated",
+            "sessionId": "page-session",
+            "params": { "frame": { "id": "main", "loaderId": "loader-b" } }
+        }));
+
+        let release = harness.next_command("Runtime.releaseObject").await;
+        assert_eq!(release["sessionId"], "page-session");
+        assert_eq!(release["params"]["objectId"], "live-serializer");
+        assert!(client.serializer_handle(&realm).is_none());
+        assert!(client
+            .runtime_state
+            .lock()
+            .unwrap()
+            .serializer_install_locks
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn execution_context_destroyed_never_retries_user_code() {
+        let mut harness = navigation_test_harness(4);
+        let client = Arc::clone(&harness.page.browser.client);
+        let evaluate_client = Arc::clone(&client);
+        let evaluate = tokio::spawn(async move {
+            evaluate_expression_in_session_before(
+                &evaluate_client,
+                "page-session",
+                Some("frame:main"),
+                make_evaluate_expression("globalThis.beaconCount += 1", None),
+                OperationDeadline::new(Duration::from_secs(1)),
+            )
+            .await
+        });
+        let install = harness.next_command("Runtime.evaluate").await;
+        harness.reply(
+            &install,
+            json!({
+                "result": {
+                    "type": "function",
+                    "objectId": "serializer-before-navigation",
+                },
+            }),
+        );
+        let user_command = harness.next_command("Runtime.callFunctionOn").await;
+        harness.reply_error_with_code(&user_command, -32_000, "Execution context was destroyed.");
+
+        assert_eq!(
+            evaluate.await.unwrap().unwrap_err().to_string(),
+            "Execution context was destroyed, most likely because of a navigation."
+        );
+        assert!(matches!(
+            harness.write_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(client
+            .serializer_handle(&client.serializer_realm_key("page-session", Some("frame:main"),))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn evaluate_serializer_cache_reinstalls_once_after_navigation_recreates_context() {
+        let mut harness = navigation_test_harness(4);
+        let client = Arc::clone(&harness.page.browser.client);
+        let initial = tokio::spawn(async move {
+            evaluate_expression_in_session_before(
+                &client,
+                "page-session",
+                None,
+                make_evaluate_expression("1", None),
+                OperationDeadline::new(Duration::from_secs(1)),
+            )
+            .await
+        });
+        let install_command = harness.next_command("Runtime.evaluate").await;
+        harness.reply(
+            &install_command,
+            json!({
+                "result": {
+                    "type": "function",
+                    "objectId": "serializer-before-navigation",
+                },
+            }),
+        );
+        let initial_call = harness.next_command("Runtime.callFunctionOn").await;
+        assert_eq!(
+            initial_call["params"]["objectId"],
+            "serializer-before-navigation"
+        );
+        harness.reply(
+            &initial_call,
+            json!({ "result": { "type": "number", "value": 1 } }),
+        );
+        assert_eq!(initial.await.unwrap().unwrap(), "1");
+
+        let client = Arc::clone(&harness.page.browser.client);
+        let after_navigation = tokio::spawn(async move {
+            evaluate_expression_in_session_before(
+                &client,
+                "page-session",
+                None,
+                make_evaluate_expression("2", None),
+                OperationDeadline::new(Duration::from_secs(1)),
+            )
+            .await
+        });
+        let stale_cache_command = harness.next_command("Runtime.callFunctionOn").await;
+        assert_eq!(
+            stale_cache_command["params"]["objectId"],
+            "serializer-before-navigation"
+        );
+        harness.reply_error_with_code(
+            &stale_cache_command,
+            -32_000,
+            "Could not find object with given id",
+        );
+        let reinstall_command = harness.next_command("Runtime.evaluate").await;
+        assert_eq!(reinstall_command["params"]["returnByValue"], false);
+        harness.reply(
+            &reinstall_command,
+            json!({
+                "result": {
+                    "type": "function",
+                    "objectId": "serializer-after-navigation",
+                },
+            }),
+        );
+        let retry_command = harness.next_command("Runtime.callFunctionOn").await;
+        assert_eq!(
+            retry_command["params"]["objectId"],
+            "serializer-after-navigation"
+        );
+        harness.reply(
+            &retry_command,
+            json!({ "result": { "type": "number", "value": 2 } }),
+        );
+        assert_eq!(after_navigation.await.unwrap().unwrap(), "2");
+        assert!(matches!(
+            harness.write_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
@@ -17008,6 +17770,378 @@ impl CdpTrafficLog {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SerializerRealmKey {
+    session_id: String,
+    realm_identity: String,
+}
+
+impl SerializerRealmKey {
+    fn new(session_id: &str, realm_identity: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            realm_identity: realm_identity.into(),
+        }
+    }
+
+    fn in_world(mut self, world_name: &str) -> Self {
+        self.realm_identity = format!("{}|world:{world_name}", self.realm_identity);
+        self
+    }
+
+    fn frame_id(&self) -> Option<&str> {
+        self.realm_identity
+            .strip_prefix("frame:")
+            .and_then(|identity| identity.split("|world:").next())
+    }
+}
+
+#[cfg(test)]
+mod serializer_realm_key_tests {
+    use super::*;
+
+    #[test]
+    fn utility_world_key_does_not_alias_the_default_frame_realm() {
+        let default_realm = SerializerRealmKey::new("page-session", "frame:main");
+        let utility_realm = default_realm.clone().in_world(FRAME_UTILITY_WORLD_NAME);
+
+        assert_ne!(utility_realm, default_realm);
+        assert_eq!(default_realm.frame_id(), Some("main"));
+        assert_eq!(utility_realm.frame_id(), Some("main"));
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SerializerCacheEntry {
+    object_id: String,
+    execution_context_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeExecutionRealm {
+    realm_identity: String,
+    frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SerializerRelease {
+    session_id: String,
+    object_id: String,
+}
+
+struct CdpRuntimeState {
+    serializers: HashMap<SerializerRealmKey, SerializerCacheEntry>,
+    serializer_install_locks: HashMap<SerializerRealmKey, Arc<tokio::sync::Mutex<()>>>,
+    serializer_generations: HashMap<SerializerRealmKey, u64>,
+    next_serializer_generation: u64,
+    execution_realms: HashMap<(String, String), RuntimeExecutionRealm>,
+    session_realms: HashMap<String, String>,
+    frame_loaders: HashMap<(String, String), String>,
+    release_tx: Option<mpsc::UnboundedSender<SerializerRelease>>,
+    #[cfg(any(test, feature = "test-support"))]
+    serializer_release_count: usize,
+}
+
+impl CdpRuntimeState {
+    fn new(release_tx: Option<mpsc::UnboundedSender<SerializerRelease>>) -> Self {
+        Self {
+            serializers: HashMap::new(),
+            serializer_install_locks: HashMap::new(),
+            serializer_generations: HashMap::new(),
+            next_serializer_generation: 0,
+            execution_realms: HashMap::new(),
+            session_realms: HashMap::new(),
+            frame_loaders: HashMap::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            serializer_release_count: 0,
+            release_tx,
+        }
+    }
+
+    fn default_realm_identity(&self, session_id: &str) -> Option<String> {
+        self.session_realms.get(session_id).cloned()
+    }
+
+    fn execution_context_for_realm(&self, realm: &SerializerRealmKey) -> Option<String> {
+        self.execution_realms
+            .iter()
+            .find_map(|((session_id, context_id), execution_realm)| {
+                (session_id == &realm.session_id
+                    && execution_realm.realm_identity == realm.realm_identity)
+                    .then(|| context_id.clone())
+            })
+    }
+
+    fn frame_id_for_execution_context(
+        &self,
+        session_id: &str,
+        execution_context_id: &str,
+    ) -> Option<String> {
+        self.execution_realms
+            .get(&(session_id.to_string(), execution_context_id.to_string()))
+            .and_then(|realm| realm.frame_id.clone())
+    }
+
+    fn next_serializer_generation(&mut self) -> u64 {
+        self.next_serializer_generation = self
+            .next_serializer_generation
+            .checked_add(1)
+            .expect("serializer generation counter exhausted");
+        self.next_serializer_generation
+    }
+
+    fn ensure_serializer_generation(&mut self, realm: &SerializerRealmKey) -> u64 {
+        if let Some(generation) = self.serializer_generations.get(realm) {
+            return *generation;
+        }
+        let generation = self.next_serializer_generation();
+        self.serializer_generations
+            .insert(realm.clone(), generation);
+        generation
+    }
+
+    fn enqueue_serializer_release(&mut self, release: SerializerRelease) {
+        let release_enqueued = self
+            .release_tx
+            .as_ref()
+            .is_some_and(|release_tx| release_tx.send(release).is_ok());
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.serializer_release_count += usize::from(release_enqueued);
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = release_enqueued;
+    }
+
+    fn evict_serializer_realms(
+        &mut self,
+        realms: impl IntoIterator<Item = SerializerRealmKey>,
+        release_live: bool,
+    ) {
+        for realm in realms.into_iter().collect::<HashSet<_>>() {
+            let had_generation = self.serializer_generations.remove(&realm).is_some();
+            let had_lock = self.serializer_install_locks.remove(&realm).is_some();
+            let entry = self.serializers.remove(&realm);
+            if !had_generation && !had_lock && entry.is_none() {
+                continue;
+            }
+            if release_live {
+                if let Some(entry) = entry {
+                    self.enqueue_serializer_release(SerializerRelease {
+                        session_id: realm.session_id,
+                        object_id: entry.object_id,
+                    });
+                }
+            }
+        }
+    }
+
+    fn evict_matching_serializer_realms(
+        &mut self,
+        mut should_evict: impl FnMut(&SerializerRealmKey) -> bool,
+        release_live: bool,
+    ) {
+        let evicted = self
+            .serializers
+            .keys()
+            .chain(self.serializer_install_locks.keys())
+            .chain(self.serializer_generations.keys())
+            .filter(|realm| should_evict(realm))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.evict_serializer_realms(evicted, release_live);
+    }
+
+    fn observe_event(&mut self, event: &Value) {
+        let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+        if method == "Target.attachedToTarget" {
+            let child_session_id = event.pointer("/params/sessionId").and_then(Value::as_str);
+            let target_info = event.pointer("/params/targetInfo");
+            if let (Some(child_session_id), Some(target_info)) = (child_session_id, target_info) {
+                let target_id = target_info.get("targetId").and_then(Value::as_str);
+                let target_type = target_info.get("type").and_then(Value::as_str);
+                if let (Some(target_id), Some(target_type)) = (target_id, target_type) {
+                    let realm_identity = match target_type {
+                        "page" | "iframe" => Some(format!("frame:{target_id}")),
+                        "worker" | "service_worker" | "shared_worker" => {
+                            Some(format!("worker:{target_id}"))
+                        }
+                        _ => None,
+                    };
+                    if let Some(realm_identity) = realm_identity {
+                        self.session_realms
+                            .insert(child_session_id.to_string(), realm_identity);
+                    }
+                }
+            }
+            return;
+        }
+
+        if method == "Target.detachedFromTarget" {
+            if let Some(detached_session_id) =
+                event.pointer("/params/sessionId").and_then(Value::as_str)
+            {
+                self.evict_session(detached_session_id, false);
+            }
+            return;
+        }
+
+        let Some(session_id) = event.get("sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        let params = event.get("params").unwrap_or(&Value::Null);
+        match method {
+            "Runtime.executionContextCreated" => {
+                let context = params.get("context").unwrap_or(&Value::Null);
+                let Some(context_id) = context.get("id") else {
+                    return;
+                };
+                let context_id = context_id.to_string();
+                let frame_id = context
+                    .pointer("/auxData/frameId")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let realm_identity = frame_id
+                    .as_deref()
+                    .map(|frame_id| format!("frame:{frame_id}"))
+                    .or_else(|| self.session_realms.get(session_id).cloned())
+                    .unwrap_or_else(|| format!("session:{session_id}"));
+                self.execution_realms.insert(
+                    (session_id.to_string(), context_id),
+                    RuntimeExecutionRealm {
+                        realm_identity,
+                        frame_id,
+                    },
+                );
+            }
+            "Runtime.executionContextDestroyed" => {
+                let context_id = params
+                    .get("executionContextId")
+                    .map(Value::to_string)
+                    .or_else(|| {
+                        params
+                            .get("executionContextUniqueId")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                    });
+                if let Some(context_id) = context_id {
+                    let execution_realm = self
+                        .execution_realms
+                        .remove(&(session_id.to_string(), context_id.clone()));
+                    let mut evicted = self
+                        .serializers
+                        .iter()
+                        .filter(|(realm, entry)| {
+                            realm.session_id == session_id
+                                && entry.execution_context_id.as_deref()
+                                    == Some(context_id.as_str())
+                        })
+                        .map(|(realm, _)| realm.clone())
+                        .collect::<Vec<_>>();
+                    if let Some(execution_realm) = execution_realm {
+                        let realm =
+                            SerializerRealmKey::new(session_id, execution_realm.realm_identity);
+                        if self.serializer_generations.contains_key(&realm)
+                            || self.serializer_install_locks.contains_key(&realm)
+                            || self.serializers.contains_key(&realm)
+                        {
+                            evicted.push(realm);
+                        }
+                    }
+                    self.evict_serializer_realms(evicted, false);
+                }
+            }
+            "Runtime.executionContextsCleared" => self.evict_session(session_id, false),
+            "Page.frameNavigated" => {
+                let frame = params.get("frame").unwrap_or(&Value::Null);
+                let frame_id = frame.get("id").and_then(Value::as_str);
+                let loader_id = frame.get("loaderId").and_then(Value::as_str);
+                if let (Some(frame_id), Some(loader_id)) = (frame_id, loader_id) {
+                    let loader_key = (session_id.to_string(), frame_id.to_string());
+                    let loader_changed = self
+                        .frame_loaders
+                        .insert(loader_key, loader_id.to_string())
+                        .is_some_and(|previous| previous != loader_id);
+                    if loader_changed {
+                        self.evict_frame(session_id, frame_id, true);
+                    }
+                }
+            }
+            "Page.frameDetached" => {
+                let reason = params.get("reason").and_then(Value::as_str);
+                let release_live = match reason {
+                    Some("remove") => Some(false),
+                    Some("swap") => Some(true),
+                    _ => None,
+                };
+                if let (Some(frame_id), Some(release_live)) =
+                    (params.get("frameId").and_then(Value::as_str), release_live)
+                {
+                    self.evict_frame(session_id, frame_id, release_live);
+                    if reason == Some("remove") {
+                        self.frame_loaders
+                            .remove(&(session_id.to_string(), frame_id.to_string()));
+                    }
+                }
+            }
+            "Page.frameSwapped" | "Page.frameSwappedByActivation" => {
+                if let Some(frame_id) = params.get("frameId").and_then(Value::as_str) {
+                    self.evict_frame(session_id, frame_id, true);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn evict_frame(&mut self, session_id: &str, frame_id: &str, release_live: bool) {
+        self.evict_matching_serializer_realms(
+            |realm| realm.session_id == session_id && realm.frame_id() == Some(frame_id),
+            release_live,
+        );
+        self.execution_realms
+            .retain(|(realm_session_id, _), realm| {
+                realm_session_id != session_id || realm.frame_id.as_deref() != Some(frame_id)
+            });
+    }
+
+    fn evict_session(&mut self, session_id: &str, release_live: bool) {
+        self.evict_matching_serializer_realms(|realm| realm.session_id == session_id, release_live);
+        self.execution_realms
+            .retain(|(realm_session_id, _), _| realm_session_id != session_id);
+        self.session_realms.remove(session_id);
+        self.frame_loaders
+            .retain(|(loader_session_id, _), _| loader_session_id != session_id);
+    }
+}
+
+fn spawn_serializer_release_pump(
+    mut release_rx: mpsc::UnboundedReceiver<SerializerRelease>,
+    write_tx: mpsc::UnboundedSender<CdpOutgoing>,
+) {
+    static NEXT_RELEASE_ID: AtomicU64 = AtomicU64::new(8_000_000_000_000_000);
+    tokio::spawn(async move {
+        while let Some(release) = release_rx.recv().await {
+            let id = NEXT_RELEASE_ID.fetch_add(1, Ordering::SeqCst);
+            let payload = json!({
+                "id": id,
+                "method": "Runtime.releaseObject",
+                "params": { "objectId": release.object_id },
+                "sessionId": release.session_id,
+            });
+            if write_tx
+                .send(CdpOutgoing::Text {
+                    payload: payload.to_string(),
+                    tracker: None,
+                    diagnostic_id: None,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
 struct CdpClientDiagnosticSnapshot {
     captured_at: Instant,
     traffic: Vec<CdpTrafficEntry>,
@@ -17127,6 +18261,7 @@ struct CdpClient {
     events: broadcast::Sender<Value>,
     event_log: Arc<Mutex<CdpEventLog>>,
     traffic_log: Arc<Mutex<CdpTrafficLog>>,
+    runtime_state: Arc<Mutex<CdpRuntimeState>>,
     next_id: AtomicU64,
     sent_runtime_enable_count: AtomicU64,
     sent_target_close_count: AtomicU64,
@@ -17374,6 +18509,7 @@ fn dispatch_cdp_payload_with_diagnostics(
     events: broadcast::Sender<Value>,
     event_log: Arc<Mutex<CdpEventLog>>,
     traffic_log: Arc<Mutex<CdpTrafficLog>>,
+    runtime_state: Arc<Mutex<CdpRuntimeState>>,
 ) {
     if let Some(id) = payload.get("id").and_then(Value::as_u64) {
         let sender = pending.lock().unwrap().remove(&id);
@@ -17402,6 +18538,7 @@ fn dispatch_cdp_payload_with_diagnostics(
             let _ = sender.send(result);
         }
     } else {
+        runtime_state.lock().unwrap().observe_event(&payload);
         traffic_log
             .lock()
             .unwrap()
@@ -17426,6 +18563,7 @@ fn dispatch_cdp_payload(
         events,
         event_log,
         Arc::new(Mutex::new(CdpTrafficLog::new())),
+        Arc::new(Mutex::new(CdpRuntimeState::new(None))),
     );
 }
 
@@ -17486,6 +18624,140 @@ fn ensure_ws_request_path(
 }
 
 impl CdpClient {
+    fn serializer_realm_key(
+        &self,
+        session_id: &str,
+        realm_identity: Option<&str>,
+    ) -> SerializerRealmKey {
+        let realm_identity = realm_identity
+            .map(ToString::to_string)
+            .or_else(|| {
+                self.runtime_state
+                    .lock()
+                    .unwrap()
+                    .default_realm_identity(session_id)
+            })
+            .unwrap_or_else(|| format!("session:{session_id}"));
+        SerializerRealmKey::new(session_id, realm_identity)
+    }
+
+    fn serializer_handle(&self, realm: &SerializerRealmKey) -> Option<String> {
+        self.runtime_state
+            .lock()
+            .unwrap()
+            .serializers
+            .get(realm)
+            .map(|entry| entry.object_id.clone())
+    }
+
+    fn serializer_install_lock(
+        &self,
+        realm: &SerializerRealmKey,
+    ) -> (u64, Arc<tokio::sync::Mutex<()>>) {
+        let mut runtime_state = self.runtime_state.lock().unwrap();
+        let generation = runtime_state.ensure_serializer_generation(realm);
+        let install_lock = runtime_state
+            .serializer_install_locks
+            .entry(realm.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        (generation, install_lock)
+    }
+
+    fn serializer_install_is_current(
+        &self,
+        realm: &SerializerRealmKey,
+        generation: u64,
+        install_lock: &Arc<tokio::sync::Mutex<()>>,
+    ) -> bool {
+        let runtime_state = self.runtime_state.lock().unwrap();
+        runtime_state.serializer_generations.get(realm) == Some(&generation)
+            && runtime_state
+                .serializer_install_locks
+                .get(realm)
+                .is_some_and(|current| Arc::ptr_eq(current, install_lock))
+    }
+
+    fn remember_serializer(
+        &self,
+        realm: &SerializerRealmKey,
+        generation: u64,
+        install_lock: &Arc<tokio::sync::Mutex<()>>,
+        object_id: String,
+        execution_context_id: Option<String>,
+    ) -> bool {
+        let mut runtime_state = self.runtime_state.lock().unwrap();
+        let generation_is_current =
+            runtime_state.serializer_generations.get(realm) == Some(&generation);
+        let lock_is_current = runtime_state
+            .serializer_install_locks
+            .get(realm)
+            .is_some_and(|current| Arc::ptr_eq(current, install_lock));
+        if !generation_is_current || !lock_is_current {
+            return false;
+        }
+        let execution_context_id =
+            execution_context_id.or_else(|| runtime_state.execution_context_for_realm(realm));
+        runtime_state.serializers.insert(
+            realm.clone(),
+            SerializerCacheEntry {
+                object_id,
+                execution_context_id,
+            },
+        );
+        true
+    }
+
+    fn cleanup_serializer_install(
+        &self,
+        realm: &SerializerRealmKey,
+        generation: u64,
+        install_lock: &Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let mut runtime_state = self.runtime_state.lock().unwrap();
+        let exact_lock = runtime_state
+            .serializer_install_locks
+            .get(realm)
+            .is_some_and(|current| Arc::ptr_eq(current, install_lock));
+        if exact_lock {
+            runtime_state.serializer_install_locks.remove(realm);
+        }
+        if exact_lock
+            && runtime_state.serializer_generations.get(realm) == Some(&generation)
+            && !runtime_state.serializers.contains_key(realm)
+        {
+            runtime_state.serializer_generations.remove(realm);
+        }
+    }
+
+    fn release_uncommitted_serializer(&self, realm: &SerializerRealmKey, object_id: String) {
+        self.runtime_state
+            .lock()
+            .unwrap()
+            .enqueue_serializer_release(SerializerRelease {
+                session_id: realm.session_id.clone(),
+                object_id,
+            });
+    }
+
+    fn forget_serializer(&self, realm: &SerializerRealmKey) {
+        self.runtime_state
+            .lock()
+            .unwrap()
+            .evict_serializer_realms([realm.clone()], false);
+    }
+
+    fn frame_id_for_execution_context(
+        &self,
+        session_id: &str,
+        execution_context_id: &str,
+    ) -> Option<String> {
+        self.runtime_state
+            .lock()
+            .unwrap()
+            .frame_id_for_execution_context(session_id, execution_context_id)
+    }
+
     async fn connect(ws_endpoint: &str) -> RwResult<Arc<Self>> {
         Self::connect_with_headers(ws_endpoint, &[]).await
     }
@@ -17543,6 +18815,12 @@ impl CdpClient {
         let traffic_log = Arc::new(Mutex::new(CdpTrafficLog::new()));
         let traffic_log_writer = Arc::clone(&traffic_log);
         let traffic_log_reader = Arc::clone(&traffic_log);
+        let (serializer_release_tx, serializer_release_rx) = mpsc::unbounded_channel();
+        let runtime_state = Arc::new(Mutex::new(CdpRuntimeState::new(Some(
+            serializer_release_tx,
+        ))));
+        let runtime_state_reader = Arc::clone(&runtime_state);
+        spawn_serializer_release_pump(serializer_release_rx, write_tx.clone());
         let alive = Arc::new(AtomicBool::new(true));
         let alive_writer = Arc::clone(&alive);
         let alive_reader = Arc::clone(&alive);
@@ -17616,6 +18894,7 @@ impl CdpClient {
                     events_reader.clone(),
                     Arc::clone(&event_log_reader),
                     Arc::clone(&traffic_log_reader),
+                    Arc::clone(&runtime_state_reader),
                 );
             }
             alive_reader.store(false, Ordering::SeqCst);
@@ -17630,6 +18909,7 @@ impl CdpClient {
             events,
             event_log,
             traffic_log,
+            runtime_state,
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -17658,6 +18938,12 @@ impl CdpClient {
         let traffic_log = Arc::new(Mutex::new(CdpTrafficLog::new()));
         let traffic_log_writer = Arc::clone(&traffic_log);
         let traffic_log_dispatcher = Arc::clone(&traffic_log);
+        let (serializer_release_tx, serializer_release_rx) = mpsc::unbounded_channel();
+        let runtime_state = Arc::new(Mutex::new(CdpRuntimeState::new(Some(
+            serializer_release_tx,
+        ))));
+        let runtime_state_dispatcher = Arc::clone(&runtime_state);
+        spawn_serializer_release_pump(serializer_release_rx, write_tx.clone());
         let alive = Arc::new(AtomicBool::new(true));
         let alive_writer = Arc::clone(&alive);
         let alive_dispatcher = Arc::clone(&alive);
@@ -17745,6 +19031,7 @@ impl CdpClient {
                     events_dispatcher.clone(),
                     Arc::clone(&event_log_dispatcher),
                     Arc::clone(&traffic_log_dispatcher),
+                    Arc::clone(&runtime_state_dispatcher),
                 );
             }
             alive_dispatcher.store(false, Ordering::SeqCst);
@@ -17763,6 +19050,7 @@ impl CdpClient {
             events,
             event_log,
             traffic_log,
+            runtime_state,
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -21162,8 +22450,8 @@ struct PyDownloadEventWaiter {
 #[pyclass(name = "_FileChooserEventWaiter")]
 struct PyFileChooserEventWaiter {
     browser: Arc<BrowserInner>,
+    page: Arc<PageInner>,
     receiver: Mutex<Option<broadcast::Receiver<Value>>>,
-    session_id: String,
 }
 
 #[cfg(feature = "python")]
@@ -21807,16 +23095,24 @@ fn evaluate_locator_wait_probe_for_page(
     timeout_ms: Option<f64>,
 ) -> RwResult<String> {
     let timeout = BrowserInner::command_timeout(timeout_ms);
+    let realm_identity = page
+        .main_frame_id
+        .lock()
+        .unwrap()
+        .as_deref()
+        .map(|frame_id| format!("frame:{frame_id}"));
     let browser = Arc::clone(&page.browser);
     browser.block_on(async move {
         let attempt_page = Arc::clone(&page);
         run_locator_wait_retry(page, timeout, move |deadline| {
             let page = Arc::clone(&attempt_page);
             let expression = expression.clone();
+            let realm_identity = realm_identity.clone();
             async move {
                 evaluate_expression_in_session_before(
                     &page.browser.client,
                     &page.session_id,
+                    realm_identity.as_deref(),
                     expression,
                     deadline,
                 )
@@ -21832,8 +23128,20 @@ async fn evaluate_expression_for_page_async(
     expression: String,
     timeout: Duration,
 ) -> RwResult<String> {
-    evaluate_expression_in_session(&page.browser.client, &page.session_id, expression, timeout)
-        .await
+    let realm_identity = page
+        .main_frame_id
+        .lock()
+        .unwrap()
+        .as_deref()
+        .map(|frame_id| format!("frame:{frame_id}"));
+    evaluate_expression_in_session(
+        &page.browser.client,
+        &page.session_id,
+        realm_identity.as_deref(),
+        expression,
+        timeout,
+    )
+    .await
 }
 
 #[derive(Clone, Copy)]
@@ -22350,6 +23658,7 @@ async fn evaluate_resolved_locator_body(
         evaluate_expression_in_session_before(
             &page.browser.client,
             &resolved.session_id,
+            None,
             expression,
             deadline,
         )
@@ -23041,6 +24350,359 @@ async fn settle_after_pointer_action(
     }
 }
 
+fn invalid_serializer_handle_error(error: &RwError) -> bool {
+    // CDP resolves the Runtime.callFunctionOn receiver and every object/context
+    // argument before it dispatches the function. These two protocol rejections
+    // therefore prove that user JavaScript did not start. They are the complete
+    // retry allow-list: navigation-time context destruction is not proof of
+    // pre-dispatch failure and must never resend user code.
+    matches!(
+        error,
+        RwError::Cdp { method, message }
+            if method == "Runtime.callFunctionOn"
+                && matches!(
+                    message.as_str(),
+                    "Could not find object with given id"
+                        | "Cannot find context with specified id"
+                )
+    )
+}
+
+fn execution_context_destroyed_error(error: &RwError) -> bool {
+    matches!(
+        error,
+        RwError::Cdp { method, message }
+            if method == "Runtime.callFunctionOn"
+                && matches!(
+                    message.as_str(),
+                    "Execution context was destroyed." | "Inspected target navigated or closed"
+                )
+    )
+}
+
+fn upstream_context_destroyed_error() -> RwError {
+    RwError::Message(
+        "Execution context was destroyed, most likely because of a navigation.".to_string(),
+    )
+}
+
+async fn install_runtime_value_serializer(
+    client: &CdpClient,
+    session_id: &str,
+    context_id: Option<&Value>,
+    receiver_object_id: Option<&str>,
+    timeout: Duration,
+) -> RwResult<String> {
+    let result = if let Some(object_id) = receiver_object_id {
+        client
+            .send(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": runtime_value_serializer_factory(),
+                    "awaitPromise": false,
+                    "returnByValue": false,
+                }),
+                Some(session_id),
+                timeout,
+            )
+            .await?
+    } else {
+        let mut params = json!({
+            "expression": format!("({})()", runtime_value_serializer_factory()),
+            "awaitPromise": false,
+            "returnByValue": false,
+        });
+        if let Some(context_id) = context_id {
+            params["contextId"] = context_id.clone();
+        }
+        client
+            .send("Runtime.evaluate", params, Some(session_id), timeout)
+            .await?
+    };
+    if let Some(exception) = result.get("exceptionDetails") {
+        return Err(RwError::Message(runtime_exception_message(exception)));
+    }
+    result
+        .pointer("/result/objectId")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            RwError::Message("CDP did not return a serializer object handle".to_string())
+        })
+}
+
+async fn serializer_for_realm(
+    client: &CdpClient,
+    realm: &SerializerRealmKey,
+    context_id: Option<&Value>,
+    receiver_object_id: Option<&str>,
+    deadline: OperationDeadline,
+) -> RwResult<String> {
+    let (generation, install_lock) = client.serializer_install_lock(realm);
+    let _install_guard = install_lock.lock().await;
+    if !client.serializer_install_is_current(realm, generation, &install_lock) {
+        client.cleanup_serializer_install(realm, generation, &install_lock);
+        return Err(upstream_context_destroyed_error());
+    }
+    if let Some(object_id) = client.serializer_handle(realm) {
+        return Ok(object_id);
+    }
+    let timeout = match deadline.remaining() {
+        Ok(timeout) => timeout,
+        Err(error) => {
+            client.cleanup_serializer_install(realm, generation, &install_lock);
+            return Err(error);
+        }
+    };
+    let object_id = match install_runtime_value_serializer(
+        client,
+        &realm.session_id,
+        context_id,
+        receiver_object_id,
+        timeout,
+    )
+    .await
+    {
+        Ok(object_id) => object_id,
+        Err(error) => {
+            client.cleanup_serializer_install(realm, generation, &install_lock);
+            return Err(error);
+        }
+    };
+    if !client.remember_serializer(
+        realm,
+        generation,
+        &install_lock,
+        object_id.clone(),
+        context_id.map(Value::to_string),
+    ) {
+        client.cleanup_serializer_install(realm, generation, &install_lock);
+        client.release_uncommitted_serializer(realm, object_id);
+        return Err(upstream_context_destroyed_error());
+    }
+    Ok(object_id)
+}
+
+async fn send_inline_serialized_evaluate(
+    client: &CdpClient,
+    session_id: &str,
+    context_id: Option<&Value>,
+    expression: &str,
+    timeout: Duration,
+) -> RwResult<Value> {
+    let mut params = json!({
+        "expression": serialize_evaluate_result_expression(expression),
+        "awaitPromise": true,
+        "returnByValue": true,
+        "userGesture": true,
+    });
+    if let Some(context_id) = context_id {
+        params["contextId"] = context_id.clone();
+    }
+    client
+        .send("Runtime.evaluate", params, Some(session_id), timeout)
+        .await
+}
+
+async fn send_serialized_evaluate(
+    client: &CdpClient,
+    session_id: &str,
+    serializer_object_id: &str,
+    function_declaration: &str,
+    timeout: Duration,
+) -> RwResult<Value> {
+    client
+        .send(
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": serializer_object_id,
+                "functionDeclaration": function_declaration,
+                "arguments": [{ "objectId": serializer_object_id }],
+                "awaitPromise": true,
+                "returnByValue": true,
+                "userGesture": true,
+            }),
+            Some(session_id),
+            timeout,
+        )
+        .await
+}
+
+async fn evaluate_serialized_expression_before(
+    client: &CdpClient,
+    realm: &SerializerRealmKey,
+    context_id: Option<&Value>,
+    expression: &str,
+    deadline: OperationDeadline,
+) -> RwResult<String> {
+    if is_script_goal_evaluate_expression(expression) {
+        let result = send_inline_serialized_evaluate(
+            client,
+            &realm.session_id,
+            context_id,
+            expression,
+            deadline.remaining()?,
+        )
+        .await?;
+        return runtime_inline_evaluate_serialized_result_to_json(&result);
+    }
+
+    let function_declaration = serialize_evaluate_result_function(expression);
+    let expected_wrapper_line = function_declaration.lines().count();
+    let serializer = serializer_for_realm(client, realm, context_id, None, deadline).await?;
+    let result = match send_serialized_evaluate(
+        client,
+        &realm.session_id,
+        &serializer,
+        &function_declaration,
+        deadline.remaining()?,
+    )
+    .await
+    {
+        Err(error) if invalid_serializer_handle_error(&error) => {
+            client.forget_serializer(realm);
+            let serializer =
+                serializer_for_realm(client, realm, context_id, None, deadline).await?;
+            send_serialized_evaluate(
+                client,
+                &realm.session_id,
+                &serializer,
+                &function_declaration,
+                deadline.remaining()?,
+            )
+            .await?
+        }
+        Err(error) if execution_context_destroyed_error(&error) => {
+            client.forget_serializer(realm);
+            return Err(upstream_context_destroyed_error());
+        }
+        result => result?,
+    };
+    runtime_evaluate_serialized_result_to_json(&result, 1, expected_wrapper_line)
+}
+
+fn arguments_with_serializer(arguments: Option<&Value>, serializer_object_id: &str) -> Value {
+    let mut arguments = arguments
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    arguments.push(json!({ "objectId": serializer_object_id }));
+    Value::Array(arguments)
+}
+
+async fn send_serialized_call_function(
+    client: &CdpClient,
+    session_id: &str,
+    object_id: &str,
+    serializer_object_id: &str,
+    function_declaration: &str,
+    arguments: Option<&Value>,
+    timeout: Duration,
+) -> RwResult<Value> {
+    client
+        .send(
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": serialize_call_function_result(function_declaration),
+                "arguments": arguments_with_serializer(arguments, serializer_object_id),
+                "awaitPromise": true,
+                "returnByValue": true,
+                "userGesture": true,
+            }),
+            Some(session_id),
+            timeout,
+        )
+        .await
+}
+
+async fn call_function_with_serialized_result_before(
+    client: &CdpClient,
+    realm: &SerializerRealmKey,
+    object_id: &str,
+    function_declaration: &str,
+    arguments: Option<&Value>,
+    deadline: OperationDeadline,
+) -> RwResult<Value> {
+    let serializer = serializer_for_realm(client, realm, None, Some(object_id), deadline).await?;
+    match send_serialized_call_function(
+        client,
+        &realm.session_id,
+        object_id,
+        &serializer,
+        function_declaration,
+        arguments,
+        deadline.remaining()?,
+    )
+    .await
+    {
+        Err(error) if invalid_serializer_handle_error(&error) => {
+            client.forget_serializer(realm);
+            let serializer =
+                serializer_for_realm(client, realm, None, Some(object_id), deadline).await?;
+            send_serialized_call_function(
+                client,
+                &realm.session_id,
+                object_id,
+                &serializer,
+                function_declaration,
+                arguments,
+                deadline.remaining()?,
+            )
+            .await
+        }
+        Err(error) if execution_context_destroyed_error(&error) => {
+            client.forget_serializer(realm);
+            Err(upstream_context_destroyed_error())
+        }
+        result => result,
+    }
+}
+
+async fn call_function_in_context_with_serialized_result_before(
+    client: &CdpClient,
+    realm: &SerializerRealmKey,
+    context_id: Option<&Value>,
+    function_declaration: &str,
+    arguments: Option<&Value>,
+    deadline: OperationDeadline,
+) -> RwResult<Value> {
+    let serializer = serializer_for_realm(client, realm, context_id, None, deadline).await?;
+    match send_serialized_call_function(
+        client,
+        &realm.session_id,
+        &serializer,
+        &serializer,
+        function_declaration,
+        arguments,
+        deadline.remaining()?,
+    )
+    .await
+    {
+        Err(error) if invalid_serializer_handle_error(&error) => {
+            client.forget_serializer(realm);
+            let serializer =
+                serializer_for_realm(client, realm, context_id, None, deadline).await?;
+            send_serialized_call_function(
+                client,
+                &realm.session_id,
+                &serializer,
+                &serializer,
+                function_declaration,
+                arguments,
+                deadline.remaining()?,
+            )
+            .await
+        }
+        Err(error) if execution_context_destroyed_error(&error) => {
+            client.forget_serializer(realm);
+            Err(upstream_context_destroyed_error())
+        }
+        result => result,
+    }
+}
+
 fn evaluate_expression_for_frame(
     page: Arc<PageInner>,
     frame_id: String,
@@ -23051,6 +24713,7 @@ fn evaluate_expression_for_frame(
     let browser = Arc::clone(&page.browser);
     let client = Arc::clone(&browser.client);
     let session_id = page.session_for_frame_id(&frame_id)?;
+    let realm_identity = format!("frame:{frame_id}");
     browser.block_on(async move {
         let world = client
             .send(
@@ -23069,33 +24732,31 @@ fn evaluate_expression_for_frame(
                 RwError::Message("CDP did not return an executionContextId".to_string())
             })?
             .clone();
-        let result = client
-            .send(
-                "Runtime.evaluate",
-                json!({
-                    "expression": expression,
-                    "contextId": context_id,
-                    "awaitPromise": true,
-                    "returnByValue": false,
-                    "userGesture": true,
-                }),
-                Some(&session_id),
-                timeout,
-            )
-            .await?;
-        runtime_result_to_json_with_serializer(&client, &session_id, &result, timeout).await
+        let realm = client
+            .serializer_realm_key(&session_id, Some(&realm_identity))
+            .in_world(FRAME_UTILITY_WORLD_NAME);
+        evaluate_serialized_expression_before(
+            &client,
+            &realm,
+            Some(&context_id),
+            &expression,
+            OperationDeadline::new(timeout),
+        )
+        .await
     })
 }
 
 async fn evaluate_expression_in_session(
     client: &CdpClient,
     session_id: &str,
+    realm_identity: Option<&str>,
     expression: String,
     timeout: Duration,
 ) -> RwResult<String> {
     evaluate_expression_in_session_before(
         client,
         session_id,
+        realm_identity,
         expression,
         OperationDeadline::new(timeout),
     )
@@ -23105,23 +24766,12 @@ async fn evaluate_expression_in_session(
 async fn evaluate_expression_in_session_before(
     client: &CdpClient,
     session_id: &str,
+    realm_identity: Option<&str>,
     expression: String,
     deadline: OperationDeadline,
 ) -> RwResult<String> {
-    let result = client
-        .send(
-            "Runtime.evaluate",
-            json!({
-                "expression": expression,
-                "awaitPromise": true,
-                "returnByValue": false,
-                "userGesture": true,
-            }),
-            Some(session_id),
-            deadline.remaining()?,
-        )
-        .await?;
-    runtime_result_to_json_with_serializer(client, session_id, &result, deadline.remaining()?).await
+    let realm = client.serializer_realm_key(session_id, realm_identity);
+    evaluate_serialized_expression_before(client, &realm, None, &expression, deadline).await
 }
 
 async fn evaluate_handle_expression_in_session(
@@ -23157,32 +24807,30 @@ async fn evaluate_expression_in_frame_context(
     let context_id =
         create_isolated_world_for_frame(client, session_id, frame_id, deadline.remaining()?)
             .await?;
-    evaluate_expression_in_context_before(client, session_id, context_id, expression, deadline)
-        .await
+    evaluate_expression_in_context_before(
+        client,
+        session_id,
+        Some(format!("frame:{frame_id}").as_str()),
+        context_id,
+        expression,
+        deadline,
+    )
+    .await
 }
 
 async fn evaluate_expression_in_context_before(
     client: &CdpClient,
     session_id: &str,
+    realm_identity: Option<&str>,
     context_id: Value,
     expression: String,
     deadline: OperationDeadline,
 ) -> RwResult<String> {
-    let result = client
-        .send(
-            "Runtime.evaluate",
-            json!({
-                "expression": expression,
-                "contextId": context_id,
-                "awaitPromise": true,
-                "returnByValue": false,
-                "userGesture": true,
-            }),
-            Some(session_id),
-            deadline.remaining()?,
-        )
-        .await?;
-    runtime_result_to_json_with_serializer(client, session_id, &result, deadline.remaining()?).await
+    let realm = client
+        .serializer_realm_key(session_id, realm_identity)
+        .in_world(FRAME_UTILITY_WORLD_NAME);
+    evaluate_serialized_expression_before(client, &realm, Some(&context_id), &expression, deadline)
+        .await
 }
 
 async fn evaluate_handle_expression_in_frame_context(
@@ -23277,6 +24925,11 @@ async fn evaluate_locator_resolution(
         evaluate_expression_in_context_before(
             &page.browser.client,
             &resolution.session_id,
+            resolution
+                .frame_id
+                .as_deref()
+                .map(|frame_id| format!("frame:{frame_id}"))
+                .as_deref(),
             context_id,
             expression,
             transport_deadline,
@@ -23286,6 +24939,7 @@ async fn evaluate_locator_resolution(
         evaluate_expression_in_session_before(
             &page.browser.client,
             &resolution.session_id,
+            None,
             expression,
             transport_deadline,
         )
@@ -23818,6 +25472,7 @@ async fn evaluate_locator_for_element_handle(
 ) -> RwResult<String> {
     let deadline = OperationDeadline::new(timeout);
     let session_id = session_id.unwrap_or_else(|| page.session_id.clone());
+    let realm = page.browser.client.serializer_realm_key(&session_id, None);
     let expression = locator_script_for_root(&locator_json, index, &body, "this");
     let expression = expression.trim();
     let attached_guard = if require_attached {
@@ -23835,24 +25490,35 @@ async fn evaluate_locator_for_element_handle(
 }}"#
     );
     let transport_timeout = deadline.remaining()?.saturating_add(transport_slack);
-    let result = page
-        .browser
-        .client
-        .send(
-            "Runtime.callFunctionOn",
-            json!({
-                "objectId": object_id,
-                "functionDeclaration": function_declaration,
-                "awaitPromise": true,
-                "returnByValue": return_by_value,
-                "userGesture": true,
-            }),
-            Some(&session_id),
-            transport_timeout,
+    let result = if return_by_value {
+        call_function_with_serialized_result_before(
+            &page.browser.client,
+            &realm,
+            &object_id,
+            &function_declaration,
+            None,
+            OperationDeadline::new(transport_timeout),
         )
-        .await?;
+        .await?
+    } else {
+        page.browser
+            .client
+            .send(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": function_declaration,
+                    "awaitPromise": true,
+                    "returnByValue": false,
+                    "userGesture": true,
+                }),
+                Some(&session_id),
+                transport_timeout,
+            )
+            .await?
+    };
     if return_by_value {
-        runtime_result_to_json(&result)
+        runtime_serialized_result_to_json(&result)
     } else {
         runtime_result_to_remote_object_with_session(&result, &session_id)
     }
@@ -27498,6 +29164,27 @@ impl PyPage {
         self.inner.background_override_active.load(Ordering::SeqCst)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn _runtime_state_test_hook(&self) -> String {
+        let state = self.inner.browser.client.runtime_state.lock().unwrap();
+        let mut serializer_realms = state
+            .serializers
+            .keys()
+            .map(|realm| format!("{}|{}", realm.session_id, realm.realm_identity))
+            .collect::<Vec<_>>();
+        serializer_realms.sort();
+        json!({
+            "serializers": state.serializers.len(),
+            "serializer_install_locks": state.serializer_install_locks.len(),
+            "serializer_generations": state.serializer_generations.len(),
+            "execution_realms": state.execution_realms.len(),
+            "frame_loaders": state.frame_loaders.len(),
+            "serializer_realms": serializer_realms,
+            "release_object_count": state.serializer_release_count,
+        })
+        .to_string()
+    }
+
     #[pyo3(signature = (url, wait_until=None, timeout_ms=None, referer=None))]
     fn goto_async(
         &self,
@@ -27890,6 +29577,14 @@ el.click();
         PyCdpSession {
             browser: Arc::clone(&self.inner.browser),
             session_id: Some(self.inner.session_id.clone()),
+            detached: AtomicBool::new(false),
+        }
+    }
+
+    fn cdp_session_for_id(&self, session_id: &str) -> PyCdpSession {
+        PyCdpSession {
+            browser: Arc::clone(&self.inner.browser),
+            session_id: Some(session_id.to_string()),
             detached: AtomicBool::new(false),
         }
     }
@@ -29123,6 +30818,11 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
     ) -> PyResult<String> {
         let arguments = serde_json::from_str::<Value>(arguments_json)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        if return_by_value {
+            return self
+                .call_function_in_default_context(function_declaration, Some(arguments), timeout_ms)
+                .map_err(py_err);
+        }
         let global_payload = self
             .evaluate_handle_expression("globalThis", timeout_ms)
             .map_err(py_err)?;
@@ -29138,6 +30838,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
             Some(arguments),
             return_by_value,
             timeout_ms,
+            None,
             None,
         );
         let _ = self.js_handle_dispose(object_id, timeout_ms, None);
@@ -29208,12 +30909,13 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         .map_err(py_err)
     }
 
-    #[pyo3(signature = (object_id, timeout_ms=None, session_id=None))]
+    #[pyo3(signature = (object_id, timeout_ms=None, session_id=None, realm_identity=None))]
     fn js_handle_json_value(
         &self,
         object_id: &str,
         timeout_ms: Option<f64>,
         session_id: Option<&str>,
+        realm_identity: Option<&str>,
     ) -> PyResult<String> {
         self.call_function_on_handle(
             object_id,
@@ -29222,6 +30924,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
             true,
             timeout_ms,
             session_id,
+            realm_identity,
         )
         .map_err(py_err)
     }
@@ -29242,6 +30945,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
             false,
             timeout_ms,
             session_id,
+            None,
         )
         .map_err(py_err)
     }
@@ -29306,7 +31010,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
             .map_err(py_err)
     }
 
-    #[pyo3(signature = (object_id, expression, arg_json=None, return_by_value=true, timeout_ms=None, session_id=None))]
+    #[pyo3(signature = (object_id, expression, arg_json=None, return_by_value=true, timeout_ms=None, session_id=None, realm_identity=None))]
     fn js_handle_evaluate(
         &self,
         object_id: &str,
@@ -29315,6 +31019,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         return_by_value: bool,
         timeout_ms: Option<f64>,
         session_id: Option<&str>,
+        realm_identity: Option<&str>,
     ) -> PyResult<String> {
         let trimmed = expression.trim();
         let function = if arg_json.is_some() {
@@ -29339,11 +31044,12 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
             return_by_value,
             timeout_ms,
             session_id,
+            realm_identity,
         )
         .map_err(py_err)
     }
 
-    #[pyo3(signature = (object_id, function_declaration, arguments_json, return_by_value=true, timeout_ms=None, session_id=None))]
+    #[pyo3(signature = (object_id, function_declaration, arguments_json, return_by_value=true, timeout_ms=None, session_id=None, realm_identity=None))]
     fn js_handle_evaluate_with_call_arguments(
         &self,
         object_id: &str,
@@ -29352,6 +31058,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         return_by_value: bool,
         timeout_ms: Option<f64>,
         session_id: Option<&str>,
+        realm_identity: Option<&str>,
     ) -> PyResult<String> {
         let arguments = serde_json::from_str::<Value>(arguments_json)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -29362,6 +31069,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
             return_by_value,
             timeout_ms,
             session_id,
+            realm_identity,
         )
         .map_err(py_err)
     }
@@ -30473,6 +32181,17 @@ return { ready: true, result: true, payload: null };
         })
     }
 
+    fn execution_context_frame_id(
+        &self,
+        session_id: &str,
+        execution_context_id: &str,
+    ) -> Option<String> {
+        self.inner
+            .browser
+            .client
+            .frame_id_for_execution_context(session_id, execution_context_id)
+    }
+
     #[pyo3(signature = (kind, request_id=None))]
     fn websocket_event_waiter(
         &self,
@@ -30577,8 +32296,8 @@ return { ready: true, result: true, payload: null };
     fn file_chooser_event_waiter(&self) -> PyFileChooserEventWaiter {
         PyFileChooserEventWaiter {
             browser: Arc::clone(&self.inner.browser),
+            page: Arc::clone(&self.inner),
             receiver: Mutex::new(Some(self.inner.browser.client.subscribe())),
-            session_id: self.inner.session_id.clone(),
         }
     }
 
@@ -30692,12 +32411,13 @@ return { ready: true, result: true, payload: null };
             .map_err(py_err)
     }
 
-    #[pyo3(signature = (backend_node_id, files_json, timeout_ms=None))]
+    #[pyo3(signature = (backend_node_id, files_json, timeout_ms=None, session_id=None))]
     fn set_file_input_files(
         &self,
         backend_node_id: u64,
         files_json: &str,
         timeout_ms: Option<f64>,
+        session_id: Option<&str>,
     ) -> PyResult<()> {
         let files: Value = serde_json::from_str(files_json)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -30705,7 +32425,9 @@ return { ready: true, result: true, payload: null };
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
         let client = Arc::clone(&browser.client);
-        let session_id = page.session_id.clone();
+        let session_id = session_id
+            .map(ToString::to_string)
+            .unwrap_or_else(|| page.session_id.clone());
         browser
             .block_on(async move {
                 set_file_input_files_for_session(
@@ -31034,24 +32756,16 @@ impl PyWorker {
         let browser = Arc::clone(&self.browser);
         let client = Arc::clone(&browser.client);
         let session_id = self.session_id.clone();
+        let realm_identity = format!("worker:{}", self.target_id);
         let timeout = BrowserInner::command_timeout(timeout_ms);
         py.detach(move || {
-            browser.block_on(async move {
-                let result = client
-                    .send(
-                        "Runtime.evaluate",
-                        json!({
-                            "expression": expression,
-                            "awaitPromise": true,
-                            "returnByValue": false,
-                            "userGesture": true,
-                        }),
-                        Some(&session_id),
-                        timeout,
-                    )
-                    .await?;
-                runtime_result_to_json_with_serializer(&client, &session_id, &result, timeout).await
-            })
+            browser.block_on(evaluate_expression_in_session(
+                &client,
+                &session_id,
+                Some(&realm_identity),
+                expression,
+                timeout,
+            ))
         })
         .map_err(py_err)
     }
@@ -31101,6 +32815,11 @@ impl PyWorker {
     ) -> PyResult<String> {
         let arguments = serde_json::from_str::<Value>(arguments_json)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        if return_by_value {
+            return self
+                .call_function_in_default_context(function_declaration, Some(arguments), timeout_ms)
+                .map_err(py_err);
+        }
         let global_payload = self
             .evaluate_handle(py, "globalThis", None, timeout_ms)
             .map_err(|error| error)?;
@@ -31308,6 +33027,35 @@ impl PyWorker {
 
 #[cfg(feature = "python")]
 impl PyWorker {
+    fn call_function_in_default_context(
+        &self,
+        function_declaration: &str,
+        arguments: Option<Value>,
+        timeout_ms: Option<f64>,
+    ) -> RwResult<String> {
+        let browser = Arc::clone(&self.browser);
+        let client = Arc::clone(&browser.client);
+        let session_id = self.session_id.clone();
+        let realm = client.serializer_realm_key(
+            &session_id,
+            Some(format!("worker:{}", self.target_id).as_str()),
+        );
+        let function_declaration = function_declaration.to_string();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        browser.block_on(async move {
+            let result = call_function_in_context_with_serialized_result_before(
+                &client,
+                &realm,
+                None,
+                &function_declaration,
+                arguments.as_ref(),
+                OperationDeadline::new(timeout),
+            )
+            .await?;
+            runtime_serialized_result_to_json(&result)
+        })
+    }
+
     fn call_function_on_handle(
         &self,
         object_id: &str,
@@ -31319,25 +33067,41 @@ impl PyWorker {
         let browser = Arc::clone(&self.browser);
         let client = Arc::clone(&browser.client);
         let session_id = self.session_id.clone();
+        let realm = client.serializer_realm_key(
+            &session_id,
+            Some(format!("worker:{}", self.target_id).as_str()),
+        );
         let object_id = object_id.to_string();
         let function_declaration = function_declaration.to_string();
         let timeout = BrowserInner::command_timeout(timeout_ms);
         browser.block_on(async move {
-            let mut params = json!({
-                "objectId": object_id,
-                "functionDeclaration": function_declaration,
-                "awaitPromise": true,
-                "returnByValue": false,
-                "userGesture": true,
-            });
-            if let Some(arguments) = arguments {
-                params["arguments"] = arguments;
-            }
-            let result = client
-                .send("Runtime.callFunctionOn", params, Some(&session_id), timeout)
-                .await?;
+            let result = if return_by_value {
+                call_function_with_serialized_result_before(
+                    &client,
+                    &realm,
+                    &object_id,
+                    &function_declaration,
+                    arguments.as_ref(),
+                    OperationDeadline::new(timeout),
+                )
+                .await?
+            } else {
+                let mut params = json!({
+                    "objectId": object_id,
+                    "functionDeclaration": function_declaration,
+                    "awaitPromise": true,
+                    "returnByValue": false,
+                    "userGesture": true,
+                });
+                if let Some(arguments) = arguments {
+                    params["arguments"] = arguments;
+                }
+                client
+                    .send("Runtime.callFunctionOn", params, Some(&session_id), timeout)
+                    .await?
+            };
             if return_by_value {
-                runtime_result_to_json_with_serializer(&client, &session_id, &result, timeout).await
+                runtime_serialized_result_to_json(&result)
             } else {
                 runtime_result_to_remote_object(&result)
             }
@@ -31787,14 +33551,11 @@ impl PyFileChooserEventWaiter {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("file chooser waiter is already waiting"))?;
         let browser = Arc::clone(&self.browser);
-        let session_id = self.session_id.clone();
+        let page = Arc::clone(&self.page);
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let (result, receiver) = py.detach(move || {
-            let result = browser.block_on_raw(wait_for_file_chooser_event(
-                &mut receiver,
-                &session_id,
-                timeout,
-            ));
+            let result =
+                browser.block_on_raw(wait_for_file_chooser_event(&mut receiver, &page, timeout));
             (result, receiver)
         });
         *self.receiver.lock().unwrap() = Some(receiver);
@@ -32076,6 +33837,39 @@ impl PyPage {
         })
     }
 
+    fn call_function_in_default_context(
+        &self,
+        function_declaration: &str,
+        arguments: Option<Value>,
+        timeout_ms: Option<f64>,
+    ) -> RwResult<String> {
+        let page = Arc::clone(&self.inner);
+        let function_declaration = function_declaration.to_string();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let browser = Arc::clone(&page.browser);
+        let client = Arc::clone(&browser.client);
+        let session_id = page.session_id.clone();
+        let realm_identity = page
+            .main_frame_id
+            .lock()
+            .unwrap()
+            .as_deref()
+            .map(|frame_id| format!("frame:{frame_id}"));
+        let realm = client.serializer_realm_key(&session_id, realm_identity.as_deref());
+        browser.block_on(async move {
+            let result = call_function_in_context_with_serialized_result_before(
+                &client,
+                &realm,
+                None,
+                &function_declaration,
+                arguments.as_ref(),
+                OperationDeadline::new(timeout),
+            )
+            .await?;
+            runtime_serialized_result_to_json(&result)
+        })
+    }
+
     fn call_function_on_handle(
         &self,
         object_id: &str,
@@ -32084,6 +33878,7 @@ impl PyPage {
         return_by_value: bool,
         timeout_ms: Option<f64>,
         session_id: Option<&str>,
+        realm_identity: Option<&str>,
     ) -> RwResult<String> {
         let page = Arc::clone(&self.inner);
         let object_id = object_id.to_string();
@@ -32094,22 +33889,35 @@ impl PyPage {
         let session_id = session_id
             .map(ToString::to_string)
             .unwrap_or_else(|| page.session_id.clone());
+        let realm = client.serializer_realm_key(&session_id, realm_identity);
         browser.block_on(async move {
-            let mut params = json!({
-                "objectId": object_id,
-                "functionDeclaration": function_declaration,
-                "awaitPromise": true,
-                "returnByValue": false,
-                "userGesture": true,
-            });
-            if let Some(arguments) = arguments {
-                params["arguments"] = arguments;
-            }
-            let result = client
-                .send("Runtime.callFunctionOn", params, Some(&session_id), timeout)
-                .await?;
+            let result = if return_by_value {
+                call_function_with_serialized_result_before(
+                    &client,
+                    &realm,
+                    &object_id,
+                    &function_declaration,
+                    arguments.as_ref(),
+                    OperationDeadline::new(timeout),
+                )
+                .await?
+            } else {
+                let mut params = json!({
+                    "objectId": object_id,
+                    "functionDeclaration": function_declaration,
+                    "awaitPromise": true,
+                    "returnByValue": false,
+                    "userGesture": true,
+                });
+                if let Some(arguments) = arguments {
+                    params["arguments"] = arguments;
+                }
+                client
+                    .send("Runtime.callFunctionOn", params, Some(&session_id), timeout)
+                    .await?
+            };
             if return_by_value {
-                runtime_result_to_json_with_serializer(&client, &session_id, &result, timeout).await
+                runtime_serialized_result_to_json(&result)
             } else {
                 runtime_result_to_remote_object_with_session(&result, &session_id)
             }
@@ -32513,6 +34321,7 @@ impl RustwrightNavigationHarness {
             events: events.clone(),
             event_log: Arc::clone(&event_log),
             traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+            runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
             next_id: AtomicU64::new(1),
             sent_runtime_enable_count: AtomicU64::new(0),
             sent_target_close_count: AtomicU64::new(0),
@@ -38003,6 +39812,7 @@ mod native_console_record_tests {
                 events: events.clone(),
                 event_log: Arc::clone(&event_log),
                 traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+                runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
                 next_id: AtomicU64::new(1),
                 sent_runtime_enable_count: AtomicU64::new(0),
                 sent_target_close_count: AtomicU64::new(0),
@@ -41201,7 +43011,7 @@ async fn wait_for_download_event(
 
 async fn wait_for_file_chooser_event(
     events: &mut broadcast::Receiver<Value>,
-    session_id: &str,
+    page: &PageInner,
     timeout: Duration,
 ) -> RwResult<String> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -41216,7 +43026,7 @@ async fn wait_for_file_chooser_event(
                 let matches_session = event
                     .get("sessionId")
                     .and_then(Value::as_str)
-                    .map(|value| value == session_id)
+                    .map(|session_id| page.frame_state.lock().unwrap().owns_session(session_id))
                     .unwrap_or(false);
                 if !matches_session {
                     continue;
@@ -41862,6 +43672,7 @@ fn websocket_frame_from_event(event: &Value, request_id: Option<&str>) -> Option
 fn file_chooser_from_event(event: &Value) -> Option<Value> {
     let params = event.get("params")?;
     Some(json!({
+        "session_id": event.get("sessionId").cloned().unwrap_or(Value::Null),
         "frame_id": params.get("frameId").cloned().unwrap_or(Value::Null),
         "backend_node_id": params.get("backendNodeId").cloned().unwrap_or(Value::Null),
         "mode": params.get("mode").cloned().unwrap_or(Value::Null),
@@ -41892,11 +43703,19 @@ fn console_from_event(event: &Value) -> Option<Value> {
         .cloned()
         .unwrap_or_default();
     let values: Vec<Value> = args.iter().map(console_arg_value).collect();
+    let session_id = event.get("sessionId").and_then(Value::as_str);
     let handle_args: Vec<Value> = args
         .iter()
         .map(|arg| {
+            let mut remote = arg.clone();
+            if let (Some(session_id), Some(remote)) = (session_id, remote.as_object_mut()) {
+                remote.insert(
+                    "__rustwright_session_id".to_string(),
+                    Value::String(session_id.to_string()),
+                );
+            }
             json!({
-                "__rustwright_cdp_remote_object__": arg,
+                "__rustwright_cdp_remote_object__": remote,
             })
         })
         .collect();
@@ -41928,6 +43747,8 @@ fn console_from_event(event: &Value) -> Option<Value> {
         "args": handle_args,
         "location": location,
         "timestamp": params.get("timestamp").cloned().unwrap_or(Value::Null),
+        "session_id": session_id,
+        "execution_context_id": params.get("executionContextId").cloned().unwrap_or(Value::Null),
     }))
 }
 
@@ -43617,7 +45438,7 @@ mod wire_decode_tests {
     }
 }
 
-const RUNTIME_VALUE_SERIALIZER: &str = r#"(function __rw_serialize(value) {
+const RUNTIME_VALUE_SERIALIZER: &str = r#"(function (value) {
     const marker = "__rustwright_cdp_unserializable_value__";
     const seen = new WeakMap();
     let nextRef = 0;
@@ -43719,6 +45540,44 @@ const RUNTIME_VALUE_SERIALIZER: &str = r#"(function __rw_serialize(value) {
     return serialize(value);
 })"#;
 
+fn runtime_value_serializer_factory() -> String {
+    format!(
+        "function __rustwright_serializer_factory__(){{const holder=Object.create(null);holder.serialize={RUNTIME_VALUE_SERIALIZER};return holder;}}"
+    )
+}
+
+fn is_script_goal_evaluate_expression(expression: &str) -> bool {
+    expression.starts_with("{\n") && expression.ends_with("\n}")
+}
+
+fn serialize_evaluate_result_expression(expression: &str) -> String {
+    format!("{expression}\n({RUNTIME_VALUE_SERIALIZER})(undefined)")
+}
+
+fn serialize_evaluate_result_function(expression: &str) -> String {
+    format!(
+        "function __rustwright_evaluate_wrapper__(){{\
+var __rw_serializer=arguments[arguments.length-1].serialize;\
+var __rw_result=(function(){{return (\n{expression}\n);}}).call(globalThis);\
+return __rw_result!==null&&(typeof __rw_result==='object'||typeof __rw_result==='function')&&typeof __rw_result.then==='function'\
+?Promise.resolve(__rw_result).then(__rw_serializer):__rw_serializer(__rw_result);\
+}}"
+    )
+}
+
+fn serialize_call_function_result(function_declaration: &str) -> String {
+    format!(
+        "function __rustwright_evaluate_wrapper__(){{\
+var __rw_serializer=arguments[arguments.length-1].serialize;\
+var __rw_result=({function_declaration}).apply(\
+this===arguments[arguments.length-1]?globalThis:this,\
+Array.prototype.slice.call(arguments,0,-1));\
+return __rw_result!==null&&(typeof __rw_result==='object'||typeof __rw_result==='function')&&typeof __rw_result.then==='function'\
+?Promise.resolve(__rw_result).then(__rw_serializer):__rw_serializer(__rw_result);\
+}}"
+    )
+}
+
 fn make_evaluate_expression(expression: &str, arg_json: Option<&str>) -> String {
     let trimmed = expression.trim();
     if is_confident_function_expression(trimmed) {
@@ -43728,7 +45587,7 @@ fn make_evaluate_expression(expression: &str, arg_json: Option<&str>) -> String 
         // working on pages whose CSP blocks eval/new Function.
         let call_args = arg_json.unwrap_or("");
         return format!(
-            "(async () => {{ const __rw_fn = ({trimmed}); return await __rw_fn({call_args}); }})()"
+            "(      () => {{ const __rw_fn = ({trimmed}); return       __rw_fn({call_args}); }})()"
         );
     }
     if arg_json.is_none() {
@@ -43754,7 +45613,7 @@ fn make_evaluate_expression(expression: &str, arg_json: Option<&str>) -> String 
     let literal = serde_json::to_string(trimmed).unwrap_or_else(|_| "\"\"".to_string());
     let call_args = arg_json.unwrap_or("");
     format!(
-        r#"(async () => {{
+        r#"(      () => {{
     const __rw_src = {literal};
     let __rw_is_expression = true;
     try {{
@@ -43771,7 +45630,7 @@ fn make_evaluate_expression(expression: &str, arg_json: Option<&str>) -> String 
     if (typeof __rw_result === "function") {{
         __rw_result = __rw_result({call_args});
     }}
-    return await __rw_result;
+    return       __rw_result;
 }})()"#
     )
 }
@@ -44057,7 +45916,12 @@ fn is_js_identifier(value: &str) -> bool {
 
 #[cfg(test)]
 mod evaluate_expression_additional_tests {
-    use super::make_evaluate_expression;
+    use super::{
+        make_evaluate_expression, normalize_serialized_evaluate_exception_stack,
+        serialize_call_function_result, serialize_evaluate_result_expression,
+        serialize_evaluate_result_function,
+    };
+    use serde_json::json;
 
     #[test]
     fn declaration_helper_discovers_functions_mid_line() {
@@ -44080,6 +45944,118 @@ mod evaluate_expression_additional_tests {
                 .matches(expression)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn serializer_wrappers_keep_the_serializer_in_function_arguments() {
+        let evaluate = serialize_evaluate_result_function("typeof __rw_value");
+        assert!(evaluate.contains("__rustwright_evaluate_wrapper__"));
+        assert!(evaluate.contains("arguments[arguments.length-1]"));
+        assert!(evaluate.contains(".call(globalThis)"));
+
+        let call = serialize_call_function_result(
+            "function() { return typeof __rw_args + typeof __rw_value; }",
+        );
+        assert!(call.contains("__rustwright_evaluate_wrapper__"));
+        assert!(call.contains("Array.prototype.slice.call(arguments,0,-1)"));
+        assert!(call.contains("this===arguments[arguments.length-1]?globalThis:this"));
+        assert!(!call.contains("const __rw_"));
+        assert!(!evaluate.contains("catch"));
+        assert!(!evaluate.contains(".stack"));
+        assert!(!call.contains("catch"));
+        assert!(!call.contains(".stack"));
+    }
+
+    #[test]
+    fn declaration_helper_serialization_stays_at_script_goal() {
+        let source = "{\nconst x = 1; var y = 2; function helper() { return x + y; }\n}";
+        let serialized = serialize_evaluate_result_expression(source);
+        assert!(serialized.starts_with(source));
+        assert!(serialized.ends_with("(undefined)"));
+        assert!(!serialized.contains("async()=>"));
+    }
+
+    #[test]
+    fn generated_evaluate_stack_frame_is_removed_and_positions_are_restored() {
+        let actual = concat!(
+            "Error: boom\n",
+            "    at __rw_fn (<anonymous>:102:47)\n",
+            "    at <anonymous>:102:82\n",
+            "    at <anonymous>:102:95\n",
+            "    at user__rustwright_evaluate_wrapper__helper (<anonymous>:102:97)\n",
+            "    at __rustwright_evaluate_wrapper__ (<anonymous>:102:99)\n",
+            "    at Object.__rustwright_evaluate_wrapper__ (<anonymous>:103:6)\n",
+            "    at caller (https://example.test/app.js:50:7)"
+        );
+        let exception = json!({
+            "exception": { "description": actual },
+            "stackTrace": {
+                "callFrames": [{
+                    "functionName": "__rustwright_evaluate_wrapper__",
+                    "scriptId": "generated-script",
+                    "url": "",
+                    "lineNumber": 101,
+                    "columnNumber": 98
+                }, {
+                    "functionName": "__rustwright_evaluate_wrapper__",
+                    "scriptId": "generated-script",
+                    "url": "",
+                    "lineNumber": 102,
+                    "columnNumber": 5
+                }]
+            }
+        });
+        assert_eq!(
+            normalize_serialized_evaluate_exception_stack(&exception, 101, 103),
+            concat!(
+                "Error: boom\n",
+                "    at __rw_fn (<anonymous>:1:47)\n",
+                "    at <anonymous>:1:82\n",
+                "    at <anonymous>:1:95\n",
+                "    at user__rustwright_evaluate_wrapper__helper (<anonymous>:1:97)\n",
+                "    at __rustwright_evaluate_wrapper__ (<anonymous>:1:99)\n",
+                "    at caller (https://example.test/app.js:50:7)"
+            )
+        );
+
+        let custom = json!({
+            "exception": { "description": "CUSTOM:10:20\nassigned stack text" }
+        });
+        assert_eq!(
+            normalize_serialized_evaluate_exception_stack(&custom, 99, 101),
+            "CUSTOM:10:20\nassigned stack text"
+        );
+    }
+
+    #[test]
+    fn wrapper_stripping_requires_outermost_generated_frame_and_position() {
+        let user_stack = concat!(
+            "Error: user boom\n",
+            "    at __rustwright_evaluate_wrapper__ (<anonymous>:8:4)\n",
+            "    at caller (https://example.test/app.js:2:1)"
+        );
+        let bare_script_id = json!({
+            "scriptId": "user-script",
+            "exception": { "description": user_stack },
+        });
+        assert_eq!(
+            normalize_serialized_evaluate_exception_stack(&bare_script_id, 0, 2),
+            user_stack
+        );
+
+        let wrong_outermost_stack = concat!(
+            "Error: user boom\n",
+            "    at __rustwright_evaluate_wrapper__ (<anonymous>:2:6)\n",
+            "    at Object.__rustwright_evaluate_wrapper__ (<anonymous>:8:4)\n",
+            "    at caller (https://example.test/app.js:2:1)"
+        );
+        let wrong_outermost = json!({
+            "exception": { "description": wrong_outermost_stack },
+        });
+        assert_eq!(
+            normalize_serialized_evaluate_exception_stack(&wrong_outermost, 0, 2),
+            wrong_outermost_stack
         );
     }
 }
@@ -44130,6 +46106,121 @@ fn runtime_exception_message(exception: &Value) -> String {
         .to_string()
 }
 
+fn normalize_serialized_evaluate_exception_stack(
+    exception: &Value,
+    line_offset: usize,
+    expected_wrapper_line: usize,
+) -> String {
+    const WRAPPER_FUNCTION: &str = "__rustwright_evaluate_wrapper__";
+    let message = runtime_exception_message(exception);
+    let source_lines = message.lines().collect::<Vec<_>>();
+    let Some(wrapper_index) = source_lines.iter().rposition(|line| {
+        let Some(callee) = line
+            .strip_prefix("    at ")
+            .and_then(|frame| frame.split_once(" ("))
+            .map(|(callee, _)| callee)
+        else {
+            return false;
+        };
+        // Runtime.callFunctionOn can qualify the generated function with the
+        // receiver class. The outermost exact-name frame is the only candidate;
+        // a user frame with the same name at any other position must survive.
+        callee == WRAPPER_FUNCTION
+            || callee
+                .rsplit_once('.')
+                .is_some_and(|(_, function)| function == WRAPPER_FUNCTION)
+    }) else {
+        return message;
+    };
+    if !source_lines[wrapper_index].ends_with(format!(":{expected_wrapper_line}:6)").as_str()) {
+        return message;
+    }
+
+    source_lines
+        .into_iter()
+        .enumerate()
+        .filter_map(|(line_index, line)| {
+            if line_index == wrapper_index {
+                return None;
+            }
+            if line_offset == 0
+                || line_index > wrapper_index
+                || !line.starts_with("    at ")
+                || !line.contains("<anonymous>")
+            {
+                return Some(line.to_string());
+            }
+
+            let bytes = line.as_bytes();
+            let mut index = 0;
+            while index < bytes.len() {
+                if bytes[index] != b':' {
+                    index += 1;
+                    continue;
+                }
+                let line_start = index + 1;
+                let mut line_end = line_start;
+                while line_end < bytes.len() && bytes[line_end].is_ascii_digit() {
+                    line_end += 1;
+                }
+                if line_end == line_start || line_end >= bytes.len() || bytes[line_end] != b':' {
+                    index += 1;
+                    continue;
+                }
+                let column_start = line_end + 1;
+                let mut column_end = column_start;
+                while column_end < bytes.len() && bytes[column_end].is_ascii_digit() {
+                    column_end += 1;
+                }
+                if column_end == column_start {
+                    index += 1;
+                    continue;
+                }
+                let Ok(source_line) = line[line_start..line_end].parse::<usize>() else {
+                    index += 1;
+                    continue;
+                };
+                if source_line <= line_offset {
+                    index = column_end;
+                    continue;
+                }
+                return Some(format!(
+                    "{}:{}{}",
+                    &line[..index],
+                    source_line - line_offset,
+                    &line[line_end..]
+                ));
+            }
+            Some(line.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn runtime_evaluate_serialized_result_to_json(
+    result: &Value,
+    stack_line_offset: usize,
+    expected_wrapper_line: usize,
+) -> RwResult<String> {
+    if let Some(exception) = result.get("exceptionDetails") {
+        return Err(RwError::Message(
+            normalize_serialized_evaluate_exception_stack(
+                exception,
+                stack_line_offset,
+                expected_wrapper_line,
+            ),
+        ));
+    }
+    runtime_serialized_result_to_json(result)
+}
+
+fn runtime_inline_evaluate_serialized_result_to_json(result: &Value) -> RwResult<String> {
+    if let Some(exception) = result.get("exceptionDetails") {
+        return Err(RwError::Message(runtime_exception_message(exception)));
+    }
+    runtime_serialized_result_to_json(result)
+}
+
 fn runtime_result_to_json(result: &Value) -> RwResult<String> {
     if let Some(exception) = result.get("exceptionDetails") {
         return Err(RwError::Message(runtime_exception_message(exception)));
@@ -44152,44 +46243,26 @@ fn runtime_result_to_json(result: &Value) -> RwResult<String> {
     Ok(value.to_string())
 }
 
-async fn runtime_result_to_json_with_serializer(
-    client: &CdpClient,
-    session_id: &str,
-    result: &Value,
-    timeout: Duration,
-) -> RwResult<String> {
-    if result.get("exceptionDetails").is_some() {
-        return runtime_result_to_json(result);
+fn runtime_serialized_result_to_json(result: &Value) -> RwResult<String> {
+    if let Some(exception) = result.get("exceptionDetails") {
+        return Err(RwError::Message(runtime_exception_message(exception)));
     }
-    let remote = result.get("result").unwrap_or(&Value::Null);
-    let Some(object_id) = remote.get("objectId").and_then(Value::as_str) else {
-        return runtime_result_to_json(result);
-    };
-    let serialized = client
-        .send(
-            "Runtime.callFunctionOn",
-            json!({
-                "objectId": object_id,
-                "functionDeclaration": format!(
-                    "function() {{ return ({RUNTIME_VALUE_SERIALIZER})(this); }}"
-                ),
-                "awaitPromise": true,
-                "returnByValue": true,
-                "userGesture": true,
-            }),
-            Some(session_id),
-            timeout,
-        )
-        .await;
-    let _ = client
-        .send(
-            "Runtime.releaseObject",
-            json!({ "objectId": object_id }),
-            Some(session_id),
-            Duration::from_secs(1),
-        )
-        .await;
-    runtime_result_to_json(&serialized?)
+    if let Some(value) = result.pointer("/result/value") {
+        if value
+            .as_object()
+            .map(|object| {
+                object.len() == 1
+                    && object
+                        .get("__rustwright_cdp_undefined__")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            })
+            .unwrap_or(false)
+        {
+            return Ok(Value::Null.to_string());
+        }
+    }
+    runtime_result_to_json(result)
 }
 
 fn runtime_result_to_remote_object(result: &Value) -> RwResult<String> {
