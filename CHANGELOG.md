@@ -4,9 +4,19 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-16
+
+### Added
+
+- Added opt-in MCP response budgets, bounded snapshot distillation, page-state
+  digests, console-message deduplication, and static-network notes.
+- Added client-aware lean MCP tool descriptions. They default to on for
+  recognized Codex clients and off for other clients, and remain configurable
+  through `RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS`.
+
 ### Breaking
 
-- **Release target: 0.3.0.** `BrowserType.connect()` no longer forwards raw-CDP
+- `BrowserType.connect()` no longer forwards raw-CDP
   endpoints to `connect_over_cdp()`. It now rejects every endpoint before
   network I/O because Rustwright does not implement Playwright wire. Migrate
   sync code from `chromium.connect(endpoint)` to
@@ -19,6 +29,12 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ### Changed
 
+- Added public browser-action failure and retry details for Rust, Python, and
+  MCP callers. Python errors expose `kind`, `phase`, `target_kind`,
+  `command_written`, and `retryable`. Python raises `UnknownOutcomeError` when
+  an input command's delivery is unknown. Callers must not retry that error
+  blindly because replay can duplicate the action.
+
 - Made frame-tree caching event-maintained: the main page session populates at attachment, OOPIF sessions populate on first locator use and after invalidation, steady-state locators issue no `Page.getFrameTree` calls, and context-bound frame actions retry once during iframe process changes.
 - Reduced steady-state object-valued `evaluate()` results to one browser-protocol command after per-realm serializer setup; the first call in a new or recreated realm re-establishes that setup.
 - Passive page-error history now records page-authored errors without enabling Chromium's `Runtime` domain; `LIMITATIONS.md` documents the full-detail limitation for evaluate-created asynchronous callbacks.
@@ -30,6 +46,10 @@ All notable user-facing changes to Rustwright are documented in this file.
 - Fixed `get_by_role()` accessible-name matching over nested content and `get_by_label()` zero-width normalization to match upstream Playwright.
 - Fixed sync and async `Page` objects to support Playwright-compatible context managers that close the page on exit.
 - Fixed `enable_playwright_compat()` on installations without the optional pytest development dependency. `enable_playwright_compat()` now returns a `PlaywrightCompatEnableResult` describing what was registered instead of `None`.
+- Fixed `type()`, `press()`, and ASCII `fill()` to dispatch trusted CDP key
+  events so page listeners receive real keyboard input.
+- Fixed navigation completion to use one deadline, reconcile state when a load
+  event is missed, and ignore navigation events from unrelated iframes.
 
 ## [0.2.0] - 2026-08-03
 
@@ -112,6 +132,7 @@ All notable user-facing changes to Rustwright are documented in this file.
 - Added an experimental Node.js binding for launching Chromium and performing core page navigation, interaction, evaluation, screenshot, and lifecycle operations.
 
 [Unreleased]: https://github.com/Skyvern-AI/rustwright/commits/main
+[0.3.0]: https://github.com/Skyvern-AI/rustwright/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Skyvern-AI/rustwright/releases/tag/v0.2.0
 [0.1.1]: https://github.com/Skyvern-AI/rustwright/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Skyvern-AI/rustwright/releases/tag/v0.1.0

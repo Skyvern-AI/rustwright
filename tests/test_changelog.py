@@ -10,6 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 CHANGELOG = ROOT / "CHANGELOG.md"
 REQUIRED_VERSIONS = (
+    "0.3.0",
     "0.2.0",
     "0.1.1",
     "0.1.0",

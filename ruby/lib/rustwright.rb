@@ -5,7 +5,7 @@ require 'monitor'
 require 'rbconfig'
 
 module Rustwright
-  VERSION = '0.2.0'
+  VERSION = '0.3.0'
   UNSET = Object.new.freeze
 
   class Error < StandardError; end
