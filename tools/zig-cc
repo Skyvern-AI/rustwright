@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${CARGO_ZIG_TARGET:?CARGO_ZIG_TARGET must be set}"
+zig_target="${CARGO_ZIG_TARGET/unknown-/}" # Zig omits Rust's `unknown-` component.
+if command -v zig >/dev/null 2>&1; then
+  zig_command=(zig)
+elif command -v python-zig >/dev/null 2>&1; then
+  zig_command=(python-zig)
+else
+  printf '%s\n' "tools/zig-cc: neither zig nor python-zig was found on PATH" >&2
+  exit 127
+fi
+
+args=()
+skip=0
+for arg in "$@"; do
+  if ((skip)); then
+    skip=0
+    continue
+  fi
+
+  case "$arg" in
+    --target=*)
+      # cc-rs may add the Rust target; use the pinned Zig target instead.
+      continue
+      ;;
+    -target)
+      skip=1
+      continue
+      ;;
+    -Wl,--fix-cortex-a53-843419)
+      # Rust's aarch64 GNU target enables this GNU-ld workaround by default.
+      # Zig 0.14 rejects the linker arg before invoking its linker. Filter only
+      # this known target-specific incompatibility; preserve every other arg.
+      continue
+      ;;
+    *)
+      args+=("$arg")
+      ;;
+  esac
+done
+
+exec "${zig_command[@]}" cc -target "$zig_target" "${args[@]}"
