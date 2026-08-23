@@ -132,7 +132,7 @@ def _version() -> str:
     try:
         return metadata.version("rustwright")
     except metadata.PackageNotFoundError:
-        return "0.2.0"
+        return "0.3.0"
 
 
 def _normal_browser_name(name: str) -> str:
