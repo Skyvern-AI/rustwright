@@ -1009,7 +1009,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rustwright"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rustwright-core",
  "serde",
@@ -1018,7 +1018,7 @@ dependencies = [
 
 [[package]]
 name = "rustwright-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "futures-util",
