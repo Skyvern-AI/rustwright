@@ -71,7 +71,7 @@ jobs:
       - name: Install Chrome
         if: steps.has.outputs.ok == 'true'
         id: chrome
-        uses: browser-actions/setup-chrome@v1
+        uses: browser-actions/setup-chrome@v2
         with:
           chrome-version: stable
       - name: Point engine at Chrome
