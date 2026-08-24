@@ -137,30 +137,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          linker="$RUNNER_TEMP/zig-cc"
-          cat > "$linker" <<'SH'
-          #!/usr/bin/env bash
-          # cc-rs appends clang-style --target=<rust-triple>; zig cc only
-          # understands zig-style triples, so drop incoming target flags in
-          # favor of the pinned ZIG_TARGET.
-          args=()
-          skip=0
-          for arg in "$@"; do
-            if (( skip )); then skip=0; continue; fi
-            case "$arg" in
-              --target=*) continue ;;
-              -target) skip=1; continue ;;
-              *) args+=("$arg") ;;
-            esac
-          done
-          exec zig cc -target "${ZIG_TARGET}" "${args[@]}"
-          SH
-          chmod +x "$linker"
           target_env="$(printf '%s' "$CARGO_BUILD_TARGET" | tr '[:lower:]-' '[:upper:]_')"
           cc_env="$(printf '%s' "$CARGO_BUILD_TARGET" | tr '-' '_')"
-          echo "ZIG_TARGET=${{ matrix.platform.zig_target }}" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_${target_env}_LINKER=$linker" >> "$GITHUB_ENV"
-          echo "CC_${cc_env}=$linker" >> "$GITHUB_ENV"
+          echo "CARGO_ZIG_TARGET=${{ matrix.platform.zig_target }}" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${target_env}_LINKER=$GITHUB_WORKSPACE/tools/zig-cc" >> "$GITHUB_ENV"
+          echo "CC_${cc_env}=$GITHUB_WORKSPACE/tools/zig-cc" >> "$GITHUB_ENV"
 
       - name: Build native library
         run: cargo build -p rustwright-capi --release --locked

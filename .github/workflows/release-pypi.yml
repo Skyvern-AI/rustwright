@@ -86,24 +86,29 @@ jobs:
           - runner: macos-latest
             target: aarch64-apple-darwin
             manylinux: auto
+            zig_target: ""
             extra_args: ""
           - runner: macos-latest
             target: x86_64-apple-darwin
             manylinux: auto
+            zig_target: ""
             extra_args: ""
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             manylinux: "2_17"
+            zig_target: ""
             extra_args: ""
           - runner: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             manylinux: "2_17"
             # ring's pregenerated aarch64 assembly fails under the manylinux
             # cross-gcc ("ARM assembler must define __ARM_ARCH"); build with zig.
+            zig_target: aarch64-linux-gnu.2.17
             extra_args: "--zig"
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             manylinux: auto
+            zig_target: ""
             extra_args: ""
 
     steps:
@@ -114,6 +119,15 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+
+      - name: Configure aarch64 Linux linker
+        if: ${{ matrix.platform.zig_target != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CARGO_ZIG_TARGET=${{ matrix.platform.zig_target }}" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$GITHUB_WORKSPACE/tools/zig-cc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=$GITHUB_WORKSPACE/tools/zig-cc" >> "$GITHUB_ENV"
 
       - name: Build abi3 wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
