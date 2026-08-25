@@ -276,7 +276,7 @@ At the time of the original measurement, `asyncio.to_thread` Rustwright was **no
 
 Concrete threshold:
 
-- Acceptable only for controlled experiments at <=25 concurrent workflows per process, and preferably only with a shared browser.
+- Acceptable only for controlled experiments at 25 or fewer concurrent workflows per process, and preferably only with a shared browser.
 - Risky at 50 concurrent workflows: Rustwright shared passed but required ~400 Python threads, which is operationally fragile.
 - Not acceptable at 100 concurrent workflows: shared-browser Rustwright failed every task with `CDP websocket is closed`; four-browser Rustwright also failed and had very high event-loop lag.
 
