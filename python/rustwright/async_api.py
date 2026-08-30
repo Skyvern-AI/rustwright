@@ -70,7 +70,7 @@ from .sync_api import (
     _MISSING,
     _UNSET,
     backend_marker,
-    _decode_json_result,
+    _decode_json_result_json,
     _copy_wire_error_metadata,
     _default_timeout_for_method,
     _emit_event,
@@ -2637,7 +2637,7 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
                 self._sync._default_timeout,
             )
         )
-        return _decode_json_result(json.loads(result))
+        return _decode_json_result_json(result)
 
     async def add_script_tag(
         self,
