@@ -28,8 +28,11 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 #[cfg(feature = "python")]
-use pyo3::types::{PyAny, PyBytes, PyModule};
-use serde::{Deserialize, Serialize};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule};
+#[cfg(feature = "python")]
+use pyo3::IntoPyObjectExt;
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
@@ -22724,6 +22727,15 @@ return this.dataset.mainWorldOverride === "observed";
 
         assert!(error.to_string().contains("duplicate field"));
     }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn python_launch_option_parse_errors_remain_value_errors() {
+        Python::attach(|py| {
+            let error = parse_python_launch_options("{").unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+        });
+    }
     #[test]
     fn remote_discovery_url_derivation_preserves_query_and_removes_known_suffix() {
         for endpoint in [
@@ -23049,6 +23061,14 @@ struct LaunchOptions {
     chromium_sandbox: bool,
     #[serde(default)]
     proxy: Option<ProxyOptions>,
+}
+
+fn parse_launch_options(json: &str) -> RwResult<LaunchOptions> {
+    serde_json::from_str(json).map_err(RwError::from)
+}
+#[cfg(feature = "python")]
+fn parse_python_launch_options(json: &str) -> PyResult<LaunchOptions> {
+    parse_launch_options(json).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -40881,8 +40901,7 @@ async fn wait_for_launch_cancellation(cancelled: Arc<AtomicBool>) {
 #[cfg(feature = "python")]
 #[pyfunction]
 fn launch_chromium(py: Python<'_>, options_json: &str) -> PyResult<PyBrowser> {
-    let options: LaunchOptions = serde_json::from_str(options_json)
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let options = parse_python_launch_options(options_json)?;
     let inner = py
         .detach(move || {
             launch_chromium_with_options_cancellation(
@@ -40899,8 +40918,7 @@ fn launch_chromium(py: Python<'_>, options_json: &str) -> PyResult<PyBrowser> {
 #[cfg(feature = "python")]
 #[pyfunction]
 fn launch_chromium_async(py: Python<'_>, options_json: &str) -> PyResult<Py<PyAny>> {
-    let options: LaunchOptions = serde_json::from_str(options_json)
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let options = parse_python_launch_options(options_json)?;
     python_future_on_thread(
         py,
         move |cancelled| {
@@ -41786,7 +41804,7 @@ pub fn rustwright_launch_chromium_with_cancel(
     options_json: &str,
     cancel: Option<&CancelToken>,
 ) -> RwResult<RustwrightBrowser> {
-    let options: LaunchOptions = serde_json::from_str(options_json)?;
+    let options = parse_launch_options(options_json)?;
     let result = match cancel {
         Some(cancel) => launch_chromium_with_options_token(options, cancel.clone()),
         None => launch_chromium_with_options(options),
@@ -53163,6 +53181,628 @@ const WIRE_LEAF_TAGS: [&str; 9] = [
     "__rustwright_cdp_function__",
 ];
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct WireNodeId(usize);
+
+impl WireNodeId {
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WireNumber {
+    Signed(i64),
+    Unsigned(u64),
+    Float(f64),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WireLeaf {
+    Unserializable(String),
+    BigInt(String),
+    Date(String),
+    RegExp {
+        pattern: String,
+        flags: String,
+    },
+    Url(String),
+    Error {
+        name: String,
+        message: String,
+        stack: String,
+    },
+    Undefined,
+    Symbol,
+    Function,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WireNodeKind {
+    Null,
+    Bool(bool),
+    Number(WireNumber),
+    String(String),
+    Array(Vec<WireNodeId>),
+    Object(Vec<(String, WireNodeId)>),
+    Leaf(WireLeaf),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WireGraph {
+    root: WireNodeId,
+    nodes: Vec<WireNodeKind>,
+}
+
+impl WireGraph {
+    pub fn root(&self) -> WireNodeId {
+        self.root
+    }
+
+    pub fn nodes(&self) -> &[WireNodeKind] {
+        &self.nodes
+    }
+
+    pub fn node(&self, id: WireNodeId) -> Option<&WireNodeKind> {
+        self.nodes.get(id.index())
+    }
+}
+
+enum WireJsonValue {
+    Null,
+    Bool(bool),
+    Number(WireNumber),
+    String(String),
+    Array(Vec<WireJsonValue>),
+    Object(Vec<(String, WireJsonValue)>),
+}
+
+impl<'de> Deserialize<'de> for WireJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct WireJsonValueVisitor;
+
+        impl<'de> Visitor<'de> for WireJsonValueVisitor {
+            type Value = WireJsonValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireJsonValue::Null)
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireJsonValue::Bool(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireJsonValue::Number(WireNumber::Signed(value)))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireJsonValue::Number(WireNumber::Unsigned(value)))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireJsonValue::Number(WireNumber::Float(value)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireJsonValue::String(value.to_string()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireJsonValue::String(value))
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+                while let Some(value) = sequence.next_element()? {
+                    values.push(value);
+                }
+                Ok(WireJsonValue::Array(values))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(entry) = map.next_entry()? {
+                    entries.push(entry);
+                }
+                Ok(WireJsonValue::Object(entries))
+            }
+        }
+
+        deserializer.deserialize_any(WireJsonValueVisitor)
+    }
+}
+
+type WireJsonObject = Vec<(String, WireJsonValue)>;
+
+#[derive(Clone, Copy)]
+enum WireStructuralKind {
+    Ref,
+    Array,
+    Object,
+}
+
+fn wire_json_object_get<'a>(object: &'a WireJsonObject, key: &str) -> Option<&'a WireJsonValue> {
+    object
+        .iter()
+        .rev()
+        .find_map(|(name, value)| (name == key).then_some(value))
+}
+
+fn wire_json_object_contains(object: &WireJsonObject, key: &str) -> bool {
+    object.iter().any(|(name, _)| name == key)
+}
+
+fn wire_structural_kind(object: &WireJsonObject) -> RwResult<Option<WireStructuralKind>> {
+    let mut result = None;
+    for (tag, kind) in [
+        (WIRE_REF_TAG, WireStructuralKind::Ref),
+        (WIRE_ARRAY_TAG, WireStructuralKind::Array),
+        (WIRE_OBJECT_TAG, WireStructuralKind::Object),
+    ] {
+        if wire_json_object_contains(object, tag) {
+            if result.is_some() {
+                return Err(RwError::InvalidInput(
+                    "wire wrapper contains multiple structural tags".to_string(),
+                ));
+            }
+            result = Some(kind);
+        }
+    }
+    Ok(result)
+}
+
+fn wire_leaf_value(object: &WireJsonObject) -> RwResult<Option<WireLeaf>> {
+    let tags = WIRE_LEAF_TAGS
+        .iter()
+        .copied()
+        .filter(|tag| wire_json_object_contains(object, tag))
+        .collect::<Vec<_>>();
+    if tags.is_empty() {
+        return Ok(None);
+    }
+    if tags.len() != 1 || object.len() != 1 {
+        return Err(RwError::InvalidInput(
+            "wire leaf wrapper must contain exactly one leaf tag".to_string(),
+        ));
+    }
+    let tag = tags[0];
+    let payload = wire_json_object_get(object, tag).expect("leaf tag was found");
+    let string_payload = |message: &str| {
+        if let WireJsonValue::String(value) = payload {
+            Ok(value.clone())
+        } else {
+            Err(RwError::InvalidInput(message.to_string()))
+        }
+    };
+    let leaf = match tag {
+        "__rustwright_cdp_unserializable_value__" => {
+            let payload = string_payload("wire unserializable leaf payload must be a string")?;
+            if let Some(value) = payload.strip_suffix('n') {
+                WireLeaf::BigInt(value.to_string())
+            } else {
+                WireLeaf::Unserializable(payload)
+            }
+        }
+        "__rustwright_cdp_bigint__" => {
+            let payload = string_payload("wire bigint leaf payload must be a string")?;
+            WireLeaf::BigInt(payload.strip_suffix('n').unwrap_or(&payload).to_string())
+        }
+        "__rustwright_cdp_date__" => {
+            WireLeaf::Date(string_payload("wire date leaf payload must be a string")?)
+        }
+        "__rustwright_cdp_regexp__" => {
+            let regexp = match payload {
+                WireJsonValue::Object(regexp) => regexp,
+                _ => {
+                    return Err(RwError::InvalidInput(
+                        "wire regexp leaf payload must be an object".to_string(),
+                    ));
+                }
+            };
+            if regexp.len() != 2 {
+                return Err(RwError::InvalidInput(
+                    "wire regexp leaf payload must contain pattern and flags".to_string(),
+                ));
+            }
+            let string_field = |name: &str| {
+                wire_json_object_get(regexp, name).and_then(|value| match value {
+                    WireJsonValue::String(value) => Some(value.clone()),
+                    _ => None,
+                })
+            };
+            let pattern = string_field("p")
+                .or_else(|| string_field("pattern"))
+                .ok_or_else(|| {
+                    RwError::InvalidInput("wire regexp pattern must be a string".to_string())
+                })?;
+            let flags = string_field("f")
+                .or_else(|| string_field("flags"))
+                .ok_or_else(|| {
+                    RwError::InvalidInput("wire regexp flags must be a string".to_string())
+                })?;
+            WireLeaf::RegExp { pattern, flags }
+        }
+        "__rustwright_cdp_url__" => {
+            WireLeaf::Url(string_payload("wire url leaf payload must be a string")?)
+        }
+        "__rustwright_cdp_error__" => {
+            let error = match payload {
+                WireJsonValue::Object(error) => error,
+                _ => {
+                    return Err(RwError::InvalidInput(
+                        "wire error leaf payload must be an object".to_string(),
+                    ));
+                }
+            };
+            if error.len() != 3 {
+                return Err(RwError::InvalidInput(
+                    "wire error leaf payload must contain name, message, and stack".to_string(),
+                ));
+            }
+            let string_field = |name: &str| {
+                wire_json_object_get(error, name)
+                    .and_then(|value| match value {
+                        WireJsonValue::String(value) => Some(value.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        RwError::InvalidInput(format!("wire error field must be a string: {name}"))
+                    })
+            };
+            WireLeaf::Error {
+                name: string_field("name")?,
+                message: string_field("message")?,
+                stack: string_field("stack")?,
+            }
+        }
+        "__rustwright_cdp_undefined__" => WireLeaf::Undefined,
+        "__rustwright_cdp_symbol__" => WireLeaf::Symbol,
+        "__rustwright_cdp_function__" => WireLeaf::Function,
+        _ => unreachable!("all wire leaf tags are listed in WIRE_LEAF_TAGS"),
+    };
+    Ok(Some(leaf))
+}
+
+fn wire_graph_reference_key(value: &WireJsonValue) -> RwResult<String> {
+    match value {
+        WireJsonValue::Number(WireNumber::Signed(value)) => Ok(value.to_string()),
+        WireJsonValue::Number(WireNumber::Unsigned(value)) => Ok(value.to_string()),
+        WireJsonValue::Number(WireNumber::Float(value)) => {
+            serde_json::to_string(value).map_err(RwError::from)
+        }
+        WireJsonValue::String(value) => serde_json::to_string(value).map_err(RwError::from),
+        _ => Err(RwError::InvalidInput(
+            "wire reference id must be a number or string".to_string(),
+        )),
+    }
+}
+
+fn wire_wrapper_id(object: &WireJsonObject, tag: &str) -> RwResult<String> {
+    wire_graph_reference_key(wire_json_object_get(object, tag).ok_or_else(|| {
+        RwError::InvalidInput(format!("wire wrapper is missing its id tag: {tag}"))
+    })?)
+}
+
+fn wire_array_items(object: &WireJsonObject) -> RwResult<&[WireJsonValue]> {
+    if object.len() != 2 {
+        return Err(RwError::InvalidInput(
+            "wire array wrapper must contain only id and items".to_string(),
+        ));
+    }
+    match wire_json_object_get(object, "items") {
+        Some(WireJsonValue::Array(items)) => Ok(items),
+        _ => Err(RwError::InvalidInput(
+            "wire array wrapper must contain an items array".to_string(),
+        )),
+    }
+}
+
+fn wire_object_entries(object: &WireJsonObject) -> RwResult<&WireJsonObject> {
+    if object.len() != 2 {
+        return Err(RwError::InvalidInput(
+            "wire object wrapper must contain only id and entries".to_string(),
+        ));
+    }
+    match wire_json_object_get(object, "entries") {
+        Some(WireJsonValue::Object(entries)) => Ok(entries),
+        _ => Err(RwError::InvalidInput(
+            "wire object wrapper must contain an entries object".to_string(),
+        )),
+    }
+}
+
+struct WireGraphParser {
+    definitions: HashMap<String, WireNodeId>,
+    built: HashSet<WireNodeId>,
+    nodes: Vec<WireNodeKind>,
+}
+
+impl WireGraphParser {
+    fn new() -> Self {
+        Self {
+            definitions: HashMap::new(),
+            built: HashSet::new(),
+            nodes: Vec::new(),
+        }
+    }
+
+    fn reserve_definition(&mut self, key: String) -> RwResult<WireNodeId> {
+        if self.definitions.contains_key(&key) {
+            return Err(RwError::InvalidInput(format!(
+                "wire reference id is defined more than once: {key}"
+            )));
+        }
+        let id = WireNodeId(self.nodes.len());
+        self.nodes.push(WireNodeKind::Null);
+        self.definitions.insert(key, id);
+        Ok(id)
+    }
+
+    fn collect_definitions(&mut self, value: &WireJsonValue) -> RwResult<()> {
+        match value {
+            WireJsonValue::Array(values) => {
+                for value in values {
+                    self.collect_definitions(value)?;
+                }
+            }
+            WireJsonValue::Object(object) => {
+                if wire_leaf_value(object)?.is_some() {
+                    return Ok(());
+                }
+                match wire_structural_kind(object)? {
+                    None => {
+                        for (_, value) in object {
+                            self.collect_definitions(value)?;
+                        }
+                    }
+                    Some(WireStructuralKind::Ref) => {
+                        if object.len() != 1 {
+                            return Err(RwError::InvalidInput(
+                                "wire ref wrapper must contain only its id".to_string(),
+                            ));
+                        }
+                        wire_wrapper_id(object, WIRE_REF_TAG)?;
+                    }
+                    Some(WireStructuralKind::Array) => {
+                        let key = wire_wrapper_id(object, WIRE_ARRAY_TAG)?;
+                        let items = wire_array_items(object)?;
+                        self.reserve_definition(key)?;
+                        for item in items {
+                            self.collect_definitions(item)?;
+                        }
+                    }
+                    Some(WireStructuralKind::Object) => {
+                        let key = wire_wrapper_id(object, WIRE_OBJECT_TAG)?;
+                        let entries = wire_object_entries(object)?;
+                        self.reserve_definition(key)?;
+                        for (_, value) in entries {
+                            self.collect_definitions(value)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn allocate(&mut self, kind: WireNodeKind) -> WireNodeId {
+        let id = WireNodeId(self.nodes.len());
+        self.nodes.push(kind);
+        id
+    }
+
+    fn definition(&self, key: &str) -> RwResult<WireNodeId> {
+        self.definitions.get(key).copied().ok_or_else(|| {
+            RwError::InvalidInput(format!("wire reference points to unknown id: {key}"))
+        })
+    }
+
+    fn build_value(&mut self, value: &WireJsonValue) -> RwResult<WireNodeId> {
+        match value {
+            WireJsonValue::Null => Ok(self.allocate(WireNodeKind::Null)),
+            WireJsonValue::Bool(value) => Ok(self.allocate(WireNodeKind::Bool(*value))),
+            WireJsonValue::Number(value) => Ok(self.allocate(WireNodeKind::Number(*value))),
+            WireJsonValue::String(value) => Ok(self.allocate(WireNodeKind::String(value.clone()))),
+            WireJsonValue::Array(values) => {
+                let id = self.allocate(WireNodeKind::Array(Vec::new()));
+                let children = values
+                    .iter()
+                    .map(|value| self.build_value(value))
+                    .collect::<RwResult<Vec<_>>>()?;
+                self.nodes[id.index()] = WireNodeKind::Array(children);
+                Ok(id)
+            }
+            WireJsonValue::Object(object) => {
+                if let Some(leaf) = wire_leaf_value(object)? {
+                    return Ok(self.allocate(WireNodeKind::Leaf(leaf)));
+                }
+                match wire_structural_kind(object)? {
+                    None => {
+                        let id = self.allocate(WireNodeKind::Object(Vec::new()));
+                        let mut entries = Vec::with_capacity(object.len());
+                        for (key, value) in object {
+                            entries.push((key.clone(), self.build_value(value)?));
+                        }
+                        self.nodes[id.index()] = WireNodeKind::Object(entries);
+                        Ok(id)
+                    }
+                    Some(WireStructuralKind::Ref) => {
+                        if object.len() != 1 {
+                            return Err(RwError::InvalidInput(
+                                "wire ref wrapper must contain only its id".to_string(),
+                            ));
+                        }
+                        let key = wire_wrapper_id(object, WIRE_REF_TAG)?;
+                        self.definition(&key)
+                    }
+                    Some(WireStructuralKind::Array) => {
+                        let key = wire_wrapper_id(object, WIRE_ARRAY_TAG)?;
+                        let id = self.definition(&key)?;
+                        if self.built.insert(id) {
+                            let items = wire_array_items(object)?;
+                            let children = items
+                                .iter()
+                                .map(|value| self.build_value(value))
+                                .collect::<RwResult<Vec<_>>>()?;
+                            self.nodes[id.index()] = WireNodeKind::Array(children);
+                        }
+                        Ok(id)
+                    }
+                    Some(WireStructuralKind::Object) => {
+                        let key = wire_wrapper_id(object, WIRE_OBJECT_TAG)?;
+                        let id = self.definition(&key)?;
+                        if self.built.insert(id) {
+                            let entries = wire_object_entries(object)?;
+                            let mut children = Vec::with_capacity(entries.len());
+                            for (key, value) in entries {
+                                children.push((key.clone(), self.build_value(value)?));
+                            }
+                            self.nodes[id.index()] = WireNodeKind::Object(children);
+                        }
+                        Ok(id)
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn parse_wire_graph(json: &str) -> RwResult<WireGraph> {
+    let value = serde_json::from_str::<WireJsonValue>(json)?;
+    let mut parser = WireGraphParser::new();
+    parser.collect_definitions(&value)?;
+    let root = parser.build_value(&value)?;
+    Ok(WireGraph {
+        root,
+        nodes: parser.nodes,
+    })
+}
+#[cfg(feature = "python")]
+fn py_wire_leaf(py: Python<'_>, callback: &Py<PyAny>, leaf: &WireLeaf) -> PyResult<Py<PyAny>> {
+    let (tag, payload) = match leaf {
+        WireLeaf::Unserializable(value) => (
+            "unserializable",
+            value.clone().into_pyobject(py)?.unbind().into_any(),
+        ),
+        WireLeaf::BigInt(value) => (
+            "bigint",
+            value.clone().into_pyobject(py)?.unbind().into_any(),
+        ),
+        WireLeaf::Date(value) => ("date", value.clone().into_pyobject(py)?.unbind().into_any()),
+        WireLeaf::RegExp { pattern, flags } => {
+            let payload = PyDict::new(py);
+            payload.set_item("pattern", pattern)?;
+            payload.set_item("flags", flags)?;
+            ("regexp", payload.unbind().into_any())
+        }
+        WireLeaf::Url(value) => ("url", value.clone().into_pyobject(py)?.unbind().into_any()),
+        WireLeaf::Error {
+            name,
+            message,
+            stack,
+        } => {
+            let payload = PyDict::new(py);
+            payload.set_item("name", name)?;
+            payload.set_item("message", message)?;
+            payload.set_item("stack", stack)?;
+            ("error", payload.unbind().into_any())
+        }
+        WireLeaf::Undefined => ("undefined", py.None()),
+        WireLeaf::Symbol => ("symbol", py.None()),
+        WireLeaf::Function => ("function", py.None()),
+    };
+    Ok(callback
+        .bind(py)
+        .call1((tag, payload.bind(py)))?
+        .unbind()
+        .into_any())
+}
+
+#[cfg(feature = "python")]
+fn py_wire_node(py: Python<'_>, callback: &Py<PyAny>, kind: &WireNodeKind) -> PyResult<Py<PyAny>> {
+    match kind {
+        WireNodeKind::Null => Ok(py.None()),
+        WireNodeKind::Bool(value) => (*value).into_py_any(py),
+        WireNodeKind::Number(WireNumber::Signed(value)) => (*value).into_py_any(py),
+        WireNodeKind::Number(WireNumber::Unsigned(value)) => (*value).into_py_any(py),
+        WireNodeKind::Number(WireNumber::Float(value)) => (*value).into_py_any(py),
+        WireNodeKind::String(value) => value.clone().into_py_any(py),
+        WireNodeKind::Array(_) => Ok(PyList::empty(py).unbind().into_any()),
+        WireNodeKind::Object(_) => Ok(PyDict::new(py).unbind().into_any()),
+        WireNodeKind::Leaf(leaf) => py_wire_leaf(py, callback, leaf),
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction]
+fn _decode_wire_value(
+    py: Python<'_>,
+    wire_json: &str,
+    leaf_callback: Py<PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let graph = parse_wire_graph(wire_json).map_err(py_err)?;
+    let callback = leaf_callback;
+    let values = graph
+        .nodes()
+        .iter()
+        .map(|kind| py_wire_node(py, &callback, kind))
+        .collect::<PyResult<Vec<_>>>()?;
+    for (index, kind) in graph.nodes().iter().enumerate() {
+        match kind {
+            WireNodeKind::Array(children) => {
+                let list = values[index].bind(py).cast::<PyList>()?;
+                for child in children {
+                    list.append(values[child.index()].bind(py))?;
+                }
+            }
+            WireNodeKind::Object(entries) => {
+                let object = values[index].bind(py).cast::<PyDict>()?;
+                for (key, child) in entries {
+                    object.set_item(key, values[child.index()].bind(py))?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(values[graph.root().index()].clone_ref(py))
+}
+
 #[derive(Clone)]
 enum WireDefinition {
     Array(Vec<Value>),
@@ -53422,6 +54062,209 @@ mod wire_decode_tests {
         let error = decode_wire_value(r#"{"unterminated": [1, 2}"#).unwrap_err();
 
         assert!(matches!(error, RwError::Json(_)));
+    }
+    #[test]
+    fn parses_nested_values_and_all_wire_leaves() {
+        let graph = parse_wire_graph(
+            r#"{
+                "__rustwright_cdp_object__": 1,
+                "entries": {
+                    "nested": {
+                        "__rustwright_cdp_array__": 2,
+                        "items": [
+                            null,
+                            true,
+                            -7,
+                            1.25,
+                            "text",
+                            {"__rustwright_cdp_unserializable_value__": "NaN"},
+                            {"__rustwright_cdp_bigint__": "123n"},
+                            {"__rustwright_cdp_date__": "2026-07-21T12:34:56.789Z"},
+                            {"__rustwright_cdp_regexp__": {"p": "a+b", "f": "gi"}},
+                            {"__rustwright_cdp_url__": "https://example.com/path"},
+                            {"__rustwright_cdp_error__": {
+                                "name": "TypeError",
+                                "message": "broken",
+                                "stack": "TypeError: broken"
+                            }},
+                            {"__rustwright_cdp_undefined__": true},
+                            {"__rustwright_cdp_symbol__": true},
+                            {"__rustwright_cdp_function__": true}
+                        ]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let WireNodeKind::Object(entries) = graph.node(graph.root()).unwrap() else {
+            panic!("root must be an object");
+        };
+        let nested = entries
+            .iter()
+            .find(|(key, _)| key == "nested")
+            .map(|(_, id)| *id)
+            .unwrap();
+        let WireNodeKind::Array(items) = graph.node(nested).unwrap() else {
+            panic!("nested value must be an array");
+        };
+        assert!(matches!(graph.node(items[0]), Some(WireNodeKind::Null)));
+        assert!(matches!(
+            graph.node(items[1]),
+            Some(WireNodeKind::Bool(true))
+        ));
+        assert!(matches!(
+            graph.node(items[2]),
+            Some(WireNodeKind::Number(WireNumber::Signed(-7)))
+        ));
+        assert!(matches!(
+            graph.node(items[3]),
+            Some(WireNodeKind::Number(WireNumber::Float(value))) if (*value - 1.25).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            graph.node(items[4]),
+            Some(WireNodeKind::String(value)) if value == "text"
+        ));
+        assert!(matches!(
+            graph.node(items[5]),
+            Some(WireNodeKind::Leaf(WireLeaf::Unserializable(value))) if value == "NaN"
+        ));
+        assert!(matches!(
+            graph.node(items[6]),
+            Some(WireNodeKind::Leaf(WireLeaf::BigInt(value))) if value == "123"
+        ));
+        assert!(matches!(
+            graph.node(items[7]),
+            Some(WireNodeKind::Leaf(WireLeaf::Date(value))) if value == "2026-07-21T12:34:56.789Z"
+        ));
+        assert!(matches!(
+            graph.node(items[8]),
+            Some(WireNodeKind::Leaf(WireLeaf::RegExp { pattern, flags }))
+                if pattern == "a+b" && flags == "gi"
+        ));
+        assert!(matches!(
+            graph.node(items[9]),
+            Some(WireNodeKind::Leaf(WireLeaf::Url(value))) if value == "https://example.com/path"
+        ));
+        assert!(matches!(
+            graph.node(items[10]),
+            Some(WireNodeKind::Leaf(WireLeaf::Error { name, message, stack }))
+                if name == "TypeError" && message == "broken" && stack == "TypeError: broken"
+        ));
+        assert!(matches!(
+            graph.node(items[11]),
+            Some(WireNodeKind::Leaf(WireLeaf::Undefined))
+        ));
+        assert!(matches!(
+            graph.node(items[12]),
+            Some(WireNodeKind::Leaf(WireLeaf::Symbol))
+        ));
+        assert!(matches!(
+            graph.node(items[13]),
+            Some(WireNodeKind::Leaf(WireLeaf::Function))
+        ));
+    }
+
+    #[test]
+    fn preserves_plain_and_wrapped_object_insertion_order() {
+        let graph = parse_wire_graph(
+            r#"{
+                "z": 1,
+                "a": 2,
+                "wrapped": {
+                    "__rustwright_cdp_object__": "obj",
+                    "entries": {
+                        "z": {
+                            "__rustwright_cdp_regexp__": {"f": "gi", "p": "a+b"}
+                        },
+                        "a": {
+                            "__rustwright_cdp_error__": {
+                                "stack": "TypeError: broken",
+                                "message": "broken",
+                                "name": "TypeError"
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let WireNodeKind::Object(entries) = graph.node(graph.root()).unwrap() else {
+            panic!("root must be an object");
+        };
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "a", "wrapped"]
+        );
+        let wrapped = entries
+            .iter()
+            .find(|(key, _)| key == "wrapped")
+            .map(|(_, id)| *id)
+            .unwrap();
+        let WireNodeKind::Object(wrapped_entries) = graph.node(wrapped).unwrap() else {
+            panic!("wrapped value must be an object");
+        };
+        assert_eq!(
+            wrapped_entries
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "a"]
+        );
+        assert!(matches!(
+            graph.node(wrapped_entries[0].1),
+            Some(WireNodeKind::Leaf(WireLeaf::RegExp { pattern, flags }))
+                if pattern == "a+b" && flags == "gi"
+        ));
+        assert!(matches!(
+            graph.node(wrapped_entries[1].1),
+            Some(WireNodeKind::Leaf(WireLeaf::Error { name, message, stack }))
+                if name == "TypeError" && message == "broken" && stack == "TypeError: broken"
+        ));
+    }
+
+    #[test]
+    fn preserves_repeated_identity_cycles_and_forward_references() {
+        let graph = parse_wire_graph(
+            r#"{
+                "__rustwright_cdp_array__": 1,
+                "items": [
+                    {"__rustwright_cdp_ref__": 2},
+                    {
+                        "__rustwright_cdp_object__": 2,
+                        "entries": {"self": {"__rustwright_cdp_ref__": 2}}
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let WireNodeKind::Array(items) = graph.node(graph.root()).unwrap() else {
+            panic!("root must be an array");
+        };
+        assert_eq!(items[0], items[1]);
+        let WireNodeKind::Object(entries) = graph.node(items[0]).unwrap() else {
+            panic!("repeated value must be an object");
+        };
+        assert_eq!(entries[0].1, items[0]);
+    }
+
+    #[test]
+    fn rejects_duplicate_unknown_and_malformed_wire_wrappers() {
+        for input in [
+            r#"[{"__rustwright_cdp_array__": 1, "items": []}, {"__rustwright_cdp_array__": 1, "items": []}]"#,
+            r#"{"__rustwright_cdp_ref__": 999}"#,
+            r#"{"__rustwright_cdp_array__": 1}"#,
+            r#"{"__rustwright_cdp_object__": 1, "entries": [], "extra": true}"#,
+            r#"{"__rustwright_cdp_ref__": 1, "extra": true}"#,
+        ] {
+            assert!(matches!(
+                parse_wire_graph(input),
+                Err(RwError::InvalidInput(_))
+            ));
+        }
     }
 }
 
@@ -56317,6 +57160,7 @@ fn _rustwright(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyWorkerCloseEventWaiter>()?;
     module.add_class::<PyServiceWorkerEventWaiter>()?;
     module.add_class::<PyBackgroundPageEventWaiter>()?;
+    module.add_function(wrap_pyfunction!(_decode_wire_value, module)?)?;
     module.add_function(wrap_pyfunction!(launch_chromium, module)?)?;
     module.add_function(wrap_pyfunction!(launch_chromium_async, module)?)?;
     module.add_function(wrap_pyfunction!(connect_over_cdp, module)?)?;
