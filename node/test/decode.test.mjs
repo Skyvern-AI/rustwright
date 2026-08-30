@@ -3,27 +3,10 @@ import { createRequire } from 'node:module';
 import test from 'node:test';
 
 const require = createRequire(import.meta.url);
-const nativePath = require.resolve('../native.cjs');
-const cachedNative = require.cache[nativePath];
-
-// The decoder is pure, so stub the native binding while loading its CJS export.
-require.cache[nativePath] = {
-  id: nativePath,
-  filename: nativePath,
-  loaded: true,
-  exports: {}
-};
-
-let decodeWireValue;
-try {
-  ({ _decodeWireValue: decodeWireValue } = require('../index.cjs'));
-} finally {
-  if (cachedNative) require.cache[nativePath] = cachedNative;
-  else delete require.cache[nativePath];
-}
+const { _decodeWireValue: decodeWireValue } = require('../index.cjs');
 
 function decodeFixture(json) {
-  return decodeWireValue(JSON.parse(json));
+  return decodeWireValue(json);
 }
 
 test('decodes core unserializable number and bigint markers', () => {
@@ -42,11 +25,18 @@ test('decodes core unserializable number and bigint markers', () => {
   assert.equal(decodeFixture(
     '{"__rustwright_cdp_unserializable_value__":"9007199254740993n"}'
   ), 9007199254740993n);
+  assert.equal(decodeFixture(
+    '{"__rustwright_cdp_bigint__":"9007199254740993n"}'
+  ), 9007199254740993n);
+  assert.deepEqual(
+    decodeFixture('{"__rustwright_cdp_unserializable_value__":"future-marker"}'),
+    { __rustwright_cdp_unserializable_value__: 'future-marker' }
+  );
 });
 
 test('decodes RegExp, Date, URL, and Error wrappers', () => {
   const regexp = decodeFixture(
-    '{"__rustwright_cdp_regexp__":{"p":"a+b\\\\s","f":"gi"}}'
+    '{"__rustwright_cdp_regexp__":{"f":"gi","p":"a+b\\\\s"}}'
   );
   assert.ok(regexp instanceof RegExp);
   assert.equal(regexp.source, 'a+b\\s');
@@ -65,7 +55,7 @@ test('decodes RegExp, Date, URL, and Error wrappers', () => {
   assert.equal(url.href, 'https://example.com/path?q=wire#value');
 
   const error = decodeFixture(
-    '{"__rustwright_cdp_error__":{"name":"TypeError","message":"boom","stack":"TypeError: boom\\n    at fixture.js:1:1"}}'
+    '{"__rustwright_cdp_error__":{"stack":"TypeError: boom\\n    at fixture.js:1:1","message":"boom","name":"TypeError"}}'
   );
   assert.ok(error instanceof Error);
   assert.equal(error.name, 'TypeError');
@@ -88,6 +78,8 @@ test('decodes nested array items and object entries wrappers', () => {
   const decoded = decodeFixture(`{
     "__rustwright_cdp_object__": 1,
     "entries": {
+      "z": "last",
+      "a": "first",
       "label": "root",
       "items": {
         "__rustwright_cdp_array__": 2,
@@ -106,12 +98,37 @@ test('decodes nested array items and object entries wrappers', () => {
     }
   }`);
 
+  assert.deepEqual(Object.keys(decoded).slice(0, 2), ['z', 'a']);
   assert.equal(decoded.label, 'root');
   assert.equal(decoded.items.length, 3);
   assert.equal(decoded.items[0], 1);
   assert.equal(decoded.items[1], undefined);
   assert.equal(decoded.items[2].big, 42n);
   assert.equal(decoded.items[2].date.toISOString(), '2026-01-02T03:04:05.000Z');
+});
+
+test('defines decoded object entries as own data properties', () => {
+  const decoded = decodeFixture(`{
+    "__rustwright_cdp_object__": 1,
+    "entries": {
+      "__proto__": {
+        "__rustwright_cdp_object__": 2,
+        "entries": {
+          "isAdmin": true
+        }
+      },
+      "nul\\u0000key": "nul"
+    }
+  }`);
+  const nulKey = `nul${String.fromCharCode(0)}key`;
+
+  assert.equal(Object.hasOwn(decoded, '__proto__'), true);
+  assert.equal(Object.hasOwn(decoded.__proto__, 'isAdmin'), true);
+  assert.equal(decoded.__proto__.isAdmin, true);
+  assert.equal(Object.getPrototypeOf(decoded), Object.prototype);
+  assert.equal(decoded.isAdmin, undefined);
+  assert.equal(Object.hasOwn(decoded, nulKey), true);
+  assert.equal(decoded[nulKey], 'nul');
 });
 
 test('resolves ref wrappers for shared values and cycles', () => {
