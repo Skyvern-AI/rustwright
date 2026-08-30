@@ -1651,7 +1651,7 @@ def _decode_wire_error(message: str) -> Optional[Error]:
         ):
             return None
         try:
-            info = _decode_json_result(json.loads(payload["last_info_json"]))
+            info = _decode_json_result_json(payload["last_info_json"])
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
         info_key = payload["last_info_key"]
@@ -2840,78 +2840,52 @@ def _normalize_nth_index(index: Any) -> Any:
     return "NaN"
 
 
+def _decode_wire_leaf(tag: str, payload: Any) -> Any:
+    if tag == "unserializable":
+        if payload == "NaN":
+            return float("nan")
+        if payload == "Infinity":
+            return float("inf")
+        if payload == "-Infinity":
+            return float("-inf")
+        if payload == "-0":
+            return -0.0
+        return {"__rustwright_cdp_unserializable_value__": payload}
+    if tag == "bigint":
+        try:
+            return int(payload)
+        except (TypeError, ValueError):
+            return {"__rustwright_cdp_bigint__": payload}
+    if tag == "date":
+        return datetime.fromisoformat(str(payload).replace("Z", "+00:00"))
+    if tag == "regexp":
+        if isinstance(payload, dict):
+            pattern = payload.get("pattern", payload.get("p"))
+            flags = payload.get("flags", payload.get("f"))
+            return {"r": {"p": pattern, "f": flags}}
+        return {"__rustwright_cdp_regexp__": payload}
+    if tag == "url":
+        return url_parse.urlparse(str(payload))
+    if tag == "error":
+        if isinstance(payload, dict):
+            message = str(payload.get("message") or "")
+            error = Error(message)
+            error._message = message
+            error._name = str(payload.get("name") or "Error")
+            error._stack = str(payload.get("stack") or "")
+            return error
+        return {"__rustwright_cdp_error__": payload}
+    if tag in {"undefined", "symbol", "function"}:
+        return None
+    raise ValueError(f"unknown wire leaf tag: {tag}")
+
+
+def _decode_json_result_json(wire_json: str) -> Any:
+    return _rustwright._decode_wire_value(wire_json, _decode_wire_leaf)
+
+
 def _decode_json_result(value: Any) -> Any:
-    references: dict[Any, Any] = {}
-
-    def decode(item: Any) -> Any:
-        if isinstance(item, dict) and set(item) == {"__rustwright_cdp_ref__"}:
-            return references.get(item["__rustwright_cdp_ref__"])
-        if isinstance(item, dict) and {"__rustwright_cdp_array__", "items"}.issubset(item.keys()):
-            ref = item.get("__rustwright_cdp_array__")
-            result: list[Any] = []
-            references[ref] = result
-            values = item.get("items")
-            if isinstance(values, list):
-                result.extend(decode(value) for value in values)
-            return result
-        if isinstance(item, dict) and {"__rustwright_cdp_object__", "entries"}.issubset(item.keys()):
-            ref = item.get("__rustwright_cdp_object__")
-            result: dict[str, Any] = {}
-            references[ref] = result
-            entries = item.get("entries")
-            if isinstance(entries, dict):
-                for key, value in entries.items():
-                    result[key] = decode(value)
-            return result
-        if isinstance(item, dict) and set(item) == {"__rustwright_cdp_unserializable_value__"}:
-            marker = item["__rustwright_cdp_unserializable_value__"]
-            if marker == "NaN":
-                return float("nan")
-            if marker == "Infinity":
-                return float("inf")
-            if marker == "-Infinity":
-                return float("-inf")
-            if marker == "-0":
-                return -0.0
-            if isinstance(marker, str) and marker.endswith("n"):
-                try:
-                    return int(marker[:-1])
-                except ValueError:
-                    pass
-        if isinstance(item, dict) and set(item) == {"__rustwright_cdp_date__"}:
-            date_value = item["__rustwright_cdp_date__"]
-            if isinstance(date_value, str):
-                return datetime.fromisoformat(date_value.replace("Z", "+00:00"))
-        if isinstance(item, dict) and set(item) == {"__rustwright_cdp_regexp__"}:
-            regexp_value = item["__rustwright_cdp_regexp__"]
-            if isinstance(regexp_value, dict):
-                return {"r": regexp_value}
-        if isinstance(item, dict) and set(item) == {"__rustwright_cdp_url__"}:
-            url_value = item["__rustwright_cdp_url__"]
-            if isinstance(url_value, str):
-                return url_parse.urlparse(url_value)
-        if isinstance(item, dict) and set(item) == {"__rustwright_cdp_error__"}:
-            error_value = item["__rustwright_cdp_error__"]
-            if isinstance(error_value, dict):
-                message = str(error_value.get("message") or "")
-                error = Error(message)
-                error._message = message
-                error._name = str(error_value.get("name") or "Error")
-                error._stack = str(error_value.get("stack") or "")
-                return error
-        if isinstance(item, dict) and set(item) == {"__rustwright_cdp_symbol__"}:
-            return None
-        if isinstance(item, dict) and set(item) == {"__rustwright_cdp_function__"}:
-            return None
-        if isinstance(item, dict) and set(item) == {"__rustwright_cdp_undefined__"}:
-            return None
-        if isinstance(item, list):
-            return [decode(value) for value in item]
-        if isinstance(item, dict):
-            return {key: decode(value) for key, value in item.items()}
-        return item
-
-    return decode(value)
+    return _decode_json_result_json(json.dumps(value, separators=(",", ":")))
 
 
 def _selector_strict(page: "Page", options: Optional[dict[str, Any]] = None) -> bool:
@@ -10125,14 +10099,12 @@ class JSHandle(_EventEmitter):
     def json_value(self) -> Any:
         self._ensure_not_disposed("json_value")
         if self._object_id:
-            return _decode_json_result(
-                json.loads(
-                    _call(
-                        self._page._core.js_handle_json_value,
-                        self._object_id,
-                        self._page._default_timeout,
-                        *self._serialized_owner_args(),
-                    )
+            return _decode_json_result_json(
+                _call(
+                    self._page._core.js_handle_json_value,
+                    self._object_id,
+                    self._page._default_timeout,
+                    *self._serialized_owner_args(),
                 )
             )
         if self._payload.get("type") == "undefined":
@@ -10156,7 +10128,7 @@ class JSHandle(_EventEmitter):
                 self._page._default_timeout if timeout_ms is None else timeout_ms,
                 *self._serialized_owner_args(),
             )
-            return bool(_decode_json_result(json.loads(result)))
+            return bool(_decode_json_result_json(result))
         if self._payload.get("type") == "undefined" or self._payload.get("subtype") == "null":
             return False
         if self._payload.get("unserializableValue") in {"NaN", "-0"}:
@@ -10271,7 +10243,7 @@ class JSHandle(_EventEmitter):
                     timeout_ms,
                     *self._serialized_owner_args(),
                 )
-                return _decode_json_result(json.loads(result))
+                return _decode_json_result_json(result)
             finally:
                 prepared.dispose_temporaries()
         arg = prepared.value if prepared is not None else arg
@@ -10286,7 +10258,7 @@ class JSHandle(_EventEmitter):
             timeout_ms,
             *self._serialized_owner_args(),
         )
-        return _decode_json_result(json.loads(result))
+        return _decode_json_result_json(result)
 
     def evaluate(self, expression: str, arg: Any = None) -> Any:
         self._ensure_not_disposed("evaluate")
@@ -10484,9 +10456,9 @@ class BrowserType(_EventEmitter):
         options = _clean_options(
             {
                 "headless": (
-                    True
-                    if headless is None
-                    else _normalize_boolean_option(headless, method=method, name="headless")
+                    _normalize_boolean_option(headless, method=method, name="headless")
+                    if headless is not None
+                    else None
                 ),
                 "executable_path": normalized_executable_path,
                 "args": normalized_args,
@@ -12317,7 +12289,7 @@ class Tracing(_EventEmitter):
     def _capture_dom_snapshot(self, page: "Page", call_id: str, snapshot_name: str) -> bool:
         try:
             result = _call(page._core.evaluate, _TRACE_DOM_SNAPSHOT_JS, None, page._default_timeout)
-            payload = _decode_json_result(json.loads(result))
+            payload = _decode_json_result_json(result)
         except Exception:
             return False
         if not isinstance(payload, dict):
@@ -14104,7 +14076,7 @@ class Frame(_EventEmitter):
                 arg_json,
                 None,
             )
-            return _decode_json_result(json.loads(result))
+            return _decode_json_result_json(result)
         if self._frame_id and arg is None:
             result = _call_with_method_prefix(
                 "Frame.evaluate",
@@ -14115,7 +14087,7 @@ class Frame(_EventEmitter):
             )
             if result is not None:
                 self._uses_direct_evaluation = True
-                return _decode_json_result(json.loads(result))
+                return _decode_json_result_json(result)
         if arg is not None and _argument_contains_handle(arg):
             prepared = _prepare_evaluate_argument(self._page, arg)
             try:
@@ -14130,7 +14102,7 @@ class Frame(_EventEmitter):
                     None,
                     *anchor._serialized_owner_args(),
                 )
-                return _decode_json_result(json.loads(result))
+                return _decode_json_result_json(result)
             finally:
                 prepared.dispose_temporaries()
         if self._frame_spec is not None:
@@ -16051,7 +16023,7 @@ class Page:
         while time.monotonic() < deadline:
             remaining = max(1.0, (deadline - time.monotonic()) * 1000)
             try:
-                snapshot = _decode_json_result(json.loads(_call(
+                snapshot = _decode_json_result_json(_call(
                     self._core.evaluate,
                     """() => ({
                     readyState: document.readyState,
@@ -16061,7 +16033,7 @@ class Page:
                     })""",
                     None,
                     min(250.0, remaining),
-                )))
+                ))
             except Error:
                 time.sleep(0.02)
                 continue
@@ -16578,7 +16550,7 @@ class Page:
     def _evaluate_history_buffer(self, expression: str, arg: Any) -> Any:
         try:
             payload = _call(self._core.evaluate, expression, json.dumps(arg), 250.0)
-            return _decode_json_result(json.loads(payload))
+            return _decode_json_result_json(payload)
         except (Error, TypeError, ValueError):
             return None
 
@@ -17313,7 +17285,7 @@ class Page:
                         None,
                         timeout_ms,
                     )
-                    content_type = _decode_json_result(json.loads(content_type_result))
+                    content_type = _decode_json_result_json(content_type_result)
                 except Exception:
                     content_type = None
                 if isinstance(content_type, str):
@@ -17888,7 +17860,7 @@ class Page:
                         True,
                         None,
                     )
-                    value = _decode_json_result(json.loads(result))
+                    value = _decode_json_result_json(result)
                 finally:
                     prepared.dispose_temporaries()
             else:
@@ -17907,7 +17879,7 @@ class Page:
                         raise
                     value = None
                 else:
-                    value = _decode_json_result(json.loads(result))
+                    value = _decode_json_result_json(result)
         except Exception as exc:
             self._trace_end_action(call_id, error=exc)
             raise
@@ -20506,7 +20478,7 @@ class Locator(_EventEmitter):
             self._page._default_timeout if timeout is None else timeout,
         )
         result = _call_with_method_prefix(method, *args) if method is not None else _call(*args)
-        return _decode_json_result(json.loads(result))
+        return _decode_json_result_json(result)
 
     def _try_immediate_aria_snapshot(self, body: str, timeout: Optional[float]) -> Any:
         if self._simple_css_indexed_read_payload() is None:
@@ -20717,7 +20689,7 @@ return true;
             json_module_dumps(payload),
             self._page._default_timeout if timeout is None else timeout,
         )
-        return _decode_json_result(json.loads(result))
+        return _decode_json_result_json(result)
 
     def _native_locator_fast_path(
         self,
@@ -20742,7 +20714,7 @@ return true;
             _json(payload),
             self._page._default_timeout if timeout is None else timeout,
         )
-        return _decode_json_result(json.loads(result))
+        return _decode_json_result_json(result)
 
     def _simple_css_indexed_read_payload(self) -> Optional[dict[str, Any]]:
         if getattr(self._page, "_locator_handlers", None):
@@ -21842,7 +21814,7 @@ return null;
             _json(options),
             self._page._default_timeout if timeout is None else timeout,
         )
-        return _decode_json_result(json.loads(result))
+        return _decode_json_result_json(result)
 
     def _fill_apply(self, value: str, *, strict: bool, forced: bool, timeout: float) -> dict[str, Any]:
         result = _call(
@@ -21854,7 +21826,7 @@ return null;
             forced,
             timeout,
         )
-        return _decode_json_result(json.loads(result))
+        return _decode_json_result_json(result)
 
     def _select_apply(
         self,
@@ -21875,7 +21847,7 @@ return null;
             _json(indexes),
             timeout,
         )
-        return _decode_json_result(json.loads(result))
+        return _decode_json_result_json(result)
 
     @staticmethod
     def _state_matches(info: dict[str, Any], state: str) -> bool:
@@ -23930,15 +23902,13 @@ return true;
         return state
 
     def _checked_state_now(self, method: str, *, timeout: Optional[float]) -> dict[str, Any]:
-        state = _decode_json_result(
-            json.loads(
-                _call_with_method_prefix(
-                    method,
-                    self._page._core.locator_check_apply,
-                    _json(self._spec),
-                    self._index,
-                    self._page._default_timeout if timeout is None else timeout,
-                )
+        state = _decode_json_result_json(
+            _call_with_method_prefix(
+                method,
+                self._page._core.locator_check_apply,
+                _json(self._spec),
+                self._index,
+                self._page._default_timeout if timeout is None else timeout,
             )
         )
         if not isinstance(state, dict) or state.get("valid") is False:
@@ -25999,14 +25969,12 @@ class Keyboard(_EventEmitter):
             self._uncertain_pressed_key = None
 
     def _send(self, method: str, params: dict[str, Any]) -> str:
-        outcome = _decode_json_result(
-            json.loads(
-                _call(
-                    self._page._core.keyboard_dispatch_native,
-                    method,
-                    json.dumps(params),
-                    self._page._default_timeout,
-                )
+        outcome = _decode_json_result_json(
+            _call(
+                self._page._core.keyboard_dispatch_native,
+                method,
+                json.dumps(params),
+                self._page._default_timeout,
             )
         )
         error_message = outcome.get("error")
@@ -27081,13 +27049,13 @@ class Worker(_EventEmitter):
                     True,
                     None,
                 )
-                return _decode_json_result(json.loads(result))
+                return _decode_json_result_json(result)
             finally:
                 prepared.dispose_temporaries()
         arg = prepared.value if prepared is not None else arg
         arg_json = None if arg is None else json.dumps(arg)
         result = _call(self._core.evaluate, expression, arg_json, None)
-        return _decode_json_result(json.loads(result))
+        return _decode_json_result_json(result)
 
     def evaluate_handle(self, expression: str, arg: Any = None) -> JSHandle:
         if self._core is None:
@@ -27357,7 +27325,7 @@ class _Expectation:
                 raise
             result: dict[str, Any] = {"passed": False, "actual": None, "log": ""}
         else:
-            decoded = _decode_json_result(json.loads(result_json))
+            decoded = _decode_json_result_json(result_json)
             if not isinstance(decoded, dict):
                 raise Error(f"{api_method}: native assertion returned an invalid result")
             result = decoded

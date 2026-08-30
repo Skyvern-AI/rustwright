@@ -23,7 +23,10 @@ as one JSON value, and returns the core JSON wire value decoded to a native
 value. `screenshot` returns encoded bytes. Timeout values are milliseconds.
 
 The language-facing option names and behavior match the Node alpha surface.
-The C launch JSON is the normalized core wire shape: `headless`,
+The core launch parser accepts canonical snake_case fields and the current
+camelCase aliases `executablePath`, `ignoreAllDefaultArgs`, `ignoreDefaultArgs`,
+`userDataDir`, and `chromiumSandbox`. C callers should emit canonical snake_case
+keys. The C launch JSON uses the normalized core wire shape: `headless`,
 `executable_path`, `channel`, `args`, `ignore_all_default_args`,
 `ignore_default_args`, `timeout`, `user_data_dir`, `env`, `chromium_sandbox`,
 and `proxy`. Screenshot JSON uses the Node names `path`, `fullPage`, `clip`,
@@ -46,6 +49,9 @@ const char *rw_last_error(void);
 void rw_string_free(char *s);
 void rw_bytes_free(uint8_t *buf, size_t len);
 
+/* evaluate wire */
+int32_t rw_decode_wire(const char *wire_json, char **out_json);
+
 /* Chromium */
 int32_t rw_chromium_executable_path(char **out_path);
 int32_t rw_chromium_launch(const char *options_json,
@@ -56,6 +62,16 @@ int32_t rw_browser_new_page(RwBrowser *b, RwPage **out_page);
 int32_t rw_browser_close(RwBrowser *b);
 char *rw_browser_ws_endpoint(RwBrowser *b);
 void rw_browser_free(RwBrowser *b);
+
+/* page timeout defaults */
+int32_t rw_page_set_default_timeout(RwPage *p, double timeout_ms_or_nan);
+int32_t rw_page_set_default_navigation_timeout(RwPage *p,
+                                               double timeout_ms_or_nan);
+int32_t rw_page_set_context_default_timeout(RwPage *p,
+                                            double timeout_ms_or_nan);
+int32_t rw_page_set_context_default_navigation_timeout(
+    RwPage *p,
+    double timeout_ms_or_nan);
 
 /* page */
 char *rw_page_target_id(RwPage *p);
@@ -149,20 +165,37 @@ arrays as `{ "__rustwright_cdp_array__": id, "items": [...] }` and objects as
 `{ "__rustwright_cdp_object__": id, "entries": {...} }`; recursively unwrap
 `items` and `entries`. It uses `__rustwright_cdp_ref__` for repeated/cyclic
 references and tagged objects for undefined, non-finite numbers, dates,
-regular expressions, URLs, errors, symbols, and functions. The core
-serializer is the single source of truth for this vocabulary; a binding maps
-the core's tags to its closest native representation and must not invent or
-assume tags the core does not emit. Manifest v1 expected/captured values are
-JSON-compatible and never require cycles; a runner must at least recursively
-decode array/object wrappers before capture or `assertEval` comparison.
+regular expressions, URLs, errors, symbols, and functions.
+
+The legacy core `decode_wire_value` and C ABI `rw_decode_wire` contract is
+flattened plain JSON. Array and object wrappers are removed, repeated
+non-cyclic references are duplicated, and references that form cycles become
+`{"__rustwright_cdp_cycle__": true}`. Leaf scalar tags remain in the output for
+binding-specific native mapping. This behavior is compatibility-stable.
+
+The PyO3 and napi graph adapters use the core graph representation instead.
+They allocate host arrays and objects with stable identity, preserve repeated
+references and cycles, and keep leaf conversion policy in the adapter. These
+graph adapters must not be replaced with the legacy flattened C ABI decoder.
+
+The core serializer is the single source of truth for this vocabulary; a
+binding maps the core's tags to its closest native representation and must not
+invent or assume tags the core does not emit. Manifest v1 expected/captured
+values are JSON-compatible and never require cycles; a runner must at least
+recursively decode array/object wrappers before capture or `assertEval`
+comparison.
 
 ### Thin-shim rule (single source of logic)
 
 Any behavior expressible as a pure function of JSON-in/JSON-out — launch and
-screenshot option normalization and defaulting, evaluate-wire decoding,
-timeout-precedence resolution, data-URL construction, and structural result
-comparison — is implemented once in `rustwright-core` and exposed through the
-C ABI (and napi/PyO3). A binding limits itself to:
+screenshot option normalization and defaulting, evaluate-wire parsing and
+decoding, timeout-precedence resolution, data-URL construction, and structural
+result comparison — is implemented once in `rustwright-core` and exposed
+through the C ABI and native PyO3/napi adapters.
+
+The legacy C ABI decoder intentionally remains a flattened JSON compatibility
+path. Native graph adapters use core graph parsing to preserve host identity
+and cycles. A binding limits itself to:
 
 - marshalling native values to and from the documented JSON wire shapes,
 - handle, memory, and thread ownership per this contract, and

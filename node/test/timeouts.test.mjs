@@ -11,7 +11,7 @@ require.cache[nativePath] = {
   id: nativePath,
   filename: nativePath,
   loaded: true,
-  exports: {}
+  exports: { decodeWire: JSON.parse }
 };
 
 let Browser;

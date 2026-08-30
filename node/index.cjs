@@ -65,61 +65,12 @@ function encodeEvaluateArg(arg) {
   return JSON.stringify(arg);
 }
 
-function decodeWireValue(value, seen = new Map()) {
-  if (Array.isArray(value)) return value.map((item) => decodeWireValue(item, seen));
-  if (!value || typeof value !== 'object') return value;
-
-  if (hasOwn(value, '__rustwright_cdp_ref__')) {
-    return seen.get(value.__rustwright_cdp_ref__);
-  }
-  if (hasOwn(value, '__rustwright_cdp_array__')) {
-    const ref = value.__rustwright_cdp_array__;
-    const result = [];
-    seen.set(ref, result);
-    for (const item of value.items || []) result.push(decodeWireValue(item, seen));
-    return result;
-  }
-  if (hasOwn(value, '__rustwright_cdp_object__')) {
-    const ref = value.__rustwright_cdp_object__;
-    const result = {};
-    seen.set(ref, result);
-    for (const [key, item] of Object.entries(value.entries || {})) {
-      result[key] = decodeWireValue(item, seen);
-    }
-    return result;
-  }
-  if (hasOwn(value, '__rustwright_cdp_undefined__')) return undefined;
-  if (hasOwn(value, '__rustwright_cdp_symbol__')) return undefined;
-  if (hasOwn(value, '__rustwright_cdp_function__')) return undefined;
-  if (hasOwn(value, '__rustwright_cdp_date__')) return new Date(value.__rustwright_cdp_date__);
-  if (hasOwn(value, '__rustwright_cdp_regexp__')) {
-    const spec = value.__rustwright_cdp_regexp__ || {};
-    return new RegExp(String(spec.p || ''), String(spec.f || ''));
-  }
-  if (hasOwn(value, '__rustwright_cdp_url__')) return new URL(value.__rustwright_cdp_url__);
-  if (hasOwn(value, '__rustwright_cdp_error__')) {
-    const spec = value.__rustwright_cdp_error__ || {};
-    const error = new Error(String(spec.message || ''));
-    error.name = String(spec.name || 'Error');
-    error.stack = String(spec.stack || '');
-    return error;
-  }
-  if (hasOwn(value, '__rustwright_cdp_unserializable_value__')) {
-    const marker = value.__rustwright_cdp_unserializable_value__;
-    if (marker === 'NaN') return NaN;
-    if (marker === 'Infinity') return Infinity;
-    if (marker === '-Infinity') return -Infinity;
-    if (marker === '-0') return -0;
-    if (typeof marker === 'string' && marker.endsWith('n')) return BigInt(marker.slice(0, -1));
-  }
-
-  return Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [key, decodeWireValue(item, seen)])
-  );
+function decodeWireValue(wireJson) {
+  return native.decodeWire(wireJson);
 }
 
 function parseRustJson(json) {
-  return decodeWireValue(JSON.parse(json));
+  return decodeWireValue(json);
 }
 
 class Browser {

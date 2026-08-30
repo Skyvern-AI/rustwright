@@ -22,27 +22,34 @@ Last updated: 2026-07-21
 ## Shim Lightness Principle
 
 The single most expensive architecture failure mode in this repo is engine
-logic accreting inside one language shim. It gets rewritten N times as other
-bindings mature, and the copies drift. Both failure modes are no longer
-hypothetical:
+logic accreting inside one language shim. It gets rewritten as other bindings
+mature, and the copies drift. Two concrete failures shaped the current split:
 
 - The remote-CDP premature-timeout bug (#96) existed because the actionability
   deadline lived in Python while the per-probe cap lived in the core — two
-  timeout engines disagreeing across the FFI boundary.
-- The Node evaluate decoder silently drifted from the core serializer (it read
-  `__rustwright_cdp_number__` and `pattern`/`flags` where the core emits
-  `__rustwright_cdp_unserializable_value__` and `p`/`f`), so NaN/BigInt
-  results leaked as raw wrapper objects and every RegExp decoded as `//`.
-  Seven hand-written decoder copies existed across the bindings when this was
-  caught.
+  timeout engines disagreed across the FFI boundary.
+- The Node evaluate decoder used an outdated tag vocabulary. That Node tag drift
+  is fixed.
+
+The compatibility split is intentional:
+
+- Core `decode_wire_value` and C ABI `rw_decode_wire` remain the flattened plain
+  JSON path. They duplicate repeated references and use the cycle sentinel.
+- Go and rust-native already use core structural decoding.
+- Python and Node use native graph adapters that preserve host object identity
+  and cycles.
+- Java, C#/.NET, Ruby, and PHP retain full structural copies until the
+  remaining C-ABI binding migration.
 
 The rule, applied to every change:
 
 1. Anything expressible as a pure function of JSON-in/JSON-out — option
    normalization and defaulting, evaluate-wire encoding/decoding,
    timeout-precedence resolution, data-URL construction, structural result
-   comparison — is implemented once in `rustwright-core` and exposed through
-   the PyO3/napi/C-ABI surfaces.
+   comparison, and graph parsing — is implemented once in
+   `rustwright-core` and exposed through the relevant binding surfaces. The C
+   ABI keeps its flattened decoder for compatibility; native graph adapters
+   preserve identity and cycles.
 2. Anything that owns a deadline, poll cadence, retry policy, or CDP
    round-trip sequencing lives in the core. A shim never contains a wait loop
    whose correctness depends on transport latency.
@@ -76,88 +83,68 @@ C-ABI bindings.
 | `capi/` | Shared C ABI (`librustwright_capi`) over `rustwright-core`; the boundary for the Go/Java/C#/Ruby/PHP bindings. |
 | `go/`, `java/`, `csharp/`, `ruby/`, `php/` | C-ABI language bindings (alpha surface) + per-language conformance runners. |
 | `bindings/` | Cross-binding contract (`CONTRACT.md`) and shared conformance case data. |
-| `benchmarks/automation_cases.py` | 408 shared Playwright-style automation/parity cases and the 15-case benchmark subset, including WebVoyager/Mind2Web-style workflow cases. |
-| `benchmarks/run_benchmarks.py` | Rustwright and Playwright benchmark runner for the 15-case comparable workload. |
+| `benchmarks/automation_cases.py` | Shared Playwright-style automation/parity cases and benchmark workflows, including WebVoyager/Mind2Web-style workflow cases. |
+| `benchmarks/run_benchmarks.py` | Rustwright and Playwright benchmark runner for a comparable workload. |
 | `tests/test_rustwright_sync_api.py` | Main behavior/regression suite. |
 | `tests/test_playwright_parity_cases.py` | Shared parity harness test entry point. |
 | `tools/api_surface_audit.py` | Public API surface comparison against reference Playwright. |
 | `tools/run_parity_cases.py` | Runs shared parity cases against Rustwright or reference Playwright. |
-| `tools/run_antibot_benchmarks.py` | Anti-bot benchmark runner covering Tier 0 local smoke signals, Tier 1 public fingerprint adapters for SannySoft, CreepJS, BrowserScan, and DeviceAndBrowserInfo, and local Tier 4 fresh/warm profile matrix checks across Rustwright and Playwright. |
+| `tools/run_antibot_benchmarks.py` | Anti-bot benchmark runner covering local smoke signals, public fingerprint adapters, and fresh/warm profile matrix checks across Rustwright and Playwright. |
 
 ## Known Architecture Debt
 
 The current implementation intentionally optimized for fast parity iteration.
 The largest monoliths are now large enough to slow development:
 
-| File | Current size | Debt |
-| --- | ---: | --- |
-| `src/lib.rs` | 19,794 lines | CDP transport, browser state, event routing, DOM helpers, stealth/dedicated-worker identity wiring, network shaping, facade promotions, and PyO3 exports are all colocated. |
-| `python/rustwright/sync_api.py` | 29,310 lines | Public API classes, option validators, event waiters, routing, locators, assertions, artifacts, and request helpers are colocated — and a large engine-in-shim share (see audit below). |
-| `python/rustwright/async_api.py` | 6,447 lines | Hand-written async mirror of the sync API; ~242 of 404 methods are pure mechanical delegations that drift when the sync surface changes. |
-| `benchmarks/automation_cases.py` | 16,158 lines | Shared parity cases and benchmark workflows are useful but increasingly hard to scan by subsystem. |
-| `tests/test_rustwright_sync_api.py` | 29,011+ lines | Broad regression coverage is useful but hard to navigate by subsystem. |
+| File | Debt |
+| --- | --- |
+| `src/lib.rs` | CDP transport, browser state, event routing, DOM helpers, stealth/dedicated-worker identity wiring, network shaping, facade promotions, and PyO3 exports are all colocated. |
+| `python/rustwright/sync_api.py` | Public API classes, option validators, event waiters, routing, locators, assertions, artifacts, and request helpers are colocated. |
+| `python/rustwright/async_api.py` | Hand-written async control paths sit beside generated mechanical delegation mixins; ownership rules must stay synchronized with the generator. |
+| `benchmarks/automation_cases.py` | Shared parity cases and benchmark workflows are useful but increasingly hard to scan by subsystem. |
+| `tests/test_rustwright_sync_api.py` | Broad regression coverage is useful but hard to navigate by subsystem. |
 
 This is acceptable for alpha while behavior is moving quickly, but the beta
 bar should include splitting by stable ownership boundaries.
 
-## Shim Weight Audit (2026-07-21)
+## Binding Ownership Audit
 
-Measured shim weight per binding (hand-maintained lines, excluding tests):
+The core graph parser establishes the evaluate-wire and launch-parser ownership split:
 
-| Binding | Lines | Mechanism | Engine-in-shim findings |
-| --- | ---: | --- | --- |
-| Python | ~39,100 | PyO3 (in-process) | ~95% of all shim code; details below. |
-| Go | ~850 | C ABI (purego) | Re-defaults `headless=true`; own wire decoder; own launch normalizer. |
-| rust-native | ~820 | rlib (in-process) | Re-defaults `headless` + injects a 30s launch timeout; partial wire decoder. |
-| C ABI (`capi/`) | ~540 | is the boundary | Passes launch JSON through raw, forcing every C-ABI binding to normalize. |
-| Java / C# / Ruby / PHP | ~300–1,300 each | C ABI | Each: own launch/screenshot normalizer, own wire decoder, own harness helpers. |
-| Node | ~420 | napi-rs (in-process) | Own launch/screenshot normalizer; wire decoder had drifted into a live bug. |
+| Binding | Current ownership |
+| --- | --- |
+| Python | PyO3 native graph adapter for evaluate results; Playwright-shaped validation and ergonomics remain in Python. |
+| Go | C ABI binding that already uses the core's flattened structural decoder and maps leaf values. |
+| rust-native | In-process facade that already uses core structural decoding and maps leaf values. |
+| C ABI | Legacy flattened JSON decoder and core launch parser; it does not preserve host graph identity. |
+| Java / C#/.NET / Ruby / PHP | C-ABI bindings with full structural copies pending migration to the core decoder. |
+| Node | napi native graph adapter; the typed camelCase coercion veneer remains in Node. |
 
-Python engine-in-shim inventory (`sync_api.py` unless noted):
+The remaining cross-shim concerns have these owners:
 
-- ~4,955 lines of the file are JavaScript inside Python strings; the
-  actionability probe (`_target_state`) is rebuilt via string `.replace()` on
-  every poll iteration.
-- 34 `_try_fast_*` DOM fast-paths totalling ~2,027 lines — pure engine
-  performance shortcuts, cleanly excisable as a unit.
-- 31 `while True` poll loops; ~1,700 lines of deadline/poll/retry code
-  (`_wait_for_single`, `_wait_for_fill_ready`, fill/select apply loops, 16
-  near-identical page event-waiter loops, 21 event context-manager classes).
-- The `expect()` assertion engine: ~1,000 lines of poll loop + probe JS.
-- `APIRequestContext`: a hand-rolled urllib HTTP/proxy/redirect stack
-  (~1,500 lines) parallel to the core's reqwest stack.
-- Error classification by string-sniffing: the core maps every failure to
-  `PyRuntimeError`, and Python re-derives timeout/crash/closed semantics by
-  matching message substrings.
-- The whole shim drives the core through ~104 native methods, most of which
-  reduce to "evaluate this JS against a locator" — the core exposes few
-  semantic DOM operations, which is the root cause of the accretion.
-
-Cross-shim duplication (non-Python):
-
-| Concern | Copies | ~LOC | Resolution |
-| --- | ---: | ---: | --- |
-| Evaluate wire decoder | 7 | 820 | Decode once core-side; shims map leaf scalars only. |
-| Launch normalize + defaults | 7 | 366 | Core accepts camelCase aliases; shim re-defaults deleted. |
-| Screenshot normalize | 5 | 120 | Already parsed core-side (`capi`); delete shim copies. |
-| Data-URL / JSON-equality / manifest validation (harness) | 5–6 each | ~1,700 | Move behind C-ABI helpers when harness work next opens. |
-| Error mapping | 7 | thin | Already correct (core-owned strings) — the model to follow. |
+| Concern | Current owner | Remaining work |
+| --- | --- | --- |
+| Evaluate wire | Core parser; C ABI uses its flattened compatibility decoder, while Python and Node use native graph adapters. | Migrate Java, C#/.NET, Ruby, and PHP to the core decoder. |
+| Launch options | Core parser accepts canonical snake_case and current camelCase aliases. | Keep C callers on canonical snake_case; retain language-specific validation and coercion only where required for compatibility. |
+| Screenshot options | Core parser. | Keep language veneers limited to marshalling and native coercion. |
+| Data URL / JSON equality / manifest validation | Binding harnesses. | Move behind C-ABI helpers when harness work next opens. |
+| Error mapping | Core-owned error strings and structured payloads where available. | Add a structured taxonomy in the later error track. |
 
 ## Shim Lightening Roadmap
 
 Ordered tracks; each is independently landable and keeps parity tests green.
 
-1. **Fix + centralize the evaluate wire decoder.** Repair the Node decoder
-   drift against the core serializer (regression-tested), then add a
-   canonical core-side decode so per-language decoders reduce to leaf-scalar
-   mapping.
-2. **Centralize launch-option normalization/defaulting.** serde camelCase
-   aliases on `LaunchOptions`; delete shim-side re-defaults (Go, rust-native)
-   and redundant key-mapping (Node).
-3. **Generate the async Python facade.** Machine-generate the mechanical
-   delegation methods in `async_api.py` from `sync_api.py` signatures with a
-   checked-in-output freshness test; hand-written code shrinks to the ~160
-   methods with real async semantics.
+1. **Core evaluate-wire graph and launch parsing (this change).** Keep the
+   legacy C ABI decoder flattened for compatibility. Use native graph adapters
+   in Python and Node, and retain core structural decoding in Go and
+   rust-native.
+2. **Migrate the remaining C-ABI bindings.** Move Java, C#/.NET, Ruby, and PHP
+   from full structural copies to the core graph contract. This remains
+   pending; do not treat those migrations as complete.
+3. **Maintain the generated async Python facade.** Keep mechanical delegation
+   methods generated from `sync_api.py` signatures, keep hand-written code
+   limited to methods with real async semantics, and keep the checked-in
+   freshness contract synchronized with public context-manager methods.
 4. **Native actionability.** Land the in-flight native-actionability branch
    (Tokio-side waits, shared probe templates, trusted CDP mouse dispatch,
    structured `ActionTimeoutError`), reconciled with the #96 probe-budget
@@ -168,22 +155,21 @@ Ordered tracks; each is independently landable and keeps parity tests green.
    Python formats parity messages without string-sniffing. Trusted keyboard
    dispatch (`Input.dispatchKeyEvent`/`insertText`) is the missing input
    primitive.
-5. **Move the 34 `_try_fast_*` DOM fast-paths into the core** as semantic
-   native operations.
+5. **Move the DOM fast paths into the core** as semantic native operations.
 6. **Bundle the injected probe/action JavaScript core-side** (single injected
    script, no per-poll string assembly).
-7. **Consolidate event waiters** behind one generic native waiter + a small
+7. **Consolidate event waiters** behind one generic native waiter plus a small
    Python descriptor table.
 8. **Native `expect()` polling** returning `(passed, actual)`; Python keeps
-   assertion API + message formatting.
+   assertion API plus message formatting.
 9. **Structured error taxonomy across the boundary** (typed timeout/crash/
    closed payloads; retire substring classification).
 10. **Core-side default-timeout register** (page/context), so
     contexts/default timeouts land once in the core instead of per shim.
 
-Sequencing rule: tracks 1–3 are independent and safe now; track 4 gates 5–8
-(they reuse its probe/loop machinery); 9 rides along with 4; 10 pairs with
-the first binding that needs contexts.
+Sequencing rule: track 1 is the contract baseline for track 2. Track 3 is
+independent. Track 4 gates tracks 5–8; track 9 rides along with track 4; track
+10 pairs with the first binding that needs contexts.
 
 ## Target Rust Module Split
 
@@ -293,11 +279,10 @@ Chrome-for-Testing installer is linux x86_64-only.
 
 ## Current Refactor Priority
 
-1. Shim Lightening Roadmap tracks 1–3 (decoder fix/centralization, launch
-   normalization, async generation) — independent, safe, in flight.
-2. Land the native-actionability branch and extend it to the sync path
-   (roadmap track 4); it unlocks tracks 5–8.
-3. Extract Python option validators into `python/rustwright/options.py`.
+1. Preserve and extend the core evaluate-wire and launch-parser contract
+   without changing the legacy C ABI behavior.
+2. Migrate the remaining C-ABI bindings; this is not complete.
+3. Maintain the generated async Python facade and its ownership checks.
 4. Extract Python event waiters/context managers into
    `python/rustwright/events.py` (pairs with roadmap track 7).
 5. Extract Rust launch/process code into `src/browser/launch.rs`, then CDP

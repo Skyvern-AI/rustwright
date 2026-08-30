@@ -24,4 +24,6 @@ export declare class Page {
 
 export declare function chromiumExecutablePath(): Promise<string | null>
 
+export declare function decodeWire(wireJson: string): unknown
+
 export declare function launchChromium(optionsJson: string): Promise<Browser>

@@ -47682,3 +47682,66 @@ def test_async_locator_evaluate_handle_flow():
             await browser.close()
 
     asyncio.run(run())
+
+
+def test_native_wire_decoder_preserves_identity_cycles_and_leaf_types():
+    from rustwright import _rustwright
+    from rustwright.sync_api import _decode_json_result_json
+
+    wire = {
+        "__rustwright_cdp_array__": 1,
+        "items": [
+            {
+                "__rustwright_cdp_object__": 2,
+                "entries": {
+                    "z": 1,
+                    "a": 2,
+                    "self": {"__rustwright_cdp_ref__": 2},
+                    "leaves": {
+                        "__rustwright_cdp_array__": 3,
+                        "items": [
+                            {"__rustwright_cdp_unserializable_value__": "NaN"},
+                            {"__rustwright_cdp_bigint__": "123n"},
+                            {"__rustwright_cdp_date__": "2026-07-21T12:34:56.789Z"},
+                            {"__rustwright_cdp_regexp__": {"f": "gi", "p": "a+b"}},
+                            {"__rustwright_cdp_url__": "https://example.com/path?q=1"},
+                            {
+                                "__rustwright_cdp_error__": {
+                                    "stack": "TypeError: broken",
+                                    "message": "broken",
+                                    "name": "TypeError",
+                                }
+                            },
+                            {"__rustwright_cdp_undefined__": True},
+                            {"__rustwright_cdp_symbol__": True},
+                            {"__rustwright_cdp_function__": True},
+                        ],
+                    },
+                },
+            },
+            {"__rustwright_cdp_ref__": 2},
+        ],
+    }
+
+    decoded = _decode_json_result_json(json.dumps(wire))
+    assert decoded[0] is decoded[1]
+    assert list(decoded[0])[:2] == ["z", "a"]
+    assert decoded[0]["self"] is decoded[0]
+    leaves = decoded[0]["leaves"]
+    assert math.isnan(leaves[0])
+    assert leaves[1] == 123
+    assert leaves[2] == datetime(2026, 7, 21, 12, 34, 56, 789000, tzinfo=timezone.utc)
+    assert leaves[3] == {"r": {"p": "a+b", "f": "gi"}}
+    assert leaves[4] == urlparse("https://example.com/path?q=1")
+    assert leaves[5]._name == "TypeError"
+    assert leaves[5]._message == "broken"
+    assert leaves[5]._stack == "TypeError: broken"
+    assert leaves[6:] == [None, None, None]
+    assert hasattr(_rustwright, "_decode_wire_value")
+
+
+def test_native_launch_parser_preserves_value_error():
+    from rustwright import _rustwright
+
+    with pytest.raises(ValueError):
+        _rustwright.launch_chromium("{")
