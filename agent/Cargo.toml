@@ -1,0 +1,15 @@
+[package]
+name = "rustwright-agent"
+version = "0.1.0"
+edition = "2024"
+publish = false
+[features]
+test-support = []
+
+
+[dependencies]
+base64 = "=0.22.1"
+rustwright = { path = "../rust-native" }
+serde = { version = "1.0.194", features = ["derive"] }
+serde_json = "1.0.127"
+tokio = { version = "1.52.3", features = ["sync", "time"] }
