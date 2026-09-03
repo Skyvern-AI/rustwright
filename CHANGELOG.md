@@ -4,6 +4,11 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ## [Unreleased]
 
+### Documentation
+
+- Added a Mintlify documentation configuration, quickstart, and guide to the
+  generated Python API inventories and compatibility evidence.
+
 ## [0.3.0] - 2026-08-16
 
 ### Added

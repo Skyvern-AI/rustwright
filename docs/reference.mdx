@@ -1,0 +1,35 @@
+---
+title: "Reading the API reference"
+description: "Understand the generated API inventories and compatibility classifications."
+---
+
+Rustwright publishes two complementary views of its Playwright-shaped Python API.
+
+## API inventories
+
+The **Sync API surface** and **Async API surface** pages are generated from the importable modules. They answer structural questions:
+
+- Does a Playwright class exist in Rustwright?
+- Does a method or property exist?
+- Does its public signature match the reference package?
+
+The generator writes a compact Markdown summary and machine-readable JSON. Do not edit those files by hand.
+
+## Parity map
+
+The [parity map](/PARITY) adds behavioral evidence for the synchronous API. Its statuses mean:
+
+| Status | Meaning |
+| --- | --- |
+| Present and exercised | The symbol exists and a registered shared compatibility case resolves it. |
+| Present, not exercised | The symbol exists, but the shared parity registry does not currently provide evidence for it. |
+| Intentionally unsupported | The symbol is present to produce an explicit compatibility error. |
+| Missing | The Playwright reference symbol is not implemented. |
+
+<Warning>
+Structural parity is not a claim of identical browser behavior. Review limitations and run your own workload before replacing Playwright in production.
+</Warning>
+
+## Regeneration
+
+The API inventory files carry a generated-file notice and are refreshed by the repository's parity tooling. If the binding surface changes, update the generator inputs rather than patching the generated tables directly.
