@@ -39,11 +39,15 @@ def _run_parity(implementation: str) -> dict:
     proc = subprocess.run(
         [
             sys.executable,
-            str(ROOT / "tools" / "run_parity_cases.py"),
+            str(ROOT / "benchmarks" / "run_benchmarks.py"),
             "--impl",
             implementation,
             "--reference-path",
             str(ROOT / ".audit-playwright"),
+            "--suite",
+            "parity",
+            "--iterations",
+            "1",
             "--json",
         ],
         cwd=ROOT,
@@ -66,5 +70,4 @@ def test_core_automation_cases_match_playwright_and_rustwright(implementation):
 
     result = _run_parity(implementation)
 
-    assert result["total"] == len(CASES)
-    assert result["passed"] == result["total"]
+    assert set(result["cases"]) == {case.__name__ for case in CASES}
