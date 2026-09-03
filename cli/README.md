@@ -1,7 +1,7 @@
 # Rustwright agent CLI
 
-`rustwright-cli` is a native, agent-focused interface to the Rustwright CDP engine. CLI commands
-share a persistent local Chromium session.
+`rustwright-cli` is a native, agent-focused interface to Rustwright. It uses
+the same browser actor as `rustwright-mcp` and keeps one local session alive.
 
 ## Install
 
@@ -45,14 +45,14 @@ state file is discarded automatically. Useful global options:
 - `open --headed` shows the browser.
 - `open --executable-path <path>` selects a Chromium executable for a new session.
 
-Snapshots list visible page content and attach `@eN` references to interactive elements. References
-belong to the latest snapshot and should be refreshed after navigation or major page changes. Direct
-CSS selectors and `text=` selectors remain available when a snapshot reference is not convenient.
+Snapshots use the shared actor's accessibility hierarchy. The CLI renders actor
+refs as `@eN` for command compatibility. A ref belongs to the latest snapshot.
+Direct CSS selectors and `text=` selectors remain available.
 References are stored as temporary DOM attributes so later CLI commands can resolve them; pages that
 observe DOM attribute changes can detect those markers.
 
 ## MCP server
 
-Looking for an MCP server? Rustwright ships a dedicated, standalone MCP server as the
-`rustwright-mcp` package (see [`mcp/`](../mcp)). This CLI focuses on the interactive agent
-command surface; the two share the same Rustwright CDP engine.
+Looking for an MCP server? Rustwright ships `rustwright-mcp` as a separate
+package (see [`mcp/`](../mcp)). The CLI and MCP server are thin transports over
+the same native actor and CDP engine.
