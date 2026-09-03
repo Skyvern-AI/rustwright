@@ -7,10 +7,11 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Objects;
 
-/** Exact Java FFM declarations and ownership helpers for all 19 rw_* symbols. */
+/** Exact Java FFM declarations and ownership helpers for Rustwright's native ABI. */
 final class NativeBindings {
     private static final ValueLayout.OfLong SIZE_T = ValueLayout.JAVA_LONG;
     private static final long MAX_C_STRING_BYTES = Integer.MAX_VALUE;
@@ -39,6 +40,25 @@ final class NativeBindings {
     private final MethodHandle rwPageScreenshot;
     private final MethodHandle rwPageClose;
     private final MethodHandle rwPageFree;
+    private final MethodHandle rwWireGraphParse;
+    private final MethodHandle rwWireGraphFree;
+    private final MethodHandle rwWireGraphNodeCount;
+    private final MethodHandle rwWireGraphRoot;
+    private final MethodHandle rwWireGraphNodeKind;
+    private final MethodHandle rwWireGraphGetBool;
+    private final MethodHandle rwWireGraphGetSigned;
+    private final MethodHandle rwWireGraphGetUnsigned;
+    private final MethodHandle rwWireGraphGetFloat;
+    private final MethodHandle rwWireGraphGetString;
+    private final MethodHandle rwWireGraphArrayLength;
+    private final MethodHandle rwWireGraphArrayChild;
+    private final MethodHandle rwWireGraphObjectLength;
+    private final MethodHandle rwWireGraphObjectKey;
+    private final MethodHandle rwWireGraphObjectChild;
+    private final MethodHandle rwWireGraphLeafKind;
+    private final MethodHandle rwWireGraphLeafFieldCount;
+    private final MethodHandle rwWireGraphLeafField;
+
 
     NativeBindings(Path path) {
         Objects.requireNonNull(path, "path");
@@ -100,6 +120,57 @@ final class NativeBindings {
                         ValueLayout.JAVA_INT));
         rwPageFree = bind(linker, lookup, "rw_page_free",
                 FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+        rwWireGraphParse = bind(linker, lookup, "rw_wire_graph_parse",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+        rwWireGraphFree = bind(linker, lookup, "rw_wire_graph_free",
+                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+        rwWireGraphNodeCount = bind(linker, lookup, "rw_wire_graph_node_count",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+        rwWireGraphRoot = bind(linker, lookup, "rw_wire_graph_root",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+        rwWireGraphNodeKind = bind(linker, lookup, "rw_wire_graph_node_kind",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, SIZE_T,
+                        ValueLayout.ADDRESS));
+        rwWireGraphGetBool = bind(linker, lookup, "rw_wire_graph_get_bool",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, SIZE_T,
+                        ValueLayout.ADDRESS));
+        rwWireGraphGetSigned = bind(linker, lookup, "rw_wire_graph_get_signed",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, SIZE_T,
+                        ValueLayout.ADDRESS));
+        rwWireGraphGetUnsigned = bind(linker, lookup, "rw_wire_graph_get_unsigned",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, SIZE_T,
+                        ValueLayout.ADDRESS));
+        rwWireGraphGetFloat = bind(linker, lookup, "rw_wire_graph_get_float",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, SIZE_T,
+                        ValueLayout.ADDRESS));
+        rwWireGraphGetString = bind(linker, lookup, "rw_wire_graph_get_string",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, SIZE_T,
+                        ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+        rwWireGraphArrayLength = bind(linker, lookup, "rw_wire_graph_array_length",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, SIZE_T,
+                        ValueLayout.ADDRESS));
+        rwWireGraphArrayChild = bind(linker, lookup, "rw_wire_graph_array_child",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, SIZE_T, SIZE_T,
+                        ValueLayout.ADDRESS));
+        rwWireGraphObjectLength = bind(linker, lookup, "rw_wire_graph_object_length",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, SIZE_T,
+                        ValueLayout.ADDRESS));
+        rwWireGraphObjectKey = bind(linker, lookup, "rw_wire_graph_object_key",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, SIZE_T, SIZE_T,
+                        ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+        rwWireGraphObjectChild = bind(linker, lookup, "rw_wire_graph_object_child",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, SIZE_T, SIZE_T,
+                        ValueLayout.ADDRESS));
+        rwWireGraphLeafKind = bind(linker, lookup, "rw_wire_graph_leaf_kind",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, SIZE_T,
+                        ValueLayout.ADDRESS));
+        rwWireGraphLeafFieldCount = bind(linker, lookup, "rw_wire_graph_leaf_field_count",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, SIZE_T,
+                        ValueLayout.ADDRESS));
+        rwWireGraphLeafField = bind(linker, lookup, "rw_wire_graph_leaf_field",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, SIZE_T, SIZE_T,
+                        ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
     }
 
     Path libraryPath() {
@@ -207,16 +278,25 @@ final class NativeBindings {
         }
     }
 
-    String pageEvaluate(MemorySegment page, String expression, String argumentJson, double timeout) {
+    MemorySegment pageEvaluateGraph(
+            MemorySegment page,
+            String expression,
+            String argumentJson,
+            double timeout) {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment out = pointerOut(arena);
             int status = invokeInt("rw_page_evaluate", rwPageEvaluate, page,
                     string(arena, expression), nullableString(arena, argumentJson), timeout, out);
             checkStatus(status, "rw_page_evaluate");
-            MemorySegment value = requireOutPointer(out, "rw_page_evaluate");
-            return takeNullableString(value);
+            MemorySegment wire = requireOutPointer(out, "rw_page_evaluate");
+            try {
+                return wireGraphParse(wire);
+            } finally {
+                invokeVoid("rw_string_free", rwStringFree, wire);
+            }
         }
     }
+
 
     byte[] pageScreenshot(MemorySegment page, String optionsJson) {
         try (Arena arena = Arena.ofConfined()) {
@@ -246,6 +326,182 @@ final class NativeBindings {
             }
         }
     }
+    MemorySegment wireGraphParse(String wireJson) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = pointerOut(arena);
+            int status = invokeInt("rw_wire_graph_parse", rwWireGraphParse,
+                    string(arena, wireJson), out);
+            checkStatus(status, "rw_wire_graph_parse");
+            return requireOutPointer(out, "rw_wire_graph_parse");
+        }
+    }
+    MemorySegment wireGraphParse(MemorySegment wireJson) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = pointerOut(arena);
+            int status = invokeInt("rw_wire_graph_parse", rwWireGraphParse, wireJson, out);
+            checkStatus(status, "rw_wire_graph_parse");
+            return requireOutPointer(out, "rw_wire_graph_parse");
+        }
+    }
+
+
+    void wireGraphFree(MemorySegment graph) {
+        invokeVoid("rw_wire_graph_free", rwWireGraphFree, graph);
+    }
+
+    long wireGraphNodeCount(MemorySegment graph) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = sizeOut(arena);
+            int status = invokeInt("rw_wire_graph_node_count", rwWireGraphNodeCount, graph, out);
+            checkStatus(status, "rw_wire_graph_node_count");
+            return out.get(SIZE_T, 0);
+        }
+    }
+
+    long wireGraphRoot(MemorySegment graph) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = sizeOut(arena);
+            int status = invokeInt("rw_wire_graph_root", rwWireGraphRoot, graph, out);
+            checkStatus(status, "rw_wire_graph_root");
+            return out.get(SIZE_T, 0);
+        }
+    }
+
+    int wireGraphNodeKind(MemorySegment graph, long node) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = intOut(arena);
+            int status = invokeInt("rw_wire_graph_node_kind", rwWireGraphNodeKind, graph, node, out);
+            checkStatus(status, "rw_wire_graph_node_kind");
+            return out.get(ValueLayout.JAVA_INT, 0);
+        }
+    }
+
+    boolean wireGraphGetBool(MemorySegment graph, long node) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = intOut(arena);
+            int status = invokeInt("rw_wire_graph_get_bool", rwWireGraphGetBool, graph, node, out);
+            checkStatus(status, "rw_wire_graph_get_bool");
+            return out.get(ValueLayout.JAVA_INT, 0) != 0;
+        }
+    }
+
+    long wireGraphGetSigned(MemorySegment graph, long node) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = longOut(arena);
+            int status = invokeInt("rw_wire_graph_get_signed", rwWireGraphGetSigned, graph, node, out);
+            checkStatus(status, "rw_wire_graph_get_signed");
+            return out.get(ValueLayout.JAVA_LONG, 0);
+        }
+    }
+
+    long wireGraphGetUnsigned(MemorySegment graph, long node) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = longOut(arena);
+            int status = invokeInt("rw_wire_graph_get_unsigned", rwWireGraphGetUnsigned, graph, node, out);
+            checkStatus(status, "rw_wire_graph_get_unsigned");
+            return out.get(ValueLayout.JAVA_LONG, 0);
+        }
+    }
+
+    double wireGraphGetFloat(MemorySegment graph, long node) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = doubleOut(arena);
+            int status = invokeInt("rw_wire_graph_get_float", rwWireGraphGetFloat, graph, node, out);
+            checkStatus(status, "rw_wire_graph_get_float");
+            return out.get(ValueLayout.JAVA_DOUBLE, 0);
+        }
+    }
+
+    String wireGraphGetString(MemorySegment graph, long node) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment outData = pointerOut(arena);
+            MemorySegment outLength = sizeOut(arena);
+            int status = invokeInt("rw_wire_graph_get_string", rwWireGraphGetString, graph, node,
+                    outData, outLength);
+            checkStatus(status, "rw_wire_graph_get_string");
+            return copyBorrowedUtf8(outData.get(ValueLayout.ADDRESS, 0), outLength.get(SIZE_T, 0));
+        }
+    }
+
+    long wireGraphArrayLength(MemorySegment graph, long node) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = sizeOut(arena);
+            int status = invokeInt("rw_wire_graph_array_length", rwWireGraphArrayLength, graph, node, out);
+            checkStatus(status, "rw_wire_graph_array_length");
+            return out.get(SIZE_T, 0);
+        }
+    }
+
+    long wireGraphArrayChild(MemorySegment graph, long node, long index) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = sizeOut(arena);
+            int status = invokeInt("rw_wire_graph_array_child", rwWireGraphArrayChild,
+                    graph, node, index, out);
+            checkStatus(status, "rw_wire_graph_array_child");
+            return out.get(SIZE_T, 0);
+        }
+    }
+
+    long wireGraphObjectLength(MemorySegment graph, long node) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = sizeOut(arena);
+            int status = invokeInt("rw_wire_graph_object_length", rwWireGraphObjectLength, graph, node, out);
+            checkStatus(status, "rw_wire_graph_object_length");
+            return out.get(SIZE_T, 0);
+        }
+    }
+
+    String wireGraphObjectKey(MemorySegment graph, long node, long index) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment outData = pointerOut(arena);
+            MemorySegment outLength = sizeOut(arena);
+            int status = invokeInt("rw_wire_graph_object_key", rwWireGraphObjectKey,
+                    graph, node, index, outData, outLength);
+            checkStatus(status, "rw_wire_graph_object_key");
+            return copyBorrowedUtf8(outData.get(ValueLayout.ADDRESS, 0), outLength.get(SIZE_T, 0));
+        }
+    }
+
+    long wireGraphObjectChild(MemorySegment graph, long node, long index) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = sizeOut(arena);
+            int status = invokeInt("rw_wire_graph_object_child", rwWireGraphObjectChild,
+                    graph, node, index, out);
+            checkStatus(status, "rw_wire_graph_object_child");
+            return out.get(SIZE_T, 0);
+        }
+    }
+
+    int wireGraphLeafKind(MemorySegment graph, long node) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = intOut(arena);
+            int status = invokeInt("rw_wire_graph_leaf_kind", rwWireGraphLeafKind, graph, node, out);
+            checkStatus(status, "rw_wire_graph_leaf_kind");
+            return out.get(ValueLayout.JAVA_INT, 0);
+        }
+    }
+
+    long wireGraphLeafFieldCount(MemorySegment graph, long node) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = sizeOut(arena);
+            int status = invokeInt("rw_wire_graph_leaf_field_count", rwWireGraphLeafFieldCount,
+                    graph, node, out);
+            checkStatus(status, "rw_wire_graph_leaf_field_count");
+            return out.get(SIZE_T, 0);
+        }
+    }
+
+    String wireGraphLeafField(MemorySegment graph, long node, long index) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment outData = pointerOut(arena);
+            MemorySegment outLength = sizeOut(arena);
+            int status = invokeInt("rw_wire_graph_leaf_field", rwWireGraphLeafField,
+                    graph, node, index, outData, outLength);
+            checkStatus(status, "rw_wire_graph_leaf_field");
+            return copyBorrowedUtf8(outData.get(ValueLayout.ADDRESS, 0), outLength.get(SIZE_T, 0));
+        }
+    }
+
 
     void pageClose(MemorySegment page, double timeout, boolean runBeforeUnload) {
         int status = invokeInt("rw_page_close", rwPageClose, page, timeout, runBeforeUnload ? 1 : 0);
@@ -268,6 +524,44 @@ final class NativeBindings {
         out.set(ValueLayout.ADDRESS, 0, MemorySegment.NULL);
         return out;
     }
+    private static MemorySegment sizeOut(Arena arena) {
+        MemorySegment out = arena.allocate(SIZE_T);
+        out.set(SIZE_T, 0, 0L);
+        return out;
+    }
+
+    private static MemorySegment intOut(Arena arena) {
+        MemorySegment out = arena.allocate(ValueLayout.JAVA_INT);
+        out.set(ValueLayout.JAVA_INT, 0, 0);
+        return out;
+    }
+
+    private static MemorySegment longOut(Arena arena) {
+        MemorySegment out = arena.allocate(ValueLayout.JAVA_LONG);
+        out.set(ValueLayout.JAVA_LONG, 0, 0L);
+        return out;
+    }
+
+    private static MemorySegment doubleOut(Arena arena) {
+        MemorySegment out = arena.allocate(ValueLayout.JAVA_DOUBLE);
+        out.set(ValueLayout.JAVA_DOUBLE, 0, 0.0d);
+        return out;
+    }
+
+    private static String copyBorrowedUtf8(MemorySegment pointer, long length) {
+        if (length < 0 || length > Integer.MAX_VALUE) {
+            throw new RustwrightException("native returned invalid UTF-8 byte length: " + length);
+        }
+        if (length == 0) {
+            return "";
+        }
+        if (isNull(pointer)) {
+            throw new RustwrightException("native returned NULL UTF-8 data with nonzero length " + length);
+        }
+        byte[] bytes = pointer.reinterpret(length).toArray(ValueLayout.JAVA_BYTE);
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
 
     private static MemorySegment nullableString(Arena arena, String value) {
         return value == null ? MemorySegment.NULL : string(arena, value);

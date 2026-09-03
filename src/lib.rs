@@ -53185,6 +53185,10 @@ const WIRE_LEAF_TAGS: [&str; 9] = [
 pub struct WireNodeId(usize);
 
 impl WireNodeId {
+    pub fn from_index(index: usize) -> Self {
+        Self(index)
+    }
+
     pub fn index(self) -> usize {
         self.0
     }

@@ -20,6 +20,85 @@ pub struct RwBrowser {
 pub struct RwPage {
     inner: rw::RustwrightPage,
 }
+/// Opaque immutable parsed wire graph. Its layout is intentionally not part of the ABI.
+pub struct RwWireGraph {
+    inner: rw::WireGraph,
+}
+
+/// Dense node ids are indices into an immutable wire graph.
+pub type RwWireNodeId = usize;
+
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RwWireNodeKind {
+    Null = 0,
+    Bool = 1,
+    Signed = 2,
+    Unsigned = 3,
+    Float = 4,
+    String = 5,
+    Array = 6,
+    Object = 7,
+    Leaf = 8,
+}
+
+impl From<RwWireNodeKind> for i32 {
+    fn from(kind: RwWireNodeKind) -> Self {
+        match kind {
+            RwWireNodeKind::Null => 0,
+            RwWireNodeKind::Bool => 1,
+            RwWireNodeKind::Signed => 2,
+            RwWireNodeKind::Unsigned => 3,
+            RwWireNodeKind::Float => 4,
+            RwWireNodeKind::String => 5,
+            RwWireNodeKind::Array => 6,
+            RwWireNodeKind::Object => 7,
+            RwWireNodeKind::Leaf => 8,
+        }
+    }
+}
+
+impl Default for RwWireNodeKind {
+    fn default() -> Self {
+        Self::Null
+    }
+}
+
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RwWireLeafKind {
+    Unserializable = 0,
+    BigInt = 1,
+    Date = 2,
+    RegExp = 3,
+    Url = 4,
+    Error = 5,
+    Undefined = 6,
+    Symbol = 7,
+    Function = 8,
+}
+
+impl From<RwWireLeafKind> for i32 {
+    fn from(kind: RwWireLeafKind) -> Self {
+        match kind {
+            RwWireLeafKind::Unserializable => 0,
+            RwWireLeafKind::BigInt => 1,
+            RwWireLeafKind::Date => 2,
+            RwWireLeafKind::RegExp => 3,
+            RwWireLeafKind::Url => 4,
+            RwWireLeafKind::Error => 5,
+            RwWireLeafKind::Undefined => 6,
+            RwWireLeafKind::Symbol => 7,
+            RwWireLeafKind::Function => 8,
+        }
+    }
+}
+
+impl Default for RwWireLeafKind {
+    fn default() -> Self {
+        Self::Unserializable
+    }
+}
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -143,6 +222,85 @@ unsafe fn page_ref<'a>(page: *mut RwPage) -> Result<&'a RwPage, String> {
     unsafe { page.as_ref() }.ok_or_else(|| "page handle must not be NULL".to_string())
 }
 
+fn init_output<T: Copy>(output: *mut T, value: T, name: &str) -> Result<(), String> {
+    if !output.is_null() {
+        // SAFETY: A non-NULL output slot is caller-provided writable storage.
+        unsafe { *output = value };
+    } else {
+        return Err(format!("{name} must not be NULL"));
+    }
+    Ok(())
+}
+
+fn init_bytes_outputs(out_data: *mut *const u8, out_len: *mut usize) -> Result<(), String> {
+    if !out_data.is_null() {
+        // SAFETY: A non-NULL output slot is caller-provided writable storage.
+        unsafe { *out_data = ptr::null() };
+    }
+    if !out_len.is_null() {
+        // SAFETY: A non-NULL output slot is caller-provided writable storage.
+        unsafe { *out_len = 0 };
+    }
+    if out_data.is_null() {
+        return Err("out_data must not be NULL".to_string());
+    }
+    if out_len.is_null() {
+        return Err("out_len must not be NULL".to_string());
+    }
+    Ok(())
+}
+
+unsafe fn wire_graph_ref<'a>(graph: *const RwWireGraph) -> Result<&'a RwWireGraph, String> {
+    // SAFETY: The caller owns a live handle created by rw_wire_graph_parse.
+    unsafe { graph.as_ref() }.ok_or_else(|| "graph handle must not be NULL".to_string())
+}
+
+fn wire_node<'a>(
+    graph: &'a RwWireGraph,
+    node: RwWireNodeId,
+) -> Result<&'a rw::WireNodeKind, String> {
+    graph
+        .inner
+        .node(rw::WireNodeId::from_index(node))
+        .ok_or_else(|| format!("wire graph node id {node} is out of range"))
+}
+
+fn wire_node_kind(kind: &rw::WireNodeKind) -> RwWireNodeKind {
+    match kind {
+        rw::WireNodeKind::Null => RwWireNodeKind::Null,
+        rw::WireNodeKind::Bool(_) => RwWireNodeKind::Bool,
+        rw::WireNodeKind::Number(rw::WireNumber::Signed(_)) => RwWireNodeKind::Signed,
+        rw::WireNodeKind::Number(rw::WireNumber::Unsigned(_)) => RwWireNodeKind::Unsigned,
+        rw::WireNodeKind::Number(rw::WireNumber::Float(_)) => RwWireNodeKind::Float,
+        rw::WireNodeKind::String(_) => RwWireNodeKind::String,
+        rw::WireNodeKind::Array(_) => RwWireNodeKind::Array,
+        rw::WireNodeKind::Object(_) => RwWireNodeKind::Object,
+        rw::WireNodeKind::Leaf(_) => RwWireNodeKind::Leaf,
+    }
+}
+
+fn wire_leaf_kind(leaf: &rw::WireLeaf) -> RwWireLeafKind {
+    match leaf {
+        rw::WireLeaf::Unserializable(_) => RwWireLeafKind::Unserializable,
+        rw::WireLeaf::BigInt(_) => RwWireLeafKind::BigInt,
+        rw::WireLeaf::Date(_) => RwWireLeafKind::Date,
+        rw::WireLeaf::RegExp { .. } => RwWireLeafKind::RegExp,
+        rw::WireLeaf::Url(_) => RwWireLeafKind::Url,
+        rw::WireLeaf::Error { .. } => RwWireLeafKind::Error,
+        rw::WireLeaf::Undefined => RwWireLeafKind::Undefined,
+        rw::WireLeaf::Symbol => RwWireLeafKind::Symbol,
+        rw::WireLeaf::Function => RwWireLeafKind::Function,
+    }
+}
+
+fn borrowed_bytes(value: &str) -> (*const u8, usize) {
+    if value.is_empty() {
+        (ptr::null(), 0)
+    } else {
+        (value.as_ptr(), value.len())
+    }
+}
+
 /// Returns the current thread's borrowed last-error message, or NULL.
 #[no_mangle]
 pub extern "C" fn rw_last_error() -> *const c_char {
@@ -226,6 +384,410 @@ pub unsafe extern "C" fn rw_decode_wire(
         let decoded = rw::decode_wire_value(wire_json).map_err(|error| error.to_string())?;
         // SAFETY: Validated above.
         unsafe { *out_json = owned_string(decoded)? };
+        Ok(())
+    })
+}
+
+/// Parse the evaluate wire format into an immutable graph owned by the caller.
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_parse(
+    wire_json: *const c_char,
+    out_graph: *mut *mut RwWireGraph,
+) -> c_int {
+    ffi_status(|| {
+        if !out_graph.is_null() {
+            // SAFETY: A non-NULL output slot is caller-provided writable storage.
+            unsafe { *out_graph = ptr::null_mut() };
+        }
+        if out_graph.is_null() {
+            return Err("out_graph must not be NULL".to_string());
+        }
+        let wire_json = unsafe { required_str(wire_json, "wire_json")? };
+        let graph = rw::parse_wire_graph(wire_json).map_err(|error| error.to_string())?;
+        // SAFETY: `out_graph` was validated above.
+        unsafe {
+            *out_graph = Box::into_raw(Box::new(RwWireGraph { inner: graph }));
+        }
+        Ok(())
+    })
+}
+
+/// Release an immutable wire graph. NULL is accepted.
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_free(graph: *mut RwWireGraph) {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        clear_error();
+        if !graph.is_null() {
+            // SAFETY: The handle came from Box::into_raw in this library and
+            // has not previously been freed.
+            drop(unsafe { Box::from_raw(graph) });
+        }
+    }));
+    if let Err(payload) = result {
+        record_error(format!(
+            "panic at Rustwright C ABI boundary: {}",
+            panic_message(payload)
+        ));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_node_count(
+    graph: *const RwWireGraph,
+    out_count: *mut usize,
+) -> c_int {
+    ffi_status(|| {
+        init_output(out_count, 0, "out_count")?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        // SAFETY: `out_count` was validated above.
+        unsafe { *out_count = graph.inner.nodes().len() };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_root(
+    graph: *const RwWireGraph,
+    out_root: *mut RwWireNodeId,
+) -> c_int {
+    ffi_status(|| {
+        init_output(out_root, 0, "out_root")?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        // SAFETY: `out_root` was validated above.
+        unsafe { *out_root = graph.inner.root().index() };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_node_kind(
+    graph: *const RwWireGraph,
+    node: RwWireNodeId,
+    out_kind: *mut i32,
+) -> c_int {
+    ffi_status(|| {
+        init_output(out_kind, i32::from(RwWireNodeKind::Null), "out_kind")?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        let kind = wire_node(graph, node)?;
+        // SAFETY: `out_kind` was validated above.
+        unsafe { *out_kind = i32::from(wire_node_kind(kind)) };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_get_bool(
+    graph: *const RwWireGraph,
+    node: RwWireNodeId,
+    out_value: *mut c_int,
+) -> c_int {
+    ffi_status(|| {
+        init_output(out_value, 0, "out_value")?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        match wire_node(graph, node)? {
+            rw::WireNodeKind::Bool(value) => {
+                // SAFETY: `out_value` was validated above.
+                unsafe { *out_value = i32::from(*value) };
+                Ok(())
+            }
+            _ => Err(format!("wire node {node} is not a boolean")),
+        }
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_get_signed(
+    graph: *const RwWireGraph,
+    node: RwWireNodeId,
+    out_value: *mut i64,
+) -> c_int {
+    ffi_status(|| {
+        init_output(out_value, 0, "out_value")?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        match wire_node(graph, node)? {
+            rw::WireNodeKind::Number(rw::WireNumber::Signed(value)) => {
+                // SAFETY: `out_value` was validated above.
+                unsafe { *out_value = *value };
+                Ok(())
+            }
+            _ => Err(format!("wire node {node} is not a signed number")),
+        }
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_get_unsigned(
+    graph: *const RwWireGraph,
+    node: RwWireNodeId,
+    out_value: *mut u64,
+) -> c_int {
+    ffi_status(|| {
+        init_output(out_value, 0, "out_value")?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        match wire_node(graph, node)? {
+            rw::WireNodeKind::Number(rw::WireNumber::Unsigned(value)) => {
+                // SAFETY: `out_value` was validated above.
+                unsafe { *out_value = *value };
+                Ok(())
+            }
+            _ => Err(format!("wire node {node} is not an unsigned number")),
+        }
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_get_float(
+    graph: *const RwWireGraph,
+    node: RwWireNodeId,
+    out_value: *mut c_double,
+) -> c_int {
+    ffi_status(|| {
+        init_output(out_value, 0.0, "out_value")?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        match wire_node(graph, node)? {
+            rw::WireNodeKind::Number(rw::WireNumber::Float(value)) => {
+                // SAFETY: `out_value` was validated above.
+                unsafe { *out_value = *value };
+                Ok(())
+            }
+            _ => Err(format!("wire node {node} is not a floating-point number")),
+        }
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_get_string(
+    graph: *const RwWireGraph,
+    node: RwWireNodeId,
+    out_data: *mut *const u8,
+    out_len: *mut usize,
+) -> c_int {
+    ffi_status(|| {
+        init_bytes_outputs(out_data, out_len)?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        let value = match wire_node(graph, node)? {
+            rw::WireNodeKind::String(value) => value,
+            _ => return Err(format!("wire node {node} is not a string")),
+        };
+        let (data, len) = borrowed_bytes(value);
+        // SAFETY: Both output slots were validated above.
+        unsafe {
+            *out_data = data;
+            *out_len = len;
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_array_length(
+    graph: *const RwWireGraph,
+    node: RwWireNodeId,
+    out_len: *mut usize,
+) -> c_int {
+    ffi_status(|| {
+        init_output(out_len, 0, "out_len")?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        match wire_node(graph, node)? {
+            rw::WireNodeKind::Array(children) => {
+                // SAFETY: `out_len` was validated above.
+                unsafe { *out_len = children.len() };
+                Ok(())
+            }
+            _ => Err(format!("wire node {node} is not an array")),
+        }
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_array_child(
+    graph: *const RwWireGraph,
+    node: RwWireNodeId,
+    index: usize,
+    out_child: *mut RwWireNodeId,
+) -> c_int {
+    ffi_status(|| {
+        init_output(out_child, 0, "out_child")?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        let children = match wire_node(graph, node)? {
+            rw::WireNodeKind::Array(children) => children,
+            _ => return Err(format!("wire node {node} is not an array")),
+        };
+        let child = children
+            .get(index)
+            .ok_or_else(|| format!("wire array index {index} is out of range"))?;
+        // SAFETY: `out_child` was validated above.
+        unsafe { *out_child = child.index() };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_object_length(
+    graph: *const RwWireGraph,
+    node: RwWireNodeId,
+    out_len: *mut usize,
+) -> c_int {
+    ffi_status(|| {
+        init_output(out_len, 0, "out_len")?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        match wire_node(graph, node)? {
+            rw::WireNodeKind::Object(entries) => {
+                // SAFETY: `out_len` was validated above.
+                unsafe { *out_len = entries.len() };
+                Ok(())
+            }
+            _ => Err(format!("wire node {node} is not an object")),
+        }
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_object_key(
+    graph: *const RwWireGraph,
+    node: RwWireNodeId,
+    index: usize,
+    out_data: *mut *const u8,
+    out_len: *mut usize,
+) -> c_int {
+    ffi_status(|| {
+        init_bytes_outputs(out_data, out_len)?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        let entries = match wire_node(graph, node)? {
+            rw::WireNodeKind::Object(entries) => entries,
+            _ => return Err(format!("wire node {node} is not an object")),
+        };
+        let (key, _) = entries
+            .get(index)
+            .ok_or_else(|| format!("wire object index {index} is out of range"))?;
+        let (data, len) = borrowed_bytes(key);
+        // SAFETY: Both output slots were validated above.
+        unsafe {
+            *out_data = data;
+            *out_len = len;
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_object_child(
+    graph: *const RwWireGraph,
+    node: RwWireNodeId,
+    index: usize,
+    out_child: *mut RwWireNodeId,
+) -> c_int {
+    ffi_status(|| {
+        init_output(out_child, 0, "out_child")?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        let entries = match wire_node(graph, node)? {
+            rw::WireNodeKind::Object(entries) => entries,
+            _ => return Err(format!("wire node {node} is not an object")),
+        };
+        let (_, child) = entries
+            .get(index)
+            .ok_or_else(|| format!("wire object index {index} is out of range"))?;
+        // SAFETY: `out_child` was validated above.
+        unsafe { *out_child = child.index() };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_leaf_kind(
+    graph: *const RwWireGraph,
+    node: RwWireNodeId,
+    out_kind: *mut i32,
+) -> c_int {
+    ffi_status(|| {
+        init_output(
+            out_kind,
+            i32::from(RwWireLeafKind::Unserializable),
+            "out_kind",
+        )?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        let leaf = match wire_node(graph, node)? {
+            rw::WireNodeKind::Leaf(leaf) => leaf,
+            _ => return Err(format!("wire node {node} is not a leaf")),
+        };
+        // SAFETY: `out_kind` was validated above.
+        unsafe { *out_kind = i32::from(wire_leaf_kind(leaf)) };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_leaf_field_count(
+    graph: *const RwWireGraph,
+    node: RwWireNodeId,
+    out_count: *mut usize,
+) -> c_int {
+    ffi_status(|| {
+        init_output(out_count, 0, "out_count")?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        let leaf = match wire_node(graph, node)? {
+            rw::WireNodeKind::Leaf(leaf) => leaf,
+            _ => return Err(format!("wire node {node} is not a leaf")),
+        };
+        let count = match leaf {
+            rw::WireLeaf::Unserializable(_)
+            | rw::WireLeaf::BigInt(_)
+            | rw::WireLeaf::Date(_)
+            | rw::WireLeaf::Url(_) => 1,
+            rw::WireLeaf::RegExp { .. } => 2,
+            rw::WireLeaf::Error { .. } => 3,
+            rw::WireLeaf::Undefined | rw::WireLeaf::Symbol | rw::WireLeaf::Function => 0,
+        };
+        // SAFETY: `out_count` was validated above.
+        unsafe { *out_count = count };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rw_wire_graph_leaf_field(
+    graph: *const RwWireGraph,
+    node: RwWireNodeId,
+    index: usize,
+    out_data: *mut *const u8,
+    out_len: *mut usize,
+) -> c_int {
+    ffi_status(|| {
+        init_bytes_outputs(out_data, out_len)?;
+        let graph = unsafe { wire_graph_ref(graph)? };
+        let leaf = match wire_node(graph, node)? {
+            rw::WireNodeKind::Leaf(leaf) => leaf,
+            _ => return Err(format!("wire node {node} is not a leaf")),
+        };
+        let value = match leaf {
+            rw::WireLeaf::Unserializable(value)
+            | rw::WireLeaf::BigInt(value)
+            | rw::WireLeaf::Date(value)
+            | rw::WireLeaf::Url(value) => (index == 0).then_some(value),
+            rw::WireLeaf::RegExp { pattern, flags } => match index {
+                0 => Some(pattern),
+                1 => Some(flags),
+                _ => None,
+            },
+            rw::WireLeaf::Error {
+                name,
+                message,
+                stack,
+            } => match index {
+                0 => Some(name),
+                1 => Some(message),
+                2 => Some(stack),
+                _ => None,
+            },
+            rw::WireLeaf::Undefined | rw::WireLeaf::Symbol | rw::WireLeaf::Function => None,
+        }
+        .ok_or_else(|| format!("wire leaf field index {index} is out of range"))?;
+        let (data, len) = borrowed_bytes(value);
+        // SAFETY: Both output slots were validated above.
+        unsafe {
+            *out_data = data;
+            *out_len = len;
+        }
         Ok(())
     })
 }
@@ -609,6 +1171,314 @@ pub unsafe extern "C" fn rw_page_free(page: *mut RwPage) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::slice;
+
+    unsafe fn parse_graph(wire: &str) -> *mut RwWireGraph {
+        let wire = CString::new(wire).unwrap();
+        let mut graph = ptr::null_mut();
+        assert_eq!(unsafe { rw_wire_graph_parse(wire.as_ptr(), &mut graph) }, 0);
+        assert!(!graph.is_null());
+        graph
+    }
+
+    unsafe fn borrowed_bytes(data: *const u8, len: usize) -> Vec<u8> {
+        if len == 0 {
+            assert!(data.is_null());
+            Vec::new()
+        } else {
+            assert!(!data.is_null());
+            unsafe { slice::from_raw_parts(data, len) }.to_vec()
+        }
+    }
+
+    unsafe fn object_entries(
+        graph: *const RwWireGraph,
+        node: RwWireNodeId,
+    ) -> Vec<(Vec<u8>, RwWireNodeId)> {
+        let mut len = 0;
+        assert_eq!(
+            unsafe { rw_wire_graph_object_length(graph, node, &mut len) },
+            0
+        );
+        (0..len)
+            .map(|index| {
+                let mut data = ptr::null();
+                let mut key_len = 0;
+                let mut child = 0;
+                assert_eq!(
+                    unsafe {
+                        rw_wire_graph_object_key(graph, node, index, &mut data, &mut key_len)
+                    },
+                    0
+                );
+                assert_eq!(
+                    unsafe { rw_wire_graph_object_child(graph, node, index, &mut child) },
+                    0
+                );
+                (unsafe { borrowed_bytes(data, key_len) }, child)
+            })
+            .collect()
+    }
+
+    unsafe fn leaf_field(graph: *const RwWireGraph, node: RwWireNodeId, index: usize) -> Vec<u8> {
+        let mut data = ptr::null();
+        let mut len = 0;
+        assert_eq!(
+            unsafe { rw_wire_graph_leaf_field(graph, node, index, &mut data, &mut len) },
+            0
+        );
+        unsafe { borrowed_bytes(data, len) }
+    }
+
+    #[test]
+    fn graph_accessors_preserve_types_order_identity_and_leaf_fields() {
+        let graph = unsafe {
+            parse_graph(
+                r#"{
+                    "__rustwright_cdp_object__": 1,
+                    "entries": {
+                        "signed": -7,
+                        "unsigned": 18446744073709551615,
+                        "nul\u0000key": "a\u0000b",
+                        "values": {
+                            "__rustwright_cdp_array__": 2,
+                            "items": [
+                                true,
+                                1.25,
+                                {"__rustwright_cdp_unserializable_value__": "NaN"},
+                                {"__rustwright_cdp_unserializable_value__": "42n"},
+                                {"__rustwright_cdp_date__": "2026-07-21T12:34:56.789Z"},
+                                {"__rustwright_cdp_regexp__": {"p": "a+b", "f": "gi"}},
+                                {"__rustwright_cdp_url__": "https://example.com/path"},
+                                {"__rustwright_cdp_error__": {
+                                    "name": "TypeError",
+                                    "message": "broken",
+                                    "stack": "TypeError: broken"
+                                }},
+                                {"__rustwright_cdp_undefined__": true},
+                                {"__rustwright_cdp_symbol__": true},
+                                {"__rustwright_cdp_function__": true},
+                                {"__rustwright_cdp_ref__": 1}
+                            ]
+                        },
+                        "forward": {"__rustwright_cdp_ref__": 3},
+                        "later": {
+                            "__rustwright_cdp_object__": 3,
+                            "entries": {"ok": true}
+                        },
+                        "self": {"__rustwright_cdp_ref__": 1}
+                    }
+                }"#,
+            )
+        };
+
+        let mut count = 0;
+        let mut root = 0;
+        let mut root_kind = i32::from(RwWireNodeKind::Null);
+        assert_eq!(unsafe { rw_wire_graph_node_count(graph, &mut count) }, 0);
+        assert!(count > 10);
+        assert_eq!(unsafe { rw_wire_graph_root(graph, &mut root) }, 0);
+        assert_eq!(
+            unsafe { rw_wire_graph_node_kind(graph, root, &mut root_kind) },
+            0
+        );
+        assert_eq!(root_kind, i32::from(RwWireNodeKind::Object));
+
+        let entries = unsafe { object_entries(graph, root) };
+        let keys = entries
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                b"signed".to_vec(),
+                b"unsigned".to_vec(),
+                b"nul\0key".to_vec(),
+                b"values".to_vec(),
+                b"forward".to_vec(),
+                b"later".to_vec(),
+                b"self".to_vec(),
+            ]
+        );
+
+        let signed_node = entries[0].1;
+        let unsigned_node = entries[1].1;
+        let string_node = entries[2].1;
+        let array_node = entries[3].1;
+        let forward_node = entries[4].1;
+        let later_node = entries[5].1;
+        assert_eq!(entries[6].1, root);
+        assert_eq!(forward_node, later_node);
+
+        let mut signed = 0;
+        let mut unsigned = 0;
+        assert_eq!(
+            unsafe { rw_wire_graph_get_signed(graph, signed_node, &mut signed) },
+            0
+        );
+        assert_eq!(signed, -7);
+        assert_eq!(
+            unsafe { rw_wire_graph_get_unsigned(graph, unsigned_node, &mut unsigned) },
+            0
+        );
+        assert_eq!(unsigned, u64::MAX);
+
+        let mut string_data = ptr::null();
+        let mut string_len = 0;
+        assert_eq!(
+            unsafe {
+                rw_wire_graph_get_string(graph, string_node, &mut string_data, &mut string_len)
+            },
+            0
+        );
+        assert_eq!(
+            unsafe { borrowed_bytes(string_data, string_len) },
+            b"a\0b".to_vec()
+        );
+
+        let mut array_len = 0;
+        assert_eq!(
+            unsafe { rw_wire_graph_array_length(graph, array_node, &mut array_len) },
+            0
+        );
+        assert_eq!(array_len, 12);
+        let mut bool_node = 0;
+        let mut float_node = 0;
+        assert_eq!(
+            unsafe { rw_wire_graph_array_child(graph, array_node, 0, &mut bool_node) },
+            0
+        );
+        assert_eq!(
+            unsafe { rw_wire_graph_array_child(graph, array_node, 1, &mut float_node) },
+            0
+        );
+        let mut bool_value = 0;
+        let mut float_value = 0.0;
+        assert_eq!(
+            unsafe { rw_wire_graph_get_bool(graph, bool_node, &mut bool_value) },
+            0
+        );
+        assert_eq!(bool_value, 1);
+        assert_eq!(
+            unsafe { rw_wire_graph_get_float(graph, float_node, &mut float_value) },
+            0
+        );
+        assert_eq!(float_value, 1.25);
+
+        let field_counts = [1, 1, 1, 2, 1, 3, 0, 0, 0];
+        for (offset, expected_kind) in [
+            RwWireLeafKind::Unserializable,
+            RwWireLeafKind::BigInt,
+            RwWireLeafKind::Date,
+            RwWireLeafKind::RegExp,
+            RwWireLeafKind::Url,
+            RwWireLeafKind::Error,
+            RwWireLeafKind::Undefined,
+            RwWireLeafKind::Symbol,
+            RwWireLeafKind::Function,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut leaf_node = 0;
+            let mut leaf_kind = i32::from(RwWireLeafKind::Unserializable);
+            let mut field_count = usize::MAX;
+            assert_eq!(
+                unsafe { rw_wire_graph_array_child(graph, array_node, offset + 2, &mut leaf_node) },
+                0
+            );
+            assert_eq!(
+                unsafe { rw_wire_graph_leaf_kind(graph, leaf_node, &mut leaf_kind) },
+                0
+            );
+            assert_eq!(leaf_kind, i32::from(expected_kind));
+            assert_eq!(
+                unsafe { rw_wire_graph_leaf_field_count(graph, leaf_node, &mut field_count,) },
+                0
+            );
+            assert_eq!(field_count, field_counts[offset]);
+        }
+
+        let mut bigint_node = 0;
+        assert_eq!(
+            unsafe { rw_wire_graph_array_child(graph, array_node, 3, &mut bigint_node) },
+            0
+        );
+        assert_eq!(unsafe { leaf_field(graph, bigint_node, 0) }, b"42");
+        let mut regexp_node = 0;
+        assert_eq!(
+            unsafe { rw_wire_graph_array_child(graph, array_node, 5, &mut regexp_node) },
+            0
+        );
+        assert_eq!(unsafe { leaf_field(graph, regexp_node, 0) }, b"a+b");
+        assert_eq!(unsafe { leaf_field(graph, regexp_node, 1) }, b"gi");
+        let mut error_node = 0;
+        assert_eq!(
+            unsafe { rw_wire_graph_array_child(graph, array_node, 7, &mut error_node) },
+            0
+        );
+        assert_eq!(unsafe { leaf_field(graph, error_node, 0) }, b"TypeError");
+        assert_eq!(unsafe { leaf_field(graph, error_node, 1) }, b"broken");
+        assert_eq!(
+            unsafe { leaf_field(graph, error_node, 2) },
+            b"TypeError: broken"
+        );
+        let mut back_edge = 0;
+        assert_eq!(
+            unsafe { rw_wire_graph_array_child(graph, array_node, 11, &mut back_edge) },
+            0
+        );
+        assert_eq!(back_edge, root);
+
+        unsafe { rw_wire_graph_free(graph) };
+    }
+
+    #[test]
+    fn graph_accessors_initialize_outputs_before_reporting_errors() {
+        let malformed = CString::new(r#"{"__rustwright_cdp_ref__":99}"#).unwrap();
+        let mut graph = 1usize as *mut RwWireGraph;
+        assert_ne!(
+            unsafe { rw_wire_graph_parse(malformed.as_ptr(), &mut graph) },
+            0
+        );
+        assert!(graph.is_null());
+        assert!(!rw_last_error().is_null());
+
+        let graph = unsafe { parse_graph(r#"{"__rustwright_cdp_array__":1,"items":[true]}"#) };
+        let mut root = 0;
+        assert_eq!(unsafe { rw_wire_graph_root(graph, &mut root) }, 0);
+        let mut bool_value = 99;
+        assert_ne!(
+            unsafe { rw_wire_graph_get_bool(graph, root, &mut bool_value) },
+            0
+        );
+        assert_eq!(bool_value, 0);
+        let mut data = 1usize as *const u8;
+        let mut len = 99;
+        assert_ne!(
+            unsafe { rw_wire_graph_get_string(graph, root, &mut data, &mut len) },
+            0
+        );
+        assert!(data.is_null());
+        assert_eq!(len, 0);
+        assert_ne!(
+            unsafe { rw_wire_graph_node_count(ptr::null(), &mut len) },
+            0
+        );
+        assert_eq!(len, 0);
+        unsafe {
+            rw_wire_graph_free(graph);
+            rw_wire_graph_free(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn wire_kind_types_have_fixed_width_abi() {
+        assert_eq!(std::mem::size_of::<RwWireNodeKind>(), 4);
+        assert_eq!(std::mem::size_of::<RwWireLeafKind>(), 4);
+        assert_eq!(std::mem::size_of::<i32>(), 4);
+    }
 
     #[test]
     fn decode_wire_round_trip_uses_c_string_ownership() {

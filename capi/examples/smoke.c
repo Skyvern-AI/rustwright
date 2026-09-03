@@ -5,6 +5,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+_Static_assert(sizeof(RwWireNodeKind) == 4,
+               "RwWireNodeKind must remain a 32-bit ABI type");
+_Static_assert(sizeof(RwWireLeafKind) == 4,
+               "RwWireLeafKind must remain a 32-bit ABI type");
+
 static void fail(const char *operation) {
   const char *error = rw_last_error();
   fprintf(stderr, "%s failed: %s\n", operation, error ? error : "unknown error");

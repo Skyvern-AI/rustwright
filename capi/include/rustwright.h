@@ -14,6 +14,38 @@ typedef struct RwBrowser RwBrowser;
 /** Opaque page handle owned by the caller. */
 typedef struct RwPage RwPage;
 
+/** Opaque immutable parsed wire graph owned by the caller. */
+typedef struct RwWireGraph RwWireGraph;
+
+/** Dense node ids are indices into the immutable graph. */
+typedef size_t RwWireNodeId;
+
+/*
+ * These tags use a fixed-width integer type. C enum storage is implementation
+ * defined and may not match the Rust ABI when passed through a pointer.
+ */
+typedef int32_t RwWireNodeKind;
+#define RW_WIRE_NODE_NULL 0
+#define RW_WIRE_NODE_BOOL 1
+#define RW_WIRE_NODE_SIGNED 2
+#define RW_WIRE_NODE_UNSIGNED 3
+#define RW_WIRE_NODE_FLOAT 4
+#define RW_WIRE_NODE_STRING 5
+#define RW_WIRE_NODE_ARRAY 6
+#define RW_WIRE_NODE_OBJECT 7
+#define RW_WIRE_NODE_LEAF 8
+
+typedef int32_t RwWireLeafKind;
+#define RW_WIRE_LEAF_UNSERIALIZABLE 0
+#define RW_WIRE_LEAF_BIGINT 1
+#define RW_WIRE_LEAF_DATE 2
+#define RW_WIRE_LEAF_REGEXP 3
+#define RW_WIRE_LEAF_URL 4
+#define RW_WIRE_LEAF_ERROR 5
+#define RW_WIRE_LEAF_UNDEFINED 6
+#define RW_WIRE_LEAF_SYMBOL 7
+#define RW_WIRE_LEAF_FUNCTION 8
+
 /**
  * Return the current thread's last error as borrowed UTF-8.
  *
@@ -43,6 +75,110 @@ void rw_bytes_free(uint8_t *buf, size_t len);
  * the error.
  */
 int32_t rw_decode_wire(const char *wire_json, char **out_json);
+
+/**
+ * Parse the evaluate wire format into an immutable graph.
+ *
+ * The graph owns all nodes and strings. On success, free it with
+ * rw_wire_graph_free. On failure, `*out_graph` is NULL.
+ */
+int32_t rw_wire_graph_parse(const char *wire_json, RwWireGraph **out_graph);
+
+/** Release a graph and all borrowed views into it. NULL is accepted. */
+void rw_wire_graph_free(RwWireGraph *graph);
+
+/** Return the dense number of nodes in a graph. */
+int32_t rw_wire_graph_node_count(const RwWireGraph *graph, size_t *out_count);
+
+/** Return the graph root's dense node id. */
+int32_t rw_wire_graph_root(const RwWireGraph *graph, RwWireNodeId *out_root);
+
+/** Return a node's kind. */
+int32_t rw_wire_graph_node_kind(const RwWireGraph *graph,
+                                RwWireNodeId node,
+                                RwWireNodeKind *out_kind);
+
+/** Read a boolean node as 0 or 1. */
+int32_t rw_wire_graph_get_bool(const RwWireGraph *graph,
+                               RwWireNodeId node,
+                               int32_t *out_value);
+
+/** Read a signed integer node. */
+int32_t rw_wire_graph_get_signed(const RwWireGraph *graph,
+                                 RwWireNodeId node,
+                                 int64_t *out_value);
+
+/** Read an unsigned integer node. */
+int32_t rw_wire_graph_get_unsigned(const RwWireGraph *graph,
+                                   RwWireNodeId node,
+                                   uint64_t *out_value);
+
+/** Read a floating-point node. */
+int32_t rw_wire_graph_get_float(const RwWireGraph *graph,
+                                RwWireNodeId node,
+                                double *out_value);
+
+/**
+ * Read a string node as a borrowed byte view.
+ *
+ * The view includes embedded NUL bytes and remains valid until graph free.
+ * Empty strings return NULL and zero.
+ */
+int32_t rw_wire_graph_get_string(const RwWireGraph *graph,
+                                 RwWireNodeId node,
+                                 const uint8_t **out_data,
+                                 size_t *out_len);
+
+/** Return an array node's length. */
+int32_t rw_wire_graph_array_length(const RwWireGraph *graph,
+                                   RwWireNodeId node,
+                                   size_t *out_len);
+
+/** Return an array child node id in native order. */
+int32_t rw_wire_graph_array_child(const RwWireGraph *graph,
+                                  RwWireNodeId node,
+                                  size_t index,
+                                  RwWireNodeId *out_child);
+
+/** Return an object node's entry count. */
+int32_t rw_wire_graph_object_length(const RwWireGraph *graph,
+                                    RwWireNodeId node,
+                                    size_t *out_len);
+
+/** Return an object key as a borrowed byte view in native order. */
+int32_t rw_wire_graph_object_key(const RwWireGraph *graph,
+                                 RwWireNodeId node,
+                                 size_t index,
+                                 const uint8_t **out_data,
+                                 size_t *out_len);
+
+/** Return an object child node id in native order. */
+int32_t rw_wire_graph_object_child(const RwWireGraph *graph,
+                                   RwWireNodeId node,
+                                   size_t index,
+                                   RwWireNodeId *out_child);
+
+/** Return a leaf's canonical kind. */
+int32_t rw_wire_graph_leaf_kind(const RwWireGraph *graph,
+                                RwWireNodeId node,
+                                RwWireLeafKind *out_kind);
+
+/**
+ * Return the positional field count for a leaf.
+ *
+ * Unserializable, bigint, date, and URL have one field; regexp has two;
+ * error has three; undefined, symbol, and function have zero.
+ */
+int32_t rw_wire_graph_leaf_field_count(const RwWireGraph *graph,
+                                       RwWireNodeId node,
+                                       size_t *out_count);
+
+/** Return one positional leaf field as a borrowed byte view. */
+int32_t rw_wire_graph_leaf_field(const RwWireGraph *graph,
+                                 RwWireNodeId node,
+                                 size_t index,
+                                 const uint8_t **out_data,
+                                 size_t *out_len);
 
 /**
  * Discover Chromium and return its executable path.

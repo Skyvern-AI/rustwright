@@ -107,8 +107,9 @@ public final class Page implements AutoCloseable {
         Objects.requireNonNull(expression, "expression");
         synchronized (lock) {
             requireOpen();
-            String wireJson = bindings.pageEvaluate(handle, expression, argumentJson, timeout(timeoutMs));
-            return WireValueDecoder.decodeJson(wireJson);
+            MemorySegment graph = bindings.pageEvaluateGraph(
+                    handle, expression, argumentJson, timeout(timeoutMs));
+            return WireValueDecoder.decodeGraph(graph, bindings);
         }
     }
 

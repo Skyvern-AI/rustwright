@@ -82,6 +82,87 @@ internal static class NativeMethods
         [MarshalAs(UnmanagedType.LPUTF8Str)] string? argumentJson,
         double timeoutMsOrNan,
         out IntPtr resultJson);
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_parse")]
+    internal static extern int WireGraphParse(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string wireJson,
+        out IntPtr graph);
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_parse")]
+    internal static extern int WireGraphParse(IntPtr wireJson, out IntPtr graph);
+
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_free")]
+    internal static extern void WireGraphFree(IntPtr graph);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_node_count")]
+    internal static extern int WireGraphNodeCount(IntPtr graph, out nuint count);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_root")]
+    internal static extern int WireGraphRoot(IntPtr graph, out nuint root);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_node_kind")]
+    internal static extern int WireGraphNodeKind(IntPtr graph, nuint node, out int kind);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_get_bool")]
+    internal static extern int WireGraphGetBool(IntPtr graph, nuint node, out int value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_get_signed")]
+    internal static extern int WireGraphGetSigned(IntPtr graph, nuint node, out long value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_get_unsigned")]
+    internal static extern int WireGraphGetUnsigned(IntPtr graph, nuint node, out ulong value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_get_float")]
+    internal static extern int WireGraphGetFloat(IntPtr graph, nuint node, out double value);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_get_string")]
+    internal static extern int WireGraphGetString(
+        IntPtr graph,
+        nuint node,
+        out IntPtr data,
+        out nuint length);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_array_length")]
+    internal static extern int WireGraphArrayLength(IntPtr graph, nuint node, out nuint length);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_array_child")]
+    internal static extern int WireGraphArrayChild(
+        IntPtr graph,
+        nuint node,
+        nuint index,
+        out nuint child);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_object_length")]
+    internal static extern int WireGraphObjectLength(IntPtr graph, nuint node, out nuint length);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_object_key")]
+    internal static extern int WireGraphObjectKey(
+        IntPtr graph,
+        nuint node,
+        nuint index,
+        out IntPtr data,
+        out nuint length);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_object_child")]
+    internal static extern int WireGraphObjectChild(
+        IntPtr graph,
+        nuint node,
+        nuint index,
+        out nuint child);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_leaf_kind")]
+    internal static extern int WireGraphLeafKind(IntPtr graph, nuint node, out int kind);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_leaf_field_count")]
+    internal static extern int WireGraphLeafFieldCount(IntPtr graph, nuint node, out nuint count);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_wire_graph_leaf_field")]
+    internal static extern int WireGraphLeafField(
+        IntPtr graph,
+        nuint node,
+        nuint index,
+        out IntPtr data,
+        out nuint length);
+
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "rw_page_screenshot")]
     internal static extern int PageScreenshot(

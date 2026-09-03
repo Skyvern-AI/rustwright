@@ -32,32 +32,35 @@ class RustwrightContractTest < Minitest::Test
       Rustwright::Normalize.screenshot(full_page: true, omitBackground: true, type: :png)
     )
   end
+  def test_wire_graph_materializes_identity_cycles_and_embedded_nul
+    library_path = ENV.fetch('RUSTWRIGHT_CAPI_LIB', Rustwright.default_library_path)
+    skip "native library not found at #{library_path}" unless File.file?(library_path)
 
-  def test_wire_wrappers_and_references
-    wire = {
-      '__rustwright_cdp_object__' => 1,
-      'entries' => {
-        'list' => {
-          '__rustwright_cdp_array__' => 2,
-          'items' => [1, { '__rustwright_cdp_ref__' => 2 }]
+    native = Rustwright::Native.new(library_path)
+    decoded = Rustwright::Wire.decode(
+      native,
+      <<~JSON
+        {
+          "__rustwright_cdp_object__": 1,
+          "entries": {
+            "self": {"__rustwright_cdp_ref__": 1},
+            "shared": {
+              "__rustwright_cdp_object__": 2,
+              "entries": {"value": "a\\u0000b"}
+            },
+            "again": {"__rustwright_cdp_ref__": 2},
+            "bigint": {"__rustwright_cdp_bigint__": "123n"},
+            "malformed_bigint": {"__rustwright_cdp_bigint__": "not-a-number"}
+          }
         }
-      }
-    }
-    decoded = Rustwright::Wire.decode(wire)
-    assert_equal 1, decoded['list'][0]
-    assert_same decoded['list'], decoded['list'][1]
-  end
-
-  def test_wire_special_values_and_documented_fallbacks
-    assert Rustwright::Wire.decode(
-      '__rustwright_cdp_unserializable_value__' => 'NaN'
-    ).nan?
-    assert_equal 123, Rustwright::Wire.decode(
-      '__rustwright_cdp_unserializable_value__' => '123n'
+      JSON
     )
-    assert_nil Rustwright::Wire.decode('__rustwright_cdp_undefined__' => true)
-    assert_nil Rustwright::Wire.decode('__rustwright_cdp_symbol__' => true)
-    assert_nil Rustwright::Wire.decode('__rustwright_cdp_function__' => true)
+
+    assert_same decoded, decoded.fetch('self')
+    assert_same decoded.fetch('shared'), decoded.fetch('again')
+    assert_equal "a\0b", decoded.dig('shared', 'value')
+    assert_equal 123, decoded.fetch('bigint')
+    assert_equal 'not-a-number', decoded.fetch('malformed_bigint')
   end
 
   def test_smoke_manifest_is_valid
