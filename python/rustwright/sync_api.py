@@ -50,7 +50,6 @@ _HISTORY_EVENT_DRAIN_TIMEOUT_SECONDS = 0.02
 _CONSOLE_HISTORY_SETTLE_TIMEOUT_SECONDS = 0.001
 _CONSOLE_HISTORY_BUFFER = "__console_history__"
 _PAGE_ERROR_HISTORY_BUFFER = "__page_error_history__"
-_UNSAFE_DOM_FASTPATH_ENV = "RUSTWRIGHT_UNSAFE_DOM_FASTPATH"
 _MULTIPART_BOUNDARY_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB"
 _CHECKED_STATE_JS = """(el) => {
 const tagName = String(el && el.tagName || '').toUpperCase();
@@ -2818,9 +2817,6 @@ def _json(value: Dict[str, Any]) -> str:
     return json.dumps(value, separators=(",", ":"))
 
 
-def _unsafe_dom_fastpath_enabled() -> bool:
-    value = os.environ.get(_UNSAFE_DOM_FASTPATH_ENV, "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _normalize_nth_index(index: Any) -> Any:
@@ -6435,6 +6431,20 @@ class Response(_EventEmitter):
     def headers_array(self) -> list[dict[str, str]]:
         return list(self._headers_array_cache)
 
+    def _set_body_from_payload(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        body = payload.get("body", "")
+        if payload.get("base64Encoded"):
+            self._body_cache = base64.b64decode(body)
+        else:
+            self._body_cache = str(body).encode("utf-8")
+        if self.request is not None:
+            self.request._sizes = {
+                **(self.request._sizes or {}),
+                "responseBodySize": len(self._body_cache),
+            }
+
     def _cache_body(self, timeout_ms: Optional[float] = None) -> bytes:
         if self._body_cache is not None:
             return self._body_cache
@@ -6452,16 +6462,7 @@ class Response(_EventEmitter):
                 self._page._default_timeout if timeout_ms is None else timeout_ms,
             )
         )
-        body = payload.get("body", "")
-        if payload.get("base64Encoded"):
-            self._body_cache = base64.b64decode(body)
-        else:
-            self._body_cache = str(body).encode("utf-8")
-        if self.request is not None:
-            self.request._sizes = {
-                **(self.request._sizes or {}),
-                "responseBodySize": len(self._body_cache),
-            }
+        self._set_body_from_payload(payload)
         return self._body_cache
 
     def body(self) -> bytes:
@@ -11221,17 +11222,7 @@ class Browser:
             )
         if "downloads_path" not in effective_options and "downloadsPath" not in effective_options and self._launch_downloads_path is not None:
             effective_options["downloads_path"] = self._launch_downloads_path
-        if effective_options.get("proxy") is not None or self._launch_proxy is not None:
-            context = self._new_context_from_options(effective_options, method="Browser.new_page")
-            try:
-                page = context._new_page(method="Browser.new_page")
-            except Exception:
-                context.close()
-                raise
-            page._owns_context = True
-            return page
-        context = BrowserContext(None, browser=self, options=effective_options)
-        self._contexts.append(context)
+        context = self._new_context_from_options(effective_options, method="Browser.new_page")
         try:
             page = context._new_page(method="Browser.new_page")
         except Exception:
@@ -15747,8 +15738,11 @@ class Page:
     def _navigation_timeout(self, timeout: Optional[float]) -> float:
         return _validate_timeout_value(_effective_navigation_timeout_value(self, timeout), method="Page")
 
-    def _mark_navigation_history_boundary(self) -> None:
-        self._drain_history_buffers()
+    def _mark_navigation_history_boundary(self, before: Optional[tuple[int, int]] = None) -> None:
+        if before is not None and self._runtime_observation_enabled:
+            self._console_messages_navigation_index = before[0]
+            self._page_errors_navigation_index = before[1]
+            return
         self._console_messages_navigation_index = len(self._console_messages)
         self._page_errors_navigation_index = len(self._page_errors)
 
@@ -15831,6 +15825,71 @@ class Page:
             retained.append(response)
         self._navigation_responses = retained[-20:]
 
+    def _navigation_response_request_ids(self) -> list[str]:
+        request_ids: list[str] = []
+        for response in self._navigation_responses:
+            if response._body_cache is not None:
+                continue
+            if response._request_id:
+                request_ids.append(str(response._request_id))
+            else:
+                response._body_cache = b""
+        return request_ids
+
+    def _apply_retained_navigation_response_bodies(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        retained = payload.get("response_bodies")
+        if not isinstance(retained, dict):
+            return
+        responses = {
+            str(response._request_id): response
+            for response in self._navigation_responses
+            if response._request_id and response._body_cache is None
+        }
+        for request_id, body_payload in retained.items():
+            response = responses.get(str(request_id))
+            if response is None:
+                continue
+            try:
+                response._set_body_from_payload(body_payload)
+            except (TypeError, ValueError):
+                continue
+
+    def _record_drained_history_payload(self, payload: Any) -> None:
+        if self._runtime_observation_enabled or not isinstance(payload, dict):
+            return
+        console_payloads = payload.get("console")
+        if isinstance(console_payloads, list):
+            for item in console_payloads:
+                if isinstance(item, dict):
+                    self._record_console_message(ConsoleMessage(self, item))
+        page_error_payloads = payload.get("page_errors")
+        if isinstance(page_error_payloads, list):
+            for item in page_error_payloads:
+                if isinstance(item, dict):
+                    self._record_page_error(_page_error_from_history_payload(item))
+
+    def _prepare_navigation(self) -> tuple[tuple[int, int], dict[str, Any]]:
+        before = (len(self._console_messages), len(self._page_errors))
+        request_ids = self._navigation_response_request_ids()
+        try:
+            payload = json.loads(
+                _call(
+                    self._core.prepare_navigation,
+                    _CONSOLE_HISTORY_BUFFER,
+                    _PAGE_ERROR_HISTORY_BUFFER,
+                    json.dumps(request_ids),
+                )
+            )
+        except (Error, TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        self._apply_retained_navigation_response_bodies(payload)
+        self._record_drained_history_payload(payload)
+        return before, payload
+
     def _uses_single_process_fallback(self) -> bool:
         browser = self._context._browser if self._context is not None else None
         if browser is None:
@@ -15848,6 +15907,7 @@ class Page:
     def _mark_request_cookie_sync_required(self) -> None:
         if self._context is not None:
             self._context._mark_request_cookie_sync_required()
+
 
     def goto(
         self,
@@ -15870,6 +15930,7 @@ class Page:
             normalized_referer = _normalize_string_option(referer, method="Page.goto", name="referer")
         target_url = self._resolve_url(url)
         self._mark_request_cookie_sync_required()
+        self._set_content_html_document_known = None
         call_id = self._trace_begin_action(
             "goto",
             {
@@ -15883,9 +15944,6 @@ class Page:
             self._uses_single_process_fallback() and target_url.lower().startswith("chrome://crash")
         )
         try:
-            self._retain_navigation_response_bodies()
-            self._mark_navigation_history_boundary()
-            self._set_content_html_document_known = None
             try:
                 target_scheme = url_parse.urlparse(target_url).scheme.lower()
             except ValueError:
@@ -15893,15 +15951,19 @@ class Page:
             download_waiter = (
                 self._download_event_waiter() if target_scheme in {"http", "https"} else None
             )
+            before, _ = self._prepare_navigation()
+            self._mark_navigation_history_boundary(before)
             try:
-                payload = json.loads(_call_wait_with_playwright_timeout(
-                    "Page.goto",
-                    self._core.goto,
-                    target_url,
-                    normalized_state,
-                    navigation_timeout,
-                    normalized_referer,
-                ))
+                payload = json.loads(
+                    _call_wait_with_playwright_timeout(
+                        "Page.goto",
+                        self._core.goto,
+                        target_url,
+                        normalized_state,
+                        navigation_timeout,
+                        normalized_referer,
+                    )
+                )
             except Error as exc:
                 message = str(exc).splitlines()[0]
                 if (
@@ -15978,8 +16040,8 @@ class Page:
             prior_time_origin = self.evaluate("() => performance.timeOrigin")
         except Error:
             prior_time_origin = None
-        self._retain_navigation_response_bodies()
-        self._mark_navigation_history_boundary()
+        before, _ = self._prepare_navigation()
+        self._mark_navigation_history_boundary(before)
         self._set_content_html_document_known = None
         waiter = self._core.network_event_waiter("response")
         payload = json.loads(_call_wait_with_playwright_timeout("Page.reload", self._core.reload, "commit", reload_timeout))
@@ -16109,10 +16171,10 @@ class Page:
     ) -> Optional[Response]:
         navigation_timeout = _navigation_timeout_for_method(self, timeout, method="Page.go_back")
         normalized_state = _normalize_lifecycle_state(wait_until, label="wait_until", method="Page.go_back")
-        boundary = self._navigation_history_boundary()
-        self._retain_navigation_response_bodies()
-        self._mark_navigation_history_boundary()
         self._set_content_html_document_known = None
+        boundary = self._navigation_history_boundary()
+        before, _ = self._prepare_navigation()
+        self._mark_navigation_history_boundary(before)
         before_url = self.url
         try:
             payload = json.loads(_call_wait_with_playwright_timeout(
@@ -16143,8 +16205,8 @@ class Page:
         navigation_timeout = _navigation_timeout_for_method(self, timeout, method="Page.go_forward")
         normalized_state = _normalize_lifecycle_state(wait_until, label="wait_until", method="Page.go_forward")
         boundary = self._navigation_history_boundary()
-        self._retain_navigation_response_bodies()
-        self._mark_navigation_history_boundary()
+        before, _ = self._prepare_navigation()
+        self._mark_navigation_history_boundary(before)
         self._set_content_html_document_known = None
         before_url = self.url
         try:
@@ -16547,58 +16609,30 @@ class Page:
 
         worker.on("console", forward)
 
-    def _evaluate_history_buffer(self, expression: str, arg: Any) -> Any:
+    def _drain_history_buffers(
+        self,
+        *,
+        record_console: bool = True,
+        record_page_errors: bool = True,
+    ) -> None:
         try:
-            payload = _call(self._core.evaluate, expression, json.dumps(arg), 250.0)
-            return _decode_json_result_json(payload)
+            payload = json.loads(
+                _call(
+                    self._core.prepare_navigation,
+                    _CONSOLE_HISTORY_BUFFER,
+                    _PAGE_ERROR_HISTORY_BUFFER,
+                    "[]",
+                )
+            )
         except (Error, TypeError, ValueError):
-            return None
-
-    def _drain_history_buffers(self) -> None:
-        self._drain_console_history_buffer()
-        self._drain_page_error_history_buffer()
-
-    def _drain_console_history_buffer(self) -> None:
-        payloads = self._evaluate_history_buffer(
-            """(name) => {
-              try {
-                const history = console && console[name];
-                if (!Array.isArray(history) || history.length === 0) return [];
-                return history.splice(0, history.length);
-              } catch (_) {
-                return [];
-              }
-            }""",
-            _CONSOLE_HISTORY_BUFFER,
-        )
-        if not isinstance(payloads, list):
             return
-        if self._runtime_observation_enabled:
+        if not isinstance(payload, dict):
             return
-        for payload in payloads:
-            if isinstance(payload, dict):
-                self._record_console_message(ConsoleMessage(self, payload))
-
-    def _drain_page_error_history_buffer(self, *, record: bool = True) -> None:
-        payloads = self._evaluate_history_buffer(
-            """(name) => {
-              try {
-                const history = window && window[name];
-                if (!Array.isArray(history) || history.length === 0) return [];
-                return history.splice(0, history.length);
-              } catch (_) {
-                return [];
-              }
-            }""",
-            _PAGE_ERROR_HISTORY_BUFFER,
-        )
-        if not isinstance(payloads, list):
-            return
-        if not record or self._runtime_observation_enabled:
-            return
-        for payload in payloads:
-            if isinstance(payload, dict):
-                self._record_page_error(_page_error_from_history_payload(payload))
+        if not record_console:
+            payload["console"] = []
+        if not record_page_errors:
+            payload["page_errors"] = []
+        self._record_drained_history_payload(payload)
 
     def _record_console_message(self, message: ConsoleMessage) -> None:
         self._console_messages_skip_wait_until = 0.0
@@ -19169,7 +19203,7 @@ class Page:
     def console_messages(self, *, filter: Optional[str] = None) -> list[ConsoleMessage]:
         if filter not in {None, "all", "since-navigation"}:
             raise Error("Page.console_messages: filter: expected one of (all|since-navigation)")
-        self._drain_console_history_buffer()
+        self._drain_history_buffers()
         messages = self._console_messages_snapshot(filter)
         if not self._closed:
             if messages:
@@ -19235,7 +19269,7 @@ class Page:
     def page_errors(self, *, filter: Optional[str] = None) -> list[Any]:
         if filter not in {None, "all", "since-navigation"}:
             raise Error("Page.page_errors: filter: expected one of (all|since-navigation)")
-        self._drain_page_error_history_buffer()
+        self._drain_history_buffers()
         errors = self._page_errors_snapshot(filter)
         if not errors and not self._closed:
             generation = self._page_errors_generation
@@ -19243,12 +19277,12 @@ class Page:
                 with self._page_errors_condition:
                     if self._page_errors_generation == generation:
                         self._page_errors_condition.wait(timeout=_HISTORY_EVENT_DRAIN_TIMEOUT_SECONDS)
-                self._drain_page_error_history_buffer()
+                self._drain_history_buffers()
                 errors = self._page_errors_snapshot(filter)
         return errors
 
     def clear_page_errors(self) -> None:
-        self._drain_page_error_history_buffer(record=False)
+        self._drain_history_buffers(record_page_errors=False)
         self._page_errors.clear()
         self._page_errors_navigation_index = 0
         self._page_errors_skip_wait_until = time.monotonic() + _HISTORY_EVENT_DRAIN_TIMEOUT_SECONDS
@@ -22241,7 +22275,6 @@ return __rw_fn(matches, __rw_arg);
         trial = _normalize_action_boolean(trial, method=method, name="trial")
         no_wait_after = _normalize_action_boolean(no_wait_after, method=method, name="no_wait_after")
         forced = bool(force)
-        unsafe_dom_fastpath = _unsafe_dom_fastpath_enabled()
 
         def run_post_action_locator_handlers() -> None:
             if not any(entry.get("no_wait_after") for entry in getattr(self._page, "_locator_handlers", [])):
@@ -22250,17 +22283,6 @@ return __rw_fn(matches, __rw_arg);
             deadline = time.monotonic() + max(timeout_ms, 1.0) / 1000
             self._page._run_locator_handlers(deadline)
 
-        if (
-            unsafe_dom_fastpath
-            and not forced
-            and not trial
-            and not any(value is not None for value in (modifiers, position, delay, button, click_count, steps))
-            and getattr(self._page, "_active_page_cdp_event_contexts", 0) <= 0
-            and self._try_fast_named_button_role_dom_click(timeout=timeout)
-        ):
-            run_post_action_locator_handlers()
-            self._page._slow_mo()
-            return
         target_info: Optional[dict[str, Any]] = None
         if forced:
             target_info = self._wait_for_forced_visible_pointer_action(
@@ -22329,46 +22351,6 @@ return __rw_fn(matches, __rw_arg);
                     click_count=None,
                     steps=None,
                 )
-            run_post_action_locator_handlers()
-            self._page._slow_mo()
-            return
-        if unsafe_dom_fastpath and self._try_fast_simple_css_dom_click(timeout=timeout):
-            run_post_action_locator_handlers()
-            self._page._slow_mo()
-            return
-        if unsafe_dom_fastpath and self._should_mouse_click_editable_control(method=method, timeout=timeout):
-            point = self._mouse_point_from_target_state(target_info, position=None, timeout=timeout) if target_info else None
-            if point is None:
-                self._mouse_click(
-                    timeout=timeout,
-                    modifiers=None,
-                    position=None,
-                    delay=None,
-                    button=None,
-                    click_count=None,
-                    steps=None,
-                )
-            else:
-                self._mouse_click_at_point(
-                    point[0],
-                    point[1],
-                    timeout=timeout,
-                    modifiers=None,
-                    delay=None,
-                    button=None,
-                    click_count=None,
-                    steps=None,
-                )
-            run_post_action_locator_handlers()
-            self._page._slow_mo()
-            return
-        if unsafe_dom_fastpath:
-            _call(
-                self._page._core.click,
-                _json(self._spec),
-                self._index,
-                self._page._default_timeout if timeout is None else timeout,
-            )
             run_post_action_locator_handlers()
             self._page._slow_mo()
             return
@@ -22748,362 +22730,10 @@ return {
             position=position,
         )
 
-    def _try_fast_fill(
-        self,
-        operation: str,
-        value: str,
-        *,
-        action: str,
-        timeout: Optional[float],
-        force: Optional[bool],
-    ) -> bool:
-        if not _unsafe_dom_fastpath_enabled():
-            return False
-        result = self._native_locator_fast_path(
-            operation,
-            timeout=timeout,
-            method=f"Locator.{action}",
-            args={"value": str(value), "forced": bool(force)},
-        )
-        if not isinstance(result, dict):
-            return False
-        result_type = result.get("type")
-        if result.get("ok"):
-            self._page._slow_mo()
-            return True
-        if result_type in {"fallback", "not-applicable", "pending"}:
-            return False
-        if result_type == "strict":
-            count = int(result.get("count") or 0)
-            raise Error(f"strict mode violation: locator resolved to {count} elements while trying to {action}")
-        if result_type == "number-text":
-            raise Error(f"Locator.{action}: Error: Cannot type text into input[type=number]")
-        if result_type == "malformed":
-            raise Error(f"Locator.{action}: Error: Malformed value")
-        if result_type == "not-editable":
-            raise Error(f"Locator.{action}: Error: Element is not editable")
-        info = result.get("info") if isinstance(result.get("info"), dict) else {}
-        if result_type == "input-type":
-            info = {**info, "non_fillable_input": True, "input_type": result.get("inputType") or info.get("input_type")}
-        if result_type == "select":
-            info = {**info, "is_select": True}
-        raise self._fill_type_error(action, info, force=result_type == "force-non-fillable")
 
-    def _try_fast_simple_css_fill(
-        self,
-        value: str,
-        *,
-        action: str,
-        timeout: Optional[float],
-        force: Optional[bool],
-    ) -> bool:
-        return self._try_fast_fill(
-            "css_fill",
-            value,
-            action=action,
-            timeout=timeout,
-            force=force,
-        )
 
-    def _try_fast_simple_css_dom_click(self, *, timeout: Optional[float]) -> bool:
-        if not _unsafe_dom_fastpath_enabled():
-            return False
-        selector = self._simple_css_fast_path_selector()
-        if selector is None or self._explicit_index or self._strict:
-            return False
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-const el = document.querySelector(String(payload.selector || ''));
-if (!el) return false;
-if (el.tagName !== 'BUTTON') return false;
-el.focus({ preventScroll: true });
-el.click();
-return true;
-}""",
-            {"selector": selector, "index": int(self._index)},
-            timeout=timeout,
-            method="Locator.click",
-        )
-        return bool(result)
 
-    def _try_fast_simple_css_select_option(
-        self,
-        *,
-        values: list[str],
-        labels: list[str],
-        indexes: list[int],
-        timeout: Optional[float],
-        force: Optional[bool],
-        method: str,
-    ) -> Optional[list[str]]:
-        if not _unsafe_dom_fastpath_enabled():
-            return None
-        payload = self._simple_css_indexed_read_payload()
-        if payload is None:
-            return None
-        payload = {**payload, "values": values, "labels": labels, "indexes": indexes, "forced": bool(force)}
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-try {
-  const allElements = document.querySelectorAll('*');
-  for (let i = 0; i < allElements.length; i++) {
-    if (allElements[i].shadowRoot) return { ok: false, type: 'fallback' };
-  }
-  const visible = el => {
-    if (!el || !el.isConnected) return false;
-    const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-    const style = view.getComputedStyle(el);
-    if (style.visibility === 'hidden' || style.display === 'none') return false;
-    const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  };
-  const disabledState = el => {
-    if (typeof el.matches === 'function' && el.matches(':disabled')) return true;
-    let current = el;
-    while (current && current.nodeType === 1) {
-      if (String(current.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return true;
-      current = current.parentElement;
-    }
-    return false;
-  };
-  const matches = Array.from(document.querySelectorAll(String(payload.selector || '')));
-  if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-  let index = Number(payload.index || 0);
-  if (index < 0) index = matches.length + index;
-  const el = matches[index] || null;
-  if (!el) return { ok: false, type: 'fallback' };
-  if (String(el.tagName || '').toUpperCase() !== 'SELECT') return { ok: false, type: 'fallback' };
-  if (disabledState(el)) return { ok: false, type: 'fallback' };
-  if (!payload.forced && !visible(el)) return { ok: false, type: 'fallback' };
-  const values = Array.isArray(payload.values) ? payload.values.map(String) : [];
-  const labels = Array.isArray(payload.labels) ? payload.labels.map(String) : [];
-  const indexes = Array.isArray(payload.indexes) ? payload.indexes.map(Number) : [];
-  const options = Array.from(el.options);
-  const foundValues = new Set();
-  const foundLabels = new Set();
-  const foundIndexes = new Set();
-  const selectedOptions = [];
-  for (const option of options) {
-    let matched = false;
-    for (const value of values) {
-      if (option.value === value || option.label === value) {
-        foundValues.add(value);
-        matched = true;
-      }
-    }
-    for (const label of labels) {
-      if (option.label === label) {
-        foundLabels.add(label);
-        matched = true;
-      }
-    }
-    for (const optionIndex of indexes) {
-      if (option.index === optionIndex) {
-        foundIndexes.add(optionIndex);
-        matched = true;
-      }
-    }
-    if (matched) selectedOptions.push(option);
-  }
-  const hasRequests = values.length > 0 || labels.length > 0 || indexes.length > 0;
-  const allRequestedFound =
-    values.every(value => foundValues.has(value)) &&
-    labels.every(label => foundLabels.has(label)) &&
-    indexes.every(optionIndex => foundIndexes.has(optionIndex));
-  const ready = !hasRequests || (el.multiple ? allRequestedFound : selectedOptions.length > 0);
-  if (!ready) return { ok: false, type: 'fallback' };
-  for (const option of options) option.selected = false;
-  if (el.multiple) {
-    for (const option of selectedOptions) option.selected = true;
-  } else if (selectedOptions.length) {
-    selectedOptions[0].selected = true;
-  }
-  el.dispatchEvent(new Event('input', { bubbles: true }));
-  el.dispatchEvent(new Event('change', { bubbles: true }));
-  return { ok: true, selected: Array.from(el.selectedOptions).map(option => option.value) };
-} catch (_) {
-  return { ok: false, type: 'fallback' };
-}
-}""",
-            payload,
-            timeout=timeout,
-            method=method,
-        )
-        if not isinstance(result, dict):
-            return None
-        if result.get("ok"):
-            self._page._slow_mo()
-            return [str(item) for item in result.get("selected") or []]
-        if result.get("type") == "strict":
-            count = int(result.get("count") or 0)
-            raise Error(f"strict mode violation: locator resolved to {count} elements while trying to select option")
-        return None
 
-    def _should_mouse_click_editable_control(self, *, method: str, timeout: Optional[float]) -> bool:
-        return bool(
-            self._eval(
-                """
-if (!el) return false;
-const tagName = String(el.tagName || '').toUpperCase();
-if (tagName === 'TEXTAREA' || el.isContentEditable) return true;
-if (tagName !== 'INPUT') return false;
-const type = String(el.type || 'text').toLowerCase();
-return ['text', 'search', 'url', 'tel', 'email', 'password', 'number'].includes(type);
-""",
-                timeout,
-                method=method,
-            )
-        )
-
-    def _try_fast_named_button_role_dom_click(self, *, timeout: Optional[float]) -> bool:
-        if not _unsafe_dom_fastpath_enabled():
-            return False
-        spec = self._spec
-        if (
-            self._explicit_index
-            or spec.get("kind") != "role"
-            or spec.get("role") != "button"
-            or spec.get("include_hidden")
-            or getattr(self._page, "_locator_handlers", None)
-        ):
-            return False
-        if any(spec.get(key) is not None for key in ("checked", "disabled", "selected", "expanded", "pressed", "level")):
-            return False
-        name = spec.get("name")
-        if not isinstance(name, str):
-            return False
-        payload = {
-            "name": name,
-            "exact": bool(spec.get("exact")),
-            "strict": bool(self._strict),
-            "index": int(self._index),
-        }
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-const normalize = value => String(value ?? '').replace(/[\\u200b\\u00ad]/g, '').replace(/\\s+/g, ' ').trim();
-const includesText = (value, needle, exact) => {
-  const left = normalize(value);
-  const right = normalize(needle);
-  return exact ? left === right : left.toLowerCase().includes(right.toLowerCase());
-};
-if (Array.from(document.querySelectorAll('*')).some(el => el.shadowRoot)) {
-  return { ok: false, type: 'fallback' };
-}
-const referencedText = el => {
-  const ids = String(el.getAttribute('aria-labelledby') || '').trim().split(/\\s+/).filter(Boolean);
-  if (!ids.length) return '';
-  const doc = el.ownerDocument || document;
-  return normalize(ids.map(id => {
-    const node = doc.getElementById(id);
-    return node ? (node.innerText || node.textContent || '') : '';
-  }).join(' '));
-};
-const explicitRoleOf = el => {
-  for (const token of String(el.getAttribute('role') || '').trim().split(/\\s+/).filter(Boolean)) {
-    if (token === 'button') return 'button';
-  }
-  return '';
-};
-const buttonRoleOf = el => {
-  if (!el || el.nodeType !== 1) return '';
-  const explicit = explicitRoleOf(el);
-  if (explicit) return explicit;
-  const tag = String(el.tagName || '').toUpperCase();
-  const type = String(el.getAttribute('type') || 'text').toLowerCase();
-  if (tag === 'BUTTON') return 'button';
-  if (tag === 'INPUT' && ['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
-  return '';
-};
-const accessibleName = el => {
-  const tag = String(el.tagName || '').toUpperCase();
-  const type = String(el.getAttribute('type') || 'text').toLowerCase();
-  const explicit = referencedText(el) || normalize(el.getAttribute('aria-label') || '');
-  if (explicit) return explicit;
-  if (tag === 'INPUT' && type === 'image') return normalize(el.getAttribute('alt') || el.getAttribute('title') || 'Submit');
-  if (el.labels && el.labels.length) {
-    const labelText = Array.from(el.labels).map(label => label.innerText || label.textContent || '').join(' ');
-    if (normalize(labelText)) return normalize(labelText);
-  }
-  if (tag === 'INPUT') {
-    const value = el.value || el.getAttribute('value') || '';
-    if (value) return normalize(value);
-    if (type === 'submit') return 'Submit';
-    if (type === 'reset') return 'Reset';
-  }
-  return normalize(el.innerText || el.textContent || el.getAttribute('title') || '');
-};
-const visible = el => {
-  if (!el || !el.isConnected) return false;
-  const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-  const style = view.getComputedStyle(el);
-  if (style.visibility === 'hidden' || style.display === 'none') return false;
-  const rect = el.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
-};
-const disabledState = el => {
-  if (typeof el.matches === 'function' && el.matches(':disabled')) return true;
-  let current = el;
-  while (current && current.nodeType === 1) {
-    if (String(current.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return true;
-    current = current.parentElement;
-  }
-  return false;
-};
-const targetContains = (target, node) => {
-  let current = node;
-  while (current) {
-    if (current === target) return true;
-    const root = current.getRootNode ? current.getRootNode() : null;
-    current = current.parentElement || (root && root.host) || null;
-  }
-  return false;
-};
-const deepElementFromPoint = (doc, x, y) => {
-  let hit = doc.elementFromPoint(x, y);
-  while (hit && hit.shadowRoot) {
-    const nested = hit.shadowRoot.elementFromPoint(x, y);
-    if (!nested || nested === hit) break;
-    hit = nested;
-  }
-  return hit;
-};
-const candidates = Array.from(document.querySelectorAll('button,input,[role]'));
-const matches = candidates.filter(el => {
-  if (buttonRoleOf(el) !== 'button') return false;
-  if (!visible(el)) return false;
-  return includesText(accessibleName(el), payload.name, !!payload.exact);
-});
-if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-const el = matches[Number(payload.index || 0)] || null;
-if (!el) return { ok: false, type: 'fallback' };
-if (disabledState(el)) return { ok: false, type: 'fallback' };
-el.scrollIntoView({ block: 'center', inline: 'center' });
-const doc = el.ownerDocument || document;
-const view = doc.defaultView || window;
-const rect = el.getBoundingClientRect();
-if (!rect || rect.width <= 0 || rect.height <= 0) return { ok: false, type: 'fallback' };
-const point = {
-  x: Math.min(Math.max(rect.left + rect.width / 2, 0), Math.max(view.innerWidth - 1, 0)),
-  y: Math.min(Math.max(rect.top + rect.height / 2, 0), Math.max(view.innerHeight - 1, 0)),
-};
-const hit = deepElementFromPoint(doc, point.x, point.y);
-if (!targetContains(el, hit)) return { ok: false, type: 'fallback' };
-if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-el.click();
-return { ok: true };
-}""",
-            payload,
-            timeout=timeout,
-            method="Locator.click",
-        )
-        if not isinstance(result, dict):
-            return False
-        if result.get("ok"):
-            return True
-        if result.get("type") == "strict":
-            count = int(result.get("count") or 0)
-            raise Error(f"strict mode violation: locator resolved to {count} elements while trying to click")
-        return False
 
     def _label_fast_path_payload(self) -> Optional[dict[str, Any]]:
         spec = self._spec
@@ -23284,205 +22914,14 @@ return {{ ok: true, value: __rw_fn(matches, payload.arg) }};
             return result.get("value")
         return _MISSING
 
-    @staticmethod
-    def _fast_placeholder_control_script(action_body: str) -> str:
-        return f"""(payload) => {{
-const allElements = document.querySelectorAll('*');
-for (let i = 0; i < allElements.length; i++) {{
-  if (allElements[i].shadowRoot) return {{ ok: false, type: 'fallback' }};
-}}
-const includesText = (value, needle, exact) => {{
-  const left = String(value ?? '');
-  const right = String(needle ?? '');
-  return exact ? left === right : left.toLowerCase().includes(right.toLowerCase());
-}};
-const visible = el => {{
-  if (!el || !el.isConnected) return false;
-  const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-  const style = view.getComputedStyle(el);
-  if (style.visibility === 'hidden' || style.display === 'none') return false;
-  const rect = el.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
-}};
-const disabledState = el => {{
-  if (typeof el.matches === 'function' && el.matches(':disabled')) return true;
-  let current = el;
-  while (current && current.nodeType === 1) {{
-    if (String(current.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return true;
-    current = current.parentElement;
-  }}
-  return false;
-}};
-const matches = Array.from(document.querySelectorAll('[placeholder]')).filter(el =>
-  includesText(el.getAttribute('placeholder') || '', payload.placeholder, !!payload.exact)
-);
-if (payload.strict && matches.length > 1) return {{ ok: false, type: 'strict', count: matches.length }};
-const el = matches[Number(payload.index || 0)] || null;
-if (!el) return {{ ok: false, type: 'fallback' }};
-{action_body}
-}}"""
 
-    def _try_fast_simple_label_fill(
-        self,
-        value: str,
-        *,
-        action: str,
-        timeout: Optional[float],
-        force: Optional[bool],
-    ) -> bool:
-        return self._try_fast_fill(
-            "label_fill",
-            value,
-            action=action,
-            timeout=timeout,
-            force=force,
-        )
 
-    def _try_fast_simple_label_check(self, *, timeout: Optional[float]) -> bool:
-        if not _unsafe_dom_fastpath_enabled():
-            return False
-        payload = self._label_fast_path_payload()
-        if payload is None:
-            return False
-        result = self._evaluate_simple_css_fast_path(
-            self._fast_label_control_script(
-                """
-const tagName = String(el.tagName || '').toUpperCase();
-const inputType = tagName === 'INPUT' ? String(el.type || '').toLowerCase() : '';
-if (tagName !== 'INPUT' || !['checkbox', 'radio'].includes(inputType)) return { ok: false, type: 'fallback' };
-if (!visible(el) || disabledState(el)) return { ok: false, type: 'fallback' };
-el.scrollIntoView({ block: 'center', inline: 'center' });
-if (!el.checked) {
-  el.checked = true;
-  el.dispatchEvent(new Event('input', { bubbles: true }));
-  el.dispatchEvent(new Event('change', { bubbles: true }));
-}
-return { ok: true };
-"""
-            ),
-            payload,
-            timeout=timeout,
-            method="Locator.check",
-        )
-        if not isinstance(result, dict):
-            return False
-        if result.get("ok"):
-            self._page._slow_mo()
-            return True
-        if result.get("type") == "strict":
-            count = int(result.get("count") or 0)
-            raise Error(f"strict mode violation: locator resolved to {count} elements while trying to check")
-        return False
 
-    def _try_fast_simple_label_select_option(
-        self,
-        *,
-        values: list[str],
-        labels: list[str],
-        indexes: list[int],
-        timeout: Optional[float],
-        force: Optional[bool],
-    ) -> Optional[list[str]]:
-        if not _unsafe_dom_fastpath_enabled():
-            return None
-        payload = self._label_fast_path_payload()
-        if payload is None:
-            return None
-        payload = {**payload, "values": values, "labels": labels, "indexes": indexes, "forced": bool(force)}
-        result = self._evaluate_simple_css_fast_path(
-            self._fast_label_control_script(
-                """
-const tagName = String(el.tagName || '').toUpperCase();
-if (tagName !== 'SELECT') return { ok: false, type: 'fallback' };
-if (disabledState(el)) return { ok: false, type: 'fallback' };
-if (!payload.forced && !visible(el)) return { ok: false, type: 'fallback' };
-const values = Array.isArray(payload.values) ? payload.values.map(String) : [];
-const labels = Array.isArray(payload.labels) ? payload.labels.map(String) : [];
-const indexes = Array.isArray(payload.indexes) ? payload.indexes.map(Number) : [];
-const options = Array.from(el.options);
-const foundValues = new Set();
-const foundLabels = new Set();
-const foundIndexes = new Set();
-const selectedOptions = [];
-for (const option of options) {
-  let matched = false;
-  for (const value of values) {
-    if (option.value === value || option.label === value) {
-      foundValues.add(value);
-      matched = true;
-    }
-  }
-  for (const label of labels) {
-    if (option.label === label) {
-      foundLabels.add(label);
-      matched = true;
-    }
-  }
-  for (const index of indexes) {
-    if (option.index === index) {
-      foundIndexes.add(index);
-      matched = true;
-    }
-  }
-  if (matched) selectedOptions.push(option);
-}
-const hasRequests = values.length > 0 || labels.length > 0 || indexes.length > 0;
-const allRequestedFound =
-  values.every(value => foundValues.has(value)) &&
-  labels.every(label => foundLabels.has(label)) &&
-  indexes.every(index => foundIndexes.has(index));
-const ready = !hasRequests || (el.multiple ? allRequestedFound : selectedOptions.length > 0);
-if (!ready) return { ok: false, type: 'fallback' };
-for (const option of options) option.selected = false;
-if (el.multiple) {
-  for (const option of selectedOptions) option.selected = true;
-} else if (selectedOptions.length) {
-  selectedOptions[0].selected = true;
-}
-el.dispatchEvent(new Event('input', { bubbles: true }));
-el.dispatchEvent(new Event('change', { bubbles: true }));
-return { ok: true, selected: Array.from(el.selectedOptions).map(option => option.value) };
-"""
-            ),
-            payload,
-            timeout=timeout,
-            method="Locator.select_option",
-        )
-        if not isinstance(result, dict):
-            return None
-        if result.get("ok"):
-            self._page._slow_mo()
-            return [str(item) for item in result.get("selected") or []]
-        if result.get("type") == "strict":
-            count = int(result.get("count") or 0)
-            raise Error(f"strict mode violation: locator resolved to {count} elements while trying to select option")
-        return None
 
-    def _try_fast_simple_placeholder_fill(
-        self,
-        value: str,
-        *,
-        action: str,
-        timeout: Optional[float],
-        force: Optional[bool],
-    ) -> bool:
-        return self._try_fast_fill(
-            "placeholder_fill",
-            value,
-            action=action,
-            timeout=timeout,
-            force=force,
-        )
 
     def _fill(self, value: str, *, action: str, timeout: Optional[float] = None, force: Optional[bool] = None) -> None:
         self._raise_if_frame_locator_in_composite(f"Locator.{action}")
         timeout_ms = _default_timeout_for_method(self._page, timeout, method=_locator_method_for_action(action))
-        if self._try_fast_simple_css_fill(value, action=action, timeout=timeout_ms, force=force):
-            return
-        if self._try_fast_simple_label_fill(value, action=action, timeout=timeout_ms, force=force):
-            return
-        if self._try_fast_simple_placeholder_fill(value, action=action, timeout=timeout_ms, force=force):
-            return
         on_poll = (
             self._page._run_locator_handlers_for_remaining
             if getattr(self._page, "_locator_handlers", None)
@@ -24162,26 +23601,6 @@ return true;
         raw_values = _normalize_select_string_options(value, method=method, field="valueOrLabel")
         raw_labels = _normalize_select_string_options(label, method=method, field="label")
         raw_indexes = _normalize_select_index_options(index, method=method)
-        if element is None:
-            fast_selected = self._try_fast_simple_css_select_option(
-                values=raw_values,
-                labels=raw_labels,
-                indexes=raw_indexes,
-                timeout=timeout_ms,
-                force=force,
-                method=method,
-            )
-            if fast_selected is not None:
-                return fast_selected
-            fast_selected = self._try_fast_simple_label_select_option(
-                values=raw_values,
-                labels=raw_labels,
-                indexes=raw_indexes,
-                timeout=timeout_ms,
-                force=force,
-            )
-            if fast_selected is not None:
-                return fast_selected
         try:
             self._wait_for_single("select option", state="enabled" if forced else "selectable", timeout=timeout_ms)
         except TimeoutError:

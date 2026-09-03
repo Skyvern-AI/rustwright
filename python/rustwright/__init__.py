@@ -1,6 +1,6 @@
 """Rust-backed browser automation with a Playwright-shaped Python API."""
 
-from ._compat import disable_playwright_compat, enable_playwright_compat
+from ._compat import enable_playwright_compat
 from .sync_api import (
     Browser,
     BrowserContext,
@@ -49,7 +49,6 @@ __all__ = [
     "UnknownOutcomeError",
     "Video",
     "backend_marker",
-    "disable_playwright_compat",
     "enable_playwright_compat",
     "expect",
     "async_playwright",
