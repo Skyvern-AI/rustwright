@@ -386,8 +386,8 @@ module Rustwright
           out
         )
         @native.check_status!(status, 'rw_page_evaluate')
-        json = @native.copy_owned_string(@native.pointer_address(out))
-        Wire.decode(JSON.parse(json))
+        wire_json = @native.copy_owned_string(@native.pointer_address(out))
+        Wire.decode(@native, wire_json)
       end
     end
 

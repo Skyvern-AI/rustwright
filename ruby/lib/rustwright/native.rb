@@ -15,6 +15,24 @@ module Rustwright
       rw_last_error: [[], VOIDP],
       rw_string_free: [[VOIDP], VOID],
       rw_bytes_free: [[VOIDP, SIZE_T], VOID],
+      rw_wire_graph_parse: [[VOIDP, VOIDP], INT],
+      rw_wire_graph_free: [[VOIDP], VOID],
+      rw_wire_graph_node_count: [[VOIDP, VOIDP], INT],
+      rw_wire_graph_root: [[VOIDP, VOIDP], INT],
+      rw_wire_graph_node_kind: [[VOIDP, SIZE_T, VOIDP], INT],
+      rw_wire_graph_get_bool: [[VOIDP, SIZE_T, VOIDP], INT],
+      rw_wire_graph_get_signed: [[VOIDP, SIZE_T, VOIDP], INT],
+      rw_wire_graph_get_unsigned: [[VOIDP, SIZE_T, VOIDP], INT],
+      rw_wire_graph_get_float: [[VOIDP, SIZE_T, VOIDP], INT],
+      rw_wire_graph_get_string: [[VOIDP, SIZE_T, VOIDP, VOIDP], INT],
+      rw_wire_graph_array_length: [[VOIDP, SIZE_T, VOIDP], INT],
+      rw_wire_graph_array_child: [[VOIDP, SIZE_T, SIZE_T, VOIDP], INT],
+      rw_wire_graph_object_length: [[VOIDP, SIZE_T, VOIDP], INT],
+      rw_wire_graph_object_key: [[VOIDP, SIZE_T, SIZE_T, VOIDP, VOIDP], INT],
+      rw_wire_graph_object_child: [[VOIDP, SIZE_T, SIZE_T, VOIDP], INT],
+      rw_wire_graph_leaf_kind: [[VOIDP, SIZE_T, VOIDP], INT],
+      rw_wire_graph_leaf_field_count: [[VOIDP, SIZE_T, VOIDP], INT],
+      rw_wire_graph_leaf_field: [[VOIDP, SIZE_T, SIZE_T, VOIDP, VOIDP], INT],
       rw_chromium_executable_path: [[VOIDP], INT],
       rw_chromium_launch: [[VOIDP, VOIDP], INT],
       rw_browser_new_page: [[VOIDP, VOIDP], INT],
@@ -75,6 +93,54 @@ module Rustwright
     def size_slot
       slot = Fiddle::Pointer.malloc(Fiddle::SIZEOF_SIZE_T)
       slot[0, Fiddle::SIZEOF_SIZE_T] = [0].pack(size_t_pack)
+      slot
+    end
+
+    def int32_slot
+      scalar_slot('l')
+    end
+
+    def int64_slot
+      scalar_slot('q')
+    end
+
+    def uint64_slot
+      scalar_slot('Q')
+    end
+
+    def double_slot
+      scalar_slot('d')
+    end
+
+    def int32_value(slot)
+      slot[0, 4].unpack1('l')
+    end
+
+    def int64_value(slot)
+      slot[0, 8].unpack1('q')
+    end
+
+    def uint64_value(slot)
+      slot[0, 8].unpack1('Q')
+    end
+
+    def double_value(slot)
+      slot[0, 8].unpack1('d')
+    end
+
+    def copy_borrowed_bytes(pointer, length)
+      return ''.b if length.zero?
+
+      address = pointer.to_i
+      raise Rustwright::Error, "Rustwright returned NULL bytes with length #{length}" if address.zero?
+
+      Fiddle::Pointer.new(address).to_str(length).dup.force_encoding(Encoding::BINARY)
+    end
+
+    def scalar_slot(format)
+      bytes = [0].pack(format).bytesize
+      slot = Fiddle::Pointer.malloc(bytes)
+      slot[0, bytes] = [0].pack(format)
       slot
     end
 
