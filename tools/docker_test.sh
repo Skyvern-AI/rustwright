@@ -16,7 +16,7 @@ usage() {
   cat >&2 <<'USAGE'
 Usage:
   tools/docker_test.sh build [docker build args...]
-  tools/docker_test.sh [pycompile|focused|parity|sampled|phase1|full|bench|bench-full|mind2web|mind2web-full|webvoyager|webvoyager-full|antibot|antibot-smoke] [mode args...]
+  tools/docker_test.sh [pycompile|focused|parity|sampled|full|bench|bench-full|mind2web|webvoyager|antibot|antibot-smoke] [mode args...]
 
 Environment:
   RUSTWRIGHT_DOCKER_IMAGE          Image name. Defaults to rustwright-verify.
@@ -25,8 +25,6 @@ Environment:
   RUSTWRIGHT_DOCKER_BASE_IMAGE     Build base image. Defaults to python:3.13-slim-bookworm.
   RUSTWRIGHT_DOCKER_LEGACY         Set to 1 to build without BuildKit cache mounts.
   BENCHMARK_FULL_ITERATIONS        Iterations for bench-full. Defaults to 10.
-  MIND2WEB_FULL_ITERATIONS         Iterations for mind2web-full. Defaults to 1.
-  WEBVOYAGER_FULL_ITERATIONS       Iterations for webvoyager-full. Defaults to 1.
   BENCHMARK_CHROMIUM_EXECUTABLE    Optional in-container Chromium path used by all benchmarked Playwright-style implementations.
   RUSTWRIGHT_BENCH_REBUILD         Set to 1 for tools/docker_test.sh bench Rustwright/all release-wheel rebuilds.
   RUSTWRIGHT_DOCKER_REBUILD_TARGET_CACHE
@@ -114,19 +112,7 @@ case "$mode" in
       --iterations "${BENCHMARK_FULL_ITERATIONS:-10}" \
       "$@"
     ;;
-  mind2web-full)
-    reject_memory_override_args "$@"
-    exec "${PYTHON:-python3}" "${HOST_WORKDIR}/tools/run_mind2web_matrix.py" \
-      --iterations "${MIND2WEB_FULL_ITERATIONS:-1}" \
-      "$@"
-    ;;
-  webvoyager-full)
-    reject_memory_override_args "$@"
-    exec "${PYTHON:-python3}" "${HOST_WORKDIR}/tools/run_webvoyager_matrix.py" \
-      --iterations "${WEBVOYAGER_FULL_ITERATIONS:-1}" \
-      "$@"
-    ;;
-  pycompile|focused|parity|sampled|phase1|full|bench|mind2web|webvoyager|antibot|antibot-smoke)
+  pycompile|focused|parity|sampled|full|bench|mind2web|webvoyager|antibot|antibot-smoke)
     run_args=(
       run
       --rm
@@ -163,6 +149,11 @@ case "$mode" in
       CODE_ARCHITECTURE.md
     do
       add_worktree_mount "$worktree_path"
+    done
+    for readonly_worktree_path in agent/Cargo.toml agent/src; do
+      if [ -e "${HOST_WORKDIR}/${readonly_worktree_path}" ]; then
+        run_args+=(--volume "${HOST_WORKDIR}/${readonly_worktree_path}:/workspace/${readonly_worktree_path}:ro")
+      fi
     done
     add_worktree_mount ".benchmark-data"
     for env_name in \

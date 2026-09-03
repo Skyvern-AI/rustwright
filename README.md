@@ -113,7 +113,7 @@ server, use the standalone [`rustwright-mcp`](mcp/) package.
 - **No Node driver subprocess.** `playwright-python` launches and pipes to a bundled Node driver. Rustwright's engine is native — the browser-control code runs in-process.
 - **Raw CDP, in Rust.** A from-scratch async CDP client — not a wrapper around another automation library.
 - **No Playwright automation fingerprint.** The driver never loads, so its signatures never appear. See [Automation detection](#automation-detection).
-- **Trusted input by default.** Clicks and typing go through real CDP input events (`Input.dispatchMouseEvent`), not synthetic `element.click()` DOM calls. Untrusted DOM shortcuts are opt-in only.
+- **Trusted input.** Clicks and typing always use real CDP input events (`Input.dispatchMouseEvent`), not synthetic `element.click()` DOM calls.
 - **Cross-origin iframes (OOPIF).** Auto-attaches out-of-process iframe targets with flattened CDP sessions and routes `frame_locator()` across origins.
 - **One engine, two languages.** The same Rust core backs the Python and Node bindings.
 

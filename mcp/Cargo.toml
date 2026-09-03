@@ -8,11 +8,13 @@ publish = false
 base64 = "=0.22.1"
 rmcp = { version = "=2.2.0", default-features = false, features = ["server", "transport-io"] }
 rustwright = { path = "../rust-native" }
+rustwright-agent = { path = "../agent" }
 serde = { version = "=1.0.194", features = ["derive"] }
 serde_json = "=1.0.127"
 tokio = { version = "=1.52.3", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync"] }
 
 [dev-dependencies]
+rustwright-agent = { path = "../agent", features = ["test-support"] }
 serde_json = "=1.0.127"
 
 [workspace]

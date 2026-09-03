@@ -12,7 +12,6 @@ import check_phase2_benchmark
 ROOT = Path(__file__).resolve().parents[1]
 MAX_MEMORY_BYTES = 8 * 1024 * 1024 * 1024
 DEFAULT_MAX_VARIANCE_RATIO = 1.2
-DEFAULT_PROGRESS = ROOT / "docs" / "internal" / "PROGRESS.json"
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -23,13 +22,6 @@ def check(condition: bool, name: str, detail: str) -> dict[str, Any]:
     return {"name": name, "passed": bool(condition), "detail": detail}
 
 
-def dot_lookup(value: dict[str, Any], path: str) -> Any:
-    current: Any = value
-    for part in path.split("."):
-        if not isinstance(current, dict) or part not in current:
-            return None
-        current = current[part]
-    return current
 
 
 def memory_limit_bytes(value: Any) -> int | None:
@@ -178,45 +170,6 @@ def matrix_json_to_evidence(
         },
     }
 
-
-def evaluate(
-    progress: dict[str, Any],
-    *,
-    evidence_path: str,
-    min_repetitions: int,
-    min_iterations: int,
-    min_case_count: int,
-    min_speedup_pct: float,
-    max_variance_ratio: float,
-    reference_impl: str,
-) -> dict[str, Any]:
-    evidence = dot_lookup(progress, evidence_path)
-    if not isinstance(evidence, dict):
-        return {
-            "status": "missing",
-            "accepted": False,
-            "evidence_path": evidence_path,
-            "checks": [check(False, "evidence_present", f"no object found at {evidence_path}")],
-            "observed": {},
-            "criteria": {
-                "min_repetitions": min_repetitions,
-                "min_iterations": min_iterations,
-            "min_case_count": min_case_count,
-            "min_speedup_pct": min_speedup_pct,
-            "max_variance_ratio": max_variance_ratio,
-            "reference_impl": reference_impl,
-        },
-        }
-    return evaluate_evidence(
-        evidence,
-        evidence_path=evidence_path,
-        min_repetitions=min_repetitions,
-        min_iterations=min_iterations,
-        min_case_count=min_case_count,
-        min_speedup_pct=min_speedup_pct,
-        max_variance_ratio=max_variance_ratio,
-        reference_impl=reference_impl,
-    )
 
 
 def evaluate_evidence(
@@ -371,16 +324,10 @@ def evaluate_evidence(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check whether recorded benchmark evidence is launch-ready latency evidence.")
     parser.add_argument(
-        "--progress",
-        type=Path,
-        default=DEFAULT_PROGRESS,
-        help="Progress metadata JSON; defaults to the internal progress file when present.",
-    )
-    parser.add_argument("--evidence-path", default="metrics.latest_blacksmith_benchmark_workflow")
-    parser.add_argument(
         "--benchmark-json",
         type=Path,
-        help="Validate a saved tools/run_benchmark_matrix.py JSON artifact directly instead of reading progress metadata.",
+        required=True,
+        help="Validate a saved tools/run_benchmark_matrix.py JSON artifact.",
     )
     parser.add_argument(
         "--source",
@@ -403,49 +350,23 @@ def main() -> int:
     if min_case_count is None:
         min_case_count = check_phase2_benchmark.current_strict_case_count()
 
-    if args.benchmark_json:
-        evidence = matrix_json_to_evidence(
-            load_json(args.benchmark_json),
-            source=args.source,
-            runner=args.runner,
-            artifact=args.artifact,
-            run_url=args.run_url,
-        )
-        report = evaluate_evidence(
-            evidence,
-            evidence_path=str(args.benchmark_json),
-            min_repetitions=args.min_repetitions,
-            min_iterations=args.min_iterations,
-            min_case_count=min_case_count,
-            min_speedup_pct=args.min_speedup_pct,
-            max_variance_ratio=args.max_variance_ratio,
-            reference_impl=args.reference_impl,
-        )
-    elif args.progress.exists():
-        report = evaluate(
-            load_json(args.progress),
-            evidence_path=args.evidence_path,
-            min_repetitions=args.min_repetitions,
-            min_iterations=args.min_iterations,
-            min_case_count=min_case_count,
-            min_speedup_pct=args.min_speedup_pct,
-            max_variance_ratio=args.max_variance_ratio,
-            reference_impl=args.reference_impl,
-        )
-    else:
-        report = {
-            "status": "unavailable",
-            "accepted": False,
-            "checks": [
-                check(
-                    False,
-                    "progress_metadata_available",
-                    f"progress metadata not found at {args.progress}; pass --benchmark-json to validate a public artifact",
-                )
-            ],
-            "observed": {"progress": str(args.progress)},
-            "criteria": {},
-        }
+    evidence = matrix_json_to_evidence(
+        load_json(args.benchmark_json),
+        source=args.source,
+        runner=args.runner,
+        artifact=args.artifact,
+        run_url=args.run_url,
+    )
+    report = evaluate_evidence(
+        evidence,
+        evidence_path=str(args.benchmark_json),
+        min_repetitions=args.min_repetitions,
+        min_iterations=args.min_iterations,
+        min_case_count=min_case_count,
+        min_speedup_pct=args.min_speedup_pct,
+        max_variance_ratio=args.max_variance_ratio,
+        reference_impl=args.reference_impl,
+    )
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:

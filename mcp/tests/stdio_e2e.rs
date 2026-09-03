@@ -194,7 +194,7 @@ const DRAG_PAGE_HTML: &str = r#"<!doctype html>
         const stamped = records
           .map((record) => record.target)
           .find((element) =>
-            element.id === duplicateId && element.hasAttribute('data-mcp-ref')
+            element.id === duplicateId && element.hasAttribute('data-rustwright-ref')
           );
         if (!stamped) return;
         observer.disconnect();
@@ -205,7 +205,7 @@ const DRAG_PAGE_HTML: &str = r#"<!doctype html>
       observer.observe(document.body, {
         attributes: true,
         subtree: true,
-        attributeFilter: ['data-mcp-ref'],
+        attributeFilter: ['data-rustwright-ref'],
       });
     }
   </script>
@@ -706,12 +706,6 @@ impl ServerProcess {
             .env_remove("RUSTWRIGHT_MCP_TOOL_TIMEOUT_MS")
             .env_remove("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES")
             .env_remove("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES")
-            .env_remove("RUSTWRIGHT_MCP_BUDGET")
-            .env_remove("RUSTWRIGHT_MCP_DISTILL")
-            .env_remove("RUSTWRIGHT_MCP_HEADER")
-            .env_remove("RUSTWRIGHT_MCP_CONSOLE_DEDUP")
-            .env_remove("RUSTWRIGHT_MCP_NET_NOTE")
-            .env_remove("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS")
             .env_remove("RUSTWRIGHT_MCP_TOOLSET")
             .env_remove("RUSTWRIGHT_MCP_ALLOW_EVAL")
             .stdin(Stdio::piped())
@@ -894,38 +888,83 @@ impl Drop for ServerProcess {
 }
 
 fn role_ref(snapshot: &str, role: &str, name: &str) -> String {
-    let line = snapshot
-        .lines()
-        .find(|line| line.contains(&format!("- {role}")) && line.contains(name))
-        .unwrap_or_else(|| panic!("{role} {name:?} missing from snapshot:\n{snapshot}"));
-    let marker = "[ref=";
-    let start = line.find(marker).expect("role ref start") + marker.len();
-    let end = line[start..].find(']').expect("role ref end") + start;
-    line[start..end].to_owned()
+    let lines = snapshot.lines().collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let Some(after_dash) = trimmed.strip_prefix("- ") else {
+            continue;
+        };
+        let Some(after_role) = after_dash.strip_prefix(role) else {
+            continue;
+        };
+        if !after_role.is_empty() && !after_role.starts_with(' ') && !after_role.starts_with('[') {
+            continue;
+        }
+
+        let fields = after_role.trim_start();
+        let (inline_name, metadata) = if fields.starts_with('"') {
+            let mut values = serde_json::Deserializer::from_str(fields).into_iter::<String>();
+            let inline_name = values
+                .next()
+                .expect("quoted accessible name")
+                .expect("valid quoted accessible name");
+            let offset = values.byte_offset();
+            (Some(inline_name), &fields[offset..])
+        } else {
+            (None, fields)
+        };
+        let mut matches_name = inline_name.as_deref() == Some(name);
+        if inline_name.is_none() {
+            let indent = line.len() - trimmed.len();
+            for descendant in &lines[index + 1..] {
+                if descendant.trim().is_empty() {
+                    continue;
+                }
+                let descendant_indent = descendant.len() - descendant.trim_start().len();
+                if descendant_indent <= indent {
+                    break;
+                }
+                matches_name |= descendant
+                    .trim_start()
+                    .strip_prefix("- text: ")
+                    .is_some_and(|text| text == name);
+            }
+        }
+        if !matches_name {
+            continue;
+        }
+        let reference = metadata
+            .split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix("[ref=")?.strip_suffix(']'))
+            .expect("role ref");
+        return reference.to_owned();
+    }
+    panic!("{role} {name:?} missing from snapshot:\n{snapshot}");
 }
 
-// Extract a rendered readout's full text so two snapshots can be compared for
-// equality. `prefix` starts with the opening quote the renderer wraps names in;
-// returning the text up to the closing quote keeps ref markers -- whose numbers
-// are reassigned on every snapshot -- out of the comparison.
-fn status_text(snapshot: &str, prefix: &str) -> String {
-    assert!(
-        prefix.starts_with('"'),
-        "prefix must start at the renderer's opening quote: {prefix:?}"
-    );
-    let mut matches = snapshot.match_indices(prefix);
-    let (start, _) = matches
-        .next()
-        .unwrap_or_else(|| panic!("{prefix:?} missing from snapshot:\n{snapshot}"));
+// Find a rendered readout by prefix. Ref markers are on ancestor nodes, so the
+// complete text line is stable.
+fn matching_status_text<'a>(snapshot: &'a str, prefix: &str) -> Option<&'a str> {
+    let mut matches = snapshot.lines().filter_map(|line| {
+        let text = line.trim_start().strip_prefix("- text: ")?;
+        text.starts_with(prefix).then_some(text)
+    });
+    let text = matches.next();
     assert!(
         matches.next().is_none(),
         "{prefix:?} matched more than once, so equality would be ambiguous:\n{snapshot}"
     );
-    let rest = &snapshot[start + 1..];
-    let end = rest
-        .find('"')
-        .unwrap_or_else(|| panic!("unterminated readout for {prefix:?}:\n{snapshot}"));
-    rest[..end].to_owned()
+    text
+}
+
+fn status_text(snapshot: &str, prefix: &str) -> String {
+    matching_status_text(snapshot, prefix)
+        .unwrap_or_else(|| panic!("{prefix:?} missing from snapshot:\n{snapshot}"))
+        .to_owned()
+}
+
+fn has_exact_status_text(snapshot: &str, expected: &str) -> bool {
+    matching_status_text(snapshot, expected).is_some_and(|text| text == expected)
 }
 
 fn result_text(message: &Value) -> &str {
@@ -997,14 +1036,7 @@ fn converge_snapshot_text(
 }
 
 fn named_ref(snapshot: &str, role: &str, name: &str) -> String {
-    let line = snapshot
-        .lines()
-        .find(|line| line.contains(&format!("- {role}")) && line.contains(name))
-        .unwrap_or_else(|| panic!("{role} {name:?} missing from snapshot:\n{snapshot}"));
-    let marker = "[ref=";
-    let start = line.find(marker).expect("named ref start") + marker.len();
-    let end = line[start..].find(']').expect("named ref end") + start;
-    line[start..end].to_owned()
+    role_ref(snapshot, role, name)
 }
 
 fn png_path_from_fallback(text: &str) -> PathBuf {
@@ -1026,14 +1058,7 @@ fn png_path_from_fallback(text: &str) -> PathBuf {
 }
 
 fn button_ref(snapshot: &str, name: &str) -> String {
-    let line = snapshot
-        .lines()
-        .find(|line| line.contains("- button") && line.contains(name))
-        .unwrap_or_else(|| panic!("button {name:?} missing from snapshot:\n{snapshot}"));
-    let marker = "[ref=";
-    let start = line.find(marker).expect("button ref start") + marker.len();
-    let end = line[start..].find(']').expect("button ref end") + start;
-    line[start..end].to_owned()
+    role_ref(snapshot, "button", name)
 }
 
 fn poll_snapshot_until(
@@ -1053,38 +1078,54 @@ fn poll_snapshot_until(
 
 // Masking is a property of EVERY snapshot, not just the one a poll settles on.
 // Checking only the returned snapshot would let a plaintext leak in the tool's
-// immediate response or in any intermediate poll pass unnoticed, because a later
-// masked snapshot would overwrite it. `poll_snapshot_state` runs its predicate on
-// the initial value and on each snapshot it fetches, so asserting inside the
-// predicate covers every snapshot this poll observes.
+// immediate response or in any intermediate poll pass unnoticed.
+fn assert_snapshot_never_leaks(snapshot: &str, secret: &str) {
+    assert!(
+        !snapshot.contains(secret),
+        "snapshot leaked the secret {secret:?}:\n{snapshot}"
+    );
+    // The positive complement of the leak check: absence of the plaintext is
+    // also satisfied by a snapshot that dropped the field entirely.
+    assert!(
+        !snapshot.contains("Secret input") || snapshot.contains("[value=••••••]"),
+        "snapshot rendered the password row unmasked:\n{snapshot}"
+    );
+}
+
 fn poll_snapshot_until_never_leaking(
     server: &mut ServerProcess,
     latest: String,
     next_id: &mut i64,
-    needle: &str,
+    expected: &str,
     secret: &str,
 ) -> String {
     poll_snapshot_state(
         server,
         latest,
         next_id,
-        &format!("{needle:?}"),
+        &format!("{expected:?}"),
         |snapshot| {
-            assert!(
-                !snapshot.contains(secret),
-                "snapshot leaked the secret {secret:?}:\n{snapshot}"
-            );
-            // The positive complement of the leak check: absence of the plaintext
-            // is also satisfied by a snapshot that dropped the field entirely, so
-            // any snapshot still rendering the password row has to render it
-            // masked. Responses that carry no snapshot mention neither string and
-            // pass, which is what lets the poll keep going instead of failing on
-            // an intermediate tool reply.
-            assert!(
-                !snapshot.contains("Secret input") || snapshot.contains("[value=••••••]"),
-                "snapshot rendered the password row unmasked:\n{snapshot}"
-            );
-            snapshot.contains(needle)
+            assert_snapshot_never_leaks(snapshot, secret);
+            has_exact_status_text(snapshot, expected)
+        },
+    )
+}
+
+fn poll_snapshot_until_status_prefix_never_leaking(
+    server: &mut ServerProcess,
+    latest: String,
+    next_id: &mut i64,
+    prefix: &str,
+    secret: &str,
+) -> String {
+    poll_snapshot_state(
+        server,
+        latest,
+        next_id,
+        &format!("{prefix:?}"),
+        |snapshot| {
+            assert_snapshot_never_leaks(snapshot, secret);
+            matching_status_text(snapshot, prefix).is_some()
         },
     )
 }
@@ -1116,6 +1157,28 @@ fn poll_snapshot_state(
         thread::sleep(Duration::from_millis(20));
     }
     latest
+}
+
+#[test]
+fn snapshot_helpers_parse_names_refs_and_statuses_exactly() {
+    let snapshot = r#"- button "Save [ref=e999]" [ref=e1]
+  - text: Save [ref=e999]
+- button "Save [draft]" [ref=e2]
+- button "Save draft" [ref=e4]
+  - text: Save
+- button [ref=e3]
+  - text: Save
+- status
+  - text: Input value: stdio typed7"#;
+
+    assert_eq!(role_ref(snapshot, "button", "Save [ref=e999]"), "e1");
+    assert_eq!(role_ref(snapshot, "button", "Save [draft]"), "e2");
+    assert_eq!(role_ref(snapshot, "button", "Save"), "e3");
+    assert!(!has_exact_status_text(snapshot, "Input value: stdio typed"));
+    assert_eq!(
+        status_text(snapshot, "Input value: "),
+        "Input value: stdio typed7"
+    );
 }
 
 fn scroll_y(snapshot: &str) -> u64 {
@@ -1580,9 +1643,9 @@ fn real_stdio_tool_profiles_and_evaluation_gate_match_contract() {
 }
 
 #[test]
-fn real_stdio_lean_description_profile_and_override_match_contract() {
-    fn listed(client_name: &str, environment: &[(&str, &str)]) -> (Value, usize) {
-        let mut server = ServerProcess::spawn_with_env(environment);
+fn real_stdio_uses_one_description_profile_for_every_client() {
+    fn listed(client_name: &str) -> (Value, usize) {
+        let mut server = ServerProcess::spawn();
         server.initialize_as(client_name);
         let id = "i".repeat(254);
         assert_eq!(
@@ -1597,36 +1660,18 @@ fn real_stdio_lean_description_profile_and_override_match_contract() {
         (response["result"].clone(), frame_bytes)
     }
 
-    let (codex_default, codex_default_frame_bytes) = listed("codex-mcp-client", &[]);
-    let (explicit_off, _) = listed(
-        "codex-mcp-client",
-        &[("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS", "off")],
-    );
-    let (unknown_default, _) = listed("unknown-hermetic-client", &[]);
-    let (explicit_on, _) = listed(
-        "unknown-hermetic-client",
-        &[("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS", "on")],
-    );
-    let (invalid_codex, _) = listed(
-        "codex-mcp-client",
-        &[("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS", "invalid")],
-    );
-
-    let archived_legacy: Value =
-        serde_json::from_str(include_str!("fixtures/tools-list-legacy.json"))
-            .expect("legacy tools/list fixture");
-    let archived_lean: Value = serde_json::from_str(include_str!("fixtures/tools-list-lean.json"))
-        .expect("lean tools/list fixture");
-    assert_eq!(explicit_off, archived_legacy);
-    assert_eq!(unknown_default, archived_legacy);
-    assert_eq!(codex_default, archived_lean);
-    assert_eq!(codex_default, explicit_on);
-    assert_eq!(invalid_codex, codex_default);
-    assert_ne!(codex_default, explicit_off);
-    assert!(
-        codex_default_frame_bytes <= 9 * 1024,
-        "lean tools/list response is {codex_default_frame_bytes} bytes, over 9216"
-    );
+    let (codex, codex_frame_bytes) = listed("codex-mcp-client");
+    let (unknown, unknown_frame_bytes) = listed("unknown-hermetic-client");
+    let archived: Value =
+        serde_json::from_str(include_str!("fixtures/tools-list.json")).expect("tools/list fixture");
+    assert_eq!(codex, archived);
+    assert_eq!(unknown, archived);
+    for frame_bytes in [codex_frame_bytes, unknown_frame_bytes] {
+        assert!(
+            frame_bytes <= 9 * 1024,
+            "tools/list response is {frame_bytes} bytes, over 9216"
+        );
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1876,126 +1921,34 @@ fn assert_page_digest<'a>(
     body
 }
 
-fn assert_legacy_union_expectations(corpus: &UnionCorpus, page_url: &str) {
-    let frozen = frozen_union_legacy_surfaces();
-    assert_eq!(frozen["schema_version"], 1);
-    assert_eq!(
-        frozen["baseline_commit"],
-        "815a6616b227c3a6373180c0528d19a96296a62b"
-    );
-    let archived_legacy: Value =
-        serde_json::from_str(include_str!("fixtures/tools-list-legacy.json"))
-            .expect("legacy tools/list fixture");
-    // Decoded union output is compared semantically here. Raw-byte archive identity
-    // remains pinned by the archive unit tests, with stdio frame bytes checked below.
-    assert_eq!(
-        corpus.catalog, archived_legacy,
-        "decoded tools/list result semantically diverged from the legacy archive"
-    );
-    let archived_legacy_bytes = include_str!("fixtures/tools-list-legacy.json").trim_end();
-    assert!(
-        corpus
-            .catalog_frame
-            .contains(&format!("\"result\":{archived_legacy_bytes}")),
-        "tools/list result bytes diverged from the legacy archive"
-    );
-    assert_eq!(
-        corpus.navigation,
-        frozen_union_surface(&frozen, "navigation")
-    );
-    assert_eq!(corpus.snapshot, frozen_union_surface(&frozen, "snapshot"));
-    // The injected console Proxy is the raw top CDP frame for both calls, so
-    // legacy/all-off intentionally reproduces its anonymous line-169 artifact.
-    assert_eq!(
-        corpus.console,
-        frozen_union_surface(&frozen, "console_template")
-    );
-    assert_eq!(
-        corpus.network,
-        frozen_union_surface(&frozen, "network_template").replace("{PAGE_URL}", page_url)
-    );
-    assert!(corpus.budget_probe.is_none());
-}
-
 #[test]
-fn union_matrix_unknown_client_with_unset_environment_is_legacy_compatible() {
+fn canonical_profile_activates_every_reviewed_behavior_for_every_client() {
     let (workspace, page_url) = union_fixture();
     assert_union_fixture_uses_external_console_script(&workspace);
     if chromium().executable_path().is_none() {
-        eprintln!("skipping union legacy matrix: Chromium executable unavailable");
-        remove_union_fixture(&workspace);
-        return;
-    }
-    let corpus = run_union_corpus(&page_url, "unknown-hermetic-client", &[], false);
-    assert_legacy_union_expectations(&corpus, &page_url);
-    remove_union_fixture(&workspace);
-}
-
-#[test]
-fn canonical_all_off_transcript_matches_pre_treatment_union_expectations() {
-    let (workspace, page_url) = union_fixture();
-    assert_union_fixture_uses_external_console_script(&workspace);
-    if chromium().executable_path().is_none() {
-        eprintln!("skipping all-off union corpus: Chromium executable unavailable");
-        remove_union_fixture(&workspace);
-        return;
-    }
-    let treatment_all_off = run_union_corpus(
-        &page_url,
-        "unknown-hermetic-client",
-        &[
-            ("RUSTWRIGHT_MCP_BUDGET", "off"),
-            ("RUSTWRIGHT_MCP_DISTILL", "off"),
-            ("RUSTWRIGHT_MCP_HEADER", "off"),
-            ("RUSTWRIGHT_MCP_CONSOLE_DEDUP", "off"),
-            ("RUSTWRIGHT_MCP_NET_NOTE", "off"),
-            ("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS", "off"),
-            ("RUSTWRIGHT_MCP_TOOLSET", "mirror"),
-        ],
-        false,
-    );
-    assert_legacy_union_expectations(&treatment_all_off, &page_url);
-    remove_union_fixture(&workspace);
-}
-
-#[test]
-fn union_matrix_exact_codex_peer_with_all_on_deployment_activates_every_wave() {
-    let (workspace, page_url) = union_fixture();
-    assert_union_fixture_uses_external_console_script(&workspace);
-    if chromium().executable_path().is_none() {
-        eprintln!("skipping union Codex matrix: Chromium executable unavailable");
+        eprintln!("skipping canonical union corpus: Chromium executable unavailable");
         remove_union_fixture(&workspace);
         return;
     }
     let treatment = run_union_corpus(
         &page_url,
-        "codex-mcp-client",
-        &[
-            ("RUSTWRIGHT_MCP_BUDGET", "on"),
-            ("RUSTWRIGHT_MCP_DISTILL", "on"),
-            ("RUSTWRIGHT_MCP_HEADER", "on"),
-            ("RUSTWRIGHT_MCP_CONSOLE_DEDUP", "on"),
-            ("RUSTWRIGHT_MCP_NET_NOTE", "on"),
-            ("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS", "on"),
-            ("RUSTWRIGHT_MCP_TOOLSET", "mirror"),
-        ],
+        "unknown-hermetic-client",
+        &[("RUSTWRIGHT_MCP_TOOLSET", "mirror")],
         true,
     );
 
-    let archived_lean: Value = serde_json::from_str(include_str!("fixtures/tools-list-lean.json"))
-        .expect("lean tools/list fixture");
-    // Decoded union output is compared semantically here. Raw-byte archive identity
-    // remains pinned by the archive unit tests, with stdio frame bytes checked below.
+    let archived: Value =
+        serde_json::from_str(include_str!("fixtures/tools-list.json")).expect("tools/list fixture");
     assert_eq!(
-        treatment.catalog, archived_lean,
-        "decoded tools/list result semantically diverged from the W5 lean archive"
+        treatment.catalog, archived,
+        "decoded tools/list result semantically diverged from the archived catalog"
     );
-    let archived_lean_bytes = include_str!("fixtures/tools-list-lean.json").trim_end();
+    let archived_bytes = include_str!("fixtures/tools-list.json").trim_end();
     assert!(
         treatment
             .catalog_frame
-            .contains(&format!("\"result\":{archived_lean_bytes}")),
-        "tools/list result bytes diverged from the lean archive"
+            .contains(&format!("\"result\":{archived_bytes}")),
+        "tools/list result bytes diverged from the archived catalog"
     );
     let distilled_snapshot = "- main\n  - heading [level=1]\n    - text: Network records";
     assert_eq!(
@@ -2093,7 +2046,10 @@ fn real_stdio_type_press_enter_and_select_option_round_trip() {
         "params":{"name":"browser_snapshot","arguments":{}}
     }));
     let snapshot = result_text(&server.receive()).to_owned();
-    assert!(snapshot.contains(r#""Password length: 0""#), "{snapshot}");
+    assert_eq!(
+        status_text(&snapshot, "Password length: "),
+        "Password length: 0"
+    );
     // Nothing has been typed yet, and the renderer omits the value part entirely
     // for an empty field, so the mask is absent here. Pinning that keeps the mask
     // assertions below honest: they observe a transition rather than a constant
@@ -2121,10 +2077,7 @@ fn real_stdio_type_press_enter_and_select_option_round_trip() {
         &mut server,
         password_typed,
         &mut next_id,
-        &format!(
-            r#""Password length: {}""#,
-            password_sentinel.chars().count()
-        ),
+        &format!("Password length: {}", password_sentinel.chars().count()),
         password_sentinel,
     );
     assert!(
@@ -2162,12 +2115,12 @@ fn real_stdio_type_press_enter_and_select_option_round_trip() {
         &mut server,
         pressed,
         &mut next_id,
-        r#""Key pressed: Enter; trusted: true; target: name""#,
+        "Key pressed: Enter; trusted: true; target: name",
         password_sentinel,
     );
-    assert!(
-        observed.contains(r#""Input value: stdio typed""#),
-        "{observed}"
+    assert_eq!(
+        status_text(&observed, "Input value: "),
+        "Input value: stdio typed"
     );
 
     let select_target = role_ref(&observed, "combobox", "Test choice");
@@ -2185,12 +2138,12 @@ fn real_stdio_type_press_enter_and_select_option_round_trip() {
         &mut server,
         selected,
         &mut next_id,
-        r#""Selected value: beta; changes: 1""#,
+        "Selected value: beta; changes: 1",
         password_sentinel,
     );
-    assert!(
-        selected.contains(r#""Input value: stdio typed""#),
-        "{selected}"
+    assert_eq!(
+        status_text(&selected, "Input value: "),
+        "Input value: stdio typed"
     );
     assert!(selected.contains("[value=••••••]"), "{selected}");
     assert!(!selected.contains(password_sentinel), "{selected}");
@@ -2215,22 +2168,19 @@ fn real_stdio_type_press_enter_and_select_option_round_trip() {
         &mut server,
         targeted,
         &mut next_id,
-        &format!(
-            r#""Password length: {}""#,
-            password_sentinel.chars().count() + 1
-        ),
+        &format!("Password length: {}", password_sentinel.chars().count() + 1),
         password_sentinel,
     );
-    assert!(
-        targeted.contains(r#""Key pressed: 7; trusted: true; target: secret""#),
-        "{targeted}"
+    assert_eq!(
+        status_text(&targeted, "Key pressed: "),
+        "Key pressed: 7; trusted: true; target: secret"
     );
     // The key went to the targeted ref and nowhere else: the text input's readout
-    // still reads exactly what the earlier typing left it, closing quote included,
-    // so a stray "7" delivered there would fail this.
-    assert!(
-        targeted.contains(r#""Input value: stdio typed""#),
-        "{targeted}"
+    // still reads exactly what the earlier typing left it, so a stray "7"
+    // delivered there would fail this.
+    assert_eq!(
+        status_text(&targeted, "Input value: "),
+        "Input value: stdio typed"
     );
     assert!(targeted.contains("[value=••••••]"), "{targeted}");
 
@@ -2238,14 +2188,14 @@ fn real_stdio_type_press_enter_and_select_option_round_trip() {
     // targeted press above focused the password field to deliver its key, so
     // focus now names `secret` -- which also proves the readout is live rather
     // than a constant, since it started at `none`.
-    let targeted = poll_snapshot_until_never_leaking(
+    let targeted = poll_snapshot_until_status_prefix_never_leaking(
         &mut server,
         targeted,
         &mut next_id,
-        r#""Focused: secret; focus changes: "#,
+        "Focused: secret; focus changes: ",
         password_sentinel,
     );
-    let focus_before = status_text(&targeted, r#""Focused: secret"#);
+    let focus_before = status_text(&targeted, "Focused: secret");
 
     // Aim the bad key at the *text* input, not the password field that currently
     // holds focus: validating after resolving the ref would run the text input's
@@ -2268,15 +2218,16 @@ fn real_stdio_type_press_enter_and_select_option_round_trip() {
     let after_reject = call_tool(&mut server, after_reject_id, "browser_snapshot", json!({}));
     let after_reject = result_text(&after_reject).to_owned();
     assert_eq!(
-        status_text(&after_reject, r#""Focused: "#),
+        status_text(&after_reject, "Focused: "),
         focus_before,
         "a rejected key press moved focus:\n{after_reject}"
     );
-    assert!(
-        after_reject.contains(r#""Key pressed: 7; trusted: true; target: secret""#),
+    assert_eq!(
+        status_text(&after_reject, "Key pressed: "),
+        "Key pressed: 7; trusted: true; target: secret",
         "a rejected key press reached the page:\n{after_reject}"
     );
-    assert!(!after_reject.contains(password_sentinel), "{after_reject}");
+    assert_snapshot_never_leaks(&after_reject, password_sentinel);
 
     // Filling a combobox resolves the visible label: the options are labelled
     // "Alpha" and "Beta" over lowercase values, so a value-only matcher finds
@@ -2303,10 +2254,13 @@ fn real_stdio_type_press_enter_and_select_option_round_trip() {
         &mut server,
         filled,
         &mut next_id,
-        r#""Selected value: alpha; changes: 2""#,
+        "Selected value: alpha; changes: 2",
         password_sentinel,
     );
-    assert!(filled.contains(r#""Input value: stdio typed""#), "{filled}");
+    assert_eq!(
+        status_text(&filled, "Input value: "),
+        "Input value: stdio typed"
+    );
     assert!(filled.contains("[value=••••••]"), "{filled}");
     assert!(!filled.contains(password_sentinel), "{filled}");
 
@@ -2720,9 +2674,6 @@ fn real_stdio_w4_console_and_network_presentation_round_trips() {
     let workspace_text = workspace.to_string_lossy().to_string();
     let mut server = ServerProcess::spawn_with_env(&[
         ("RUSTWRIGHT_MCP_WORKSPACE", &workspace_text),
-        ("RUSTWRIGHT_MCP_CONSOLE_DEDUP", "on"),
-        ("RUSTWRIGHT_MCP_NET_NOTE", "on"),
-        ("RUSTWRIGHT_MCP_BUDGET", "on"),
         ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "4096"),
         ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "16"),
     ]);
@@ -2900,41 +2851,17 @@ fn real_stdio_w4_console_and_network_presentation_round_trips() {
         line.starts_with("S> ") && line.contains("successful static requests hidden")
     }));
 
-    let mut legacy =
-        ServerProcess::spawn_with_env(&[("RUSTWRIGHT_MCP_WORKSPACE", &workspace_text)]);
-    legacy.initialize_as("offline-w4-legacy-fixture");
-    let _ = call_tool(
-        &mut legacy,
-        950,
-        "browser_navigate",
-        json!({"url": console_url}),
-    );
-    let _ = call_tool(
-        &mut legacy,
-        951,
-        "browser_evaluate",
-        json!({
-            "function": "() => { console.warn('W4 adjacent   duplicate'); console.warn('W4 adjacent duplicate'); console.error('W4 adjacent duplicate'); console.warn('W4 separator'); console.warn('W4 adjacent duplicate'); return true; }"
-        }),
-    );
-    let _ = call_tool(
-        &mut legacy,
-        952,
-        "browser_navigate",
-        json!({"url": network_url}),
-    );
-    let legacy_console = call_tool(
-        &mut legacy,
-        953,
-        "browser_console_messages",
-        json!({"level": "debug", "all": true}),
-    );
     assert_eq!(
         normalize_console_locations(&console_artifact),
-        normalize_console_locations(result_text(&legacy_console)),
-        "active-W4 export must exactly match an independently captured legacy rendering"
+        vec![
+            "WARNING <location> W4 adjacent   duplicate".to_owned(),
+            "WARNING <location> W4 adjacent duplicate".to_owned(),
+            "ERROR <location> W4 adjacent duplicate".to_owned(),
+            "WARNING <location> W4 separator".to_owned(),
+            "WARNING <location> W4 adjacent duplicate".to_owned(),
+        ],
+        "file export must preserve each raw console record"
     );
-    legacy.finish();
 
     for filename in [
         "console-w4.txt",
@@ -3224,8 +3151,16 @@ fn real_stdio_dialog_returns_fast_surfaces_modal_and_converges_after_accept() {
         "dialog-triggering click did not return promptly: {click_elapsed:?}"
     );
     let modal = result_text(&clicked);
-    assert!(modal.contains("### Modal"), "{modal}");
-    assert!(modal.contains("Parity dialog"), "{modal}");
+    assert!(
+        modal.contains(
+            "- Current tab: Dialog pending: type=alert; message=\"Parity dialog\". Call browser_handle_dialog."
+        ),
+        "{modal}"
+    );
+    assert!(
+        modal.contains("Snapshot deferred until the pending modal is handled."),
+        "{modal}"
+    );
 
     let deferred_started = Instant::now();
     let deferred = call_tool(&mut server, 302, "browser_snapshot", json!({}));
@@ -4243,7 +4178,6 @@ fn malformed_json_and_unknown_method_return_errors_and_server_recovers() {
 fn budgeted_stdio_preserves_validation_and_unknown_tool_error_envelopes() {
     let canary = "opaque-request-id-value".repeat(300);
     let mut server = ServerProcess::spawn_with_env(&[
-        ("RUSTWRIGHT_MCP_BUDGET", "on"),
         ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "4096"),
         ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "16"),
     ]);
@@ -4281,10 +4215,8 @@ fn budgeted_stdio_preserves_validation_and_unknown_tool_error_envelopes() {
 
 #[test]
 fn no_browser_actor_handler_rmcp_frames_preserve_ids_and_result_classes() {
-    let mut server = ServerProcess::spawn_with_env(&[("RUSTWRIGHT_MCP_BUDGET", "on")]);
-    // This is the production initialize/peer_info path; the profile is selected by the
-    // name rmcp stores from this frame, not by calling the matcher in the test.
-    server.initialize_as("codex-mcp-client");
+    let mut server = ServerProcess::spawn();
+    server.initialize_as("unknown-hermetic-client");
     server.send(json!({
         "jsonrpc":"2.0","id":"actor-success","method":"tools/call",
         "params":{"name":"browser_close","arguments":{}}
@@ -4320,249 +4252,8 @@ fn no_browser_actor_handler_rmcp_frames_preserve_ids_and_result_classes() {
 }
 
 #[test]
-fn absent_and_explicit_off_are_raw_transcript_equivalent_for_generic_config_path() {
-    fn run(environment: &[(&str, &str)]) -> Vec<String> {
-        let mut server = ServerProcess::spawn_with_env(environment);
-        server.initialize_as("unknown-hermetic-client");
-        server.send(json!({
-            "jsonrpc":"2.0","id":81,"method":"tools/call",
-            "params":{"name":"browser_close","arguments":{}}
-        }));
-        assert_eq!(server.receive()["result"]["isError"], false);
-        server.finish().0
-    }
-    assert_eq!(
-        run(&[]),
-        run(&[
-            ("RUSTWRIGHT_MCP_BUDGET", "off"),
-            ("RUSTWRIGHT_MCP_CONSOLE_DEDUP", "off"),
-            ("RUSTWRIGHT_MCP_NET_NOTE", "off"),
-        ])
-    );
-}
-
-#[test]
-fn absent_and_explicit_off_are_byte_exact_for_console_and_network_production_paths() {
-    if chromium().executable_path().is_none() {
-        eprintln!("skipping W4 off-switch test: Chromium executable unavailable");
-        return;
-    }
-
-    let workspace = std::env::temp_dir().join(format!(
-        "rustwright-mcp-w4-off-{}-{}",
-        std::process::id(),
-        STDIO_WORKSPACE_COUNTER.fetch_add(1, Ordering::SeqCst)
-    ));
-    fs::create_dir(&workspace).expect("create W4 off-switch workspace");
-    let console_page = workspace.join("off-console.html");
-    let network_page = workspace.join("off-network.html");
-    let static_asset = workspace.join("off-static.svg");
-    fs::write(
-        &console_page,
-        "<!doctype html><title>off console</title><main>console</main>",
-    )
-    .expect("write off console fixture");
-    fs::write(
-        &network_page,
-        "<!doctype html><title>off network</title><img src=\"off-static.svg\">",
-    )
-    .expect("write off network fixture");
-    fs::write(
-        &static_asset,
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\"></svg>",
-    )
-    .expect("write off static fixture");
-    let console_url = format!("file://{}", console_page.display());
-    let network_url = format!("file://{}", network_page.display());
-
-    fn environment<'a>(workspace: &'a str, explicit_off: bool) -> Vec<(&'a str, &'a str)> {
-        if explicit_off {
-            vec![
-                ("RUSTWRIGHT_MCP_WORKSPACE", workspace),
-                ("RUSTWRIGHT_MCP_CONSOLE_DEDUP", "off"),
-                ("RUSTWRIGHT_MCP_NET_NOTE", "off"),
-            ]
-        } else {
-            vec![("RUSTWRIGHT_MCP_WORKSPACE", workspace)]
-        }
-    }
-
-    fn run_console(
-        workspace: &Path,
-        console_url: &str,
-        filename: &str,
-        explicit_off: bool,
-    ) -> (String, String) {
-        let workspace_text = workspace.to_string_lossy();
-        let environment = environment(&workspace_text, explicit_off);
-        let artifact_path = workspace.join(filename);
-        assert!(
-            !artifact_path.exists(),
-            "console export path must be unused before the production write"
-        );
-        let mut server = ServerProcess::spawn_with_env(&environment);
-        server.initialize_as("offline-w4-off-fixture");
-        let _ = call_tool(
-            &mut server,
-            970,
-            "browser_navigate",
-            json!({"url": console_url}),
-        );
-        let _ = call_tool(
-            &mut server,
-            971,
-            "browser_evaluate",
-            json!({
-                "function": "() => { console.warn('W4 off duplicate'); console.warn('W4 off duplicate'); return true; }"
-            }),
-        );
-        let console = call_tool(
-            &mut server,
-            973,
-            "browser_console_messages",
-            json!({"level": "debug", "all": true}),
-        );
-        let console_written = call_tool(
-            &mut server,
-            974,
-            "browser_console_messages",
-            json!({"level": "debug", "all": true, "filename": filename}),
-        );
-        assert!(result_text(&console_written).contains("Console messages written"));
-        let console_artifact = fs::read_to_string(&artifact_path).unwrap();
-        server.finish();
-        (result_text(&console).to_owned(), console_artifact)
-    }
-
-    fn run_network(
-        workspace: &Path,
-        network_url: &str,
-        filename: &str,
-        explicit_off: bool,
-    ) -> (String, String) {
-        let workspace_text = workspace.to_string_lossy();
-        let environment = environment(&workspace_text, explicit_off);
-        let artifact_path = workspace.join(filename);
-        assert!(
-            !artifact_path.exists(),
-            "network export path must be unused before the production write"
-        );
-        let mut server = ServerProcess::spawn_with_env(&environment);
-        server.initialize_as("offline-w4-off-fixture");
-        let _ = call_tool(
-            &mut server,
-            972,
-            "browser_navigate",
-            json!({"url": network_url}),
-        );
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let network = loop {
-            let response = call_tool(&mut server, 975, "browser_network_requests", json!({}));
-            if result_text(&response).contains("off-network.html") {
-                break response;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "network records did not converge"
-            );
-            thread::sleep(Duration::from_millis(25));
-        };
-        let network_written = call_tool(
-            &mut server,
-            976,
-            "browser_network_requests",
-            json!({"filename": filename}),
-        );
-        assert!(result_text(&network_written).contains("Network requests written"));
-        let network_artifact = fs::read_to_string(&artifact_path).unwrap();
-        server.finish();
-        (result_text(&network).to_owned(), network_artifact)
-    }
-
-    let mut export_workspaces = HashSet::new();
-    let mut reserve_workspace = |configuration: &str, phase: &str| {
-        let path = workspace.join(format!("export-{configuration}-{phase}"));
-        assert!(
-            export_workspaces.insert(path.clone()),
-            "each configuration/phase pair must reserve a unique workspace"
-        );
-        assert!(
-            !path.exists(),
-            "reserved export workspace must not pre-exist"
-        );
-        fs::create_dir(&path).expect("create isolated W4 export workspace");
-        path
-    };
-    let absent_console_workspace = reserve_workspace("absent", "console");
-    let absent_network_workspace = reserve_workspace("absent", "network");
-    let off_console_workspace = reserve_workspace("explicit-off", "console");
-    let off_network_workspace = reserve_workspace("explicit-off", "network");
-    assert_eq!(export_workspaces.len(), 4);
-
-    let absent_console = run_console(
-        &absent_console_workspace,
-        &console_url,
-        "absent-console-export.txt",
-        false,
-    );
-    let absent_network = run_network(
-        &absent_network_workspace,
-        &network_url,
-        "absent-network-export.txt",
-        false,
-    );
-    let explicit_off_console = run_console(
-        &off_console_workspace,
-        &console_url,
-        "explicit-off-console-export.txt",
-        true,
-    );
-    let explicit_off_network = run_network(
-        &off_network_workspace,
-        &network_url,
-        "explicit-off-network-export.txt",
-        true,
-    );
-    let absent = (
-        absent_console.0,
-        absent_network.0,
-        absent_console.1,
-        absent_network.1,
-    );
-    let explicit_off = (
-        explicit_off_console.0,
-        explicit_off_network.0,
-        explicit_off_console.1,
-        explicit_off_network.1,
-    );
-    assert_eq!(absent, explicit_off);
-    assert_eq!(absent.0.matches("W4 off duplicate").count(), 2);
-    assert!(!absent.0.contains("(repeated"));
-    assert!(!absent.1.contains("static requests hidden"));
-
-    for export_workspace in export_workspaces {
-        let entries = fs::read_dir(&export_workspace)
-            .expect("read isolated W4 export workspace")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect isolated W4 export artifacts");
-        assert_eq!(entries.len(), 1, "each phase writes exactly one artifact");
-        fs::remove_file(entries[0].path()).expect("remove isolated W4 export artifact");
-        fs::remove_dir(export_workspace).expect("remove isolated W4 export workspace");
-    }
-    for filename in ["off-console.html", "off-network.html", "off-static.svg"] {
-        fs::remove_file(workspace.join(filename)).expect("remove W4 off-switch artifact");
-    }
-    fs::remove_dir(workspace).expect("remove W4 off-switch workspace");
-}
-
-#[test]
-fn isolated_process_parses_config_environment_and_warns_once_per_invalid_value() {
+fn isolated_process_validates_response_dimensions() {
     let mut server = ServerProcess::spawn_with_env(&[
-        ("RUSTWRIGHT_MCP_BUDGET", "invalid"),
-        ("RUSTWRIGHT_MCP_DISTILL", "ON"),
-        ("RUSTWRIGHT_MCP_CONSOLE_DEDUP", "invalid"),
-        ("RUSTWRIGHT_MCP_NET_NOTE", "yes"),
-        ("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS", "invalid"),
         ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "4095"),
         ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "15"),
     ]);
@@ -4571,14 +4262,10 @@ fn isolated_process_parses_config_environment_and_warns_once_per_invalid_value()
     let listed = server.receive();
     assert_eq!(
         listed["result"]["tools"][0]["description"],
-        "Navigate the browser and return a compact page snapshot."
+        "Navigate; snapshot."
     );
     let (_, diagnostics) = server.finish();
     for variable in [
-        "RUSTWRIGHT_MCP_BUDGET",
-        "RUSTWRIGHT_MCP_CONSOLE_DEDUP",
-        "RUSTWRIGHT_MCP_NET_NOTE",
-        "RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS",
         "RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES",
         "RUSTWRIGHT_MCP_MAX_RESPONSE_LINES",
     ] {
@@ -4589,7 +4276,6 @@ fn isolated_process_parses_config_environment_and_warns_once_per_invalid_value()
             1
         );
     }
-    assert!(!diagnostics.contains("variable=RUSTWRIGHT_MCP_DISTILL"));
 
     fn config_diagnostics(environment: &[(&str, &str)]) -> String {
         let mut server = ServerProcess::spawn_with_env(environment);
@@ -4598,8 +4284,6 @@ fn isolated_process_parses_config_environment_and_warns_once_per_invalid_value()
     }
 
     for (variable, value) in [
-        ("RUSTWRIGHT_MCP_HEADER", "on"),
-        ("RUSTWRIGHT_MCP_DISTILL", "off"),
         ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "0"),
         ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "4096"),
         ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "0"),
@@ -4611,25 +4295,10 @@ fn isolated_process_parses_config_environment_and_warns_once_per_invalid_value()
             "valid subprocess value {variable}={value} warned: {diagnostics}"
         );
     }
-    for (variable, value) in [
-        ("RUSTWRIGHT_MCP_HEADER", "invalid"),
-        ("RUSTWRIGHT_MCP_DISTILL", "invalid"),
-        ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "invalid"),
-        ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "invalid"),
-    ] {
-        let diagnostics = config_diagnostics(&[(variable, value)]);
-        assert_eq!(
-            diagnostics
-                .matches(&format!("variable={variable} "))
-                .count(),
-            1,
-            "invalid subprocess value {variable}={value}: {diagnostics}"
-        );
-    }
 
-    fn oversized_error_frame(environment: &[(&str, &str)], client_name: &str) -> (usize, String) {
+    fn oversized_error_frame(environment: &[(&str, &str)]) -> (usize, String) {
         let mut server = ServerProcess::spawn_with_env(environment);
-        server.initialize_as(client_name);
+        server.initialize_as("unknown-hermetic-client");
         server.send(json!({
             "jsonrpc":"2.0","id":77,"method":"tools/call",
             "params":{"name":"unknown_tool".repeat(3000),"arguments":{}}
@@ -4639,36 +4308,24 @@ fn isolated_process_parses_config_environment_and_warns_once_per_invalid_value()
         (frame_bytes, diagnostics)
     }
 
-    let (disabled_bytes, disabled_diagnostics) = oversized_error_frame(
-        &[
-            ("RUSTWRIGHT_MCP_BUDGET", "on"),
-            ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "0"),
-            ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "0"),
-        ],
-        "unknown-hermetic-client",
-    );
+    let (disabled_bytes, disabled_diagnostics) = oversized_error_frame(&[
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "0"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "0"),
+    ]);
     assert!(disabled_bytes > 9 * 1024);
     assert!(!disabled_diagnostics.contains("invalid_or_too_small"));
 
-    let (minimum_bytes, minimum_diagnostics) = oversized_error_frame(
-        &[
-            ("RUSTWRIGHT_MCP_BUDGET", "on"),
-            ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "4096"),
-            ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "16"),
-        ],
-        "unknown-hermetic-client",
-    );
+    let (minimum_bytes, minimum_diagnostics) = oversized_error_frame(&[
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "4096"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "16"),
+    ]);
     assert!(minimum_bytes <= 4096);
     assert!(!minimum_diagnostics.contains("invalid_or_too_small"));
 
-    let (fallback_bytes, fallback_diagnostics) = oversized_error_frame(
-        &[
-            ("RUSTWRIGHT_MCP_BUDGET", "on"),
-            ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "4095"),
-            ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "15"),
-        ],
-        "codex-mcp-client",
-    );
+    let (fallback_bytes, fallback_diagnostics) = oversized_error_frame(&[
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES", "4095"),
+        ("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES", "15"),
+    ]);
     assert!(fallback_bytes <= 9 * 1024);
     assert_eq!(
         fallback_diagnostics.matches("invalid_or_too_small").count(),
