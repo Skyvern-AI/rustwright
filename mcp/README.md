@@ -115,42 +115,18 @@ profile. The default `mirror` profile exposes all 27 native tools.
 | `RUSTWRIGHT_MCP_ALLOW_EVAL` | Enable or disable `browser_evaluate`; defaults to enabled. |
 | `RUSTWRIGHT_MCP_WORKSPACE` | Absolute directory that confines file paths supplied to `browser_drop`. |
 | `RUSTWRIGHT_MCP_SCREENSHOT_MAX_BYTES` | Largest screenshot returned inline. Oversized captures are written to a private (0600) temp file and the path is returned instead. |
-| `RUSTWRIGHT_MCP_BUDGET` | `on` enables client-aware text response shaping; defaults to `off`. Codex product ids (`codex`, `codex-mcp-client`, and `codex-*`) use exact 9 KiB/200-line JSON-RPC limits. Unknown clients remain unbounded unless an explicit nonzero limit is set. |
-| `RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES` | Overrides the profile byte limit. `0` disables this dimension; nonzero values below 4096 or invalid values warn and use the profile default. |
-| `RUSTWRIGHT_MCP_MAX_RESPONSE_LINES` | Overrides the decoded text line limit. `0` disables this dimension; nonzero values below 16 or invalid values warn and use the profile default. |
-| `RUSTWRIGHT_MCP_CONSOLE_DEDUP` | `on` collapses adjacent inline console duplicates by severity and normalized text. File exports remain verbatim. Defaults to `off`. |
-| `RUSTWRIGHT_MCP_NET_NOTE` | `on` reports successful static requests hidden after regex filtering. `static:true` still returns them. Defaults to `off`. |
-| `RUSTWRIGHT_MCP_DISTILL` | `on` enables bounded full-tree construction, full-subset refs/find, and render-only snapshot distillation. `off` selects the retained legacy traversal before page-side ref mutation. Defaults to `off`. |
-| `RUSTWRIGHT_MCP_HEADER` | `on` prepends a change-triggered `### Page` digest with the active URL, title when available, navigation status, and console error/warning counts. Unchanged page state is not repeated. Defaults to `off`. |
-| `RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS` | `on` serves shorter descriptions with narrowing guidance; `off` serves the byte-compatible legacy catalog. When unset or invalid, recognized Codex clients default to `on` and other clients to `off`; invalid values warn. |
+| `RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES` | Overrides the default 9 KiB text-response limit. `0` disables this dimension. Values below 4096 or invalid values warn and use the default. |
+| `RUSTWRIGHT_MCP_MAX_RESPONSE_LINES` | Overrides the default 200-line text-response limit. `0` disables this dimension. Values below 16 or invalid values warn and use the default. |
 
-Budgeting is applied to text success results, browser errors, and validation or
-unknown-tool JSON-RPC errors. Image blocks and explicit file-output contracts are
-unchanged. Explicit response dimensions take precedence over the matched client
-profile; `RUSTWRIGHT_MCP_BUDGET=off` bypasses all response shaping.
+Rustwright uses one MCP behavior profile for every client. It distills snapshots,
+adds change-triggered page headers, deduplicates adjacent inline console records,
+reports filtered static network requests, and serves the compact tool catalog.
+Text success results, browser errors, and JSON-RPC errors use the default
+9 KiB and 200-line limits. Image blocks and explicit file-output contracts are
+not shaped. The two response-limit variables above can change or disable each
+dimension.
 
-The Codex treatment deployment is an explicit all-on configuration; peer
-identification alone defaults only lean descriptions to `on`:
-
-```text
-RUSTWRIGHT_MCP_BUDGET=on
-RUSTWRIGHT_MCP_DISTILL=on
-RUSTWRIGHT_MCP_HEADER=on
-RUSTWRIGHT_MCP_CONSOLE_DEDUP=on
-RUSTWRIGHT_MCP_NET_NOTE=on
-RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS=on
-RUSTWRIGHT_MCP_TOOLSET=mirror
-```
-
-Treated console presentation attributes messages to the first page frame;
-legacy presentation preserves Chromium's raw top-frame attribution.
-
-The hermetic configuration regression fixture records the initialize frame and
-capture metadata observed from Codex CLI 0.146.0. CI parses that static fixture;
-it does not execute Codex or require network access, authentication, or a
-browser. Live recapture is a manual release compatibility check when updating
-supported client metadata. The fixture verifies profile selection only and does
-not establish or quantify token savings.
+Console presentation attributes messages to the first page frame.
 
 Snapshot traversal executes in the page's main JavaScript world. This preserves
 the existing trust boundary: page scripts can observe or patch the traversal.

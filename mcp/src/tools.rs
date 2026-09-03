@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
 use crate::actor::{BrowserOp, FillField, FillFieldKind, RegexSpec, ScreenshotType, TabAction};
+pub(crate) use rustwright_agent::{ConsoleLevel, NetworkPart};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ToolKind {
@@ -42,171 +43,143 @@ pub(crate) struct ToolSpec {
     pub(crate) kind: ToolKind,
     pub(crate) name: &'static str,
     pub(crate) description: &'static str,
-    pub(crate) lean_description: &'static str,
 }
 
 pub(crate) const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         kind: ToolKind::Navigate,
         name: "browser_navigate",
-        description: "Navigate the browser and return a compact page snapshot.",
-        lean_description: "Navigate; snapshot.",
+        description: "Navigate; snapshot.",
     },
     ToolSpec {
         kind: ToolKind::NavigateBack,
         name: "browser_navigate_back",
-        description: "Navigate back in browser history and return a compact page snapshot.",
-        lean_description: "Back; snapshot.",
+        description: "Back; snapshot.",
     },
     ToolSpec {
         kind: ToolKind::NavigateForward,
         name: "browser_navigate_forward",
-        description: "Navigate forward in browser history and return a compact page snapshot.",
-        lean_description: "Forward; snapshot.",
+        description: "Forward; snapshot.",
     },
     ToolSpec {
         kind: ToolKind::Reload,
         name: "browser_reload",
-        description: "Reload the active page and return a compact page snapshot.",
-        lean_description: "Reload; snapshot.",
+        description: "Reload; snapshot.",
     },
     ToolSpec {
         kind: ToolKind::Resize,
         name: "browser_resize",
-        description: "Resize the active page viewport in CSS pixels and return a fresh snapshot.",
-        lean_description: "Resize viewport; snapshot.",
+        description: "Resize viewport; snapshot.",
     },
     ToolSpec {
         kind: ToolKind::Snapshot,
         name: "browser_snapshot",
-        description: "Return a fresh full or targeted compact snapshot of the current page.",
-        lean_description: "Snapshot page. Narrow with target/depth. Refs are session-only and never reused.",
+        description: "Snapshot page. Narrow with target/depth. Refs are session-only and never reused.",
     },
     ToolSpec {
         kind: ToolKind::Find,
         name: "browser_find",
-        description: "Search one fresh snapshot and return compact actionable context.",
-        lean_description: "Find text/regex; snapshot.",
+        description: "Find text/regex; snapshot.",
     },
     ToolSpec {
         kind: ToolKind::Click,
         name: "browser_click",
-        description: "Click or double-click a ref from the latest snapshot and return a fresh snapshot.",
-        lean_description: "Click/double-click ref; snapshot.",
+        description: "Click/double-click ref; snapshot.",
     },
     ToolSpec {
         kind: ToolKind::Scroll,
         name: "browser_scroll",
-        description: "Scroll a snapshot ref into view or move the viewport, then return a fresh snapshot.",
-        lean_description: "Scroll ref/viewport; snapshot.",
+        description: "Scroll ref/viewport; snapshot.",
     },
     ToolSpec {
         kind: ToolKind::Type,
         name: "browser_type",
-        description: "Enter text into a snapshot ref, optionally slowly or followed by Enter.",
-        lean_description: "Type ref; optional submit.",
+        description: "Type ref; optional submit.",
     },
     ToolSpec {
         kind: ToolKind::SelectOption,
         name: "browser_select_option",
-        description: "Select one or more option values or labels in a snapshot ref.",
-        lean_description: "Select values/labels on ref.",
+        description: "Select values/labels on ref.",
     },
     ToolSpec {
         kind: ToolKind::FillForm,
         name: "browser_fill_form",
-        description: "Fill up to 50 fields sequentially as a non-transactional batch.",
-        lean_description: "Fill 1-50 fields; non-transactional.",
+        description: "Fill 1-50 fields; non-transactional.",
     },
     ToolSpec {
         kind: ToolKind::Hover,
         name: "browser_hover",
-        description: "Move Chromium's native mouse to a snapshot ref and return a fresh snapshot.",
-        lean_description: "Native hover ref; snapshot.",
+        description: "Native hover ref; snapshot.",
     },
     ToolSpec {
         kind: ToolKind::PressKey,
         name: "browser_press_key",
-        description: "Press a native browser key, optionally focusing a snapshot ref first, and return a fresh snapshot.",
-        lean_description: "Press key; optional ref focus; snapshot.",
+        description: "Press key; optional ref focus; snapshot.",
     },
     ToolSpec {
         kind: ToolKind::Drag,
         name: "browser_drag",
-        description: "Physically drag one snapshot ref to another through Chromium's native mouse input.",
-        lean_description: "Native drag between refs.",
+        description: "Native drag between refs.",
     },
     ToolSpec {
         kind: ToolKind::Drop,
         name: "browser_drop",
-        description: "Synthesize a DataTransfer drop of confined files and/or MIME strings on a snapshot ref.",
-        lean_description: "Drop confined files/MIME on ref.",
+        description: "Drop confined files/MIME on ref.",
     },
     ToolSpec {
         kind: ToolKind::ConsoleMessages,
         name: "browser_console_messages",
-        description: "List bounded console records at a severity threshold.",
-        lean_description: "List bounded console records; filter by level.",
+        description: "List bounded console records; filter by level.",
     },
     ToolSpec {
         kind: ToolKind::NetworkRequests,
         name: "browser_network_requests",
-        description: "List bounded current-navigation network lifecycle records.",
-        lean_description: "List/filter bounded requests; use browser_network_request for one.",
+        description: "List/filter bounded requests; use browser_network_request for one.",
     },
     ToolSpec {
         kind: ToolKind::NetworkRequest,
         name: "browser_network_request",
-        description: "Return request/response details and a bounded lazy response body by stable index.",
-        lean_description: "Get one request/response or bounded body.",
+        description: "Get one request/response or bounded body.",
     },
     ToolSpec {
         kind: ToolKind::Tabs,
         name: "browser_tabs",
-        description: "List, open, select, or close browser tabs.",
-        lean_description: "List/change tabs.",
+        description: "List/change tabs.",
     },
     ToolSpec {
         kind: ToolKind::HandleDialog,
         name: "browser_handle_dialog",
-        description: "Accept or dismiss the JavaScript dialog that is pending now.",
-        lean_description: "Handle dialog. Dialogs block further page work until handled.",
+        description: "Handle dialog. Dialogs block further page work until handled.",
     },
     ToolSpec {
         kind: ToolKind::FileUpload,
         name: "browser_file_upload",
-        description: "Resolve the pending file chooser with confined local files, or cancel it.",
-        lean_description: "Resolve chooser with confined paths or cancel.",
+        description: "Resolve chooser with confined paths or cancel.",
     },
     ToolSpec {
         kind: ToolKind::WaitFor,
         name: "browser_wait_for",
-        description: "Wait for elapsed time and/or visible-text state, then return a fresh snapshot.",
-        lean_description: "Wait for time/text; snapshot.",
+        description: "Wait for time/text; snapshot.",
     },
     ToolSpec {
         kind: ToolKind::GetText,
         name: "browser_get_text",
-        description: "Return rendered inner text for a unique CSS selector.",
-        lean_description: "Extract text. Use browser_wait_for to validate.",
+        description: "Extract text. Use browser_wait_for to validate.",
     },
     ToolSpec {
         kind: ToolKind::Evaluate,
         name: "browser_evaluate",
-        description: "Evaluate a JavaScript function in the page or snapshot-ref context.",
-        lean_description: "Run page JS on page/ref.",
+        description: "Run page JS on page/ref.",
     },
     ToolSpec {
         kind: ToolKind::TakeScreenshot,
         name: "browser_take_screenshot",
-        description: "Capture the current page as an inline PNG or JPEG image. Oversized fallback files remain available until this server process shuts down.",
-        lean_description: "Capture image; fallback lasts until shutdown.",
+        description: "Capture image; fallback lasts until shutdown.",
     },
     ToolSpec {
         kind: ToolKind::Close,
         name: "browser_close",
-        description: "Close the browser; the next browser tool starts a fresh session.",
-        lean_description: "Close browser; next tool starts fresh.",
+        description: "Close browser; next tool starts fresh.",
     },
 ];
 
@@ -404,15 +377,6 @@ struct DropArgs {
     data: Vec<(String, String)>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum ConsoleLevel {
-    Error,
-    Warning,
-    Info,
-    Debug,
-}
-
 fn default_console_level() -> ConsoleLevel {
     ConsoleLevel::Info
 }
@@ -434,15 +398,6 @@ struct NetworkRequestsArgs {
     include_static: bool,
     filter: Option<String>,
     filename: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum NetworkPart {
-    RequestHeaders,
-    RequestBody,
-    ResponseHeaders,
-    ResponseBody,
 }
 
 #[derive(Deserialize)]
@@ -629,14 +584,6 @@ fn eval_allowed() -> Result<bool, String> {
 
 pub(crate) fn descriptor(spec: ToolSpec) -> Tool {
     Tool::new(spec.name, spec.description, schema(spec.kind))
-}
-
-pub(crate) fn descriptor_with_profile(spec: ToolSpec, lean_descriptions: bool) -> Tool {
-    if lean_descriptions {
-        Tool::new(spec.name, spec.lean_description, schema(spec.kind))
-    } else {
-        descriptor(spec)
-    }
 }
 
 pub(crate) fn parse_op(
@@ -1315,29 +1262,25 @@ mod tests {
 
     use rmcp::model::{ListToolsResult, RequestId, ServerJsonRpcMessage, ServerResult};
 
-    const LEGACY_CATALOG_FIXTURE: &str = include_str!("../tests/fixtures/tools-list-legacy.json");
-    const LEAN_CATALOG_FIXTURE: &str = include_str!("../tests/fixtures/tools-list-lean.json");
+    const CATALOG_FIXTURE: &str = include_str!("../tests/fixtures/tools-list.json");
 
-    fn catalog(lean_descriptions: bool) -> ListToolsResult {
-        catalog_for_profile(ToolsetProfile::Mirror, lean_descriptions)
+    fn catalog() -> ListToolsResult {
+        catalog_for_toolset(ToolsetProfile::Mirror)
     }
 
-    fn catalog_for_profile(
-        toolset_profile: ToolsetProfile,
-        lean_descriptions: bool,
-    ) -> ListToolsResult {
+    fn catalog_for_toolset(toolset_profile: ToolsetProfile) -> ListToolsResult {
         ListToolsResult::with_all_items(
             TOOL_SPECS
                 .iter()
                 .copied()
                 .filter(|spec| tool_in_profile(spec.name, toolset_profile))
-                .map(|spec| descriptor_with_profile(spec, lean_descriptions))
+                .map(descriptor)
                 .collect(),
         )
     }
 
-    fn serialized_catalog(lean_descriptions: bool) -> String {
-        serde_json::to_string(&catalog(lean_descriptions)).expect("serialize tools/list catalog")
+    fn serialized_catalog() -> String {
+        serde_json::to_string(&catalog()).expect("serialize tools/list catalog")
     }
 
     fn tool_description<'a>(catalog: &'a ListToolsResult, name: &str) -> &'a str {
@@ -1356,85 +1299,51 @@ mod tests {
     }
 
     #[test]
-    fn lean_catalog_preserves_names_order_and_schemas() {
-        let legacy = catalog(false);
-        let lean = catalog(true);
-        assert_eq!(legacy.tools.len(), lean.tools.len());
-        for (legacy, lean) in legacy.tools.iter().zip(&lean.tools) {
-            assert_eq!(legacy.name, lean.name);
-            assert_eq!(legacy.input_schema, lean.input_schema);
-        }
-    }
-
-    #[test]
-    fn lean_descriptions_are_materially_shorter() {
-        let legacy_bytes: usize = catalog(false)
-            .tools
-            .iter()
-            .filter_map(|tool| tool.description.as_deref())
-            .map(str::len)
-            .sum();
-        let lean_bytes: usize = catalog(true)
-            .tools
-            .iter()
-            .filter_map(|tool| tool.description.as_deref())
-            .map(str::len)
-            .sum();
-        assert!(
-            lean_bytes * 100 <= legacy_bytes * 60,
-            "lean descriptions are {lean_bytes} bytes versus {legacy_bytes} legacy bytes"
-        );
-    }
-
-    #[test]
-    fn every_description_tool_reference_is_exposed_in_its_toolset_profile() {
+    fn every_description_tool_reference_is_exposed_in_its_toolset() {
         for toolset_profile in [ToolsetProfile::Mirror, ToolsetProfile::Lean] {
-            for lean_descriptions in [false, true] {
-                let profile = catalog_for_profile(toolset_profile, lean_descriptions);
-                let exposed: HashSet<&str> = profile
-                    .tools
-                    .iter()
-                    .map(|tool| tool.name.as_ref())
-                    .collect();
-                for tool in &profile.tools {
-                    let description = tool.description.as_deref().expect("tool description");
-                    for referenced in references_in(description) {
-                        assert!(
-                            exposed.contains(referenced),
-                            "{} references unavailable tool {referenced} in toolset={} descriptions={}",
-                            tool.name,
-                            if toolset_profile == ToolsetProfile::Lean {
-                                "lean"
-                            } else {
-                                "mirror"
-                            },
-                            if lean_descriptions { "lean" } else { "legacy" }
-                        );
-                    }
+            let profile = catalog_for_toolset(toolset_profile);
+            let exposed: HashSet<&str> = profile
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect();
+            for tool in &profile.tools {
+                let description = tool.description.as_deref().expect("tool description");
+                for referenced in references_in(description) {
+                    assert!(
+                        exposed.contains(referenced),
+                        "{} references unavailable tool {referenced} in toolset={}",
+                        tool.name,
+                        if toolset_profile == ToolsetProfile::Lean {
+                            "lean"
+                        } else {
+                            "mirror"
+                        },
+                    );
                 }
             }
         }
     }
 
     #[test]
-    fn lean_catalog_pins_lifetimes_dialog_blocking_and_all_steering() {
-        let lean = catalog(true);
+    fn canonical_catalog_pins_lifetimes_dialog_blocking_and_steering() {
+        let catalog = catalog();
         assert!(
-            tool_description(&lean, "browser_snapshot")
+            tool_description(&catalog, "browser_snapshot")
                 .contains("Refs are session-only and never reused.")
         );
         assert!(
-            tool_description(&lean, "browser_take_screenshot")
+            tool_description(&catalog, "browser_take_screenshot")
                 .contains("fallback lasts until shutdown.")
         );
         assert!(
-            tool_description(&lean, "browser_handle_dialog")
+            tool_description(&catalog, "browser_handle_dialog")
                 .contains("Dialogs block further page work until handled.")
         );
         let steering_descriptions: Vec<(&str, &str)> = TOOL_SPECS
             .iter()
             .filter(|spec| {
-                spec.lean_description
+                spec.description
                     .split(|character: char| !character.is_ascii_alphabetic())
                     .any(|word| {
                         ["prefer", "use", "narrow", "filter"]
@@ -1442,7 +1351,7 @@ mod tests {
                             .any(|marker| word.eq_ignore_ascii_case(marker))
                     })
             })
-            .map(|spec| (spec.name, spec.lean_description))
+            .map(|spec| (spec.name, spec.description))
             .collect();
         assert_eq!(
             steering_descriptions,
@@ -1468,56 +1377,32 @@ mod tests {
     }
 
     #[test]
-    fn lean_serialized_catalog_fits_codex_nine_kib_budget_at_w1_id_boundary() {
-        // W1 certifies ordinary request ids through 256 serialized bytes. Unlike
-        // tool-call text, tools/list has no response body that can fall back to an
-        // empty string, so the complete catalog must fit at that boundary.
-        const LEAN_CATALOG_MAX_BYTES: usize = 9 * 1024;
+    fn serialized_catalog_fits_default_nine_kib_budget_at_id_boundary() {
+        const CATALOG_MAX_BYTES: usize = 9 * 1024;
         let id = RequestId::String("i".repeat(254).into());
         assert_eq!(serde_json::to_vec(&id).unwrap().len(), 256);
-        let response =
-            ServerJsonRpcMessage::response(ServerResult::ListToolsResult(catalog(true)), id);
+        let response = ServerJsonRpcMessage::response(ServerResult::ListToolsResult(catalog()), id);
         let mut serialized = serde_json::to_vec(&response).expect("serialize tools/list response");
         serialized.push(b'\n');
         assert!(
-            serialized.len() <= LEAN_CATALOG_MAX_BYTES - 64,
-            "lean tools/list response is {} bytes, leaving less than 64 bytes below {LEAN_CATALOG_MAX_BYTES}",
+            serialized.len() <= CATALOG_MAX_BYTES - 64,
+            "tools/list response is {} bytes, leaving less than 64 bytes below {CATALOG_MAX_BYTES}",
             serialized.len()
         );
     }
 
     #[test]
-    fn legacy_catalog_matches_archived_pre_w5_bytes() {
-        let actual = serialized_catalog(false);
-        if std::env::var_os("RUSTWRIGHT_UPDATE_LEGACY_TOOL_CATALOG").is_some() {
-            // Regenerate only from the legacy descriptor path:
-            // RUSTWRIGHT_UPDATE_LEGACY_TOOL_CATALOG=1 cargo test \
-            //   --manifest-path mcp/Cargo.toml legacy_catalog_matches_archived_pre_w5_bytes
-            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/tools-list-legacy.json");
-            fs::write(path, format!("{actual}\n")).expect("write legacy catalog fixture");
+    fn catalog_matches_archived_bytes() {
+        let actual = serialized_catalog();
+        if std::env::var_os("RUSTWRIGHT_UPDATE_TOOL_CATALOG").is_some() {
+            let path =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tools-list.json");
+            fs::write(path, format!("{actual}\n")).expect("write catalog fixture");
             return;
         }
         assert_eq!(
             actual.as_bytes(),
-            LEGACY_CATALOG_FIXTURE.trim_end_matches('\n').as_bytes()
-        );
-    }
-
-    #[test]
-    fn lean_catalog_matches_archived_w5_bytes() {
-        let actual = serialized_catalog(true);
-        if std::env::var_os("RUSTWRIGHT_UPDATE_LEAN_TOOL_CATALOG").is_some() {
-            // Regenerate only by explicit opt-in from the complete mirror toolset
-            // with lean descriptions enabled.
-            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/tools-list-lean.json");
-            fs::write(path, format!("{actual}\n")).expect("write lean catalog fixture");
-            return;
-        }
-        assert_eq!(
-            actual.as_bytes(),
-            LEAN_CATALOG_FIXTURE.trim_end_matches('\n').as_bytes()
+            CATALOG_FIXTURE.trim_end_matches('\n').as_bytes()
         );
     }
 
