@@ -1599,7 +1599,6 @@ struct LocatorDispatchScript {
 #[derive(Debug)]
 struct LocatorFastPathScript {
     body: String,
-    fill_guard_key: Option<String>,
 }
 
 fn locator_fill_apply_body(value: &str, strict: bool, forced: bool) -> RwResult<LocatorFillScript> {
@@ -1736,23 +1735,6 @@ fn simple_label_fast_spec(spec: &Value, explicit_index: bool) -> bool {
         )
 }
 
-fn simple_placeholder_fast_spec(spec: &Value, explicit_index: bool) -> bool {
-    !explicit_index
-        && spec.get("kind").and_then(Value::as_str) == Some("placeholder")
-        && spec.get("value").and_then(Value::as_str).is_some()
-}
-
-fn fast_fill_body(args: &Value) -> RwResult<LocatorFillScript> {
-    let value = args.get("value").and_then(Value::as_str).ok_or_else(|| {
-        RwError::InvalidInput("locator fast fill value must be a string".to_string())
-    })?;
-    locator_fill_apply_body(
-        value,
-        args.get("strict").and_then(Value::as_bool).unwrap_or(false),
-        args.get("forced").and_then(Value::as_bool).unwrap_or(false),
-    )
-}
-
 fn locator_fast_path_body(
     locator_json: &str,
     operation: &str,
@@ -1771,7 +1753,6 @@ fn locator_fast_path_body(
         .get("explicit_index")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut fill_guard_key = None;
     let body = match operation {
         "css_count" if simple_css_fast_spec(&spec) => Some(LOCATOR_FAST_COUNT_BODY.to_string()),
         "css_text" if simple_css_fast_spec(&spec) => Some(LOCATOR_FAST_TEXT_BODY.to_string()),
@@ -1793,11 +1774,6 @@ fn locator_fast_path_body(
         }
         "css_input_value" if simple_css_fast_spec(&spec) => {
             Some(LOCATOR_FAST_INPUT_VALUE_BODY.to_string())
-        }
-        "css_fill" if !explicit_index && simple_css_fast_spec(&spec) => {
-            let fill = fast_fill_body(&args)?;
-            fill_guard_key = Some(fill.guard_key);
-            Some(fill.body)
         }
         "css_immediate_state" if simple_css_fast_spec(&spec) => {
             let state = args.get("state").and_then(Value::as_str);
@@ -1828,16 +1804,6 @@ fn locator_fast_path_body(
         "label_attribute" if simple_label_fast_spec(&spec, explicit_index) => {
             Some(LOCATOR_FAST_ATTRIBUTE_BODY.to_string())
         }
-        "label_fill" if simple_label_fast_spec(&spec, explicit_index) => {
-            let fill = fast_fill_body(&args)?;
-            fill_guard_key = Some(fill.guard_key);
-            Some(fill.body)
-        }
-        "placeholder_fill" if simple_placeholder_fast_spec(&spec, explicit_index) => {
-            let fill = fast_fill_body(&args)?;
-            fill_guard_key = Some(fill.guard_key);
-            Some(fill.body)
-        }
         _ => None,
     };
     let Some(body) = body else {
@@ -1850,21 +1816,10 @@ fn locator_fast_path_body(
     ) {
         effective_args["strict"] = Value::Bool(false);
     }
-    let body = if fill_guard_key.is_some() {
-        // Fill owns its strictness ordering: a retained dispatch must be observed before
-        // element-count strictness is considered. Wrapping it in the generic fast-path
-        // preflight would inspect a page-created duplicate before the fill guard can
-        // confirm the already-dispatched edit.
-        body
-    } else {
-        LOCATOR_FAST_PATH_TEMPLATE
-            .replace("__ARGS__", &effective_args.to_string())
-            .replace("__BODY__", &body)
-    };
-    Ok(Some(LocatorFastPathScript {
-        body,
-        fill_guard_key,
-    }))
+    let body = LOCATOR_FAST_PATH_TEMPLATE
+        .replace("__ARGS__", &effective_args.to_string())
+        .replace("__BODY__", &body);
+    Ok(Some(LocatorFastPathScript { body }))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -7422,10 +7377,146 @@ multiline-compatible = """4.5.6"""
 
     #[test]
     fn chromium_default_launch_args_disable_system_keychains() {
-        let args = chromium_default_launch_args(&LaunchOptions::default());
+        let args = chromium_effective_launch_args(&LaunchOptions::default());
 
         assert!(args.iter().any(|arg| arg == "--password-store=basic"));
         assert!(args.iter().any(|arg| arg == "--use-mock-keychain"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--disable-blink-features=AutomationControlled"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--enable-features=CDPScreenshotNewSurface"));
+        for switch in [
+            "--disable-back-forward-cache",
+            "--disable-extensions",
+            "--disable-component-update",
+            "--disable-field-trial-config",
+            "--metrics-recording-only",
+            "--no-service-autorun",
+            "--disable-sync",
+            "--disable-default-apps",
+            "--disable-hang-monitor",
+            "--disable-ipc-flooding-protection",
+            "--disable-breakpad",
+            "--disable-client-side-phishing-detection",
+            "--disable-component-extensions-with-background-pages",
+            "--allow-pre-commit-input",
+            "--force-color-profile=srgb",
+            "--disable-search-engine-choice-screen",
+        ] {
+            assert!(args.iter().any(|arg| arg == switch), "missing {switch}");
+        }
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.starts_with("--disable-features="))
+                .count(),
+            1
+        );
+        assert!(args.iter().any(|arg| {
+            arg == "--disable-features=DialMediaRouteProvider,GlobalMediaControls,MediaRouter,OptimizationHints,Translate,HttpsUpgrades,PaintHolding,ThirdPartyStoragePartitioning,DestroyProfileOnBrowserClose,AvoidUnnecessaryBeforeUnloadCheckSync,LensOverlay"
+        }));
+    }
+
+    #[test]
+    fn chromium_effective_launch_args_merge_feature_lists() {
+        let expected_default = vec![
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--password-store=basic",
+            "--use-mock-keychain",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-renderer-backgrounding",
+            "--disable-popup-blocking",
+            "--disable-prompt-on-repost",
+            "--disable-back-forward-cache",
+            "--disable-extensions",
+            "--disable-component-update",
+            "--disable-field-trial-config",
+            "--metrics-recording-only",
+            "--no-service-autorun",
+            "--disable-sync",
+            "--disable-default-apps",
+            "--disable-hang-monitor",
+            "--disable-ipc-flooding-protection",
+            "--disable-breakpad",
+            "--disable-client-side-phishing-detection",
+            "--disable-component-extensions-with-background-pages",
+            "--allow-pre-commit-input",
+            "--force-color-profile=srgb",
+            "--disable-search-engine-choice-screen",
+            "--disable-features=DialMediaRouteProvider,GlobalMediaControls,MediaRouter,OptimizationHints,Translate,HttpsUpgrades,PaintHolding,ThirdPartyStoragePartitioning,DestroyProfileOnBrowserClose,AvoidUnnecessaryBeforeUnloadCheckSync,LensOverlay",
+            "--enable-features=CDPScreenshotNewSurface",
+            "--mute-audio",
+            "--headless=new",
+            "--hide-scrollbars",
+            "--no-sandbox",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            chromium_effective_launch_args(&LaunchOptions::default()),
+            expected_default
+        );
+
+        let mut user_features = LaunchOptions::default();
+        user_features.args = vec![
+            "--disable-features=UserFeature,DialMediaRouteProvider".to_string(),
+            "--enable-features=UserEnabled,CDPScreenshotNewSurface".to_string(),
+            "--disable-blink-features=UserBlink,AutomationControlled".to_string(),
+        ];
+        let mut expected_user_features = expected_default.clone();
+        expected_user_features[7] =
+            "--disable-blink-features=AutomationControlled,UserBlink".to_string();
+        expected_user_features[27] = "--disable-features=DialMediaRouteProvider,GlobalMediaControls,MediaRouter,OptimizationHints,Translate,HttpsUpgrades,PaintHolding,ThirdPartyStoragePartitioning,DestroyProfileOnBrowserClose,AvoidUnnecessaryBeforeUnloadCheckSync,LensOverlay,UserFeature".to_string();
+        expected_user_features[28] =
+            "--enable-features=CDPScreenshotNewSurface,UserEnabled".to_string();
+        assert_eq!(
+            chromium_effective_launch_args(&user_features),
+            expected_user_features
+        );
+
+        let mut selective_ignore = LaunchOptions::default();
+        selective_ignore.ignore_default_args = vec!["--disable-features".to_string()];
+        selective_ignore.args = vec!["--disable-features=SelectiveProbe".to_string()];
+        let mut expected_selective_ignore = expected_default.clone();
+        expected_selective_ignore.remove(27);
+        expected_selective_ignore.push("--disable-features=SelectiveProbe".to_string());
+        assert_eq!(
+            chromium_effective_launch_args(&selective_ignore),
+            expected_selective_ignore
+        );
+
+        let mut ignore_all = LaunchOptions::default();
+        ignore_all.ignore_all_default_args = true;
+        ignore_all.args = vec![
+            "--disable-features=First,First".to_string(),
+            "--disable-features=Second".to_string(),
+            "--enable-features=UserEnabled".to_string(),
+        ];
+        assert_eq!(chromium_effective_launch_args(&ignore_all), ignore_all.args);
+    }
+
+    #[test]
+    fn browser_context_defaults_create_disposable_native_contexts() {
+        let params = browser_context_create_params(None).unwrap();
+
+        assert_eq!(params["disposeOnDetach"], true);
+    }
+
+    #[test]
+    fn navigation_history_expression_drains_both_named_buffers() {
+        let expression = navigation_history_expression("console-buffer", "page-errors");
+
+        assert!(expression.contains("console-buffer"));
+        assert!(expression.contains("page-errors"));
+        assert!(expression.contains("console: drain"));
+        assert!(expression.contains("page_errors: drain"));
+        assert_eq!(expression.matches("splice(0, history.length)").count(), 1);
     }
 
     #[test]
@@ -7727,25 +7818,6 @@ multiline-compatible = """4.5.6"""
         )
         .unwrap()
         .is_some());
-
-        let fill = locator_fast_path_body(
-            r##"{"kind":"css","selector":"#target"}"##,
-            "css_fill",
-            r#"{"strict":true,"explicit_index":false,"has_handlers":false,"value":"committed","forced":false}"#,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(fill.fill_guard_key.is_some());
-        assert!(!fill.body.contains("const fastArgs ="));
-        assert!(
-            fill.body
-                .find("const pendingFillGuard")
-                .expect("fill guard observation")
-                < fill
-                    .body
-                    .find("if (strict && (strictFrameViolation || matches.length > 1))")
-                    .expect("fill strictness")
-        );
     }
 
     #[test]
@@ -8004,99 +8076,6 @@ multiline-compatible = """4.5.6"""
         );
     }
 
-    #[cfg(feature = "python")]
-    #[tokio::test]
-    async fn fast_path_post_dispatch_fill_timeout_has_settle_metadata() {
-        Python::initialize();
-        let (page, mut peer) = input_protocol_page(Some("Ada"));
-        let page = PyPage { inner: page.inner };
-        peer.allow_close = true;
-        peer.pending_fill_confirmation = true;
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = Python::attach(|py| {
-                page.locator_fast_path(
-                    py,
-                    r##"{"kind":"css","selector":"#target"}"##,
-                    0,
-                    "css_fill",
-                    r#"{"strict":true,"explicit_index":false,"has_handlers":false,"value":"Ada","forced":false}"#,
-                    Some(60.0),
-                )
-            });
-            let _ = result_tx.send(result.map_err(|error| error.to_string()));
-        });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let error = loop {
-            if let Ok(result) = result_rx.try_recv() {
-                break result.expect_err("configured fast fill must time out");
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "real fast fill timeout did not finish"
-            );
-            let _ = tokio::time::timeout(Duration::from_millis(150), peer.next_command()).await;
-        };
-        let marker = error
-            .find(ACTION_TIMEOUT_MARKER)
-            .expect("PyErr must contain the structured ActionTimeout marker");
-        let Some(FfiWireError::ActionTimeout(payload)) = FfiWireError::parse(&error[marker..])
-        else {
-            panic!("fast fill must preserve structured ActionTimeout: {error}");
-        };
-        assert_eq!(payload.phase, Some(FailurePhase::Settle));
-        assert_eq!(payload.command_written, Some(CommandWritten::Yes));
-        assert_eq!(payload.retryable, Some(false));
-    }
-
-    #[cfg(feature = "python")]
-    #[tokio::test]
-    async fn fast_path_retryable_tracked_timeout_cleans_retained_fill_guard() {
-        Python::initialize();
-        let (page, mut peer) = input_protocol_page(Some(""));
-        let page = PyPage { inner: page.inner };
-        peer.allow_close = true;
-        peer.fail_delete_before_begin = true;
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = Python::attach(|py| {
-                page.locator_fast_path(
-                    py,
-                    r##"{"kind":"css","selector":"#target"}"##,
-                    0,
-                    "css_fill",
-                    r#"{"strict":true,"explicit_index":false,"has_handlers":false,"value":"","forced":false}"#,
-                    Some(60.0),
-                )
-            });
-            let _ = result_tx.send(result.map_err(|error| error.to_string()));
-        });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let mut commands = Vec::new();
-        let error = loop {
-            if let Ok(result) = result_rx.try_recv() {
-                break result.expect_err("configured fast fill dispatch must fail");
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "fast fill cleanup regression did not finish"
-            );
-            if let Ok(command) =
-                tokio::time::timeout(Duration::from_millis(150), peer.next_command()).await
-            {
-                commands.push(command);
-            }
-        };
-        assert!(
-            error.contains(TIMEOUT_MARKER)
-                && error.contains(r#""command_written":"no","retryable":true"#),
-            "tracked timeout must retain its structured metadata: {error}"
-        );
-        assert!(commands.iter().any(|command| {
-            input_command_expression(command)
-                .is_some_and(|expression| expression.contains("guard.cleanup()"))
-        }));
-    }
     #[test]
     fn ffi_wire_error_markers_round_trip_with_closed_payload_schemas() {
         let action_timeout = |evidence: FillAttemptEvidence| {
@@ -9280,7 +9259,7 @@ multiline-compatible = """4.5.6"""
                     .await
                     .map(Some)
                 },
-                |_| async { Ok(()) },
+                |_| async { Ok(DragOutcome::NoInterceptedDrop) },
             ),
             async {
                 let mut commands = Vec::new();
@@ -9311,6 +9290,147 @@ multiline-compatible = """4.5.6"""
         assert_eq!(cleanup_commands[1]["params"]["type"], "mouseReleased");
         assert_eq!(cleanup_commands[1]["params"]["buttons"], 0);
         assert_eq!(cleanup_commands[1]["sessionId"], "pointer-session");
+        assert!(write_rx.try_recv().is_err());
+    }
+
+    fn new_drag_test_client() -> (CdpClient, mpsc::UnboundedReceiver<CdpOutgoing>) {
+        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let (events, _) = broadcast::channel(4);
+        let (alive_tx, _) = watch::channel(true);
+        (
+            CdpClient {
+                write_tx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                outstanding: Arc::new(Mutex::new(HashMap::new())),
+                events,
+                event_log: Arc::new(Mutex::new(CdpEventLog::new())),
+                traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+                runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
+                next_id: AtomicU64::new(1),
+                sent_runtime_enable_count: AtomicU64::new(0),
+                sent_target_close_count: AtomicU64::new(0),
+                sent_context_dispose_count: AtomicU64::new(0),
+                sent_get_frame_tree_count: AtomicU64::new(0),
+                alive: Arc::new(AtomicBool::new(true)),
+                alive_tx,
+            },
+            write_rx,
+        )
+    }
+
+    async fn collect_drag_test_commands(
+        client: &CdpClient,
+        write_rx: &mut mpsc::UnboundedReceiver<CdpOutgoing>,
+        count: usize,
+    ) -> Vec<Value> {
+        let mut commands = Vec::new();
+        for _ in 0..count {
+            let command = match write_rx.recv().await.unwrap() {
+                CdpOutgoing::Text { payload, .. } => {
+                    serde_json::from_str::<Value>(&payload).unwrap()
+                }
+                CdpOutgoing::Close => panic!("unexpected transport close"),
+            };
+            dispatch_cdp_payload(
+                json!({ "id": command["id"], "result": {} }),
+                Arc::clone(&client.pending),
+                client.events.clone(),
+                Arc::clone(&client.event_log),
+            );
+            commands.push(command);
+        }
+        commands
+    }
+
+    #[tokio::test]
+    async fn intercepted_drag_success_skips_mouse_release() {
+        let (client, mut write_rx) = new_drag_test_client();
+        let client_for_completion = &client;
+        let (result, commands) = tokio::join!(
+            run_drag_with_cleanup(
+                &client,
+                "root-session",
+                "pointer-session",
+                30.0,
+                40.0,
+                0,
+                async { Ok(Some(json!({ "items": [] }))) },
+                |drag_data| async move {
+                    assert!(drag_data.is_some());
+                    client_for_completion
+                        .send(
+                            "Input.dispatchDragEvent",
+                            json!({ "type": "drop" }),
+                            Some("pointer-session"),
+                            Duration::from_secs(1),
+                        )
+                        .await?;
+                    Ok(DragOutcome::InterceptedDrop)
+                },
+            ),
+            collect_drag_test_commands(&client, &mut write_rx, 2),
+        );
+
+        result.unwrap();
+        assert_eq!(commands[0]["method"], "Input.setInterceptDrags");
+        assert_eq!(commands[0]["params"]["enabled"], false);
+        assert_eq!(commands[1]["method"], "Input.dispatchDragEvent");
+        assert_eq!(commands[1]["params"]["type"], "drop");
+        assert!(write_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn drag_without_intercepted_start_releases_mouse() {
+        let (client, mut write_rx) = new_drag_test_client();
+        let (result, commands) = tokio::join!(
+            run_drag_with_cleanup(
+                &client,
+                "root-session",
+                "pointer-session",
+                30.0,
+                40.0,
+                0,
+                async { Ok(None) },
+                |_| async { Ok(DragOutcome::NoInterceptedDrop) },
+            ),
+            collect_drag_test_commands(&client, &mut write_rx, 2),
+        );
+
+        result.unwrap();
+        assert_eq!(commands[0]["method"], "Input.setInterceptDrags");
+        assert_eq!(commands[0]["params"]["enabled"], false);
+        assert_eq!(commands[1]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(commands[1]["params"]["type"], "mouseReleased");
+        assert_eq!(commands[1]["params"]["x"], 30.0);
+        assert_eq!(commands[1]["params"]["y"], 40.0);
+        assert!(write_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn drag_completion_error_releases_mouse() {
+        let (client, mut write_rx) = new_drag_test_client();
+        let (result, commands) = tokio::join!(
+            run_drag_with_cleanup(
+                &client,
+                "root-session",
+                "pointer-session",
+                30.0,
+                40.0,
+                0,
+                async { Ok(Some(json!({ "items": [] }))) },
+                |_| async { Err(RwError::Message("completion failed".to_string())) },
+            ),
+            collect_drag_test_commands(&client, &mut write_rx, 2),
+        );
+
+        assert!(matches!(
+            result,
+            Err(RwError::Message(message)) if message == "completion failed"
+        ));
+        assert_eq!(commands[0]["method"], "Input.setInterceptDrags");
+        assert_eq!(commands[0]["params"]["enabled"], false);
+        assert_eq!(commands[1]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(commands[1]["params"]["type"], "mouseReleased");
         assert!(write_rx.try_recv().is_err());
     }
 
@@ -22199,6 +22319,200 @@ return this.dataset.mainWorldOverride === "observed";
         );
     }
 
+    #[test]
+    fn goto_timeout_reports_configured_budget_after_suboperation_timeout() {
+        let deadline = OperationDeadline::new(Duration::from_millis(50));
+        assert!(matches!(
+            normalize_navigation_timeout(RwError::Timeout(49), deadline),
+            RwError::Timeout(50)
+        ));
+    }
+
+    #[tokio::test]
+    async fn observed_goto_timeout_reports_configured_budget_after_suboperation_timeout() {
+        let mut harness = navigation_test_harness(4);
+        let timeout = Duration::from_millis(150);
+        let navigation = page_goto_observed_async(
+            Arc::clone(&harness.page),
+            "https://example.test/observed-timeout".to_owned(),
+            "load".to_owned(),
+            timeout,
+            None,
+        );
+        let responder = async move {
+            let navigate = harness.next_command("Page.navigate").await;
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            harness.reply(
+                &navigate,
+                json!({ "frameId": "frame-1", "loaderId": "loader-1" }),
+            );
+            harness.next_command("Runtime.evaluate").await;
+        };
+
+        let (result, ()) = tokio::time::timeout(Duration::from_millis(300), async {
+            tokio::join!(navigation, responder)
+        })
+        .await
+        .expect("observed goto timeout should remain bounded");
+        assert!(
+            matches!(result, Err(RwError::Timeout(150))),
+            "observed goto timeout: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_timeout_reports_configured_budget_after_suboperation_timeout() {
+        let mut harness = navigation_test_harness(4);
+        let timeout = Duration::from_millis(150);
+        let navigation = page_reload_observed_async(
+            Arc::clone(&harness.page),
+            Arc::clone(&harness.page.browser.client),
+            "page-session".to_owned(),
+            "load".to_owned(),
+            timeout,
+        );
+        let responder = async move {
+            harness
+                .reply_next(
+                    "Page.getFrameTree",
+                    json!({
+                        "frameTree": {
+                            "frame": {
+                                "id": "frame-main",
+                                "url": "https://example.test/reload-timeout"
+                            }
+                        }
+                    }),
+                )
+                .await;
+            let reload = harness.next_command("Page.reload").await;
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            harness.reply(&reload, json!({}));
+            harness.next_command("Runtime.evaluate").await;
+        };
+
+        let (result, ()) = tokio::time::timeout(Duration::from_millis(300), async {
+            tokio::join!(navigation, responder)
+        })
+        .await
+        .expect("reload timeout should remain bounded");
+        assert!(
+            matches!(result, Err(RwError::Timeout(150))),
+            "reload timeout: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_navigation_timeouts_report_configured_budget_after_suboperation_timeout() {
+        for offset in [-1, 1] {
+            let mut harness = navigation_test_harness(4);
+            let timeout = Duration::from_millis(150);
+            let navigation = page_history_observed_async(
+                Arc::clone(&harness.page),
+                Arc::clone(&harness.page.browser.client),
+                "page-session".to_owned(),
+                offset,
+                "commit".to_owned(),
+                timeout,
+            );
+            let responder = async move {
+                let history = harness.next_command("Page.getNavigationHistory").await;
+                tokio::time::sleep(Duration::from_millis(90)).await;
+                harness.reply(
+                    &history,
+                    json!({
+                        "currentIndex": if offset < 0 { 1 } else { 0 },
+                        "entries": [
+                            { "id": 1, "url": "https://example.test/history-a" },
+                            { "id": 2, "url": "https://example.test/history-b" }
+                        ]
+                    }),
+                );
+                harness
+                    .reply_next(
+                        "Page.getFrameTree",
+                        json!({
+                            "frameTree": {
+                                "frame": {
+                                    "id": "frame-main",
+                                    "url": "https://example.test/history-current"
+                                }
+                            }
+                        }),
+                    )
+                    .await;
+                harness.next_command("Page.navigateToHistoryEntry").await;
+            };
+
+            let (result, ()) = tokio::time::timeout(Duration::from_millis(300), async {
+                tokio::join!(navigation, responder)
+            })
+            .await
+            .expect("history timeout should remain bounded");
+            assert!(
+                matches!(result, Err(RwError::Timeout(150))),
+                "history offset {offset} timeout: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_navigation_timeouts_report_configured_budget_after_suboperation_timeout() {
+        let timeout = Duration::from_millis(150);
+
+        let mut reload_harness = navigation_test_harness(4);
+        let reload_page = RustwrightPage {
+            inner: Arc::clone(&reload_harness.page),
+        };
+        let reload_handle = reload_harness.page.browser.runtime.handle().clone();
+        reload_handle.spawn(async move {
+            let reload = reload_harness.next_command("Page.reload").await;
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            reload_harness.reply(&reload, json!({}));
+        });
+        let reload_result = reload_page.reload(Some("load"), timeout);
+        assert!(
+            matches!(reload_result, Err(RwError::Timeout(150))),
+            "reload timeout: {reload_result:?}"
+        );
+
+        for offset in [-1_i64, 1] {
+            let mut history_harness = navigation_test_harness(4);
+            let history_page = RustwrightPage {
+                inner: Arc::clone(&history_harness.page),
+            };
+            let history_handle = history_harness.page.browser.runtime.handle().clone();
+            history_handle.spawn(async move {
+                let history = history_harness
+                    .next_command("Page.getNavigationHistory")
+                    .await;
+                tokio::time::sleep(Duration::from_millis(90)).await;
+                history_harness.reply(
+                    &history,
+                    json!({
+                        "currentIndex": if offset < 0 { 1 } else { 0 },
+                        "entries": [
+                            { "id": 1, "url": "https://example.test/history-a" },
+                            { "id": 2, "url": "https://example.test/history-b" }
+                        ]
+                    }),
+                );
+                history_harness
+                    .next_command("Page.navigateToHistoryEntry")
+                    .await;
+            });
+            let result = if offset < 0 {
+                history_page.go_back(Some("commit"), timeout)
+            } else {
+                history_page.go_forward(Some("commit"), timeout)
+            };
+            assert!(
+                matches!(result, Err(RwError::Timeout(150))),
+                "history offset {offset} timeout: {result:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn navigation_reconciles_missing_domcontentloaded_event_from_ready_state() {
         let mut harness = navigation_test_harness(4);
@@ -22731,6 +23045,7 @@ return this.dataset.mainWorldOverride === "observed";
     #[cfg(feature = "python")]
     #[test]
     fn python_launch_option_parse_errors_remain_value_errors() {
+        Python::initialize();
         Python::attach(|py| {
             let error = parse_python_launch_options("{").unwrap_err();
             assert!(error.is_instance_of::<PyValueError>(py));
@@ -30569,6 +30884,12 @@ async fn wait_for_drag_intercepted(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragOutcome {
+    InterceptedDrop,
+    NoInterceptedDrop,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_drag_with_cleanup<Start, Complete, Completion>(
     client: &CdpClient,
@@ -30583,7 +30904,7 @@ async fn run_drag_with_cleanup<Start, Complete, Completion>(
 where
     Start: Future<Output = RwResult<Option<Value>>>,
     Complete: FnOnce(Option<Value>) -> Completion,
-    Completion: Future<Output = RwResult<()>>,
+    Completion: Future<Output = RwResult<DragOutcome>>,
 {
     const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -30600,28 +30921,31 @@ where
         Ok(drag_data) => complete(drag_data).await,
         Err(error) => Err(error),
     };
-    if let Err(error) = client
-        .send(
-            "Input.dispatchMouseEvent",
-            mouse_event_payload(
-                "mouseReleased",
-                release_x,
-                release_y,
-                "left",
-                0,
-                1,
-                modifiers,
-            ),
-            Some(pointer_session_id),
-            CLEANUP_TIMEOUT,
-        )
-        .await
-    {
-        eprintln!(
-            "rustwright: mouse release cleanup received no confirmation after committed drag: {error}"
-        );
+    let release_mouse = !matches!(result, Ok(DragOutcome::InterceptedDrop));
+    if release_mouse {
+        if let Err(error) = client
+            .send(
+                "Input.dispatchMouseEvent",
+                mouse_event_payload(
+                    "mouseReleased",
+                    release_x,
+                    release_y,
+                    "left",
+                    0,
+                    1,
+                    modifiers,
+                ),
+                Some(pointer_session_id),
+                CLEANUP_TIMEOUT,
+            )
+            .await
+        {
+            eprintln!(
+                "rustwright: mouse release cleanup received no confirmation after committed drag: {error}"
+            );
+        }
     }
-    result
+    result.map(|_| ())
 }
 
 const PHYSICAL_DRAG_STEPS: u32 = 10;
@@ -30683,7 +31007,8 @@ async fn dispatch_physical_drag_sequence_in_session(
                 modifiers,
                 deadline,
             )
-            .await
+            .await?;
+            Ok(DragOutcome::NoInterceptedDrop)
         },
     )
     .await
@@ -33820,6 +34145,129 @@ async fn resolve_screenshot_clip(
     }))
 }
 
+const NAVIGATION_HISTORY_TIMEOUT: Duration = Duration::from_millis(250);
+
+async fn retain_navigation_response_bodies_async(
+    client: &CdpClient,
+    session_id: &str,
+    request_ids: &[String],
+) -> Value {
+    let mut retained = serde_json::Map::new();
+    for request_id in request_ids {
+        if request_id.is_empty() {
+            continue;
+        }
+        if let Ok(body) = client
+            .send(
+                "Network.getResponseBody",
+                json!({ "requestId": request_id }),
+                Some(session_id),
+                NAVIGATION_HISTORY_TIMEOUT,
+            )
+            .await
+        {
+            retained.insert(request_id.clone(), body);
+        }
+    }
+    Value::Object(retained)
+}
+
+fn navigation_history_expression(
+    console_buffer_name: &str,
+    page_error_buffer_name: &str,
+) -> String {
+    let console_name =
+        serde_json::to_string(console_buffer_name).unwrap_or_else(|_| "\"\"".to_string());
+    let page_error_name =
+        serde_json::to_string(page_error_buffer_name).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(() => {{
+          const drain = (owner, name) => {{
+            try {{
+              const history = owner && owner[name];
+              if (!Array.isArray(history) || history.length === 0) return [];
+              return history.splice(0, history.length);
+            }} catch (_) {{
+              return [];
+            }}
+          }};
+          return {{
+            console: drain(typeof console === "undefined" ? null : console, {console_name}),
+            page_errors: drain(typeof window === "undefined" ? null : window, {page_error_name})
+          }};
+        }})()"#
+    )
+}
+
+async fn drain_navigation_history_async(
+    client: &CdpClient,
+    session_id: &str,
+    console_buffer_name: &str,
+    page_error_buffer_name: &str,
+) -> Value {
+    let result = client
+        .send(
+            "Runtime.evaluate",
+            json!({
+                "expression": navigation_history_expression(
+                    console_buffer_name,
+                    page_error_buffer_name,
+                ),
+                "awaitPromise": false,
+                "returnByValue": true,
+                "userGesture": true,
+            }),
+            Some(session_id),
+            NAVIGATION_HISTORY_TIMEOUT,
+        )
+        .await;
+    match result
+        .as_ref()
+        .ok()
+        .and_then(|value| runtime_result_to_json(value).ok())
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+    {
+        Some(Value::Object(history)) => Value::Object(history),
+        _ => json!({ "console": [], "page_errors": [] }),
+    }
+}
+
+async fn prepare_navigation_async(
+    page: &Arc<PageInner>,
+    console_buffer_name: &str,
+    page_error_buffer_name: &str,
+    request_ids: Vec<String>,
+) -> RwResult<Value> {
+    let client = Arc::clone(&page.browser.client);
+    let session_id = page.session_id.clone();
+    let response_bodies =
+        retain_navigation_response_bodies_async(&client, &session_id, &request_ids).await;
+    let history = drain_navigation_history_async(
+        &client,
+        &session_id,
+        console_buffer_name,
+        page_error_buffer_name,
+    )
+    .await;
+    let mut payload = match history {
+        Value::Object(history) => history,
+        _ => serde_json::Map::new(),
+    };
+    payload.insert("response_bodies".to_string(), response_bodies);
+    Ok(Value::Object(payload))
+}
+
+fn parse_navigation_request_ids(request_ids_json: Option<&str>) -> RwResult<Vec<String>> {
+    match request_ids_json {
+        None => Ok(Vec::new()),
+        Some(value) if value.trim().is_empty() => Ok(Vec::new()),
+        Some(value) => {
+            let request_ids = serde_json::from_str::<Vec<String>>(value)?;
+            Ok(request_ids)
+        }
+    }
+}
+
 async fn page_goto_async(
     page: Arc<PageInner>,
     url: String,
@@ -33856,7 +34304,7 @@ async fn page_goto_async(
                 started_at,
             )
             .await;
-            return Err(error);
+            return Err(normalize_navigation_timeout(error, deadline));
         }
         Err(error) => return Err(error),
     };
@@ -33885,10 +34333,10 @@ async fn page_goto_async(
     }
     let navigation_frame_id = match navigation_frame_id {
         Some(frame_id) => frame_id,
-        None => {
-            page.main_frame_id(&client, &session_id, deadline.remaining()?)
-                .await?
-        }
+        None => page
+            .main_frame_id(&client, &session_id, deadline.remaining()?)
+            .await
+            .map_err(|error| normalize_navigation_timeout(error, deadline))?,
     };
     let response = match wait_for_navigation(
         &client,
@@ -33922,7 +34370,7 @@ async fn page_goto_async(
                 started_at,
             )
             .await;
-            return Err(error);
+            return Err(normalize_navigation_timeout(error, deadline));
         }
         Err(error) => return Err(error),
     };
@@ -33967,7 +34415,9 @@ async fn page_goto_observed_async(
     timeout: Duration,
     referer: Option<String>,
 ) -> RwResult<NavigationObservation> {
-    page_goto_observed_impl(page, url, wait_until, timeout, referer).await
+    page_goto_observed_impl(page, url, wait_until, timeout, referer)
+        .await
+        .map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
 }
 
 async fn page_goto_observed_impl(
@@ -34112,6 +34562,18 @@ async fn page_reload_observed_async(
     wait_until: String,
     timeout: Duration,
 ) -> RwResult<NavigationObservation> {
+    page_reload_observed_impl(page, client, session_id, wait_until, timeout)
+        .await
+        .map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
+}
+
+async fn page_reload_observed_impl(
+    page: Arc<PageInner>,
+    client: Arc<CdpClient>,
+    session_id: String,
+    wait_until: String,
+    timeout: Duration,
+) -> RwResult<NavigationObservation> {
     let deadline = OperationDeadline::new(timeout);
     let expected_frame_id = page
         .main_frame_id(&client, &session_id, deadline.remaining()?)
@@ -34170,6 +34632,19 @@ async fn page_reload_observed_async(
 }
 
 async fn page_history_observed_async(
+    page: Arc<PageInner>,
+    client: Arc<CdpClient>,
+    session_id: String,
+    offset: i64,
+    wait_until: String,
+    timeout: Duration,
+) -> RwResult<HistoryNavigationObservation> {
+    page_history_observed_impl(page, client, session_id, offset, wait_until, timeout)
+        .await
+        .map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
+}
+
+async fn page_history_observed_impl(
     page: Arc<PageInner>,
     client: Arc<CdpClient>,
     session_id: String,
@@ -34773,78 +35248,6 @@ async fn element_handle_wait_for_selector_async(
     )
     .await?;
     wait_for_selector_result(&json, timeout)
-}
-
-fn locator_action_body(action: &str, strict: bool, timeout: Duration) -> String {
-    let strict_json = if strict { "true" } else { "false" };
-    let timeout_millis = timeout.as_millis().max(1);
-    format!(
-        r#"
-const strict = {strict_json};
-const timeoutMs = {timeout_millis};
-const attempt = () => {{
-  const currentMatches = all(spec);
-  if (strict && currentMatches.length > 1) return {{ done: true, value: `__rustwright_strict_violation__:${{currentMatches.length}}` }};
-  const current = currentMatches[index] || null;
-  if (!current || !visible(current) || current.disabled) return {{ done: false }};
-  const el = current;
-  {action}
-  return {{ done: true, value: true }};
-}};
-const first = attempt();
-if (first.done) return first.value;
-return new Promise(resolve => {{
-  let settled = false;
-  let observer = null;
-  let interval = null;
-  let timer = null;
-  const finish = value => {{
-    if (settled) return;
-    settled = true;
-    if (observer) observer.disconnect();
-    if (interval) clearInterval(interval);
-    if (timer) clearTimeout(timer);
-    resolve(value);
-  }};
-  const check = () => {{
-    const next = attempt();
-    if (next.done) finish(next.value);
-  }};
-  observer = new MutationObserver(check);
-  observer.observe(document, {{ subtree: true, childList: true, attributes: true, characterData: true }});
-  interval = setInterval(check, 5);
-  timer = setTimeout(() => finish('__rustwright_timeout__'), timeoutMs);
-}});
-"#
-    )
-}
-
-async fn page_locator_action_async(
-    page: Arc<PageInner>,
-    locator_json: String,
-    index: usize,
-    action: String,
-    timeout: Duration,
-    strict: bool,
-    method: &'static str,
-) -> RwResult<()> {
-    let body = locator_action_body(&action, strict, timeout);
-    let eval_timeout = Duration::from_millis(timeout.as_millis().saturating_add(1_000) as u64);
-    let json = evaluate_locator_for_page(page, locator_json, index, body, eval_timeout).await?;
-    let value = serde_json::from_str::<Value>(&json).unwrap_or(Value::Null);
-    if value.as_str() == Some("__rustwright_timeout__") {
-        return Err(RwError::Timeout(timeout.as_millis() as u64));
-    }
-    if let Some(count) = value
-        .as_str()
-        .and_then(|text| text.strip_prefix("__rustwright_strict_violation__:"))
-        .and_then(|text| text.parse::<u64>().ok())
-    {
-        return Err(RwError::Message(format!(
-            "strict mode violation: locator resolved to {count} elements while trying to {method}"
-        )));
-    }
-    Ok(())
 }
 
 fn native_action_body(template: &str) -> String {
@@ -35929,7 +36332,6 @@ impl PyPage {
         .to_string()
     }
 
-    #[pyo3(signature = (url, wait_until=None, timeout_ms=None, referer=None))]
     fn goto_async(
         &self,
         py: Python<'_>,
@@ -35969,40 +36371,6 @@ impl PyPage {
             runtime,
             evaluate_expression_for_page_async(page, expression, timeout),
             |py, value| Ok(value.into_pyobject(py)?.unbind().into_any()),
-        )
-    }
-
-    #[pyo3(signature = (locator_json, index, timeout_ms=None, strict=false))]
-    fn click_async(
-        &self,
-        py: Python<'_>,
-        locator_json: &str,
-        index: usize,
-        timeout_ms: Option<f64>,
-        strict: bool,
-    ) -> PyResult<Py<PyAny>> {
-        let page = Arc::clone(&self.inner);
-        let runtime = page.browser.runtime.handle().clone();
-        let timeout = BrowserInner::command_timeout(timeout_ms);
-        let action = r#"
-el.scrollIntoView({ block: 'center', inline: 'center' });
-if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-el.click();
-"#
-        .to_string();
-        python_future_on(
-            py,
-            runtime,
-            page_locator_action_async(
-                page,
-                locator_json.to_string(),
-                index,
-                action,
-                timeout,
-                strict,
-                "click",
-            ),
-            |py, ()| Ok(py.None()),
         )
     }
 
@@ -36056,36 +36424,6 @@ el.click();
                 initial_buttons,
                 modifiers,
                 remaining_ms,
-            ),
-            |py, ()| Ok(py.None()),
-        )
-    }
-
-    #[pyo3(signature = (locator_json, index, value, timeout_ms=None, strict=false))]
-    fn fill_async(
-        &self,
-        py: Python<'_>,
-        locator_json: &str,
-        index: usize,
-        value: &str,
-        timeout_ms: Option<f64>,
-        strict: bool,
-    ) -> PyResult<Py<PyAny>> {
-        let page = Arc::clone(&self.inner);
-        let runtime = page.browser.runtime.handle().clone();
-        python_future_on(
-            py,
-            runtime,
-            page_fill_actionable_async(
-                page,
-                locator_json.to_string(),
-                index,
-                value.to_string(),
-                timeout_ms,
-                strict,
-                false,
-                "fill".to_string(),
-                None,
             ),
             |py, ()| Ok(py.None()),
         )
@@ -36723,8 +37061,10 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                                             deadline.remaining()?,
                                         )
                                         .await?;
+                                    Ok(DragOutcome::InterceptedDrop)
+                                } else {
+                                    Ok(DragOutcome::NoInterceptedDrop)
                                 }
-                                Ok(())
                             },
                         )
                         .await?;
@@ -36800,6 +37140,33 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                 modifiers,
                 timeout,
             ))
+        })
+        .map_err(py_err)
+    }
+
+    #[pyo3(signature = (console_buffer_name, page_error_buffer_name, response_request_ids_json=None))]
+    fn prepare_navigation(
+        &self,
+        py: Python<'_>,
+        console_buffer_name: &str,
+        page_error_buffer_name: &str,
+        response_request_ids_json: Option<&str>,
+    ) -> PyResult<String> {
+        let request_ids =
+            parse_navigation_request_ids(response_request_ids_json).map_err(py_err)?;
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let console_buffer_name = console_buffer_name.to_string();
+        let page_error_buffer_name = page_error_buffer_name.to_string();
+        py.detach(move || {
+            browser
+                .block_on(prepare_navigation_async(
+                    &page,
+                    &console_buffer_name,
+                    &page_error_buffer_name,
+                    request_ids,
+                ))
+                .map(|payload| payload.to_string())
         })
         .map_err(py_err)
     }
@@ -36915,6 +37282,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                     .to_string())
             })
         })
+        .map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
         .map_err(py_err)
     }
 
@@ -37937,6 +38305,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                 }
                 Ok(Value::Null.to_string())
             })
+            .map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
             .map_err(py_err)
     }
 
@@ -37950,34 +38319,6 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         self.navigate_history(1, wait_until, timeout_ms)
     }
 
-    #[pyo3(signature = (locator_json, index, timeout_ms=None))]
-    fn click(
-        &self,
-        py: Python<'_>,
-        locator_json: &str,
-        index: usize,
-        timeout_ms: Option<f64>,
-    ) -> PyResult<()> {
-        let prepare_body = r#"
-if (!el) throw new Error('No element matches locator');
-el.scrollIntoView({ block: 'center', inline: 'center' });
-if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-return { ready: true, result: true, payload: null };
-"#;
-        let dispatch_body = "if (!el.isConnected) throw new Error('__rustwright_action_dispatch_not_started__: element detached'); rustwrightCommitDispatch(true); el.click(); return true;";
-        py.detach(|| {
-            self.evaluate_locator_dispatch(
-                locator_json,
-                index,
-                prepare_body,
-                dispatch_body,
-                timeout_ms,
-            )
-        })
-        .map(|_| ())
-        .map_err(py_err)
-    }
-
     #[pyo3(signature = (locator_json, index, body, timeout_ms=None))]
     fn locator_eval(
         &self,
@@ -37987,11 +38328,10 @@ return { ready: true, result: true, payload: null };
         body: &str,
         timeout_ms: Option<f64>,
     ) -> PyResult<String> {
-        // Release the GIL for the duration of the blocking CDP round-trip, matching
-        // `click` and `locator_eval_handle`. `evaluate_locator` already detaches inside
-        // `block_on`, but keeping the detach explicit at the binding layer keeps the
-        // three locator bindings consistent and guards against a future refactor that
-        // adds GIL-holding work before `block_on` or changes the transport.
+        // Release the GIL for the blocking CDP round-trip, as
+        // `locator_eval_handle` does. `evaluate_locator` already detaches inside
+        // `block_on`, but an explicit binding-layer detach prevents a future
+        // refactor from adding GIL-holding work before `block_on`.
         py.detach(|| self.evaluate_locator(locator_json, index, body, timeout_ms))
             .map_err(py_err)
     }
@@ -38134,211 +38474,12 @@ return { ready: true, result: true, payload: null };
         else {
             return Ok(json!({ "ok": false, "type": "not-applicable" }).to_string());
         };
-        let fill_options = if matches!(operation, "css_fill" | "label_fill" | "placeholder_fill") {
-            let args = serde_json::from_str::<Value>(args_json)
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
-            Some((
-                args.get("value")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        PyValueError::new_err("locator fast fill value must be a string")
-                    })?
-                    .to_string(),
-                args.get("strict").and_then(Value::as_bool).unwrap_or(false),
-            ))
-        } else {
-            None
-        };
         let page = Arc::clone(&self.inner);
         let locator_json = locator_json.to_string();
         let wait_probe = operation == "css_immediate_state";
         let timeout = BrowserInner::command_timeout(timeout_ms);
         py.detach(move || {
-            if let Some((value, strict)) = fill_options {
-                let guard_key = script.fill_guard_key.ok_or_else(|| {
-                    RwError::Message("fast fill did not return a fill guard key".to_string())
-                })?;
-                let fill_script = LocatorFillScript {
-                    body: script.body,
-                    guard_key,
-                };
-                let browser = Arc::clone(&page.browser);
-                browser.block_on(async move {
-                    let deadline = action_deadline(timeout);
-                    let mut pinned_resolution = None;
-                    let mut current_attempt_evidence = FillAttemptEvidence::Resolve;
-                    let evaluation = evaluate_locator_fill_for_page(
-                        Arc::clone(&page),
-                        locator_json.clone(),
-                        index,
-                        fill_script.body.clone(),
-                        fill_script.guard_key.clone(),
-                        value.clone(),
-                        timeout,
-                        &mut pinned_resolution,
-                        &mut current_attempt_evidence,
-                        None,
-                    )
-                    .await;
-                    let mut json = match evaluation {
-                        Ok(json) => json,
-                        Err(error) if error.is_retryable_timeout() => {
-                            let _ = cleanup_retained_fill_guard(
-                                Arc::clone(&page),
-                                &locator_json,
-                                &fill_script.guard_key,
-                                pinned_resolution.as_ref(),
-                                Duration::from_millis(100),
-                            )
-                            .await;
-                            return Err(error);
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let first_result =
-                        decode_runtime_serialized_value(serde_json::from_str::<Value>(&json)?);
-                    let first_info = first_result
-                        .get("info")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}));
-                    let first_result_type = first_result.get("type").and_then(Value::as_str);
-                    let first_result_succeeded =
-                        first_result.get("ok").and_then(Value::as_bool) == Some(true);
-                    if !first_result_succeeded
-                        && !matches!(
-                            first_result_type,
-                            Some("observe-dispatch" | "pending-dispatch")
-                        )
-                    {
-                        if let Some(error) = strict_violation_error(&first_info, strict, "fill") {
-                            let _ = cleanup_retained_fill_guard(
-                                Arc::clone(&page),
-                                &locator_json,
-                                &fill_script.guard_key,
-                                pinned_resolution.as_ref(),
-                                Duration::from_millis(100),
-                            )
-                            .await;
-                            return Err(error);
-                        }
-                    }
-                    match classify_fill_attempt(&first_result, "fill")? {
-                        FillAttempt::Success | FillAttempt::PendingActionability => {
-                            return Ok(json);
-                        }
-                        FillAttempt::PendingDispatch => {}
-                    }
-                    let mut last_info = first_info;
-                    let mut last_info_json = json;
-                    let mut last_timeout_state = "confirmed as edited";
-                    let mut last_attempt_evidence = FillAttemptEvidence::SettleWritten;
-                    loop {
-                        if Instant::now() >= deadline {
-                            let _ = cleanup_retained_fill_guard(
-                                Arc::clone(&page),
-                                &locator_json,
-                                &fill_script.guard_key,
-                                pinned_resolution.as_ref(),
-                                Duration::from_millis(100),
-                            )
-                            .await;
-                            return Err(ActionTimeoutError::from_attempt_raw_json(
-                                last_timeout_state,
-                                "fill".to_string(),
-                                last_info_json,
-                                &last_info,
-                                Some("info"),
-                                last_attempt_evidence,
-                            )
-                            .into());
-                        }
-                        tokio::time::sleep(
-                            deadline
-                                .saturating_duration_since(Instant::now())
-                                .min(Duration::from_millis(20)),
-                        )
-                        .await;
-                        if let Err(error) = ensure_native_action_owner_available(&page, "fill") {
-                            let _ = cleanup_retained_fill_guard(
-                                Arc::clone(&page),
-                                &locator_json,
-                                &fill_script.guard_key,
-                                pinned_resolution.as_ref(),
-                                Duration::from_millis(100),
-                            )
-                            .await;
-                            return Err(error);
-                        }
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        let mut current_attempt_evidence = FillAttemptEvidence::Resolve;
-                        let evaluation = evaluate_locator_fill_for_page(
-                            Arc::clone(&page),
-                            locator_json.clone(),
-                            index,
-                            fill_script.body.clone(),
-                            fill_script.guard_key.clone(),
-                            value.clone(),
-                            remaining.max(Duration::from_millis(1)),
-                            &mut pinned_resolution,
-                            &mut current_attempt_evidence,
-                            None,
-                        )
-                        .await;
-                        json = match evaluation {
-                            Ok(json) => json,
-                            Err(error) if error.is_retryable_timeout() => {
-                                last_attempt_evidence = current_attempt_evidence;
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        };
-                        let result =
-                            decode_runtime_serialized_value(serde_json::from_str::<Value>(&json)?);
-                        let info = result.get("info").cloned().unwrap_or_else(|| json!({}));
-                        let result_type = result.get("type").and_then(Value::as_str);
-                        let result_succeeded =
-                            result.get("ok").and_then(Value::as_bool) == Some(true);
-                        if !result_succeeded
-                            && !matches!(result_type, Some("observe-dispatch" | "pending-dispatch"))
-                        {
-                            if let Some(error) = strict_violation_error(&info, strict, "fill") {
-                                let _ = cleanup_retained_fill_guard(
-                                    Arc::clone(&page),
-                                    &locator_json,
-                                    &fill_script.guard_key,
-                                    pinned_resolution.as_ref(),
-                                    Duration::from_millis(100),
-                                )
-                                .await;
-                                return Err(error);
-                            }
-                        }
-                        match classify_fill_attempt(&result, "fill")? {
-                            FillAttempt::Success => return Ok(json),
-                            FillAttempt::PendingActionability | FillAttempt::PendingDispatch => {
-                                let pending_dispatch = result_type == Some("pending-dispatch");
-                                last_attempt_evidence = if pending_dispatch {
-                                    debug_assert_eq!(
-                                        current_attempt_evidence,
-                                        FillAttemptEvidence::SettleWritten
-                                    );
-                                    FillAttemptEvidence::SettleWritten
-                                } else {
-                                    pinned_resolution.take();
-                                    FillAttemptEvidence::Resolve
-                                };
-                                last_timeout_state = if pending_dispatch {
-                                    "confirmed as edited"
-                                } else {
-                                    "editable"
-                                };
-                                last_info = info;
-                                last_info_json = json;
-                            }
-                        }
-                    }
-                })
-            } else if wait_probe {
+            if wait_probe {
                 let expression = locator_script(&locator_json, index, &script.body);
                 evaluate_locator_wait_probe_for_page(page, expression, timeout_ms)
             } else {
@@ -38421,31 +38562,6 @@ return { ready: true, result: true, payload: null };
             ))
         })
         .map_err(py_err)
-    }
-
-    #[pyo3(signature = (locator_json, index, value, timeout_ms=None))]
-    fn fill(
-        &self,
-        locator_json: &str,
-        index: usize,
-        value: &str,
-        timeout_ms: Option<f64>,
-    ) -> PyResult<()> {
-        let page = Arc::clone(&self.inner);
-        let browser = Arc::clone(&page.browser);
-        browser
-            .block_on(page_fill_actionable_async(
-                page,
-                locator_json.to_string(),
-                index,
-                value.to_string(),
-                timeout_ms,
-                false,
-                false,
-                "fill".to_string(),
-                None,
-            ))
-            .map_err(py_err)
     }
 
     #[pyo3(signature = (locator_json, index, text, timeout_ms=None))]
@@ -40545,6 +40661,7 @@ impl PyPage {
                 .await?;
                 Ok(response.response.unwrap_or(Value::Null).to_string())
             })
+            .map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
             .map_err(py_err)
     }
 
@@ -42510,7 +42627,7 @@ impl RustwrightPage {
         let session_id = page.session_id.clone();
         let operation_client = Arc::clone(&client);
         let operation_session_id = session_id.clone();
-        browser.block_on_raw(cancelable_navigation(
+        let result = browser.block_on_raw(cancelable_navigation(
             client,
             session_id,
             cancel.cloned(),
@@ -42551,7 +42668,8 @@ impl RustwrightPage {
                 }
                 Ok(Value::Null.to_string())
             },
-        ))
+        ));
+        result.map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
     }
 
     pub fn reload_with_cancel_observed(
@@ -43396,7 +43514,7 @@ return waitForScrollSettle();
         let session_id = page.session_id.clone();
         let operation_client = Arc::clone(&client);
         let operation_session_id = session_id.clone();
-        browser.block_on_raw(cancelable_navigation(
+        let result = browser.block_on_raw(cancelable_navigation(
             client,
             session_id,
             cancel.cloned(),
@@ -43499,7 +43617,8 @@ return waitForScrollSettle();
                 }
                 Ok((true, response.response.unwrap_or(Value::Null).to_string()))
             },
-        ))
+        ));
+        result.map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
     }
 
     fn evaluate_locator_json(
@@ -49187,6 +49306,110 @@ fn launch_chromium_process(
     }
 }
 
+const CHROMIUM_FEATURE_SWITCHES: [&str; 3] = [
+    "--disable-features",
+    "--enable-features",
+    "--disable-blink-features",
+];
+
+fn chromium_feature_switch_index(arg: &str) -> Option<usize> {
+    CHROMIUM_FEATURE_SWITCHES.iter().position(|name| {
+        arg.strip_prefix(name)
+            .is_some_and(|value| value.starts_with('='))
+    })
+}
+
+fn append_chromium_feature_values(
+    values: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    arg: &str,
+    name: &str,
+) {
+    let Some(feature_list) = arg
+        .strip_prefix(name)
+        .and_then(|value| value.strip_prefix('='))
+    else {
+        return;
+    };
+    for feature in feature_list.split(',') {
+        let feature = feature.trim();
+        if !feature.is_empty() && seen.insert(feature.to_string()) {
+            values.push(feature.to_string());
+        }
+    }
+}
+
+fn chromium_effective_launch_arg_parts(options: &LaunchOptions) -> (Vec<String>, Vec<String>) {
+    if options.ignore_all_default_args {
+        return (Vec::new(), options.args.clone());
+    }
+
+    let default_args = chromium_default_launch_args(options);
+    let mut effective_defaults = Vec::with_capacity(default_args.len());
+    let mut effective_user_args = Vec::with_capacity(options.args.len());
+    let mut feature_positions = [None; CHROMIUM_FEATURE_SWITCHES.len()];
+    let mut feature_values: Vec<Vec<String>> = (0..CHROMIUM_FEATURE_SWITCHES.len())
+        .map(|_| Vec::new())
+        .collect();
+    let mut feature_seen: Vec<HashSet<String>> = (0..CHROMIUM_FEATURE_SWITCHES.len())
+        .map(|_| HashSet::new())
+        .collect();
+
+    for arg in default_args {
+        if launch_default_arg_ignored(&arg, &options.ignore_default_args) {
+            continue;
+        }
+        if let Some(index) = chromium_feature_switch_index(&arg) {
+            if feature_positions[index].is_none() {
+                feature_positions[index] = Some(effective_defaults.len());
+                effective_defaults.push(String::new());
+            }
+            append_chromium_feature_values(
+                &mut feature_values[index],
+                &mut feature_seen[index],
+                &arg,
+                CHROMIUM_FEATURE_SWITCHES[index],
+            );
+        } else {
+            effective_defaults.push(arg);
+        }
+    }
+
+    for arg in &options.args {
+        if let Some(index) = chromium_feature_switch_index(arg) {
+            if feature_positions[index].is_some() {
+                append_chromium_feature_values(
+                    &mut feature_values[index],
+                    &mut feature_seen[index],
+                    arg,
+                    CHROMIUM_FEATURE_SWITCHES[index],
+                );
+                continue;
+            }
+        }
+        effective_user_args.push(arg.clone());
+    }
+
+    for (index, position) in feature_positions.into_iter().enumerate() {
+        if let Some(position) = position {
+            effective_defaults[position] = format!(
+                "{}={}",
+                CHROMIUM_FEATURE_SWITCHES[index],
+                feature_values[index].join(",")
+            );
+        }
+    }
+    (effective_defaults, effective_user_args)
+}
+
+#[cfg(test)]
+fn chromium_effective_launch_args(options: &LaunchOptions) -> Vec<String> {
+    let (mut effective_defaults, effective_user_args) =
+        chromium_effective_launch_arg_parts(options);
+    effective_defaults.extend(effective_user_args);
+    effective_defaults
+}
+
 fn chromium_default_launch_args(options: &LaunchOptions) -> Vec<String> {
     let mut default_args = vec![
         "--no-first-run".to_string(),
@@ -49200,6 +49423,23 @@ fn chromium_default_launch_args(options: &LaunchOptions) -> Vec<String> {
         "--disable-renderer-backgrounding".to_string(),
         "--disable-popup-blocking".to_string(),
         "--disable-prompt-on-repost".to_string(),
+        "--disable-back-forward-cache".to_string(),
+        "--disable-extensions".to_string(),
+        "--disable-component-update".to_string(),
+        "--disable-field-trial-config".to_string(),
+        "--metrics-recording-only".to_string(),
+        "--no-service-autorun".to_string(),
+        "--disable-sync".to_string(),
+        "--disable-default-apps".to_string(),
+        "--disable-hang-monitor".to_string(),
+        "--disable-ipc-flooding-protection".to_string(),
+        "--disable-breakpad".to_string(),
+        "--disable-client-side-phishing-detection".to_string(),
+        "--disable-component-extensions-with-background-pages".to_string(),
+        "--allow-pre-commit-input".to_string(),
+        "--force-color-profile=srgb".to_string(),
+        "--disable-search-engine-choice-screen".to_string(),
+        "--disable-features=DialMediaRouteProvider,GlobalMediaControls,MediaRouter,OptimizationHints,Translate,HttpsUpgrades,PaintHolding,ThirdPartyStoragePartitioning,DestroyProfileOnBrowserClose,AvoidUnnecessaryBeforeUnloadCheckSync,LensOverlay".to_string(),
         "--enable-features=CDPScreenshotNewSurface".to_string(),
         "--mute-audio".to_string(),
     ];
@@ -49264,13 +49504,10 @@ fn launch_chromium_attempt(
         }
     }
 
-    let default_args = chromium_default_launch_args(options);
-    if !options.ignore_all_default_args {
-        for arg in default_args {
-            if !launch_default_arg_ignored(&arg, &options.ignore_default_args) {
-                command.arg(arg);
-            }
-        }
+    let (effective_default_args, effective_user_args) =
+        chromium_effective_launch_arg_parts(options);
+    for arg in effective_default_args {
+        command.arg(arg);
     }
     for (key, value) in &options.env {
         command.env(key, value);
@@ -49281,7 +49518,7 @@ fn launch_chromium_attempt(
             command.arg(format!("--proxy-bypass-list={bypass}"));
         }
     }
-    for arg in &options.args {
+    for arg in effective_user_args {
         command.arg(arg);
     }
     if single_process_fallback && !has_chromium_arg(&options.args, "--single-process") {
@@ -52021,6 +52258,13 @@ const NAVIGATION_RECONCILIATION_MAX_BUDGET: Duration = Duration::from_millis(250
 
 fn navigation_timeout(deadline: OperationDeadline) -> RwError {
     RwError::Timeout(duration_millis_u64(deadline.timeout))
+}
+
+fn normalize_navigation_timeout(error: RwError, deadline: OperationDeadline) -> RwError {
+    match error {
+        RwError::Timeout(_) => navigation_timeout(deadline),
+        error => error,
+    }
 }
 
 fn navigation_ready_state_satisfies(state: &str, ready_state: &str) -> bool {
