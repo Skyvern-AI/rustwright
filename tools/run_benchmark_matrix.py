@@ -85,7 +85,25 @@ def run_impl(args: argparse.Namespace, implementation: str) -> dict[str, Any]:
             result["failure_kind"] = "docker_daemon_error"
         return result
     result = extract_json(combined)
-    result["status"] = "passed"
+    memory = result.get("memory")
+    memory_available = (
+        isinstance(memory, dict)
+        and memory.get("available") is True
+        and all(
+            type(memory.get(field)) is int and memory[field] > 0
+            for field in ("rss_self_kb", "rss_tree_kb")
+        )
+        and memory["rss_tree_kb"] >= memory["rss_self_kb"]
+    )
+    if memory_available:
+        result["status"] = "passed"
+    else:
+        result["status"] = "failed"
+        result["failure_kind"] = "memory_unavailable"
+        result["output_tail"] = (
+            "benchmark completed, but process-tree RSS was unavailable; "
+            "canonical matrix runs require paired latency and memory results"
+        )
     result["container_isolation"] = "separate_container"
     result["command"] = " ".join(command)
     result["rustwright_rebuild"] = env["RUSTWRIGHT_BENCH_REBUILD"] == "1"
