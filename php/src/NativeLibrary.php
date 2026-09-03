@@ -8,14 +8,38 @@ final class NativeLibrary
 {
     private const C_DECLARATIONS = <<<'CDEF'
 typedef signed int int32_t;
+typedef signed long long int64_t;
+typedef unsigned long long uint64_t;
 typedef unsigned char uint8_t;
 
 typedef struct RwBrowser RwBrowser;
 typedef struct RwPage RwPage;
+typedef struct RwWireGraph RwWireGraph;
+typedef size_t RwWireNodeId;
+typedef int32_t RwWireNodeKind;
+typedef int32_t RwWireLeafKind;
 
 const char *rw_last_error(void);
 void rw_string_free(char *s);
 void rw_bytes_free(uint8_t *buf, size_t len);
+int32_t rw_wire_graph_parse(const char *wire_json, RwWireGraph **out_graph);
+void rw_wire_graph_free(RwWireGraph *graph);
+int32_t rw_wire_graph_node_count(const RwWireGraph *graph, size_t *out_count);
+int32_t rw_wire_graph_root(const RwWireGraph *graph, RwWireNodeId *out_root);
+int32_t rw_wire_graph_node_kind(const RwWireGraph *graph, RwWireNodeId node, RwWireNodeKind *out_kind);
+int32_t rw_wire_graph_get_bool(const RwWireGraph *graph, RwWireNodeId node, int32_t *out_value);
+int32_t rw_wire_graph_get_signed(const RwWireGraph *graph, RwWireNodeId node, int64_t *out_value);
+int32_t rw_wire_graph_get_unsigned(const RwWireGraph *graph, RwWireNodeId node, uint64_t *out_value);
+int32_t rw_wire_graph_get_float(const RwWireGraph *graph, RwWireNodeId node, double *out_value);
+int32_t rw_wire_graph_get_string(const RwWireGraph *graph, RwWireNodeId node, const uint8_t **out_ptr, size_t *out_len);
+int32_t rw_wire_graph_array_length(const RwWireGraph *graph, RwWireNodeId node, size_t *out_len);
+int32_t rw_wire_graph_array_child(const RwWireGraph *graph, RwWireNodeId node, size_t index, RwWireNodeId *out_child);
+int32_t rw_wire_graph_object_length(const RwWireGraph *graph, RwWireNodeId node, size_t *out_len);
+int32_t rw_wire_graph_object_key(const RwWireGraph *graph, RwWireNodeId node, size_t index, const uint8_t **out_ptr, size_t *out_len);
+int32_t rw_wire_graph_object_child(const RwWireGraph *graph, RwWireNodeId node, size_t index, RwWireNodeId *out_child);
+int32_t rw_wire_graph_leaf_kind(const RwWireGraph *graph, RwWireNodeId node, RwWireLeafKind *out_kind);
+int32_t rw_wire_graph_leaf_field_count(const RwWireGraph *graph, RwWireNodeId node, size_t *out_count);
+int32_t rw_wire_graph_leaf_field(const RwWireGraph *graph, RwWireNodeId node, size_t index, const uint8_t **out_ptr, size_t *out_len);
 int32_t rw_chromium_executable_path(char **out_path);
 int32_t rw_chromium_launch(const char *options_json, RwBrowser **out_browser);
 int32_t rw_browser_new_page(RwBrowser *b, RwPage **out_page);
@@ -191,7 +215,7 @@ CDEF;
         string $expression,
         ?string $argumentJson,
         ?float $timeout,
-    ): mixed {
+    ): string {
         $out = $this->ffi->new('char *');
         $status = $this->ffi->rw_page_evaluate(
             $page,
@@ -205,7 +229,170 @@ CDEF;
         if ($json === null) {
             throw new RustwrightException('rw_page_evaluate succeeded without returning JSON');
         }
-        return WireDecoder::decode($json);
+        return $json;
+    }
+    public function wireGraphParse(string $wireJson): \FFI\CData
+    {
+        $out = $this->ffi->new('RwWireGraph *');
+        $status = $this->ffi->rw_wire_graph_parse(self::cAbiString($wireJson), \FFI::addr($out));
+        $this->checkStatus($status, 'rw_wire_graph_parse');
+        if ($this->isNull($out)) {
+            throw new RustwrightException('rw_wire_graph_parse succeeded without returning a graph');
+        }
+        return $out;
+    }
+
+    public function wireGraphFree(\FFI\CData $graph): void
+    {
+        $this->ffi->rw_wire_graph_free($graph);
+    }
+
+    public function wireGraphNodeCount(\FFI\CData $graph): int
+    {
+        $out = $this->ffi->new('size_t');
+        $status = $this->ffi->rw_wire_graph_node_count($graph, \FFI::addr($out));
+        $this->checkStatus($status, 'rw_wire_graph_node_count');
+        return (int) $out->cdata;
+    }
+
+    public function wireGraphRoot(\FFI\CData $graph): int
+    {
+        $out = $this->ffi->new('RwWireNodeId');
+        $status = $this->ffi->rw_wire_graph_root($graph, \FFI::addr($out));
+        $this->checkStatus($status, 'rw_wire_graph_root');
+        return (int) $out->cdata;
+    }
+
+    public function wireGraphNodeKind(\FFI\CData $graph, int $node): int
+    {
+        $out = $this->ffi->new('RwWireNodeKind');
+        $status = $this->ffi->rw_wire_graph_node_kind($graph, $node, \FFI::addr($out));
+        $this->checkStatus($status, 'rw_wire_graph_node_kind');
+        return (int) $out->cdata;
+    }
+
+    public function wireGraphGetBool(\FFI\CData $graph, int $node): bool
+    {
+        $out = $this->ffi->new('int32_t');
+        $status = $this->ffi->rw_wire_graph_get_bool($graph, $node, \FFI::addr($out));
+        $this->checkStatus($status, 'rw_wire_graph_get_bool');
+        return (int) $out->cdata !== 0;
+    }
+
+    public function wireGraphGetSigned(\FFI\CData $graph, int $node): int
+    {
+        $out = $this->ffi->new('int64_t');
+        $status = $this->ffi->rw_wire_graph_get_signed($graph, $node, \FFI::addr($out));
+        $this->checkStatus($status, 'rw_wire_graph_get_signed');
+        return (int) $out->cdata;
+    }
+
+    public function wireGraphGetUnsigned(\FFI\CData $graph, int $node): int|float
+    {
+        $out = $this->ffi->new('uint64_t');
+        $status = $this->ffi->rw_wire_graph_get_unsigned($graph, $node, \FFI::addr($out));
+        $this->checkStatus($status, 'rw_wire_graph_get_unsigned');
+        return is_int($out->cdata) ? $out->cdata : (float) $out->cdata;
+    }
+
+    public function wireGraphGetFloat(\FFI\CData $graph, int $node): float
+    {
+        $out = $this->ffi->new('double');
+        $status = $this->ffi->rw_wire_graph_get_float($graph, $node, \FFI::addr($out));
+        $this->checkStatus($status, 'rw_wire_graph_get_float');
+        return (float) $out->cdata;
+    }
+
+    public function wireGraphGetString(\FFI\CData $graph, int $node): string
+    {
+        $pointer = $this->ffi->new('uint8_t *');
+        $length = $this->ffi->new('size_t');
+        $status = $this->ffi->rw_wire_graph_get_string(
+            $graph,
+            $node,
+            \FFI::addr($pointer),
+            \FFI::addr($length),
+        );
+        $this->checkStatus($status, 'rw_wire_graph_get_string');
+        return $this->copyBorrowedBytes($pointer, (int) $length->cdata);
+    }
+
+    public function wireGraphArrayLength(\FFI\CData $graph, int $node): int
+    {
+        $out = $this->ffi->new('size_t');
+        $status = $this->ffi->rw_wire_graph_array_length($graph, $node, \FFI::addr($out));
+        $this->checkStatus($status, 'rw_wire_graph_array_length');
+        return (int) $out->cdata;
+    }
+
+    public function wireGraphArrayChild(\FFI\CData $graph, int $node, int $index): int
+    {
+        $out = $this->ffi->new('RwWireNodeId');
+        $status = $this->ffi->rw_wire_graph_array_child($graph, $node, $index, \FFI::addr($out));
+        $this->checkStatus($status, 'rw_wire_graph_array_child');
+        return (int) $out->cdata;
+    }
+
+    public function wireGraphObjectLength(\FFI\CData $graph, int $node): int
+    {
+        $out = $this->ffi->new('size_t');
+        $status = $this->ffi->rw_wire_graph_object_length($graph, $node, \FFI::addr($out));
+        $this->checkStatus($status, 'rw_wire_graph_object_length');
+        return (int) $out->cdata;
+    }
+
+    public function wireGraphObjectKey(\FFI\CData $graph, int $node, int $index): string
+    {
+        $pointer = $this->ffi->new('uint8_t *');
+        $length = $this->ffi->new('size_t');
+        $status = $this->ffi->rw_wire_graph_object_key(
+            $graph,
+            $node,
+            $index,
+            \FFI::addr($pointer),
+            \FFI::addr($length),
+        );
+        $this->checkStatus($status, 'rw_wire_graph_object_key');
+        return $this->copyBorrowedBytes($pointer, (int) $length->cdata);
+    }
+
+    public function wireGraphObjectChild(\FFI\CData $graph, int $node, int $index): int
+    {
+        $out = $this->ffi->new('RwWireNodeId');
+        $status = $this->ffi->rw_wire_graph_object_child($graph, $node, $index, \FFI::addr($out));
+        $this->checkStatus($status, 'rw_wire_graph_object_child');
+        return (int) $out->cdata;
+    }
+
+    public function wireGraphLeafKind(\FFI\CData $graph, int $node): int
+    {
+        $out = $this->ffi->new('RwWireLeafKind');
+        $status = $this->ffi->rw_wire_graph_leaf_kind($graph, $node, \FFI::addr($out));
+        $this->checkStatus($status, 'rw_wire_graph_leaf_kind');
+        return (int) $out->cdata;
+    }
+
+    public function wireGraphLeafFieldCount(\FFI\CData $graph, int $node): int
+    {
+        $out = $this->ffi->new('size_t');
+        $status = $this->ffi->rw_wire_graph_leaf_field_count($graph, $node, \FFI::addr($out));
+        $this->checkStatus($status, 'rw_wire_graph_leaf_field_count');
+        return (int) $out->cdata;
+    }
+
+    public function wireGraphLeafField(\FFI\CData $graph, int $node, int $index): string
+    {
+        $pointer = $this->ffi->new('uint8_t *');
+        $length = $this->ffi->new('size_t');
+        $status = $this->ffi->rw_wire_graph_leaf_field(
+            $graph,
+            $node,
+            $index,
+            \FFI::addr($pointer),
+            \FFI::addr($length),
+        );
+        $this->checkStatus($status, 'rw_wire_graph_leaf_field');
+        return $this->copyBorrowedBytes($pointer, (int) $length->cdata);
     }
 
     public function pageScreenshot(\FFI\CData $page, ?string $optionsJson): string
@@ -273,6 +460,16 @@ CDEF;
         } finally {
             $this->ffi->rw_string_free($value);
         }
+    }
+    private function copyBorrowedBytes(mixed $pointer, int $length): string
+    {
+        if ($length === 0) {
+            return '';
+        }
+        if ($this->isNull($pointer)) {
+            throw new RustwrightException('Rustwright returned NULL bytes with a nonzero length');
+        }
+        return \FFI::string($pointer, $length);
     }
 
     private function isNull(mixed $value): bool

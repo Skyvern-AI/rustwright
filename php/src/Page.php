@@ -69,7 +69,8 @@ final class Page
         $this->ensureOpen();
         self::assertOptionKeys($options, ['timeout'], 'evaluate');
         $argumentJson = $argumentWasProvided ? Json::encodeValue($argument) : null;
-        return $this->native->pageEvaluate($this->handle, $expression, $argumentJson, self::timeout($options));
+        $wireJson = $this->native->pageEvaluate($this->handle, $expression, $argumentJson, self::timeout($options));
+        return WireDecoder::decode($wireJson, $this->native);
     }
 
     /** @param array<string, mixed> $options */
