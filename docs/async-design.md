@@ -73,12 +73,11 @@ sleeps and do not occupy a Python executor worker or hold the GIL. As on the
 sync path, per-poll renderer evaluation timeouts propagate; only successful
 pending actionability results are polled again.
 
-The native action gate currently applies to page-level click/fill with their
-default option set. Option combinations such as positioned, forced, delayed,
-multi-click, or trial clicks and forced fills still use the off-loop sync path;
-locator, frame, and element-handle actions are follow-up scope. Setting
-`RUSTWRIGHT_UNSAFE_DOM_FASTPATH` retains the explicitly opted-in synthetic DOM
-click/fill behavior rather than selecting trusted actionability.
+The native action gate applies to page-level click and fill with their default
+option set. Positioned, forced, delayed, multi-click, trial, and forced-fill
+calls use the off-loop sync path. Every path uses trusted native action
+semantics. Locator, frame, and element-handle native async actions remain
+follow-up scope.
 
 Re-measurement on the same benchmark (macOS arm64, 10 cores, Python 3.13.5),
 `benchmarks/async_concurrency_load.py --concurrency 100`, all scenarios
