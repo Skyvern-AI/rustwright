@@ -54,17 +54,12 @@ The launcher forwards its environment unchanged to the native server. Supported 
 - `RUSTWRIGHT_MCP_ALLOW_EVAL`: enable or disable `browser_evaluate`; defaults to enabled.
 - `RUSTWRIGHT_MCP_WORKSPACE`: absolute directory that confines paths supplied to `browser_drop`.
 - `RUSTWRIGHT_MCP_SCREENSHOT_MAX_BYTES`: largest screenshot returned inline; oversized captures use a private temporary file.
-- `RUSTWRIGHT_MCP_BUDGET`: set to `on` for client-aware text response budgeting. Recognized Codex clients use exact 9 KiB and 200-line limits; unknown clients are unchanged unless an explicit limit is supplied.
-- `RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES` / `RUSTWRIGHT_MCP_MAX_RESPONSE_LINES`: override individual response dimensions; `0` disables that dimension. Minimum nonzero values are 4096 bytes and 16 lines.
-- `RUSTWRIGHT_MCP_CONSOLE_DEDUP`: set to `on` to collapse adjacent duplicates in inline console output; file exports remain verbatim.
-- `RUSTWRIGHT_MCP_NET_NOTE`: set to `on` to report successful static requests hidden after regex filtering.
-- `RUSTWRIGHT_MCP_DISTILL`: set to `on` for bounded full-tree snapshot construction, full-subset refs/find, and render-only distillation. `off` retains legacy traversal and ref assignment.
-- `RUSTWRIGHT_MCP_HEADER`: set to `on` to prepend a change-triggered `### Page` digest with active URL, title when available, navigation status, and console error/warning counts. Unchanged page state is not repeated.
-- `RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS`: set to `on` for shorter descriptions with narrowing guidance or `off` for the byte-compatible legacy catalog. When unset or invalid, recognized Codex clients default to `on` and other clients to `off`; invalid values warn.
+- `RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES` / `RUSTWRIGHT_MCP_MAX_RESPONSE_LINES`: override the default 9 KiB and 200-line response limits. `0` disables that dimension. Minimum nonzero values are 4096 bytes and 16 lines.
 
-Other optimization switches default to `off`. `RUSTWRIGHT_MCP_BUDGET=off`
-bypasses shaping; otherwise explicit response dimensions take precedence over
-the client profile. Images are never shaped.
+The server uses one behavior profile for every client. It distills snapshots,
+adds page headers, deduplicates adjacent inline console records, reports filtered
+static network requests, and serves compact tool descriptions. Images are never
+shaped.
 
 For example, a Desktop entry can include an `env` object:
 

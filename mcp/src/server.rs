@@ -23,10 +23,7 @@ use crate::{
     actor::{BrowserActor, BrowserError, BrowserOutput},
     config::{FeatureConfig, ResponseBudget},
     shaping::{ResponseShape, shape_error, shape_tool_text, shape_tool_text_with_shape},
-    tools::{
-        descriptor_with_profile, enabled_tool_specs, find_tool, parse_op,
-        validate_tool_configuration,
-    },
+    tools::{descriptor, enabled_tool_specs, find_tool, parse_op, validate_tool_configuration},
 };
 
 const DEFAULT_SCREENSHOT_MAX_BYTES: usize = 5 * 1024 * 1024;
@@ -48,7 +45,7 @@ impl BrowserServer {
         let screenshot_temp_dir = ScreenshotTempDir::new()?;
         let features = FeatureConfig::from_env();
         Ok(Self {
-            actor: Arc::new(BrowserActor::spawn_with_features(features.clone())),
+            actor: Arc::new(BrowserActor::spawn()),
             screenshot_max_bytes: screenshot_max_bytes_from_env(),
             screenshot_temp_dir,
             features,
@@ -237,24 +234,15 @@ impl ServerHandler for BrowserServer {
     fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        context: RequestContext<RoleServer>,
+        _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
-        let client_name = context
-            .peer
-            .peer_info()
-            .map(|peer| peer.client_info.name.clone());
-        let lean_descriptions = self.features.lean_descriptions(client_name.as_deref());
         std::future::ready(Ok(ListToolsResult::with_all_items(
-            enabled_tool_specs()
-                .into_iter()
-                .map(|spec| descriptor_with_profile(spec, lean_descriptions))
-                .collect(),
+            enabled_tool_specs().into_iter().map(descriptor).collect(),
         )))
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        let lean_descriptions = self.features.lean_descriptions(None);
-        find_tool(name).map(|spec| descriptor_with_profile(spec, lean_descriptions))
+        find_tool(name).map(descriptor)
     }
 
     async fn call_tool(
@@ -263,11 +251,7 @@ impl ServerHandler for BrowserServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let request_id = context.id.clone();
-        let client_name = context
-            .peer
-            .peer_info()
-            .map(|peer| peer.client_info.name.clone());
-        let budget = self.features.response_budget(client_name.as_deref());
+        let budget = self.features.response_budget();
         let tool_name = request.name.to_string();
         let spec = match find_tool(&request.name) {
             Some(spec) => spec,
@@ -326,7 +310,7 @@ mod tests {
     use rustwright::{
         CommandWritten, FailureKind, FailureMetadata, FailurePhase, FailureTargetKind,
     };
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     fn classified_error(metadata: FailureMetadata) -> BrowserError {
         BrowserError::Classified {

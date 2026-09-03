@@ -181,12 +181,6 @@ impl ServerProcess {
             .env_remove("RUSTWRIGHT_MCP_CDP_TIMEOUT_MS")
             .env_remove("RUSTWRIGHT_MCP_MAX_RESPONSE_BYTES")
             .env_remove("RUSTWRIGHT_MCP_MAX_RESPONSE_LINES")
-            .env_remove("RUSTWRIGHT_MCP_BUDGET")
-            .env_remove("RUSTWRIGHT_MCP_DISTILL")
-            .env_remove("RUSTWRIGHT_MCP_HEADER")
-            .env_remove("RUSTWRIGHT_MCP_CONSOLE_DEDUP")
-            .env_remove("RUSTWRIGHT_MCP_NET_NOTE")
-            .env_remove("RUSTWRIGHT_MCP_LEAN_DESCRIPTIONS")
             .env("RUSTWRIGHT_MCP_CDP_ENDPOINT", endpoint)
             .env("RUSTWRIGHT_MCP_CDP_HEADERS", headers.to_string())
             .env("RUSTWRIGHT_MCP_CDP_TIMEOUT_MS", "10000")
@@ -324,13 +318,25 @@ fn result_text(message: &Value) -> &str {
 }
 
 fn button_ref(snapshot: &str) -> String {
-    let line = snapshot
-        .lines()
-        .find(|line| line.contains("- button") && line.contains("Validate action"))
-        .unwrap_or_else(|| panic!("validation button absent from snapshot:\n{snapshot}"));
-    let start = line.find("[ref=").expect("validation button ref start") + 5;
-    let end = line[start..].find(']').expect("validation button ref end") + start;
-    line[start..end].to_owned()
+    let lines = snapshot.lines().collect::<Vec<_>>();
+    for pair in lines.windows(2) {
+        let button = pair[0];
+        let child = pair[1];
+        let button_indent = button.len() - button.trim_start().len();
+        let child_indent = child.len() - child.trim_start().len();
+        if !button.trim_start().starts_with("- button ")
+            || child_indent <= button_indent
+            || child.trim_start() != "- text: Validate action"
+        {
+            continue;
+        }
+        let reference = button
+            .split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix("[ref=")?.strip_suffix(']'))
+            .expect("validation button ref");
+        return reference.to_owned();
+    }
+    panic!("validation button absent from snapshot:\n{snapshot}");
 }
 
 #[test]
