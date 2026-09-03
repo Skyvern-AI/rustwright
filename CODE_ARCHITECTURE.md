@@ -77,18 +77,19 @@ C-ABI bindings.
 | `python/rustwright/cli.py` | CLI entry points. |
 | `python/rustwright/pytest_plugin.py` | Pytest fixtures. |
 | `python/playwright/*`, `python/patchright/*`, `python/cloakbrowser/*` | Compatibility import packages. Public alpha compatibility imports should be enabled only through opt-in compatibility mode. |
-| `rust-native/` | Native Rust facade crate over `rustwright-core` (crates.io `rustwright`); also the facade `mcp/` consumes. |
-| `mcp/` | `rustwright-mcp`: the canonical native Rust MCP stdio server on the promoted engine facade, with its npm packaging under `mcp/npm/`. |
+| `rust-native/` | Native Rust facade crate over `rustwright-core` (crates.io `rustwright`); the shared actor consumes this facade. |
+| `agent/` | Transport-independent native actor: browser session, tabs, refs, snapshots, actions, cancellation, file confinement, and structured errors. |
+| `mcp/` | `rustwright-mcp`: MCP schemas, request-ID adaptation, response shaping, stdio transport, and npm packaging over `rustwright-agent`. |
+| `cli/` | Persistent daemon and command/output adapter over `rustwright-agent`; it does not own browser or ref semantics. |
 | `node/` | napi-rs binding (in-process, links `rustwright-core` directly). |
 | `capi/` | Shared C ABI (`librustwright_capi`) over `rustwright-core`; the boundary for the Go/Java/C#/Ruby/PHP bindings. |
 | `go/`, `java/`, `csharp/`, `ruby/`, `php/` | C-ABI language bindings (alpha surface) + per-language conformance runners. |
 | `bindings/` | Cross-binding contract (`CONTRACT.md`) and shared conformance case data. |
 | `benchmarks/automation_cases.py` | Shared Playwright-style automation/parity cases and benchmark workflows, including WebVoyager/Mind2Web-style workflow cases. |
-| `benchmarks/run_benchmarks.py` | Rustwright and Playwright benchmark runner for a comparable workload. |
+| `benchmarks/run_benchmarks.py` | Canonical Rustwright and Playwright runner for benchmark and shared parity suites. |
 | `tests/test_rustwright_sync_api.py` | Main behavior/regression suite. |
 | `tests/test_playwright_parity_cases.py` | Shared parity harness test entry point. |
 | `tools/api_surface_audit.py` | Public API surface comparison against reference Playwright. |
-| `tools/run_parity_cases.py` | Runs shared parity cases against Rustwright or reference Playwright. |
 | `tools/run_antibot_benchmarks.py` | Anti-bot benchmark runner covering local smoke signals, public fingerprint adapters, and fresh/warm profile matrix checks across Rustwright and Playwright. |
 
 ## Known Architecture Debt
@@ -283,12 +284,13 @@ Chrome-for-Testing installer is linux x86_64-only.
    without changing the legacy C ABI behavior.
 2. Keep every language binding limited to graph materialization, native leaf
    conversion, ownership, and public validation.
-3. Maintain the generated async Python facade and its ownership checks.
-4. Extract Python event waiters/context managers into
+3. Keep MCP and CLI code limited to transport, validation, and output shaping.
+4. Maintain the generated async Python facade and its ownership checks.
+5. Extract Python event waiters/context managers into
    `python/rustwright/events.py` (pairs with roadmap track 7).
-5. Extract Rust launch/process code into `src/browser/launch.rs`, then CDP
+6. Extract Rust launch/process code into `src/browser/launch.rs`, then CDP
    transport/session code into `src/cdp/`.
-6. Split tests by subsystem after the corresponding code module split.
+7. Split tests by subsystem after the corresponding code module split.
 
 The module splits move code without changing ownership; the lightening
 roadmap changes ownership (shim → core). When the two conflict, lightening
