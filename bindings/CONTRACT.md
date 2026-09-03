@@ -39,6 +39,28 @@ Opaque handles have no public layout:
 ```c
 typedef struct RwBrowser RwBrowser;
 typedef struct RwPage RwPage;
+typedef struct RwWireGraph RwWireGraph;
+typedef size_t RwWireNodeId;
+typedef int32_t RwWireNodeKind;
+#define RW_WIRE_NODE_NULL 0
+#define RW_WIRE_NODE_BOOL 1
+#define RW_WIRE_NODE_SIGNED 2
+#define RW_WIRE_NODE_UNSIGNED 3
+#define RW_WIRE_NODE_FLOAT 4
+#define RW_WIRE_NODE_STRING 5
+#define RW_WIRE_NODE_ARRAY 6
+#define RW_WIRE_NODE_OBJECT 7
+#define RW_WIRE_NODE_LEAF 8
+typedef int32_t RwWireLeafKind;
+#define RW_WIRE_LEAF_UNSERIALIZABLE 0
+#define RW_WIRE_LEAF_BIGINT 1
+#define RW_WIRE_LEAF_DATE 2
+#define RW_WIRE_LEAF_REGEXP 3
+#define RW_WIRE_LEAF_URL 4
+#define RW_WIRE_LEAF_ERROR 5
+#define RW_WIRE_LEAF_UNDEFINED 6
+#define RW_WIRE_LEAF_SYMBOL 7
+#define RW_WIRE_LEAF_FUNCTION 8
 ```
 
 The complete exported ABI is:
@@ -51,6 +73,63 @@ void rw_bytes_free(uint8_t *buf, size_t len);
 
 /* evaluate wire */
 int32_t rw_decode_wire(const char *wire_json, char **out_json);
+int32_t rw_wire_graph_parse(const char *wire_json,
+                            RwWireGraph **out_graph);
+void rw_wire_graph_free(RwWireGraph *graph);
+int32_t rw_wire_graph_node_count(const RwWireGraph *graph,
+                                 size_t *out_count);
+int32_t rw_wire_graph_root(const RwWireGraph *graph,
+                           RwWireNodeId *out_root);
+int32_t rw_wire_graph_node_kind(const RwWireGraph *graph,
+                                RwWireNodeId node,
+                                RwWireNodeKind *out_kind);
+int32_t rw_wire_graph_get_bool(const RwWireGraph *graph,
+                               RwWireNodeId node,
+                               int32_t *out_value);
+int32_t rw_wire_graph_get_signed(const RwWireGraph *graph,
+                                 RwWireNodeId node,
+                                 int64_t *out_value);
+int32_t rw_wire_graph_get_unsigned(const RwWireGraph *graph,
+                                   RwWireNodeId node,
+                                   uint64_t *out_value);
+int32_t rw_wire_graph_get_float(const RwWireGraph *graph,
+                                RwWireNodeId node,
+                                double *out_value);
+int32_t rw_wire_graph_get_string(const RwWireGraph *graph,
+                                 RwWireNodeId node,
+                                 const uint8_t **out_data,
+                                 size_t *out_len);
+int32_t rw_wire_graph_array_length(const RwWireGraph *graph,
+                                   RwWireNodeId node,
+                                   size_t *out_len);
+int32_t rw_wire_graph_array_child(const RwWireGraph *graph,
+                                  RwWireNodeId node,
+                                  size_t index,
+                                  RwWireNodeId *out_child);
+int32_t rw_wire_graph_object_length(const RwWireGraph *graph,
+                                    RwWireNodeId node,
+                                    size_t *out_len);
+int32_t rw_wire_graph_object_key(const RwWireGraph *graph,
+                                 RwWireNodeId node,
+                                 size_t index,
+                                 const uint8_t **out_data,
+                                 size_t *out_len);
+int32_t rw_wire_graph_object_child(const RwWireGraph *graph,
+                                   RwWireNodeId node,
+                                   size_t index,
+                                   RwWireNodeId *out_child);
+int32_t rw_wire_graph_leaf_kind(const RwWireGraph *graph,
+                                RwWireNodeId node,
+                                RwWireLeafKind *out_kind);
+int32_t rw_wire_graph_leaf_field_count(const RwWireGraph *graph,
+                                       RwWireNodeId node,
+                                       size_t *out_count);
+int32_t rw_wire_graph_leaf_field(const RwWireGraph *graph,
+                                 RwWireNodeId node,
+                                 size_t index,
+                                 const uint8_t **out_data,
+                                 size_t *out_len);
+
 
 /* Chromium */
 int32_t rw_chromium_executable_path(char **out_path);
@@ -173,10 +252,11 @@ non-cyclic references are duplicated, and references that form cycles become
 `{"__rustwright_cdp_cycle__": true}`. Leaf scalar tags remain in the output for
 binding-specific native mapping. This behavior is compatibility-stable.
 
-The PyO3 and napi graph adapters use the core graph representation instead.
-They allocate host arrays and objects with stable identity, preserve repeated
-references and cycles, and keep leaf conversion policy in the adapter. These
-graph adapters must not be replaced with the legacy flattened C ABI decoder.
+Identity-preserving bindings use `rw_wire_graph_parse`. They allocate all
+host containers by dense node id before they fill array and object edges.
+This preserves repeated references, cycles, and object entry order. PyO3 and
+napi use the same core graph directly. None of these adapters may substitute
+the flattened `rw_decode_wire` compatibility path.
 
 The core serializer is the single source of truth for this vocabulary; a
 binding maps the core's tags to its closest native representation and must not
@@ -184,6 +264,17 @@ invent or assume tags the core does not emit. Manifest v1 expected/captured
 values are JSON-compatible and never require cycles; a runner must at least
 recursively decode array/object wrappers before capture or `assertEval`
 comparison.
+
+`RwWireGraph` is immutable and caller-owned. Borrowed string, object-key, and
+leaf-field byte views remain valid only until `rw_wire_graph_free`. Bindings
+must copy each view by its explicit length before graph release. The length can
+include embedded NUL bytes. Empty views use NULL plus zero.
+
+Node and leaf tag values are fixed in `capi/include/rustwright.h`, where both
+public kind aliases are `int32_t` rather than implementation-defined C enums.
+Leaf fields are positional: unserializable, bigint, date, and URL have one
+field; regexp has pattern then flags; error has name, message, then stack;
+undefined, symbol, and function have no fields.
 
 ### Thin-shim rule (single source of logic)
 
