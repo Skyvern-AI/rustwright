@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
 use crate::actor::{BrowserOp, FillField, FillFieldKind, RegexSpec, ScreenshotType, TabAction};
+pub(crate) use rustwright_agent::{ConsoleLevel, NetworkPart};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ToolKind {
@@ -404,15 +405,6 @@ struct DropArgs {
     data: Vec<(String, String)>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum ConsoleLevel {
-    Error,
-    Warning,
-    Info,
-    Debug,
-}
-
 fn default_console_level() -> ConsoleLevel {
     ConsoleLevel::Info
 }
@@ -434,15 +426,6 @@ struct NetworkRequestsArgs {
     include_static: bool,
     filter: Option<String>,
     filename: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum NetworkPart {
-    RequestHeaders,
-    RequestBody,
-    ResponseHeaders,
-    ResponseBody,
 }
 
 #[derive(Deserialize)]

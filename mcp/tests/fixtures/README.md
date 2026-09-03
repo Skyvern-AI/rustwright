@@ -8,7 +8,7 @@ Baseline commit: `815a6616b227c3a6373180c0528d19a96296a62b`.
 
 | Artifact | Immutable provenance / derivation | SHA-256 | Exact regeneration command |
 |---|---|---|---|
-| `../../src/snapshot_legacy.js` | Baseline `mcp/src/snapshot.js`, plus only the structured `units` and `rendererIncomplete` mirror fields required by response shaping. The legacy `outline`, ref assignment, and traversal are unchanged. The derivation is pinned in `snapshot_legacy-derivation.patch`. | `7afe8d9ef138b35ad19e6d0de95eba2cd069058c63895051f4fcb80fd96a702f` | `git show 815a6616b227c3a6373180c0528d19a96296a62b:mcp/src/snapshot.js > mcp/src/snapshot_legacy.js && git apply mcp/tests/fixtures/snapshot_legacy-derivation.patch` |
+| `../../../agent/src/snapshot_legacy.js` | Baseline `mcp/src/snapshot.js`, plus the structured `units` and `rendererIncomplete` mirror fields required by response shaping. The shared actor migration renames the internal DOM marker from `data-mcp-ref` to `data-rustwright-ref`; the legacy outline and traversal stay unchanged. The response-shape derivation is pinned in `snapshot_legacy-derivation.patch`. | `3e9be04b7cbbc6c3567c7341d09c168ed720a9fcd162006e1d5ac9236bc32340` | `git show 815a6616b227c3a6373180c0528d19a96296a62b:mcp/src/snapshot.js > mcp/src/snapshot_legacy.js && git apply mcp/tests/fixtures/snapshot_legacy-derivation.patch && python -c 'from pathlib import Path; p = Path("mcp/src/snapshot_legacy.js"); p.write_text(p.read_text().replace("data-mcp-ref", "data-rustwright-ref"))' && mv mcp/src/snapshot_legacy.js agent/src/snapshot_legacy.js` |
 | `tools-list-legacy.json` | Complete `mirror` catalog serialized through the retained legacy-description path. The descriptions and schemas originate at the baseline commit above. | `6083c18fb648153975998bbde2172523fa6fdd1aa74637d5990727ca19239f56` | `RUSTWRIGHT_UPDATE_LEGACY_TOOL_CATALOG=1 cargo test --manifest-path mcp/Cargo.toml --locked legacy_catalog_matches_archived_pre_w5_bytes` |
 | `tools-list-lean.json` | Complete `mirror` catalog serialized through the W5 lean-description path. | `addbebf233cadc7d8aed1cc6765920430eeda4623e01bccfb208b1386ce7ec75` | `RUSTWRIGHT_UPDATE_LEAN_TOOL_CATALOG=1 cargo test --manifest-path mcp/Cargo.toml --locked lean_catalog_matches_archived_w5_bytes` |
 | `union-legacy-surfaces.json` | Exact decoded all-off union outputs. Navigation and snapshot were derived offline by running the union DOM through `mcp/src/snapshot.js` extracted from the baseline archive. Console and network are browser-observable: their exact renderings are pinned from the hash-checked baseline `actor.rs` formatter and the certified legacy-path W4 tests. The console template preserves the injected Proxy's raw anonymous top-frame line; `{PAGE_URL}` is the sole network-template input. | `93022b7a449042e922b1dc3514edae7de0bf3e4ba844206dd50f984a2e1cd04d` | `LEGACY_FIXTURE_DIR="$(mktemp -d)"; git archive 815a6616b227c3a6373180c0528d19a96296a62b | tar -x -C "$LEGACY_FIXTURE_DIR"; node mcp/tests/fixtures/derive_union_legacy_surfaces.js "$LEGACY_FIXTURE_DIR" > mcp/tests/fixtures/union-legacy-surfaces.json` |
@@ -20,7 +20,7 @@ After a catalog refresh, run the same test command again without its
 with:
 
 ```text
-shasum -a 256 mcp/src/snapshot_legacy.js \
+shasum -a 256 agent/src/snapshot_legacy.js \
   mcp/tests/fixtures/codex-mcp-initialize-0.146.0.json \
   mcp/tests/fixtures/tools-list-legacy.json \
   mcp/tests/fixtures/tools-list-lean.json \
