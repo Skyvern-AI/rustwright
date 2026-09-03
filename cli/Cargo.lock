@@ -952,6 +952,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "rustwright"
+version = "0.3.0"
+dependencies = [
+ "rustwright-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rustwright-agent"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "rustwright",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rustwright-cli"
 version = "0.1.0"
 dependencies = [
@@ -959,7 +979,8 @@ dependencies = [
  "clap",
  "fs2",
  "libc",
- "rustwright-core",
+ "rustwright",
+ "rustwright-agent",
  "serde",
  "serde_json",
  "tempfile",

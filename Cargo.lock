@@ -982,6 +982,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustwright-agent"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "rustwright",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rustwright-capi"
 version = "0.3.0"
 dependencies = [

@@ -1,15 +1,19 @@
-use std::thread;
-use std::time::Duration;
+use std::{fs, thread, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
-use rustwright_core::{rustwright_launch_chromium, RustwrightBrowser, RustwrightPage};
+use rustwright::LaunchOptions;
+use rustwright_agent::{
+    ActorConfig, BrowserActor, BrowserOp, BrowserOutput, BrowserStartup, RequestId, ResponseShape,
+    ScreenshotType,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-const DEFAULT_TIMEOUT_MS: f64 = 30_000.0;
 const DEFAULT_SNAPSHOT_ITEMS: usize = 200;
 const MAX_SNAPSHOT_ITEMS: usize = 1_000;
-const REF_ATTRIBUTE: &str = "data-rustwright-agent-ref";
+// Preserve the published 30-second action budget. The daemon socket allows
+// 125 seconds, so cancellation and structured error delivery have ample margin.
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct LaunchConfig {
@@ -42,21 +46,28 @@ impl BrowserAction {
 }
 
 pub struct BrowserSession {
-    launch: LaunchConfig,
-    browser: Option<RustwrightBrowser>,
-    page: Option<RustwrightPage>,
+    actor: BrowserActor,
+    next_request_id: i64,
     closed: bool,
-    launch_failed: bool,
 }
 
 impl BrowserSession {
     pub fn new(launch: LaunchConfig) -> Self {
+        let mut options = LaunchOptions::default().headless(!launch.headed);
+        if let Some(path) = launch.executable_path {
+            options = options.executable_path(path);
+        }
+        let actor = BrowserActor::spawn_with_startup_and_config(
+            BrowserStartup::LocalWithOptions(options),
+            ActorConfig {
+                default_timeout: DEFAULT_COMMAND_TIMEOUT,
+                ..ActorConfig::default()
+            },
+        );
         Self {
-            launch,
-            browser: None,
-            page: None,
+            actor,
+            next_request_id: 1,
             closed: false,
-            launch_failed: false,
         }
     }
 
@@ -72,190 +83,132 @@ impl BrowserSession {
         {
             bail!("browser session is closed; call open before another browser command");
         }
+
         match action {
             BrowserAction::Ping => Ok(json!({ "status": "ready" })),
             BrowserAction::Open { url } => {
                 self.closed = false;
-                self.open(url.as_deref())
+                if let Some(url) = url {
+                    self.request(BrowserOp::Navigate(url))?;
+                }
+                let output = self.request(snapshot_op(DEFAULT_SNAPSHOT_ITEMS))?;
+                let snapshot = snapshot_from_output(output, DEFAULT_SNAPSHOT_ITEMS)?;
+                let info = self.page_info()?;
+                Ok(json!({
+                    "url": info["url"],
+                    "title": info["title"],
+                    "snapshot": snapshot,
+                }))
             }
             BrowserAction::Snapshot { max_items } => {
-                let snapshot = self.snapshot(max_items.unwrap_or(DEFAULT_SNAPSHOT_ITEMS))?;
+                let max_items = snapshot_item_limit(max_items)?;
+                let snapshot =
+                    snapshot_from_output(self.request(snapshot_op(max_items))?, max_items)?;
                 Ok(json!({ "snapshot": snapshot }))
             }
             BrowserAction::Click { target } => {
-                let selector = selector_for_target(&target)?;
-                self.page()?.click(&selector, Some(DEFAULT_TIMEOUT_MS))?;
-                Ok(json!({
-                    "clicked": target,
-                    "snapshot": self.snapshot(DEFAULT_SNAPSHOT_ITEMS)?,
-                }))
+                let op = match parse_target(&target)? {
+                    ActorTarget::Ref(reference) => BrowserOp::Click {
+                        target: reference,
+                        double_click: false,
+                    },
+                    ActorTarget::Selector(selector) => BrowserOp::ClickSelector {
+                        selector,
+                        double_click: false,
+                    },
+                };
+                self.request(op)?;
+                let snapshot = snapshot_from_output(
+                    self.request(snapshot_op(DEFAULT_SNAPSHOT_ITEMS))?,
+                    DEFAULT_SNAPSHOT_ITEMS,
+                )?;
+                Ok(json!({ "clicked": target, "snapshot": snapshot }))
             }
             BrowserAction::Fill { target, text } => {
-                let selector = selector_for_target(&target)?;
-                self.page()?
-                    .fill(&selector, &text, Some(DEFAULT_TIMEOUT_MS))?;
-                Ok(json!({
-                    "filled": target,
-                    "snapshot": self.snapshot(DEFAULT_SNAPSHOT_ITEMS)?,
-                }))
+                let op = match parse_target(&target)? {
+                    ActorTarget::Ref(reference) => BrowserOp::Type {
+                        target: reference,
+                        text,
+                        submit: false,
+                        slowly: false,
+                        clear: true,
+                    },
+                    ActorTarget::Selector(selector) => BrowserOp::FillSelector { selector, text },
+                };
+                self.request(op)?;
+                let snapshot = snapshot_from_output(
+                    self.request(snapshot_op(DEFAULT_SNAPSHOT_ITEMS))?,
+                    DEFAULT_SNAPSHOT_ITEMS,
+                )?;
+                Ok(json!({ "filled": target, "snapshot": snapshot }))
             }
             BrowserAction::Text { target } => {
-                let selector = match target.as_deref() {
-                    Some(target) => selector_for_target(target)?,
-                    None => "body".to_string(),
+                let op = match target.as_deref() {
+                    Some(target) => match parse_target(target)? {
+                        ActorTarget::Ref(reference) => BrowserOp::GetTextRef {
+                            target: reference,
+                            max_chars: usize::MAX,
+                        },
+                        ActorTarget::Selector(selector) => BrowserOp::GetTextStrict {
+                            selector,
+                            max_chars: usize::MAX,
+                        },
+                    },
+                    None => BrowserOp::GetTextStrict {
+                        selector: "body".to_owned(),
+                        max_chars: usize::MAX,
+                    },
                 };
-                let text = self
-                    .page()?
-                    .text_content(&selector, Some(DEFAULT_TIMEOUT_MS))?
-                    .ok_or_else(|| anyhow!("target {selector:?} was not found"))?;
+                let text = text_from_output(self.request(op)?)?;
                 Ok(json!({ "target": target, "text": text }))
             }
-            BrowserAction::Title => Ok(json!({
-                "title": self.page()?.title(Some(DEFAULT_TIMEOUT_MS))?,
-            })),
-            BrowserAction::Url => Ok(json!({ "url": self.current_url()? })),
+            BrowserAction::Title => Ok(json!({ "title": self.page_info()?["title"] })),
+            BrowserAction::Url => Ok(json!({ "url": self.page_info()?["url"] })),
             BrowserAction::Evaluate { expression } => {
-                let raw = self
-                    .page()?
-                    .evaluate(&expression, None, Some(DEFAULT_TIMEOUT_MS))?;
-                Ok(json!({ "value": decode_evaluation(&raw) }))
+                let output = self.request(BrowserOp::EvaluateWire { expression })?;
+                let value = result_value(output)?;
+                Ok(json!({ "value": value }))
             }
             BrowserAction::Screenshot { path, full_page } => {
-                let bytes = self.page()?.screenshot(
-                    Some(&path),
-                    Some(full_page),
-                    None,
-                    Some(DEFAULT_TIMEOUT_MS),
-                    None,
-                    None,
-                    None,
-                )?;
+                let output = self.request(BrowserOp::TakeScreenshot {
+                    full_page,
+                    image_type: ScreenshotType::Png,
+                })?;
+                let bytes = image_from_output(output)?;
+                fs::write(&path, &bytes).with_context(|| format!("failed to write {path}"))?;
                 Ok(json!({ "path": path, "bytes": bytes.len() }))
             }
             BrowserAction::Wait { milliseconds } => {
                 thread::sleep(Duration::from_millis(milliseconds));
                 Ok(json!({ "waited_ms": milliseconds }))
             }
-            BrowserAction::Status => Ok(json!({
-                "running": self.browser.is_some(),
-                "launch_failed": self.launch_failed,
-                "url": if self.page.is_some() { Some(self.current_url()?) } else { None },
-            })),
+            BrowserAction::Status => json_from_text(self.request(BrowserOp::Status)?),
             BrowserAction::Close => {
-                self.close()?;
+                self.request(BrowserOp::Close)?;
+                self.closed = true;
                 Ok(json!({ "closed": true }))
             }
         }
     }
 
-    pub fn screenshot_bytes(&mut self, full_page: bool) -> Result<Vec<u8>> {
-        if self.closed {
-            bail!("browser session is closed; call browser_open before another browser command");
-        }
-        Ok(self.page()?.screenshot(
-            None,
-            Some(full_page),
-            None,
-            Some(DEFAULT_TIMEOUT_MS),
-            None,
-            None,
-            None,
-        )?)
-    }
-
     pub fn close(&mut self) -> Result<()> {
-        self.page.take();
-        if let Some(browser) = self.browser.take() {
-            browser.close()?;
+        if !self.closed {
+            self.request(BrowserOp::Close)?;
+            self.closed = true;
         }
-        self.closed = true;
-        self.launch_failed = false;
         Ok(())
     }
 
-    fn ensure_page(&mut self) -> Result<()> {
-        if self.page.is_some() {
-            return Ok(());
-        }
-
-        let mut options = json!({
-            "headless": !self.launch.headed,
-            "timeout": DEFAULT_TIMEOUT_MS,
-        });
-        if let Some(executable_path) = &self.launch.executable_path {
-            options["executable_path"] = Value::String(executable_path.clone());
-        }
-        let browser = match rustwright_launch_chromium(&options.to_string()) {
-            Ok(browser) => browser,
-            Err(error) => {
-                self.launch_failed = true;
-                return Err(error).context("failed to launch Chromium");
-            }
-        };
-        let page = match browser.new_page() {
-            Ok(page) => page,
-            Err(error) => {
-                self.launch_failed = true;
-                let _ = browser.close();
-                return Err(error).context("failed to create page");
-            }
-        };
-        self.browser = Some(browser);
-        self.page = Some(page);
-        self.launch_failed = false;
-        Ok(())
+    fn request(&mut self, op: BrowserOp) -> Result<BrowserOutput> {
+        let request_id = RequestId::Number(self.next_request_id);
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        self.actor
+            .execute_blocking(request_id, op)
+            .map_err(|error| anyhow!(error.to_string()))
     }
 
-    fn page(&mut self) -> Result<RustwrightPage> {
-        self.ensure_page()?;
-        self.page
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| anyhow!("browser page is unavailable"))
-    }
-
-    fn open(&mut self, url: Option<&str>) -> Result<Value> {
-        let page = self.page()?;
-        if let Some(url) = url {
-            page.goto(url, Some("load"), Some(DEFAULT_TIMEOUT_MS), None)
-                .with_context(|| format!("failed to open {url}"))?;
-        }
-        Ok(json!({
-            "url": self.current_url()?,
-            "title": page.title(Some(DEFAULT_TIMEOUT_MS))?,
-            "snapshot": self.snapshot(DEFAULT_SNAPSHOT_ITEMS)?,
-        }))
-    }
-
-    fn current_url(&mut self) -> Result<String> {
-        let raw =
-            self.page()?
-                .evaluate("document.location.href", None, Some(DEFAULT_TIMEOUT_MS))?;
-        Ok(serde_json::from_str::<String>(&raw).unwrap_or(raw))
-    }
-
-    fn snapshot(&mut self, max_items: usize) -> Result<String> {
-        if max_items == 0 {
-            bail!("max_items must be greater than zero");
-        }
-        let max_items = max_items.min(MAX_SNAPSHOT_ITEMS);
-        let script = snapshot_script(max_items);
-        let raw = self
-            .page()?
-            .evaluate(&script, None, Some(DEFAULT_TIMEOUT_MS))?;
-        let encoded = serde_json::from_str::<String>(&raw)
-            .context("snapshot script did not return a JSON string")?;
-        let payload: SnapshotPayload =
-            serde_json::from_str(&encoded).context("snapshot payload was invalid")?;
-        let mut output = format!("- page {:?}\n  - url: {}", payload.title, payload.url);
-        for line in payload.lines {
-            output.push_str("\n  ");
-            output.push_str(&line);
-        }
-        if payload.truncated {
-            output.push_str("\n  - note: snapshot truncated");
-        }
-        Ok(output)
+    fn page_info(&mut self) -> Result<Value> {
+        json_from_text(self.request(BrowserOp::PageInfo)?)
     }
 }
 
@@ -265,130 +218,114 @@ impl Drop for BrowserSession {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SnapshotPayload {
-    url: String,
-    title: String,
-    lines: Vec<String>,
-    truncated: bool,
-}
-
-fn snapshot_script(max_items: usize) -> String {
-    format!(
-        r#"() => {{
-  const refAttr = {ref_attribute};
-  const maxItems = {max_items};
-  document.querySelectorAll(`[${{refAttr}}]`).forEach(el => el.removeAttribute(refAttr));
-  const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
-  const visible = el => {{
-    const style = getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
-    return style.display !== 'none' && style.visibility !== 'hidden' &&
-      Number(style.opacity || 1) !== 0 && rect.width > 0 && rect.height > 0;
-  }};
-  const explicitRole = el => el.getAttribute('role');
-  const implicitRole = el => {{
-    const tag = el.tagName.toLowerCase();
-    if (tag === 'a' && el.hasAttribute('href')) return 'link';
-    if (tag === 'button') return 'button';
-    if (tag === 'textarea') return 'textbox';
-    if (tag === 'select') return 'combobox';
-    if (tag === 'summary') return 'button';
-    if (tag === 'img') return 'img';
-    if (/^h[1-6]$/.test(tag)) return 'heading';
-    if (tag === 'input') {{
-      const type = (el.getAttribute('type') || 'text').toLowerCase();
-      if (type === 'checkbox') return 'checkbox';
-      if (type === 'radio') return 'radio';
-      if (['button', 'submit', 'reset'].includes(type)) return 'button';
-      return 'textbox';
-    }}
-    return '';
-  }};
-  const interactive = el => {{
-    const tag = el.tagName.toLowerCase();
-    return ['a', 'button', 'input', 'textarea', 'select', 'summary'].includes(tag) ||
-      el.hasAttribute('role') || el.hasAttribute('onclick') ||
-      el.hasAttribute('contenteditable') || el.tabIndex >= 0;
-  }};
-  const name = el => normalize(
-    (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
-      .map(id => document.getElementById(id)).filter(Boolean)
-      .map(node => node.innerText || node.textContent).join(' ') ||
-    el.getAttribute('aria-label') ||
-    (el.labels ? Array.from(el.labels).map(label => label.innerText || label.textContent).join(' ') : '') ||
-    el.getAttribute('alt') ||
-    el.getAttribute('placeholder') || el.getAttribute('title') ||
-    (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) ? el.value : '') ||
-    el.innerText || el.textContent
-  ).slice(0, 160);
-  const lines = [];
-  let refIndex = 0;
-  let truncated = false;
-  const nodes = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,a,button,input,textarea,select,summary,[role],[contenteditable],[onclick],[tabindex]'));
-  for (const el of nodes) {{
-    if (!visible(el)) continue;
-    const isInteractive = interactive(el);
-    const role = explicitRole(el) || implicitRole(el) || el.tagName.toLowerCase();
-    const label = name(el);
-    if (!isInteractive && !label) continue;
-    if (lines.length >= maxItems) {{
-      truncated = true;
-      break;
-    }}
-    let ref = '';
-    if (isInteractive) {{
-      ref = `e${{++refIndex}}`;
-      el.setAttribute(refAttr, ref);
-    }}
-    const checked = 'checked' in el && el.checked ? ' [checked]' : '';
-    const disabled = el.disabled || el.getAttribute('aria-disabled') === 'true' ? ' [disabled]' : '';
-    const refText = ref ? ` [ref=@${{ref}}]` : '';
-    lines.push(`- ${{role}}${{label ? ` "${{label.replace(/"/g, '\\"')}}"` : ''}}${{refText}}${{checked}}${{disabled}}`);
-  }}
-  return JSON.stringify({{
-    url: document.location.href,
-    title: document.title,
-    lines,
-    truncated,
-  }});
-}}"#,
-        ref_attribute = serde_json::to_string(REF_ATTRIBUTE).expect("constant is valid JSON"),
-    )
-}
-
-pub fn selector_for_target(target: &str) -> Result<String> {
-    let Some(reference) = target.strip_prefix('@') else {
-        if target.trim().is_empty() {
-            bail!("target must not be empty");
-        }
-        return Ok(target.to_string());
-    };
-    if reference.len() < 2
-        || !reference.starts_with('e')
-        || !reference[1..]
-            .chars()
-            .all(|character| character.is_ascii_digit())
-    {
-        bail!("invalid snapshot reference {target:?}; expected @e followed by digits");
+fn snapshot_item_limit(max_items: Option<usize>) -> Result<usize> {
+    let max_items = max_items.unwrap_or(DEFAULT_SNAPSHOT_ITEMS);
+    if max_items == 0 {
+        bail!("max_items must be greater than zero");
     }
-    Ok(format!(r#"[{REF_ATTRIBUTE}="{reference}"]"#))
+    Ok(max_items.min(MAX_SNAPSHOT_ITEMS))
 }
 
-fn decode_evaluation(raw: &str) -> Value {
-    let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
-    decode_runtime_value(value)
+fn snapshot_op(max_items: usize) -> BrowserOp {
+    BrowserOp::SnapshotLimited { max_items }
 }
 
-fn decode_runtime_value(value: Value) -> Value {
-    match value {
-        Value::Array(values) => {
-            Value::Array(values.into_iter().map(decode_runtime_value).collect())
+fn snapshot_from_output(output: BrowserOutput, max_items: usize) -> Result<String> {
+    if max_items == 0 {
+        bail!("max_items must be greater than zero");
+    }
+    let (text, shape) = text_and_shape(output)?;
+    let snapshot = shape
+        .and_then(|shape| shape.snapshot)
+        .map(|snapshot| snapshot.legacy)
+        .or_else(|| {
+            text.rsplit_once("\n\n### Snapshot\n")
+                .map(|(_, value)| value.to_owned())
+        })
+        .unwrap_or(text);
+    let limit = max_items.min(MAX_SNAPSHOT_ITEMS);
+    let truncated = snapshot.lines().count() > limit;
+    let mut visible = snapshot
+        .lines()
+        .take(limit)
+        .map(render_cli_refs)
+        .collect::<Vec<_>>();
+    if truncated {
+        visible.push("  - note: snapshot truncated".to_owned());
+    }
+    Ok(visible.join("\n"))
+}
+
+fn render_cli_refs(line: &str) -> String {
+    if line.trim_start().starts_with("- text:") {
+        return line.to_owned();
+    }
+
+    let characters = line.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(line.len() + 1);
+    let mut index = 0;
+    let mut quoted = false;
+    while index < characters.len() {
+        if characters[index] == '\\' && quoted && index + 1 < characters.len() {
+            output.push(characters[index]);
+            output.push(characters[index + 1]);
+            index += 2;
+            continue;
         }
+        if characters[index] == '"' {
+            quoted = !quoted;
+        }
+        let marker = ['[', 'r', 'e', 'f', '=', 'e'];
+        if !quoted && characters[index..].starts_with(&marker) {
+            let mut end = index + marker.len();
+            while end < characters.len() && characters[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > index + marker.len()
+                && characters
+                    .get(end)
+                    .is_some_and(|character| *character == ']')
+            {
+                output.push_str("[ref=@e");
+                output.extend(characters[index + marker.len()..end].iter());
+                output.push(']');
+                index = end + 1;
+                continue;
+            }
+        }
+        output.push(characters[index]);
+        index += 1;
+    }
+    output
+}
+
+fn result_value(output: BrowserOutput) -> Result<Value> {
+    let (text, shape) = text_and_shape(output)?;
+    let value = shape
+        .and_then(|shape| shape.result_prefix)
+        .or_else(|| {
+            text.split_once("\n\n### Snapshot\n")
+                .map(|(value, _)| value.to_owned())
+        })
+        .unwrap_or(text);
+    let value = serde_json::from_str(&value).context("actor evaluation result was not JSON")?;
+    Ok(decode_legacy_runtime_value(value))
+}
+
+fn decode_legacy_runtime_value(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(decode_legacy_runtime_value)
+                .collect(),
+        ),
         Value::Object(mut object) => {
             if object.contains_key("__rustwright_cdp_array__") {
                 if let Some(Value::Array(items)) = object.remove("items") {
-                    return Value::Array(items.into_iter().map(decode_runtime_value).collect());
+                    return Value::Array(
+                        items.into_iter().map(decode_legacy_runtime_value).collect(),
+                    );
                 }
             }
             if object.contains_key("__rustwright_cdp_object__") {
@@ -396,7 +333,7 @@ fn decode_runtime_value(value: Value) -> Value {
                     return Value::Object(
                         entries
                             .into_iter()
-                            .map(|(key, value)| (key, decode_runtime_value(value)))
+                            .map(|(key, value)| (key, decode_legacy_runtime_value(value)))
                             .collect(),
                     );
                 }
@@ -404,7 +341,7 @@ fn decode_runtime_value(value: Value) -> Value {
             Value::Object(
                 object
                     .into_iter()
-                    .map(|(key, value)| (key, decode_runtime_value(value)))
+                    .map(|(key, value)| (key, decode_legacy_runtime_value(value)))
                     .collect(),
             )
         }
@@ -412,47 +349,146 @@ fn decode_runtime_value(value: Value) -> Value {
     }
 }
 
+fn json_from_text(output: BrowserOutput) -> Result<Value> {
+    let text = text_from_output(output)?;
+    serde_json::from_str(&text).context("actor response was not JSON")
+}
+
+fn text_from_output(output: BrowserOutput) -> Result<String> {
+    text_and_shape(output).map(|(text, _)| text)
+}
+
+fn text_and_shape(output: BrowserOutput) -> Result<(String, Option<ResponseShape>)> {
+    match output {
+        BrowserOutput::Text(text) => Ok((text, None)),
+        BrowserOutput::ShapedText { text, shape } => Ok((text, Some(shape))),
+        BrowserOutput::Image { .. } => bail!("actor returned an image for a text operation"),
+    }
+}
+
+fn image_from_output(output: BrowserOutput) -> Result<Vec<u8>> {
+    match output {
+        BrowserOutput::Image { bytes, .. } => Ok(bytes),
+        BrowserOutput::Text(_) | BrowserOutput::ShapedText { .. } => {
+            bail!("actor returned text for a screenshot operation")
+        }
+    }
+}
+
+enum ActorTarget {
+    Ref(String),
+    Selector(String),
+}
+
+fn parse_target(target: &str) -> Result<ActorTarget> {
+    if let Some(reference) = target.strip_prefix('@') {
+        validate_reference(reference)?;
+        Ok(ActorTarget::Ref(reference.to_owned()))
+    } else if target.is_empty() {
+        bail!("target must not be empty")
+    } else {
+        Ok(ActorTarget::Selector(target.to_owned()))
+    }
+}
+
+#[cfg(test)]
+fn selector_for_target(target: &str) -> Result<String> {
+    match parse_target(target)? {
+        ActorTarget::Ref(reference) => Ok(format!(r#"[data-rustwright-ref="{reference}"]"#)),
+        ActorTarget::Selector(selector) => Ok(selector),
+    }
+}
+
+fn validate_reference(reference: &str) -> Result<()> {
+    let Some(number) = reference.strip_prefix('e') else {
+        bail!("snapshot references must use @eN")
+    };
+    if number.is_empty()
+        || number.starts_with('0')
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        bail!("snapshot references must use @eN")
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_references_become_scoped_css_selectors() {
+    fn snapshot_references_become_shared_actor_targets() {
         assert_eq!(
             selector_for_target("@e42").unwrap(),
-            r#"[data-rustwright-agent-ref="e42"]"#
+            r#"[data-rustwright-ref="e42"]"#
         );
     }
 
     #[test]
-    fn css_and_text_targets_pass_through() {
-        assert_eq!(selector_for_target("#submit").unwrap(), "#submit");
+    fn selectors_pass_through_unchanged() {
         assert_eq!(
-            selector_for_target("text=Continue").unwrap(),
-            "text=Continue"
+            selector_for_target("button.submit").unwrap(),
+            "button.submit"
         );
     }
 
     #[test]
-    fn malformed_references_are_rejected() {
-        assert!(selector_for_target("@e").is_err());
+    fn legacy_evaluation_unwraps_containers_but_preserves_leaves() {
+        let value = json!({
+            "__rustwright_cdp_object__": 1,
+            "entries": {
+                "values": {
+                    "__rustwright_cdp_array__": 2,
+                    "items": [
+                        1,
+                        {"__rustwright_cdp_unserializable_value__": "NaN"}
+                    ]
+                }
+            }
+        });
+        assert_eq!(
+            decode_legacy_runtime_value(value),
+            json!({
+                "values": [
+                    1,
+                    {"__rustwright_cdp_unserializable_value__": "NaN"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn cli_ref_rendering_does_not_mutate_page_text() {
+        assert_eq!(
+            render_cli_refs(r#"- button "literal [ref=e42]" [ref=e7]"#),
+            r#"- button "literal [ref=e42]" [ref=@e7]"#
+        );
+        assert_eq!(
+            render_cli_refs("- text: literal [ref=e42]"),
+            "- text: literal [ref=e42]"
+        );
+    }
+
+    #[test]
+    fn snapshot_limit_is_validated_before_actor_dispatch() {
+        assert_eq!(
+            snapshot_item_limit(Some(MAX_SNAPSHOT_ITEMS + 1)).unwrap(),
+            MAX_SNAPSHOT_ITEMS
+        );
+        assert!(snapshot_item_limit(Some(0)).is_err());
+    }
+
+    #[test]
+    fn truncated_snapshot_keeps_legacy_notice() {
+        assert_eq!(
+            snapshot_from_output(BrowserOutput::Text("first\nsecond".to_owned()), 1).unwrap(),
+            "first\n  - note: snapshot truncated"
+        );
+    }
+
+    #[test]
+    fn malformed_snapshot_references_are_rejected() {
         assert!(selector_for_target("@x1").is_err());
         assert!(selector_for_target("@e1]").is_err());
-    }
-
-    #[test]
-    fn evaluation_objects_and_arrays_become_plain_json() {
-        let raw = r#"{"__rustwright_cdp_object__":1,"entries":{"name":"Ada","values":{"__rustwright_cdp_array__":2,"items":[1,2]}}}"#;
-        assert_eq!(
-            decode_evaluation(raw),
-            json!({ "name": "Ada", "values": [1, 2] })
-        );
-    }
-
-    #[test]
-    fn snapshot_script_embeds_limits_and_reference_attribute() {
-        let script = snapshot_script(17);
-        assert!(script.contains("const maxItems = 17"));
-        assert!(script.contains(REF_ATTRIBUTE));
     }
 }

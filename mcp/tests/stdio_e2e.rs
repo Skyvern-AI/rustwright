@@ -194,7 +194,7 @@ const DRAG_PAGE_HTML: &str = r#"<!doctype html>
         const stamped = records
           .map((record) => record.target)
           .find((element) =>
-            element.id === duplicateId && element.hasAttribute('data-mcp-ref')
+            element.id === duplicateId && element.hasAttribute('data-rustwright-ref')
           );
         if (!stamped) return;
         observer.disconnect();
@@ -205,7 +205,7 @@ const DRAG_PAGE_HTML: &str = r#"<!doctype html>
       observer.observe(document.body, {
         attributes: true,
         subtree: true,
-        attributeFilter: ['data-mcp-ref'],
+        attributeFilter: ['data-rustwright-ref'],
       });
     }
   </script>

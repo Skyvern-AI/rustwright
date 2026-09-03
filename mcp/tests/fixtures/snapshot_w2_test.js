@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const sourceRoot = path.resolve(__dirname, '..', '..', 'src');
+const sourceRoot = path.resolve(__dirname, '..', '..', '..', 'agent', 'src');
 const snapshotSource = fs.readFileSync(path.join(sourceRoot, 'snapshot.js'), 'utf8');
 const fixtureLimitsKey = Symbol.for('rustwright.mcp.snapshotFixtureLimits');
 const fixtureSnapshotSource = snapshotSource
@@ -117,12 +117,12 @@ class FlatElement {
   get tabIndex() { return -1; }
   getAttribute(name) {
     if (name === 'aria-label') return this._name;
-    if (name === 'data-mcp-ref') return this._ref;
+    if (name === 'data-rustwright-ref') return this._ref;
     return null;
   }
-  hasAttribute(name) { return name === 'data-mcp-ref' && this._ref !== null; }
-  setAttribute(name, value) { if (name === 'data-mcp-ref') this._ref = String(value); }
-  removeAttribute(name) { if (name === 'data-mcp-ref') this._ref = null; }
+  hasAttribute(name) { return name === 'data-rustwright-ref' && this._ref !== null; }
+  setAttribute(name, value) { if (name === 'data-rustwright-ref') this._ref = String(value); }
+  removeAttribute(name) { if (name === 'data-rustwright-ref') this._ref = null; }
   getBoundingClientRect() {
     return { left: 0, top: 0, right: 10, bottom: 10, width: 10, height: 10 };
   }
@@ -148,8 +148,8 @@ class Document {
   }
 
   querySelectorAll(selector) {
-    if (selector === '[data-mcp-ref]') {
-      return this.all().filter((node) => node.hasAttribute('data-mcp-ref'));
+    if (selector === '[data-rustwright-ref]') {
+      return this.all().filter((node) => node.hasAttribute('data-rustwright-ref'));
     }
     if (selector === '*') return this.all();
     return [];
@@ -157,8 +157,8 @@ class Document {
 
   querySelector(selector) {
     if (this.missingSelectors.has(selector)) return null;
-    const ref = selector.match(/^\[data-mcp-ref="([^"]+)"\]$/);
-    if (ref) return this.all().find((node) => node.getAttribute('data-mcp-ref') === ref[1]) || null;
+    const ref = selector.match(/^\[data-rustwright-ref="([^"]+)"\]$/);
+    if (ref) return this.all().find((node) => node.getAttribute('data-rustwright-ref') === ref[1]) || null;
     if (selector.startsWith('#')) {
       return this.all().find((node) => node.getAttribute('id') === selector.slice(1)) || null;
     }
@@ -267,10 +267,10 @@ function runProduction(renderer, body, extra = {}) {
   ]);
   const result = run(snapshot, body);
   assert.deepEqual(result.refs, ['e1', 'e2', 'e3', 'e4']);
-  assert.equal(pointerRoot.getAttribute('data-mcp-ref'), 'e3');
-  assert.equal(pointerChild.getAttribute('data-mcp-ref'), null);
-  assert.equal(propertyClick.getAttribute('data-mcp-ref'), 'e4');
-  assert.equal(listenerOnly.getAttribute('data-mcp-ref'), null);
+  assert.equal(pointerRoot.getAttribute('data-rustwright-ref'), 'e3');
+  assert.equal(pointerChild.getAttribute('data-rustwright-ref'), null);
+  assert.equal(propertyClick.getAttribute('data-rustwright-ref'), 'e4');
+  assert.equal(listenerOnly.getAttribute('data-rustwright-ref'), null);
 }
 
 // Every concrete WAI-ARIA 1.2 widget role receives a semantic ref. Separator
@@ -293,11 +293,11 @@ function runProduction(renderer, body, extra = {}) {
     ...widgets, separator, passiveSeparator, fallback, firstRecognized,
   ]));
   assert.equal(result.refs.length, roles.length + 2);
-  assert.equal(widgets.every((node) => node.hasAttribute('data-mcp-ref')), true);
-  assert.equal(separator.hasAttribute('data-mcp-ref'), true);
-  assert.equal(passiveSeparator.hasAttribute('data-mcp-ref'), false);
-  assert.equal(fallback.hasAttribute('data-mcp-ref'), true);
-  assert.equal(firstRecognized.hasAttribute('data-mcp-ref'), false);
+  assert.equal(widgets.every((node) => node.hasAttribute('data-rustwright-ref')), true);
+  assert.equal(separator.hasAttribute('data-rustwright-ref'), true);
+  assert.equal(passiveSeparator.hasAttribute('data-rustwright-ref'), false);
+  assert.equal(fallback.hasAttribute('data-rustwright-ref'), true);
+  assert.equal(firstRecognized.hasAttribute('data-rustwright-ref'), false);
   assert.match(result.outline, /button "Fallback" \[ref=e\d+\]/);
   assert.match(result.outline, /navigation "Navigation"/);
 }
@@ -339,7 +339,7 @@ function runProduction(renderer, body, extra = {}) {
   });
   assert.match(overflow.rendererIncomplete, /after 2 elements \(element limit\)/);
   assert.deepEqual(overflow.refs, ['e1']);
-  assert.equal(second.getAttribute('data-mcp-ref'), null);
+  assert.equal(second.getAttribute('data-rustwright-ref'), null);
 }
 
 // The wall-time valve is deterministic under the fixture clock.
@@ -375,7 +375,7 @@ function runProduction(renderer, body, extra = {}) {
     assert.notEqual(match.ref, null);
     assert.equal(capped.refs.includes(match.ref), true);
     assert.equal(match.line.includes(`[ref=${match.ref}]`), true);
-    assert.equal(global.document.querySelector(`[data-mcp-ref="${match.ref}"]`) !== null, true);
+    assert.equal(global.document.querySelector(`[data-rustwright-ref="${match.ref}"]`) !== null, true);
   }
 
   const regex = run(snapshot, el('body', {}, [
@@ -408,11 +408,11 @@ function runProduction(renderer, body, extra = {}) {
   assert.deepEqual(first.refs, ['e1', 'e2']);
   excluded.setAttribute('aria-hidden', 'true');
   const second = runDocument(snapshot, fixtureDocument, { startRef: first.nextRef });
-  assert.equal(excluded.getAttribute('data-mcp-ref'), null);
+  assert.equal(excluded.getAttribute('data-rustwright-ref'), null);
   assert.equal(second.refs.includes('e1'), false);
   assert.deepEqual(second.refs, ['e3']);
 
-  const targetSelector = '[data-mcp-ref="e3"]';
+  const targetSelector = '[data-rustwright-ref="e3"]';
   fixtureDocument.missingSelectors.add(targetSelector);
   const missing = runDocument(snapshot, fixtureDocument, {
     startRef: second.nextRef,
@@ -420,7 +420,7 @@ function runProduction(renderer, body, extra = {}) {
   });
   assert.equal(missing.outline, '- (snapshot target is no longer available)');
   assert.deepEqual(missing.refs, []);
-  assert.equal(survivor.getAttribute('data-mcp-ref'), null);
+  assert.equal(survivor.getAttribute('data-rustwright-ref'), null);
 }
 
 // Invalid regex syntax and other page-side RegExp throws happen before old DOM
@@ -429,13 +429,13 @@ function runProduction(renderer, body, extra = {}) {
   const button = el('button', { 'aria-label': 'Stable' });
   const fixtureDocument = new Document(el('body', {}, [button]));
   const first = runDocument(snapshot, fixtureDocument);
-  assert.equal(button.getAttribute('data-mcp-ref'), 'e1');
+  assert.equal(button.getAttribute('data-rustwright-ref'), 'e1');
   // parse_regex("/[/") produces this exact page payload.
   assert.throws(() => runDocument(snapshot, fixtureDocument, {
     startRef: first.nextRef,
     find: { kind: 'regex', pattern: '[', flags: '' },
   }), SyntaxError);
-  assert.equal(button.getAttribute('data-mcp-ref'), 'e1');
+  assert.equal(button.getAttribute('data-rustwright-ref'), 'e1');
 
   const NativeRegExp = global.RegExp;
   global.RegExp = function PagePatchedRegExp() { throw new Error('page-side RegExp failure'); };
@@ -447,7 +447,7 @@ function runProduction(renderer, body, extra = {}) {
   } finally {
     global.RegExp = NativeRegExp;
   }
-  assert.equal(button.getAttribute('data-mcp-ref'), 'e1');
+  assert.equal(button.getAttribute('data-rustwright-ref'), 'e1');
 }
 
 // Frozen legacy corpus: exact outline bytes, registry/ref map, nextRef, DOM
@@ -459,10 +459,10 @@ function runProduction(renderer, body, extra = {}) {
     rendererIncomplete: result.rendererIncomplete,
     refs: result.refs,
     refMap: Object.fromEntries(fixtureDocument.all()
-      .filter((node) => node.hasAttribute('data-mcp-ref'))
-      .map((node) => [node.getAttribute('data-mcp-ref'), node.getAttribute('id')])),
+      .filter((node) => node.hasAttribute('data-rustwright-ref'))
+      .map((node) => [node.getAttribute('data-rustwright-ref'), node.getAttribute('id')])),
     domRefs: fixtureDocument.all().filter((node) => node.getAttribute('id'))
-      .map((node) => [node.getAttribute('id'), node.getAttribute('data-mcp-ref')]),
+      .map((node) => [node.getAttribute('id'), node.getAttribute('data-rustwright-ref')]),
     nextRef: result.nextRef,
   });
   const semanticDocument = new Document(el('body', {}, [
@@ -512,7 +512,7 @@ function runProduction(renderer, body, extra = {}) {
     rendererIncomplete: null, refs: [], refMap: {}, domRefs: [], nextRef: 1,
   });
   const missingTargetDocument = new Document(el('body', {}, [
-    el('button', { id: 'old', 'data-mcp-ref': 'e6', 'aria-label': 'Old' }),
+    el('button', { id: 'old', 'data-rustwright-ref': 'e6', 'aria-label': 'Old' }),
   ]));
   const missingTarget = record(runDocument(legacy, missingTargetDocument, {
     startRef: 7, target: '#gone',
@@ -647,7 +647,7 @@ function runProduction(renderer, body, extra = {}) {
   assert.equal(exact.refs.length, 49999);
   assert.equal(exact.nextRef, 50000);
   assert.equal(allChildren.slice(0, 49999).every((child, index) =>
-    child.getAttribute('data-mcp-ref') === `e${index + 1}`), true);
+    child.getAttribute('data-rustwright-ref') === `e${index + 1}`), true);
   if (process.env.RUSTWRIGHT_MCP_SNAPSHOT_PERF_ASSERT === '1') {
     assert.ok(snapshotMs < 30000, `50,000-element snapshot took ${snapshotMs}ms`);
   }
@@ -669,10 +669,10 @@ function runProduction(renderer, body, extra = {}) {
     assert.notEqual(match.ref, null);
     assert.equal(found.refs.includes(match.ref), true);
     assert.equal(match.line.includes(`[ref=${match.ref}]`), true);
-    assert.equal(fixtureDocument.querySelector(`[data-mcp-ref="${match.ref}"]`) !== null, true);
+    assert.equal(fixtureDocument.querySelector(`[data-rustwright-ref="${match.ref}"]`) !== null, true);
   }
   assert.equal(allChildren.slice(0, 49999).every((child, index) =>
-    child.getAttribute('data-mcp-ref') === `e${index + 1}`), true);
+    child.getAttribute('data-rustwright-ref') === `e${index + 1}`), true);
   if (process.env.RUSTWRIGHT_MCP_SNAPSHOT_PERF_ASSERT === '1') {
     assert.ok(findMs < 30000, `50,000-element find took ${findMs}ms`);
   }
