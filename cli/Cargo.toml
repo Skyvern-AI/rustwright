@@ -17,7 +17,8 @@ anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
 fs2 = "0.4"
 libc = "0.2"
-rustwright_core = { package = "rustwright-core", path = "..", default-features = false }
+rustwright = { path = "../rust-native" }
+rustwright-agent = { path = "../agent" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1", features = ["v4"] }
