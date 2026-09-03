@@ -13,14 +13,16 @@ Each passed item in `results` contains a `memory` block with:
   including the driver and Chromium process tree.
 - sampling provenance, interval, availability, and sample count.
 
-The sampler uses the same method as `benchmarks/async_concurrency_load.py`: it
-walks parent/child PIDs with `ps`, reads RSS in KiB, samples every 50 ms, and
-retains the independent peak for the root and whole tree. It takes one baseline
-before entering the implementation run, then samples on a daemon background
-thread; case timers continue to wrap only the operation under test, so `ps`
-calls are not executed on the latency hot path. If `ps`, the tree walk, or an
-individual RSS read is unavailable, the corresponding value is `null` and the
-benchmark continues.
+On Linux, the sampler reads parent PIDs and `VmRSS` directly from
+`/proc/<pid>/status`. Other platforms fall back to `ps`. It samples every 50 ms
+and retains independent peaks for the root process and the full process tree. It
+takes one baseline before the implementation run, then samples on a daemon
+background thread. Case timers still wrap only the operation under test.
+
+If neither backend yields complete positive `rss_self_kb` and `rss_tree_kb`
+values in KiB, both fields are unavailable for canonical evidence. `bench-full`
+treats that run as failed, so the matrix cannot publish a latency-only or
+partial-tree comparison.
 
 Whole-tree RSS is normally Chromium-dominated. Report `rss_tree_kb` for the
 actual end-to-end process cost and `rss_self_kb` alongside it as the available
