@@ -368,7 +368,14 @@ public sealed class Page : IDisposable
                 throw NativeError.FromNullResult("rw_page_evaluate");
             }
 
-            return JsonWire.Decode(NativeError.ReadOwnedString(pointer));
+            try
+            {
+                return JsonWire.DecodeWire(pointer);
+            }
+            finally
+            {
+                NativeMethods.StringFree(pointer);
+            }
         }
     }
 

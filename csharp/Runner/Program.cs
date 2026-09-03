@@ -46,6 +46,10 @@ internal static class RunnerApplication
             }
 
             WriteResults(options.OutputPath, results);
+            foreach (var failed in results.Where(result => !result.Ok))
+            {
+                Console.Error.WriteLine($"{failed.Id}: {failed.Error}");
+            }
             if (browserCloseError is not null)
             {
                 Console.Error.WriteLine($"browser close failed: {browserCloseError.Message}");
