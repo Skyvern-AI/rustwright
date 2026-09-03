@@ -12857,7 +12857,6 @@ def test_click_updates_dom(page):
 
 
 def test_locator_click_dispatches_trusted_mouse_sequence_by_default(page, monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <button id="go" onclick="document.body.dataset.clicked = 'yes'">Go</button>
@@ -12902,34 +12901,6 @@ def test_locator_click_dispatches_trusted_mouse_sequence_by_default(page, monkey
     assert page.evaluate("document.body.dataset.clicked") == "yes"
     assert page.evaluate("document.activeElement.id") == "go"
 
-
-def test_locator_click_unsafe_dom_fastpath_opt_in_restores_dom_click(page, monkeypatch):
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-    page.set_content(
-        """
-        <button id="go" onclick="document.body.dataset.clicked = 'yes'">Go</button>
-        <script>
-        window.events = [];
-        for (const type of [
-          'pointerover', 'pointerenter', 'mouseover', 'mouseenter',
-          'pointermove', 'mousemove', 'pointerdown', 'mousedown',
-          'focus', 'pointerup', 'mouseup', 'click'
-        ]) {
-          document.querySelector('#go').addEventListener(type, event => {
-            window.events.push({ type, trusted: event.isTrusted });
-          });
-        }
-        </script>
-        """
-    )
-
-    page.locator("#go").click(timeout=1_000)
-
-    events = page.evaluate("window.events")
-    assert [event["type"] for event in events] == ["focus", "click"]
-    assert events[0]["trusted"] is True
-    assert events[1]["trusted"] is False
-    assert page.evaluate("document.body.dataset.clicked") == "yes"
 
 
 def test_native_actionability_templates_are_core_owned_and_structured_results_keep_shapes(page):
@@ -13205,20 +13176,6 @@ def test_locator_fill_apply_reaches_react_value_tracker_through_browser_input(pa
     _assert_fill_uses_browser_input_pipeline(page, core_fill)
 
 
-def test_locator_simple_css_fast_fill_reaches_react_value_tracker_through_browser_input(page, monkeypatch):
-    from rustwright.sync_api import Locator
-
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-
-    def reject_core_fallback(*args, **kwargs):
-        raise AssertionError("simple-CSS fill unexpectedly fell through to Locator._fill_apply")
-
-    monkeypatch.setattr(Locator, "_fill_apply", reject_core_fallback)
-
-    def simple_css_fill(selector, value):
-        page.locator(selector).fill(value, timeout=500)
-
-    _assert_fill_uses_browser_input_pipeline(page, simple_css_fill)
 
 
 def test_locator_fill_routes_deadline_retry_and_result_classification_through_core():
@@ -13374,7 +13331,6 @@ def test_sync_and_async_fill_accept_page_committed_value_from_canceled_beforeinp
 def test_locator_fill_rejects_pre_settle_value_as_canceled_unchanged_commit(
     page, monkeypatch
 ):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="target" value="old">
@@ -13458,18 +13414,7 @@ def test_locator_fill_accepts_canceled_beforeinput_custom_commit_once(
     assert page.evaluate("() => window.__audit.handlerCount") == 1
 
 
-@pytest.mark.parametrize(
-    "unsafe_fastpath",
-    [False, True],
-    ids=["standard-loop", "fastpath-loop"],
-)
-def test_locator_fill_strict_observe_ignores_temporary_duplicate(
-    page, monkeypatch, unsafe_fastpath
-):
-    if unsafe_fastpath:
-        monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-    else:
-        monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+def test_locator_fill_strict_observe_ignores_temporary_duplicate(page):
     page.set_content(
         """
         <input id="target" value="old">
@@ -13508,7 +13453,6 @@ def test_locator_fill_strict_observe_ignores_temporary_duplicate(
 
 
 def test_locator_fill_slow_async_commit_dispatches_once(page, monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="target" value="old">
@@ -14097,7 +14041,6 @@ def test_locator_fill_guard_renews_once_after_lease_while_renderer_is_blocked(
 def test_locator_fill_records_own_input_when_capture_formatter_expires_guard(
     page, monkeypatch
 ):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="target" value="old">
@@ -14155,7 +14098,6 @@ def test_locator_fill_records_own_input_when_capture_formatter_expires_guard(
 def test_locator_fill_records_beforeinput_that_passivates_active_guard(
     page, monkeypatch
 ):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="target" value="old">
@@ -14212,7 +14154,6 @@ def test_locator_fill_records_beforeinput_that_passivates_active_guard(
 def test_locator_fill_records_window_capture_formatter_after_stop_propagation(
     page, monkeypatch
 ):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="target" value="old">
@@ -14245,7 +14186,6 @@ def test_locator_fill_records_window_capture_formatter_after_stop_propagation(
 def test_locator_fill_pins_dispatching_frame_when_frame_locator_retargets(
     page, monkeypatch
 ):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <iframe id="frame-a" data-fill-target></iframe>
@@ -14300,7 +14240,6 @@ def test_locator_fill_pins_dispatching_frame_when_frame_locator_retargets(
 
 
 def test_locator_value_like_fill_retry_keeps_retargeted_frame_pin(page, monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <iframe id="frame-a" data-fill-target></iframe>
@@ -14368,63 +14307,11 @@ def test_locator_fill_timeout_distinguishes_missing_dispatch_confirmation_from_e
     assert page.locator("#target").input_value() == "old"
 
 
-@pytest.mark.parametrize("page_commits", [False, True], ids=["no-commit", "moved-commit"])
-def test_locator_fast_fill_pending_dispatch_observes_single_dispatch(
-    page, monkeypatch, page_commits
-):
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-    page.set_content(
-        """
-        <input id="a" value="old">
-        <input id="b">
-        <script>
-        const target = document.querySelector('#a');
-        window.__fillAudit = { trustedBeforeInput: 0, pageCommits: false };
-        target.addEventListener('beforeinput', event => {
-          if (!event.isTrusted) return;
-          const requested = event.data;
-          window.__fillAudit.trustedBeforeInput++;
-          event.preventDefault();
-          if (!window.__fillAudit.pageCommits) return;
-          setTimeout(() => {
-            target.value = `moved-${requested}`;
-            target.dispatchEvent(new InputEvent('input', {
-              bubbles: true,
-              composed: true,
-              data: requested,
-              inputType: event.inputType,
-            }));
-          }, 50);
-        });
-        </script>
-        """
-    )
-    page.evaluate(
-        "(pageCommits) => { window.__fillAudit.pageCommits = pageCommits; }",
-        page_commits,
-    )
-
-    if page_commits:
-        page.locator("#a").fill("blocked", timeout=500)
-        assert page.locator("#a").input_value() == "moved-blocked"
-    else:
-        with pytest.raises(TimeoutError):
-            page.locator("#a").fill("blocked", timeout=250)
-
-    assert page.evaluate("window.__fillAudit.trustedBeforeInput") == 1
-    assert page.evaluate(
-        """() => Object.getOwnPropertyNames(globalThis).filter(
-          key => key.startsWith('__rustwright_fill_guard_')
-        )"""
-    ) == []
-    page.locator("#b").fill("works", timeout=1_000)
-    assert page.locator("#b").input_value() == "works"
 
 
 def test_locator_fill_timeout_does_not_interfere_with_sequential_fill(
     page, monkeypatch
 ):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="a" value="old">
@@ -14445,7 +14332,6 @@ def test_locator_fill_timeout_does_not_interfere_with_sequential_fill(
 
 
 def test_locator_fill_ignores_pre_dispatch_synthetic_input_noise(page, monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="target" value="old">
@@ -15889,7 +15775,6 @@ def test_native_value_fill_input_event_crosses_shadow_boundary(page):
 
 
 def test_native_value_fill_evaluator_retry_dispatches_events_once(page, monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="target" type="date" value="2025-01-01">
@@ -16076,148 +15961,6 @@ def test_locator_single_target_actions_are_strict(page):
 
     assert page.evaluate("document.body.dataset.clicked || null") is None
 
-
-def test_named_role_button_click_fast_path_preserves_click_and_strictness(page, monkeypatch):
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-    page.set_content(
-        """
-        <button aria-label="Save record" onclick="document.body.dataset.clicked = 'save'">Save</button>
-        <button aria-label="Duplicate action" onclick="document.body.dataset.clicked = 'first'">One</button>
-        <button aria-label="Duplicate action" onclick="document.body.dataset.clicked = 'second'">Two</button>
-        """
-    )
-
-    assert page.get_by_role("button", name="Save record")._try_fast_named_button_role_dom_click(timeout=500) is True
-    assert page.evaluate("document.body.dataset.clicked") == "save"
-
-    with pytest.raises(Error, match="strict mode violation: locator resolved to 2 elements"):
-        page.get_by_role("button", name="Duplicate action")._try_fast_named_button_role_dom_click(timeout=500)
-
-    assert page.evaluate("document.body.dataset.clicked") == "save"
-
-
-def test_label_control_fast_paths_fill_check_and_preserve_strictness(page, monkeypatch):
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-    page.set_content(
-        """
-        <label>Email <input id="email"></label>
-        <label><input id="urgent" type="checkbox"> Urgent only</label>
-        <label>Duplicate <input id="first-duplicate"></label>
-        <label>Duplicate <input id="second-duplicate"></label>
-        <input id="aria-email" aria-label="ARIA Address">
-        """
-    )
-
-    assert page.get_by_label("Email")._try_fast_simple_label_fill("ada@example.com", action="fill", timeout=500, force=None) is True
-    assert page.locator("#email").input_value() == "ada@example.com"
-
-    assert page.get_by_label("ARIA Address")._try_fast_simple_label_fill("aria@example.com", action="fill", timeout=500, force=None) is True
-    assert page.locator("#aria-email").input_value() == "aria@example.com"
-
-    assert page.get_by_label("Urgent only")._try_fast_simple_label_check(timeout=500) is True
-    assert page.locator("#urgent").is_checked()
-
-    with pytest.raises(Error, match="strict mode violation: locator resolved to 2 elements"):
-        page.get_by_label("Duplicate")._try_fast_simple_label_fill("nope", action="fill", timeout=500, force=None)
-
-    assert page.locator("#first-duplicate").input_value() == ""
-    assert page.locator("#second-duplicate").input_value() == ""
-
-
-def test_placeholder_fill_fast_path_preserves_fill_and_strictness(page, monkeypatch):
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-    page.set_content(
-        """
-        <input id="query" placeholder="Search catalog">
-        <textarea id="notes" placeholder="Order notes"></textarea>
-        <input id="first-duplicate" placeholder="Duplicate field">
-        <input id="second-duplicate" placeholder="Duplicate field">
-        """
-    )
-
-    assert page.get_by_placeholder("Search catalog")._try_fast_simple_placeholder_fill(
-        "travel",
-        action="fill",
-        timeout=500,
-        force=None,
-    ) is True
-    assert page.locator("#query").input_value() == "travel"
-
-    assert page.get_by_placeholder("notes")._try_fast_simple_placeholder_fill(
-        "leave at desk",
-        action="fill",
-        timeout=500,
-        force=None,
-    ) is True
-    assert page.locator("#notes").input_value() == "leave at desk"
-
-    with pytest.raises(Error, match="strict mode violation: locator resolved to 2 elements"):
-        page.get_by_placeholder("Duplicate")._try_fast_simple_placeholder_fill(
-            "nope",
-            action="fill",
-            timeout=500,
-            force=None,
-        )
-
-    assert page.locator("#first-duplicate").input_value() == ""
-    assert page.locator("#second-duplicate").input_value() == ""
-
-
-def test_label_select_option_fast_path_preserves_selection_and_strictness(page, monkeypatch):
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-    page.set_content(
-        """
-        <label>Category
-          <select id="category">
-            <option value="all">All</option>
-            <option value="travel">Travel</option>
-            <option value="office">Office</option>
-          </select>
-        </label>
-        <label>Priority
-          <select id="priority" multiple>
-            <option value="p0">P0</option>
-            <option value="p1">P1</option>
-            <option value="p2">P2</option>
-          </select>
-        </label>
-        <label>Duplicate <select id="first-duplicate"><option value="one">One</option></select></label>
-        <label>Duplicate <select id="second-duplicate"><option value="one">One</option></select></label>
-        """
-    )
-
-    assert page.get_by_label("Category")._try_fast_simple_label_select_option(
-        values=["travel"],
-        labels=[],
-        indexes=[],
-        timeout=500,
-        force=None,
-    ) == ["travel"]
-    assert page.locator("#category").input_value() == "travel"
-
-    assert page.get_by_label("Priority")._try_fast_simple_label_select_option(
-        values=[],
-        labels=["P0", "P2"],
-        indexes=[],
-        timeout=500,
-        force=None,
-    ) == ["p0", "p2"]
-    assert page.locator("#priority").evaluate("(select) => Array.from(select.selectedOptions).map(option => option.value)") == [
-        "p0",
-        "p2",
-    ]
-
-    with pytest.raises(Error, match="strict mode violation: locator resolved to 2 elements"):
-        page.get_by_label("Duplicate")._try_fast_simple_label_select_option(
-            values=["one"],
-            labels=[],
-            indexes=[],
-            timeout=500,
-            force=None,
-        )
-
-    assert page.locator("#first-duplicate").input_value() == "one"
-    assert page.locator("#second-duplicate").input_value() == "one"
 
 
 def test_locator_explicit_index_and_collection_helpers_allow_multiple_matches(page):
@@ -41218,7 +40961,6 @@ def test_async_locator_strictness_and_page_selector_default():
 
 
 def test_async_page_click_default_waits_for_receives_events(monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
 
     async def run() -> None:
         from playwright.async_api import TimeoutError, async_playwright
@@ -41246,7 +40988,6 @@ def test_async_page_click_default_waits_for_receives_events(monkeypatch):
 
 
 def test_async_page_fill_default_rejects_readonly_input(monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
 
     async def run() -> None:
         from playwright.async_api import TimeoutError, async_playwright
@@ -41270,42 +41011,10 @@ def test_async_page_fill_default_rejects_readonly_input(monkeypatch):
     asyncio.run(run())
 
 
-def test_async_page_click_and_fill_unsafe_dom_fastpath_stays_native(monkeypatch):
-    import rustwright.async_api as async_api
-
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-
-    async def reject_sync_dispatch(*args, **kwargs):
-        raise AssertionError("unsafe optionless page click/fill should stay on the native path")
-
-    monkeypatch.setattr(async_api, "_run_sync_wait_sliced", reject_sync_dispatch)
-
-    async def run() -> None:
-        from playwright.async_api import async_playwright
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.set_content(
-                """
-                <button id="target" onclick="document.body.dataset.clicked = String(event.isTrusted)">Target</button>
-                <input id="x" value="old">
-                """
-            )
-
-            await page.click("#target", timeout=1_000)
-            await page.fill("#x", "new", timeout=1_000)
-            assert await page.evaluate("document.body.dataset.clicked") == "false"
-            assert await page.locator("#x").input_value() == "new"
-            await browser.close()
-
-    asyncio.run(run())
-
 
 def test_async_page_click_default_dispatches_native_trusted_sequence(monkeypatch):
     import rustwright.async_api as async_api
 
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
 
     async def reject_sync_dispatch(*args, **kwargs):
         raise AssertionError("optionless page click should use native actionability")
@@ -41363,7 +41072,6 @@ def test_async_page_click_default_dispatches_native_trusted_sequence(monkeypatch
 def test_async_page_fill_default_commits_natively_without_synthetic_change(monkeypatch):
     import rustwright.async_api as async_api
 
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
 
     async def reject_sync_dispatch(*args, **kwargs):
         raise AssertionError("optionless page fill should use native actionability")
@@ -41413,7 +41121,6 @@ def test_async_page_fill_default_commits_natively_without_synthetic_change(monke
 
 
 def test_async_page_actionable_error_messages_match_sync(monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
 
     async def run() -> None:
         from playwright.async_api import Error, TimeoutError, async_playwright
@@ -41472,7 +41179,7 @@ def test_async_page_actionable_error_messages_match_sync(monkeypatch):
     asyncio.run(run())
 
 
-def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monkeypatch):
+def test_async_page_click_and_fill_native_eligibility_matches_sync(monkeypatch):
     import rustwright.async_api as async_api
 
     class FakeCore:
@@ -41506,17 +41213,6 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
         def locator_fill_actionable(self, *args):
             self.calls.append(("locator_fill_actionable", args))
 
-        def click_async(self, *args):
-            async def run():
-                self.calls.append(("click", args))
-
-            return run()
-
-        def fill_async(self, *args):
-            async def run():
-                self.calls.append(("fill", args))
-
-            return run()
 
     class FakeSyncPage:
         def __init__(self):
@@ -41558,7 +41254,6 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
     monkeypatch.setattr(async_api, "_run_sync_wait_sliced", record_sync_dispatch)
 
     async def run() -> None:
-        monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
         await page.click("#target")
         await page.fill("#target", "value")
         assert [call[0] for call in sync_page._core.calls] == [
@@ -41577,19 +41272,7 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
         assert (sync_page.mouse._x, sync_page.mouse._y) == (12.0, 34.0)
         assert sync_page.mouse._buttons == 2
 
-        monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-        await page.click("#target")
-        await page.fill("#target", "value")
-        assert [call[0] for call in sync_page._core.calls] == [
-            "click_actionable_wait",
-            "dispatch_mouse_click",
-            "fill_actionable",
-            "click",
-            "fill",
-        ]
-        assert sync_calls == []
 
-        monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
         await page.click("#target", force=False)
         await page.fill("#target", "value", force=False)
         assert [call[0] for call in sync_calls] == ["click"]
@@ -41608,17 +41291,10 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
             "click_actionable_wait",
             "dispatch_mouse_click",
             "fill_actionable",
-            "click",
-            "fill",
             "locator_fill_actionable",
             "locator_fill_actionable",
         ]
 
-        monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-        sync_calls.clear()
-        await page.fill("#target", "value")
-        assert [call[0] for call in sync_calls] == ["fill"]
-        assert sync_page._core.calls[-1][0] == "locator_fill_actionable"
 
     asyncio.run(run())
 
@@ -41667,7 +41343,6 @@ def test_async_page_fill_sync_fallback_cancellation_signals_rust_token(monkeypat
     monkeypatch.setattr(async_api, "_rustwright", fake_rustwright)
     monkeypatch.setattr(async_api, "_native_page_hot_path_supported", lambda _page: False)
     monkeypatch.setattr(async_api, "_native_selector_locator", lambda *args, **kwargs: FakeLocator())
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
 
     async def run() -> None:
         fill = asyncio.create_task(page.fill("#target", "value"))
@@ -41741,7 +41416,6 @@ def test_async_page_click_preserves_sync_mouse_state_on_dispatch_failure(monkeyp
     page._sync = sync_page
     monkeypatch.setattr(async_api, "_native_page_hot_path_supported", lambda _page: True)
     monkeypatch.setattr(async_api, "_native_selector_locator", lambda *args, **kwargs: FakeLocator())
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
 
     async def run() -> None:
         with pytest.raises(AsyncTimeoutError, match="Page.click: timed out after 5 ms"):

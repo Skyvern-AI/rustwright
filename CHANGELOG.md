@@ -4,6 +4,20 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ## [Unreleased]
 
+### Breaking
+
+- Removed `disable_playwright_compat()`. Compatibility aliases are now a one-way
+  process opt-in.
+- Removed `RUSTWRIGHT_UNSAFE_DOM_FASTPATH`. Click, fill, check, and select
+  actions always use the trusted native action path.
+- Promoted one MCP behavior profile for every client. Snapshot distillation,
+  page headers, console deduplication, network notes, compact descriptions, and
+  9 KiB/200-line response limits are now the defaults.
+
+### Changed
+
+- Network request filters now accept the standard Rust `regex` syntax.
+
 ## [0.3.0] - 2026-08-16
 
 ### Added

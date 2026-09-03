@@ -7,74 +7,10 @@ use rmcp::{
 
 use crate::config::ResponseBudget;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NetworkSection {
-    pub(crate) name: &'static str,
-    pub(crate) payload: String,
-    pub(crate) body_marker: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SnapshotStructure {
-    pub(crate) legacy: String,
-    pub(crate) units: Vec<String>,
-    pub(crate) head: Option<String>,
-    pub(crate) renderer_incomplete: Option<String>,
-    pub(crate) renderer_incomplete_index: Option<usize>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TabEntry {
-    pub(crate) index: usize,
-    pub(crate) title: String,
-    pub(crate) url: String,
-    pub(crate) active: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TabsStructure {
-    pub(crate) entries: Vec<TabEntry>,
-    pub(crate) active_index: Option<usize>,
-    /// Populated only by an explicit `browser_tabs select` operation.
-    pub(crate) selected_exact_url: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ModalRecovery {
-    pub(crate) owner: &'static str,
-    pub(crate) kind: String,
-    pub(crate) message: String,
-    pub(crate) instruction: &'static str,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FindStructure {
-    pub(crate) blocks: Vec<String>,
-    pub(crate) actor_omitted: usize,
-    pub(crate) incomplete: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum NetworkStructure {
-    Detail {
-        sections: Vec<NetworkSection>,
-    },
-    List {
-        entries: Vec<String>,
-        tail_notices: Vec<String>,
-    },
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ResponseShape {
-    pub(crate) page: Option<String>,
-    pub(crate) modal_recovery: Vec<ModalRecovery>,
-    pub(crate) snapshot: Option<SnapshotStructure>,
-    pub(crate) tabs: Option<TabsStructure>,
-    pub(crate) find: Option<FindStructure>,
-    pub(crate) network: Option<NetworkStructure>,
-    pub(crate) result_prefix: Option<String>,
-}
+pub(crate) use rustwright_agent::{
+    FindStructure, ModalRecovery, NetworkSection, NetworkStructure, ResponseShape,
+    SnapshotStructure, TabEntry, TabsStructure,
+};
 
 #[derive(Clone, Copy)]
 enum ToolClass {

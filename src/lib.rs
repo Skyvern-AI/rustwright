@@ -1599,7 +1599,6 @@ struct LocatorDispatchScript {
 #[derive(Debug)]
 struct LocatorFastPathScript {
     body: String,
-    fill_guard_key: Option<String>,
 }
 
 fn locator_fill_apply_body(value: &str, strict: bool, forced: bool) -> RwResult<LocatorFillScript> {
@@ -1736,23 +1735,6 @@ fn simple_label_fast_spec(spec: &Value, explicit_index: bool) -> bool {
         )
 }
 
-fn simple_placeholder_fast_spec(spec: &Value, explicit_index: bool) -> bool {
-    !explicit_index
-        && spec.get("kind").and_then(Value::as_str) == Some("placeholder")
-        && spec.get("value").and_then(Value::as_str).is_some()
-}
-
-fn fast_fill_body(args: &Value) -> RwResult<LocatorFillScript> {
-    let value = args.get("value").and_then(Value::as_str).ok_or_else(|| {
-        RwError::InvalidInput("locator fast fill value must be a string".to_string())
-    })?;
-    locator_fill_apply_body(
-        value,
-        args.get("strict").and_then(Value::as_bool).unwrap_or(false),
-        args.get("forced").and_then(Value::as_bool).unwrap_or(false),
-    )
-}
-
 fn locator_fast_path_body(
     locator_json: &str,
     operation: &str,
@@ -1771,7 +1753,6 @@ fn locator_fast_path_body(
         .get("explicit_index")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut fill_guard_key = None;
     let body = match operation {
         "css_count" if simple_css_fast_spec(&spec) => Some(LOCATOR_FAST_COUNT_BODY.to_string()),
         "css_text" if simple_css_fast_spec(&spec) => Some(LOCATOR_FAST_TEXT_BODY.to_string()),
@@ -1793,11 +1774,6 @@ fn locator_fast_path_body(
         }
         "css_input_value" if simple_css_fast_spec(&spec) => {
             Some(LOCATOR_FAST_INPUT_VALUE_BODY.to_string())
-        }
-        "css_fill" if !explicit_index && simple_css_fast_spec(&spec) => {
-            let fill = fast_fill_body(&args)?;
-            fill_guard_key = Some(fill.guard_key);
-            Some(fill.body)
         }
         "css_immediate_state" if simple_css_fast_spec(&spec) => {
             let state = args.get("state").and_then(Value::as_str);
@@ -1828,16 +1804,6 @@ fn locator_fast_path_body(
         "label_attribute" if simple_label_fast_spec(&spec, explicit_index) => {
             Some(LOCATOR_FAST_ATTRIBUTE_BODY.to_string())
         }
-        "label_fill" if simple_label_fast_spec(&spec, explicit_index) => {
-            let fill = fast_fill_body(&args)?;
-            fill_guard_key = Some(fill.guard_key);
-            Some(fill.body)
-        }
-        "placeholder_fill" if simple_placeholder_fast_spec(&spec, explicit_index) => {
-            let fill = fast_fill_body(&args)?;
-            fill_guard_key = Some(fill.guard_key);
-            Some(fill.body)
-        }
         _ => None,
     };
     let Some(body) = body else {
@@ -1850,21 +1816,10 @@ fn locator_fast_path_body(
     ) {
         effective_args["strict"] = Value::Bool(false);
     }
-    let body = if fill_guard_key.is_some() {
-        // Fill owns its strictness ordering: a retained dispatch must be observed before
-        // element-count strictness is considered. Wrapping it in the generic fast-path
-        // preflight would inspect a page-created duplicate before the fill guard can
-        // confirm the already-dispatched edit.
-        body
-    } else {
-        LOCATOR_FAST_PATH_TEMPLATE
-            .replace("__ARGS__", &effective_args.to_string())
-            .replace("__BODY__", &body)
-    };
-    Ok(Some(LocatorFastPathScript {
-        body,
-        fill_guard_key,
-    }))
+    let body = LOCATOR_FAST_PATH_TEMPLATE
+        .replace("__ARGS__", &effective_args.to_string())
+        .replace("__BODY__", &body);
+    Ok(Some(LocatorFastPathScript { body }))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -7727,25 +7682,6 @@ multiline-compatible = """4.5.6"""
         )
         .unwrap()
         .is_some());
-
-        let fill = locator_fast_path_body(
-            r##"{"kind":"css","selector":"#target"}"##,
-            "css_fill",
-            r#"{"strict":true,"explicit_index":false,"has_handlers":false,"value":"committed","forced":false}"#,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(fill.fill_guard_key.is_some());
-        assert!(!fill.body.contains("const fastArgs ="));
-        assert!(
-            fill.body
-                .find("const pendingFillGuard")
-                .expect("fill guard observation")
-                < fill
-                    .body
-                    .find("if (strict && (strictFrameViolation || matches.length > 1))")
-                    .expect("fill strictness")
-        );
     }
 
     #[test]
@@ -8004,99 +7940,6 @@ multiline-compatible = """4.5.6"""
         );
     }
 
-    #[cfg(feature = "python")]
-    #[tokio::test]
-    async fn fast_path_post_dispatch_fill_timeout_has_settle_metadata() {
-        Python::initialize();
-        let (page, mut peer) = input_protocol_page(Some("Ada"));
-        let page = PyPage { inner: page.inner };
-        peer.allow_close = true;
-        peer.pending_fill_confirmation = true;
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = Python::attach(|py| {
-                page.locator_fast_path(
-                    py,
-                    r##"{"kind":"css","selector":"#target"}"##,
-                    0,
-                    "css_fill",
-                    r#"{"strict":true,"explicit_index":false,"has_handlers":false,"value":"Ada","forced":false}"#,
-                    Some(60.0),
-                )
-            });
-            let _ = result_tx.send(result.map_err(|error| error.to_string()));
-        });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let error = loop {
-            if let Ok(result) = result_rx.try_recv() {
-                break result.expect_err("configured fast fill must time out");
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "real fast fill timeout did not finish"
-            );
-            let _ = tokio::time::timeout(Duration::from_millis(150), peer.next_command()).await;
-        };
-        let marker = error
-            .find(ACTION_TIMEOUT_MARKER)
-            .expect("PyErr must contain the structured ActionTimeout marker");
-        let Some(FfiWireError::ActionTimeout(payload)) = FfiWireError::parse(&error[marker..])
-        else {
-            panic!("fast fill must preserve structured ActionTimeout: {error}");
-        };
-        assert_eq!(payload.phase, Some(FailurePhase::Settle));
-        assert_eq!(payload.command_written, Some(CommandWritten::Yes));
-        assert_eq!(payload.retryable, Some(false));
-    }
-
-    #[cfg(feature = "python")]
-    #[tokio::test]
-    async fn fast_path_retryable_tracked_timeout_cleans_retained_fill_guard() {
-        Python::initialize();
-        let (page, mut peer) = input_protocol_page(Some(""));
-        let page = PyPage { inner: page.inner };
-        peer.allow_close = true;
-        peer.fail_delete_before_begin = true;
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = Python::attach(|py| {
-                page.locator_fast_path(
-                    py,
-                    r##"{"kind":"css","selector":"#target"}"##,
-                    0,
-                    "css_fill",
-                    r#"{"strict":true,"explicit_index":false,"has_handlers":false,"value":"","forced":false}"#,
-                    Some(60.0),
-                )
-            });
-            let _ = result_tx.send(result.map_err(|error| error.to_string()));
-        });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let mut commands = Vec::new();
-        let error = loop {
-            if let Ok(result) = result_rx.try_recv() {
-                break result.expect_err("configured fast fill dispatch must fail");
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "fast fill cleanup regression did not finish"
-            );
-            if let Ok(command) =
-                tokio::time::timeout(Duration::from_millis(150), peer.next_command()).await
-            {
-                commands.push(command);
-            }
-        };
-        assert!(
-            error.contains(TIMEOUT_MARKER)
-                && error.contains(r#""command_written":"no","retryable":true"#),
-            "tracked timeout must retain its structured metadata: {error}"
-        );
-        assert!(commands.iter().any(|command| {
-            input_command_expression(command)
-                .is_some_and(|expression| expression.contains("guard.cleanup()"))
-        }));
-    }
     #[test]
     fn ffi_wire_error_markers_round_trip_with_closed_payload_schemas() {
         let action_timeout = |evidence: FillAttemptEvidence| {
@@ -22731,6 +22574,7 @@ return this.dataset.mainWorldOverride === "observed";
     #[cfg(feature = "python")]
     #[test]
     fn python_launch_option_parse_errors_remain_value_errors() {
+        Python::initialize();
         Python::attach(|py| {
             let error = parse_python_launch_options("{").unwrap_err();
             assert!(error.is_instance_of::<PyValueError>(py));
@@ -34775,78 +34619,6 @@ async fn element_handle_wait_for_selector_async(
     wait_for_selector_result(&json, timeout)
 }
 
-fn locator_action_body(action: &str, strict: bool, timeout: Duration) -> String {
-    let strict_json = if strict { "true" } else { "false" };
-    let timeout_millis = timeout.as_millis().max(1);
-    format!(
-        r#"
-const strict = {strict_json};
-const timeoutMs = {timeout_millis};
-const attempt = () => {{
-  const currentMatches = all(spec);
-  if (strict && currentMatches.length > 1) return {{ done: true, value: `__rustwright_strict_violation__:${{currentMatches.length}}` }};
-  const current = currentMatches[index] || null;
-  if (!current || !visible(current) || current.disabled) return {{ done: false }};
-  const el = current;
-  {action}
-  return {{ done: true, value: true }};
-}};
-const first = attempt();
-if (first.done) return first.value;
-return new Promise(resolve => {{
-  let settled = false;
-  let observer = null;
-  let interval = null;
-  let timer = null;
-  const finish = value => {{
-    if (settled) return;
-    settled = true;
-    if (observer) observer.disconnect();
-    if (interval) clearInterval(interval);
-    if (timer) clearTimeout(timer);
-    resolve(value);
-  }};
-  const check = () => {{
-    const next = attempt();
-    if (next.done) finish(next.value);
-  }};
-  observer = new MutationObserver(check);
-  observer.observe(document, {{ subtree: true, childList: true, attributes: true, characterData: true }});
-  interval = setInterval(check, 5);
-  timer = setTimeout(() => finish('__rustwright_timeout__'), timeoutMs);
-}});
-"#
-    )
-}
-
-async fn page_locator_action_async(
-    page: Arc<PageInner>,
-    locator_json: String,
-    index: usize,
-    action: String,
-    timeout: Duration,
-    strict: bool,
-    method: &'static str,
-) -> RwResult<()> {
-    let body = locator_action_body(&action, strict, timeout);
-    let eval_timeout = Duration::from_millis(timeout.as_millis().saturating_add(1_000) as u64);
-    let json = evaluate_locator_for_page(page, locator_json, index, body, eval_timeout).await?;
-    let value = serde_json::from_str::<Value>(&json).unwrap_or(Value::Null);
-    if value.as_str() == Some("__rustwright_timeout__") {
-        return Err(RwError::Timeout(timeout.as_millis() as u64));
-    }
-    if let Some(count) = value
-        .as_str()
-        .and_then(|text| text.strip_prefix("__rustwright_strict_violation__:"))
-        .and_then(|text| text.parse::<u64>().ok())
-    {
-        return Err(RwError::Message(format!(
-            "strict mode violation: locator resolved to {count} elements while trying to {method}"
-        )));
-    }
-    Ok(())
-}
-
 fn native_action_body(template: &str) -> String {
     template
         .replace("__SCROLL__", "true")
@@ -35973,40 +35745,6 @@ impl PyPage {
     }
 
     #[pyo3(signature = (locator_json, index, timeout_ms=None, strict=false))]
-    fn click_async(
-        &self,
-        py: Python<'_>,
-        locator_json: &str,
-        index: usize,
-        timeout_ms: Option<f64>,
-        strict: bool,
-    ) -> PyResult<Py<PyAny>> {
-        let page = Arc::clone(&self.inner);
-        let runtime = page.browser.runtime.handle().clone();
-        let timeout = BrowserInner::command_timeout(timeout_ms);
-        let action = r#"
-el.scrollIntoView({ block: 'center', inline: 'center' });
-if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-el.click();
-"#
-        .to_string();
-        python_future_on(
-            py,
-            runtime,
-            page_locator_action_async(
-                page,
-                locator_json.to_string(),
-                index,
-                action,
-                timeout,
-                strict,
-                "click",
-            ),
-            |py, ()| Ok(py.None()),
-        )
-    }
-
-    #[pyo3(signature = (locator_json, index, timeout_ms=None, strict=false))]
     fn click_actionable_wait_async(
         &self,
         py: Python<'_>,
@@ -36056,36 +35794,6 @@ el.click();
                 initial_buttons,
                 modifiers,
                 remaining_ms,
-            ),
-            |py, ()| Ok(py.None()),
-        )
-    }
-
-    #[pyo3(signature = (locator_json, index, value, timeout_ms=None, strict=false))]
-    fn fill_async(
-        &self,
-        py: Python<'_>,
-        locator_json: &str,
-        index: usize,
-        value: &str,
-        timeout_ms: Option<f64>,
-        strict: bool,
-    ) -> PyResult<Py<PyAny>> {
-        let page = Arc::clone(&self.inner);
-        let runtime = page.browser.runtime.handle().clone();
-        python_future_on(
-            py,
-            runtime,
-            page_fill_actionable_async(
-                page,
-                locator_json.to_string(),
-                index,
-                value.to_string(),
-                timeout_ms,
-                strict,
-                false,
-                "fill".to_string(),
-                None,
             ),
             |py, ()| Ok(py.None()),
         )
@@ -37950,34 +37658,6 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         self.navigate_history(1, wait_until, timeout_ms)
     }
 
-    #[pyo3(signature = (locator_json, index, timeout_ms=None))]
-    fn click(
-        &self,
-        py: Python<'_>,
-        locator_json: &str,
-        index: usize,
-        timeout_ms: Option<f64>,
-    ) -> PyResult<()> {
-        let prepare_body = r#"
-if (!el) throw new Error('No element matches locator');
-el.scrollIntoView({ block: 'center', inline: 'center' });
-if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-return { ready: true, result: true, payload: null };
-"#;
-        let dispatch_body = "if (!el.isConnected) throw new Error('__rustwright_action_dispatch_not_started__: element detached'); rustwrightCommitDispatch(true); el.click(); return true;";
-        py.detach(|| {
-            self.evaluate_locator_dispatch(
-                locator_json,
-                index,
-                prepare_body,
-                dispatch_body,
-                timeout_ms,
-            )
-        })
-        .map(|_| ())
-        .map_err(py_err)
-    }
-
     #[pyo3(signature = (locator_json, index, body, timeout_ms=None))]
     fn locator_eval(
         &self,
@@ -37987,11 +37667,10 @@ return { ready: true, result: true, payload: null };
         body: &str,
         timeout_ms: Option<f64>,
     ) -> PyResult<String> {
-        // Release the GIL for the duration of the blocking CDP round-trip, matching
-        // `click` and `locator_eval_handle`. `evaluate_locator` already detaches inside
-        // `block_on`, but keeping the detach explicit at the binding layer keeps the
-        // three locator bindings consistent and guards against a future refactor that
-        // adds GIL-holding work before `block_on` or changes the transport.
+        // Release the GIL for the blocking CDP round-trip, as
+        // `locator_eval_handle` does. `evaluate_locator` already detaches inside
+        // `block_on`, but an explicit binding-layer detach prevents a future
+        // refactor from adding GIL-holding work before `block_on`.
         py.detach(|| self.evaluate_locator(locator_json, index, body, timeout_ms))
             .map_err(py_err)
     }
@@ -38134,211 +37813,12 @@ return { ready: true, result: true, payload: null };
         else {
             return Ok(json!({ "ok": false, "type": "not-applicable" }).to_string());
         };
-        let fill_options = if matches!(operation, "css_fill" | "label_fill" | "placeholder_fill") {
-            let args = serde_json::from_str::<Value>(args_json)
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
-            Some((
-                args.get("value")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        PyValueError::new_err("locator fast fill value must be a string")
-                    })?
-                    .to_string(),
-                args.get("strict").and_then(Value::as_bool).unwrap_or(false),
-            ))
-        } else {
-            None
-        };
         let page = Arc::clone(&self.inner);
         let locator_json = locator_json.to_string();
         let wait_probe = operation == "css_immediate_state";
         let timeout = BrowserInner::command_timeout(timeout_ms);
         py.detach(move || {
-            if let Some((value, strict)) = fill_options {
-                let guard_key = script.fill_guard_key.ok_or_else(|| {
-                    RwError::Message("fast fill did not return a fill guard key".to_string())
-                })?;
-                let fill_script = LocatorFillScript {
-                    body: script.body,
-                    guard_key,
-                };
-                let browser = Arc::clone(&page.browser);
-                browser.block_on(async move {
-                    let deadline = action_deadline(timeout);
-                    let mut pinned_resolution = None;
-                    let mut current_attempt_evidence = FillAttemptEvidence::Resolve;
-                    let evaluation = evaluate_locator_fill_for_page(
-                        Arc::clone(&page),
-                        locator_json.clone(),
-                        index,
-                        fill_script.body.clone(),
-                        fill_script.guard_key.clone(),
-                        value.clone(),
-                        timeout,
-                        &mut pinned_resolution,
-                        &mut current_attempt_evidence,
-                        None,
-                    )
-                    .await;
-                    let mut json = match evaluation {
-                        Ok(json) => json,
-                        Err(error) if error.is_retryable_timeout() => {
-                            let _ = cleanup_retained_fill_guard(
-                                Arc::clone(&page),
-                                &locator_json,
-                                &fill_script.guard_key,
-                                pinned_resolution.as_ref(),
-                                Duration::from_millis(100),
-                            )
-                            .await;
-                            return Err(error);
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let first_result =
-                        decode_runtime_serialized_value(serde_json::from_str::<Value>(&json)?);
-                    let first_info = first_result
-                        .get("info")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}));
-                    let first_result_type = first_result.get("type").and_then(Value::as_str);
-                    let first_result_succeeded =
-                        first_result.get("ok").and_then(Value::as_bool) == Some(true);
-                    if !first_result_succeeded
-                        && !matches!(
-                            first_result_type,
-                            Some("observe-dispatch" | "pending-dispatch")
-                        )
-                    {
-                        if let Some(error) = strict_violation_error(&first_info, strict, "fill") {
-                            let _ = cleanup_retained_fill_guard(
-                                Arc::clone(&page),
-                                &locator_json,
-                                &fill_script.guard_key,
-                                pinned_resolution.as_ref(),
-                                Duration::from_millis(100),
-                            )
-                            .await;
-                            return Err(error);
-                        }
-                    }
-                    match classify_fill_attempt(&first_result, "fill")? {
-                        FillAttempt::Success | FillAttempt::PendingActionability => {
-                            return Ok(json);
-                        }
-                        FillAttempt::PendingDispatch => {}
-                    }
-                    let mut last_info = first_info;
-                    let mut last_info_json = json;
-                    let mut last_timeout_state = "confirmed as edited";
-                    let mut last_attempt_evidence = FillAttemptEvidence::SettleWritten;
-                    loop {
-                        if Instant::now() >= deadline {
-                            let _ = cleanup_retained_fill_guard(
-                                Arc::clone(&page),
-                                &locator_json,
-                                &fill_script.guard_key,
-                                pinned_resolution.as_ref(),
-                                Duration::from_millis(100),
-                            )
-                            .await;
-                            return Err(ActionTimeoutError::from_attempt_raw_json(
-                                last_timeout_state,
-                                "fill".to_string(),
-                                last_info_json,
-                                &last_info,
-                                Some("info"),
-                                last_attempt_evidence,
-                            )
-                            .into());
-                        }
-                        tokio::time::sleep(
-                            deadline
-                                .saturating_duration_since(Instant::now())
-                                .min(Duration::from_millis(20)),
-                        )
-                        .await;
-                        if let Err(error) = ensure_native_action_owner_available(&page, "fill") {
-                            let _ = cleanup_retained_fill_guard(
-                                Arc::clone(&page),
-                                &locator_json,
-                                &fill_script.guard_key,
-                                pinned_resolution.as_ref(),
-                                Duration::from_millis(100),
-                            )
-                            .await;
-                            return Err(error);
-                        }
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        let mut current_attempt_evidence = FillAttemptEvidence::Resolve;
-                        let evaluation = evaluate_locator_fill_for_page(
-                            Arc::clone(&page),
-                            locator_json.clone(),
-                            index,
-                            fill_script.body.clone(),
-                            fill_script.guard_key.clone(),
-                            value.clone(),
-                            remaining.max(Duration::from_millis(1)),
-                            &mut pinned_resolution,
-                            &mut current_attempt_evidence,
-                            None,
-                        )
-                        .await;
-                        json = match evaluation {
-                            Ok(json) => json,
-                            Err(error) if error.is_retryable_timeout() => {
-                                last_attempt_evidence = current_attempt_evidence;
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        };
-                        let result =
-                            decode_runtime_serialized_value(serde_json::from_str::<Value>(&json)?);
-                        let info = result.get("info").cloned().unwrap_or_else(|| json!({}));
-                        let result_type = result.get("type").and_then(Value::as_str);
-                        let result_succeeded =
-                            result.get("ok").and_then(Value::as_bool) == Some(true);
-                        if !result_succeeded
-                            && !matches!(result_type, Some("observe-dispatch" | "pending-dispatch"))
-                        {
-                            if let Some(error) = strict_violation_error(&info, strict, "fill") {
-                                let _ = cleanup_retained_fill_guard(
-                                    Arc::clone(&page),
-                                    &locator_json,
-                                    &fill_script.guard_key,
-                                    pinned_resolution.as_ref(),
-                                    Duration::from_millis(100),
-                                )
-                                .await;
-                                return Err(error);
-                            }
-                        }
-                        match classify_fill_attempt(&result, "fill")? {
-                            FillAttempt::Success => return Ok(json),
-                            FillAttempt::PendingActionability | FillAttempt::PendingDispatch => {
-                                let pending_dispatch = result_type == Some("pending-dispatch");
-                                last_attempt_evidence = if pending_dispatch {
-                                    debug_assert_eq!(
-                                        current_attempt_evidence,
-                                        FillAttemptEvidence::SettleWritten
-                                    );
-                                    FillAttemptEvidence::SettleWritten
-                                } else {
-                                    pinned_resolution.take();
-                                    FillAttemptEvidence::Resolve
-                                };
-                                last_timeout_state = if pending_dispatch {
-                                    "confirmed as edited"
-                                } else {
-                                    "editable"
-                                };
-                                last_info = info;
-                                last_info_json = json;
-                            }
-                        }
-                    }
-                })
-            } else if wait_probe {
+            if wait_probe {
                 let expression = locator_script(&locator_json, index, &script.body);
                 evaluate_locator_wait_probe_for_page(page, expression, timeout_ms)
             } else {
@@ -38421,31 +37901,6 @@ return { ready: true, result: true, payload: null };
             ))
         })
         .map_err(py_err)
-    }
-
-    #[pyo3(signature = (locator_json, index, value, timeout_ms=None))]
-    fn fill(
-        &self,
-        locator_json: &str,
-        index: usize,
-        value: &str,
-        timeout_ms: Option<f64>,
-    ) -> PyResult<()> {
-        let page = Arc::clone(&self.inner);
-        let browser = Arc::clone(&page.browser);
-        browser
-            .block_on(page_fill_actionable_async(
-                page,
-                locator_json.to_string(),
-                index,
-                value.to_string(),
-                timeout_ms,
-                false,
-                false,
-                "fill".to_string(),
-                None,
-            ))
-            .map_err(py_err)
     }
 
     #[pyo3(signature = (locator_json, index, text, timeout_ms=None))]

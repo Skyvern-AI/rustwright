@@ -5,11 +5,13 @@ import os
 import subprocess
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, TypeVar, cast
 
 
 SAMPLE_INTERVAL_SECONDS = 0.05
 PS_TIMEOUT_SECONDS = 2.0
+PROC_ROOT = Path("/proc")
 
 
 @dataclass(frozen=True)
@@ -80,8 +82,8 @@ class ProcessTreeRssSampler:
             "sampling_interval_ms": self.sample_interval * 1000,
             "statistic": "peak",
             "scope": "benchmark_process_and_descendants",
-            "sampling_mode": "background_thread_ps",
-            "available": rss_self_kb is not None or rss_tree_kb is not None,
+            "sampling_mode": "background_thread_procfs_or_ps",
+            "available": rss_self_kb is not None and rss_tree_kb is not None,
         }
 
 
@@ -113,20 +115,95 @@ def max_optional(values: Any) -> int | None:
 
 
 def sample_process_tree_rss(root_pid: int) -> ProcessTreeRssSample:
+    procfs_sample = procfs_process_tree_rss(root_pid)
+    if procfs_sample is not None:
+        return procfs_sample
     tree = ps_process_tree(root_pid)
+    rss_self_kb = ps_rss_kb(root_pid)
     return ProcessTreeRssSample(
-        rss_self_kb=ps_rss_kb(root_pid),
-        rss_tree_kb=sum_optional(ps_rss_kb(pid) for pid in tree),
+        rss_self_kb=rss_self_kb,
+        rss_tree_kb=(
+            None
+            if tree is None
+            else sum_required(ps_rss_kb(pid) for pid in tree)
+        ),
     )
 
 
-def sum_optional(values: Any) -> int | None:
+def procfs_process_tree_rss(
+    root_pid: int,
+    proc_root: Path | None = None,
+) -> ProcessTreeRssSample | None:
+    process_table, complete = procfs_process_table(
+        PROC_ROOT if proc_root is None else proc_root
+    )
+    if not complete or root_pid not in process_table:
+        return None
+    children: dict[int, list[int]] = {}
+    for pid, (parent_pid, _) in process_table.items():
+        children.setdefault(parent_pid, []).append(pid)
+    tree: list[int] = []
+    stack = [root_pid]
+    while stack:
+        pid = stack.pop()
+        if pid in tree:
+            continue
+        tree.append(pid)
+        stack.extend(children.get(pid, []))
+    return ProcessTreeRssSample(
+        rss_self_kb=process_table[root_pid][1],
+        rss_tree_kb=sum_required(process_table[pid][1] for pid in tree),
+    )
+
+
+def procfs_process_table(
+    proc_root: Path,
+) -> tuple[dict[int, tuple[int, int | None]], bool]:
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return {}, False
+    numeric_entries = [entry for entry in entries if entry.name.isdigit()]
+    unreadable: set[str] = set()
+    result: dict[int, tuple[int, int | None]] = {}
+    for entry in numeric_entries:
+        try:
+            status = (entry / "status").read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            unreadable.add(entry.name)
+            continue
+        parent_pid: int | None = None
+        rss_kb: int | None = None
+        for line in status.splitlines():
+            if line.startswith("PPid:"):
+                try:
+                    parent_pid = int(line.split()[1])
+                except (IndexError, ValueError):
+                    parent_pid = None
+            elif line.startswith("VmRSS:"):
+                try:
+                    rss_kb = int(line.split()[1])
+                except (IndexError, ValueError):
+                    rss_kb = None
+        if parent_pid is None:
+            unreadable.add(entry.name)
+            continue
+        result[int(entry.name)] = (parent_pid, rss_kb)
+    try:
+        remaining = {entry.name for entry in proc_root.iterdir() if entry.name.isdigit()}
+    except OSError:
+        return result, False
+    return result, not bool(unreadable & remaining)
+
+
+def sum_required(values: Any) -> int | None:
     total = 0
     seen = False
     for value in values:
-        if value is not None:
-            total += value
-            seen = True
+        if value is None:
+            return None
+        total += value
+        seen = True
     return total if seen else None
 
 
@@ -155,10 +232,10 @@ def ps_rss_kb(pid: int) -> int | None:
         return None
 
 
-def ps_process_tree(root_pid: int) -> list[int]:
+def ps_process_tree(root_pid: int) -> list[int] | None:
     output = run_ps(["ps", "-axo", "pid=,ppid="])
     if not output:
-        return [root_pid]
+        return None
     children: dict[int, list[int]] = {}
     for line in output.splitlines():
         parts = line.split()

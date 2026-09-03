@@ -89,7 +89,6 @@ from .sync_api import (
     _options_from_explicit_kwargs,
     _response_from_payload,
     _translate_error,
-    _unsafe_dom_fastpath_enabled,
     _validate_timeout_value,
 )
 from .sync_api import sync_playwright as _sync_playwright
@@ -2748,17 +2747,6 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
         normalized_selector = _native_normalize_selector(selector, method="Page.click")
         timeout_ms = _default_timeout_for_method(self._sync, timeout, method="Page.click")
         locator = _native_selector_locator(self._sync, normalized_selector, strict, method="Page.click")
-        if _unsafe_dom_fastpath_enabled():
-            await _await_native_method(
-                "Page.click",
-                self._sync._core.click_async(
-                    _json(locator._spec),
-                    locator._index,
-                    timeout_ms,
-                    locator._strict,
-                ),
-            )
-            return
         point_info = await _await_native_action(
             "Page.click",
             self._sync._core.click_actionable_wait_async(
@@ -2807,18 +2795,6 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
             or no_wait_after is not None
             or force is not None
         )
-        if sync_fallback and _unsafe_dom_fastpath_enabled():
-            await _run_sync_wait_sliced(
-                self._sync,
-                self._sync.fill,
-                selector,
-                value,
-                timeout=timeout,
-                no_wait_after=no_wait_after,
-                strict=strict,
-                force=force,
-            )
-            return
         normalized_selector = _native_normalize_selector(selector, method="Page.fill")
         normalized_value = _normalize_required_string_argument(
             value,
@@ -2828,18 +2804,6 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
         )
         timeout_ms = _default_timeout_for_method(self._sync, timeout, method="Page.fill")
         locator = _native_selector_locator(self._sync, normalized_selector, strict, method="Page.fill")
-        if _unsafe_dom_fastpath_enabled():
-            await _await_native_method(
-                "Page.fill",
-                self._sync._core.fill_async(
-                    _json(locator._spec),
-                    locator._index,
-                    normalized_value,
-                    timeout_ms,
-                    locator._strict,
-                ),
-            )
-            return
         if sync_fallback:
             # Cancelling an executor Future does not stop its running sync call. Carry
             # cancellation into Rust so the fill future—and its guard owner—is dropped.

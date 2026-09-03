@@ -1419,14 +1419,31 @@ impl Page {
         options: ActionOptions,
         cancel: Option<&CancelToken>,
     ) -> Result<Value> {
-        let arg_json = arg.map(serde_json::to_string).transpose()?;
-        let json = self.inner.evaluate_with_cancel(
-            expression,
-            arg_json.as_deref(),
-            options.timeout,
-            cancel,
-        )?;
+        let json = self.evaluate_wire_with_cancel(expression, arg, options, cancel)?;
         decode_evaluate_wire(&json)
+    }
+
+    /// Evaluate JavaScript and return the core's tagged JSON wire value.
+    pub fn evaluate_wire(
+        &self,
+        expression: &str,
+        arg: Option<&Value>,
+        options: ActionOptions,
+    ) -> Result<String> {
+        self.evaluate_wire_with_cancel(expression, arg, options, None)
+    }
+
+    /// Return the tagged JSON wire value with an optional cancellation signal.
+    pub fn evaluate_wire_with_cancel(
+        &self,
+        expression: &str,
+        arg: Option<&Value>,
+        options: ActionOptions,
+        cancel: Option<&CancelToken>,
+    ) -> Result<String> {
+        let arg_json = arg.map(serde_json::to_string).transpose()?;
+        self.inner
+            .evaluate_with_cancel(expression, arg_json.as_deref(), options.timeout, cancel)
     }
 
     /// Capture a screenshot and return its encoded bytes.

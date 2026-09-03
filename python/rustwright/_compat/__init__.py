@@ -5,13 +5,13 @@ Aliases are installed eagerly. If pytest is not importable when
 the function again after pytest becomes importable to add them. Pytest users
 normally enable compatibility inside a process where pytest is importable.
 
-Target imports happen before alias publication. If enable fails, canonical
+Alias publication is transactional. If enable fails, canonical
 ``rustwright._compat.*`` modules and pytest imported during that phase stay in
-``sys.modules``. Complete rollback covers only legacy alias entries and their
-parent attributes; removing canonical imports could disturb unrelated users.
+``sys.modules``. Published legacy aliases and parent attributes return to their
+prior state.
 
-Do not enable or disable compatibility concurrently with in-flight imports of
-aliased names. Direct ``sys.modules`` aliasing cannot make those imports atomic.
+Do not enable compatibility concurrently with in-flight imports of aliased
+names. Direct ``sys.modules`` aliasing cannot make those imports atomic.
 """
 
 from __future__ import annotations
@@ -53,8 +53,6 @@ _PYTEST_ALIASES = (
 )
 
 _MISSING = object()
-_PREVIOUS_MODULES: dict[str, object] = {}
-_PREVIOUS_PARENT_ATTRIBUTES: dict[str, tuple[ModuleType, object]] = {}
 _STATE_LOCK = RLock()
 _ENABLED = False
 _PYTEST_ALIASES_ENABLED = False
@@ -122,10 +120,9 @@ def enable_playwright_compat() -> PlaywrightCompatEnableResult:
     Calling again after pytest becomes importable upgrades an enabled core-only
     state with the pytest aliases.
 
-    Target imports are outside the rollback boundary. Successfully imported
-    canonical compatibility modules, including pytest dependencies, remain in
-    ``sys.modules`` if enable later fails. Legacy alias entries and their parent
-    attributes are the complete transactional publication boundary.
+    Canonical compatibility modules, including pytest dependencies, remain in
+    ``sys.modules`` if enable fails. Published legacy aliases and parent
+    attributes return to their prior state.
     """
 
     global _ENABLED, _LAST_ENABLE_RESULT, _PYTEST_ALIASES_ENABLED
@@ -162,10 +159,14 @@ def enable_playwright_compat() -> PlaywrightCompatEnableResult:
             _restore_aliases(previous_modules, previous_parent_attributes)
             raise
 
-        _PREVIOUS_MODULES.update(previous_modules)
-        _PREVIOUS_PARENT_ATTRIBUTES.update(previous_parent_attributes)
         _ENABLED = True
         _PYTEST_ALIASES_ENABLED = _PYTEST_ALIASES_ENABLED or pytest_available
+        registered_aliases = tuple(
+            alias_name
+            for alias_name, _target_name in (
+                _CORE_ALIASES + (_PYTEST_ALIASES if _PYTEST_ALIASES_ENABLED else ())
+            )
+        )
         skipped_aliases = (
             ()
             if _PYTEST_ALIASES_ENABLED
@@ -173,30 +174,14 @@ def enable_playwright_compat() -> PlaywrightCompatEnableResult:
         )
         _LAST_ENABLE_RESULT = PlaywrightCompatEnableResult(
             True,
-            tuple(_PREVIOUS_MODULES),
+            registered_aliases,
             skipped_aliases,
         )
         return _LAST_ENABLE_RESULT
 
 
-def disable_playwright_compat() -> None:
-    """Restore modules and parent attributes replaced by compatibility."""
-
-    global _ENABLED, _LAST_ENABLE_RESULT, _PYTEST_ALIASES_ENABLED
-
-    with _STATE_LOCK:
-        if not _ENABLED:
-            return
-        _restore_aliases(_PREVIOUS_MODULES, _PREVIOUS_PARENT_ATTRIBUTES)
-        _PREVIOUS_MODULES.clear()
-        _PREVIOUS_PARENT_ATTRIBUTES.clear()
-        _ENABLED = False
-        _PYTEST_ALIASES_ENABLED = False
-        _LAST_ENABLE_RESULT = PlaywrightCompatEnableResult(False, (), ())
-
 
 __all__ = [
     "PlaywrightCompatEnableResult",
-    "disable_playwright_compat",
     "enable_playwright_compat",
 ]
