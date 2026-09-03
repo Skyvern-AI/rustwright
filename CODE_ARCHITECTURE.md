@@ -38,8 +38,8 @@ The compatibility split is intentional:
 - Go and rust-native already use core structural decoding.
 - Python and Node use native graph adapters that preserve host object identity
   and cycles.
-- Java, C#/.NET, Ruby, and PHP retain full structural copies until the
-  remaining C-ABI binding migration.
+- Java, C#/.NET, Ruby, and PHP use the opaque C graph API. Their shims only
+  allocate host values, connect graph edges, and map leaf values.
 
 The rule, applied to every change:
 
@@ -116,15 +116,15 @@ The core graph parser establishes the evaluate-wire and launch-parser ownership 
 | Python | PyO3 native graph adapter for evaluate results; Playwright-shaped validation and ergonomics remain in Python. |
 | Go | C ABI binding that already uses the core's flattened structural decoder and maps leaf values. |
 | rust-native | In-process facade that already uses core structural decoding and maps leaf values. |
-| C ABI | Legacy flattened JSON decoder and core launch parser; it does not preserve host graph identity. |
-| Java / C#/.NET / Ruby / PHP | C-ABI bindings with full structural copies pending migration to the core decoder. |
+| C ABI | Legacy flattened JSON decoder plus an opaque identity-preserving graph API; both use the core parser. |
+| Java / C#/.NET / Ruby / PHP | Two-pass host materializers over the opaque C graph API; leaf conversion stays language-native. |
 | Node | napi native graph adapter; the typed camelCase coercion veneer remains in Node. |
 
 The remaining cross-shim concerns have these owners:
 
 | Concern | Current owner | Remaining work |
 | --- | --- | --- |
-| Evaluate wire | Core parser; C ABI uses its flattened compatibility decoder, while Python and Node use native graph adapters. | Migrate Java, C#/.NET, Ruby, and PHP to the core decoder. |
+| Evaluate wire | Core parser; C ABI exposes flattened compatibility and opaque graph paths. Every identity-preserving binding materializes the core graph. | Keep only language-native leaf conversion in binding shims. |
 | Launch options | Core parser accepts canonical snake_case and current camelCase aliases. | Keep C callers on canonical snake_case; retain language-specific validation and coercion only where required for compatibility. |
 | Screenshot options | Core parser. | Keep language veneers limited to marshalling and native coercion. |
 | Data URL / JSON equality / manifest validation | Binding harnesses. | Move behind C-ABI helpers when harness work next opens. |
@@ -138,9 +138,9 @@ Ordered tracks; each is independently landable and keeps parity tests green.
    legacy C ABI decoder flattened for compatibility. Use native graph adapters
    in Python and Node, and retain core structural decoding in Go and
    rust-native.
-2. **Migrate the remaining C-ABI bindings.** Move Java, C#/.NET, Ruby, and PHP
-   from full structural copies to the core graph contract. This remains
-   pending; do not treat those migrations as complete.
+2. **Expose the graph through the C ABI (this change).** Java, C#/.NET, Ruby,
+   and PHP materialize the opaque core graph instead of parsing wire wrappers,
+   tags, and references in each language.
 3. **Maintain the generated async Python facade.** Keep mechanical delegation
    methods generated from `sync_api.py` signatures, keep hand-written code
    limited to methods with real async semantics, and keep the checked-in
@@ -281,7 +281,8 @@ Chrome-for-Testing installer is linux x86_64-only.
 
 1. Preserve and extend the core evaluate-wire and launch-parser contract
    without changing the legacy C ABI behavior.
-2. Migrate the remaining C-ABI bindings; this is not complete.
+2. Keep every language binding limited to graph materialization, native leaf
+   conversion, ownership, and public validation.
 3. Maintain the generated async Python facade and its ownership checks.
 4. Extract Python event waiters/context managers into
    `python/rustwright/events.py` (pairs with roadmap track 7).
