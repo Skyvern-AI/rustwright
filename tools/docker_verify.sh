@@ -114,19 +114,13 @@ pycompile() {
     tools/import_mind2web.py \
     tools/import_webvoyager.py \
     tools/run_mind2web_benchmark.py \
-    tools/run_mind2web_matrix.py \
     tools/run_webvoyager_benchmark.py \
-    tools/run_webvoyager_matrix.py \
-    tools/run_parity_cases.py \
     tools/run_antibot_benchmarks.py \
     tools/run_benchmark_matrix.py \
     tools/render_benchmark_matrix.py \
     tools/check_cross_library_speed_goal.py \
     tools/check_launch_latency_claim.py \
     tools/run_remote_docker_test.py \
-    tools/query_project_state.py \
-    tools/render_project_tables.py \
-    tools/check_phase1_gate.py \
     tools/check_native_extension.py \
     tools/api_surface_audit.py \
     tools/check_benchmark_artifacts.py \
@@ -135,7 +129,7 @@ pycompile() {
     tools/run_skyvern_cloud_overlay_tests.py \
     tools/run_skyvern_alias_command.py \
     tools/run_skyvern_prompt_overlay_smoke.py \
-    tests/test_project_status_tools.py \
+    tests/test_repository_tools.py \
     tests/test_skyvern_replacement_smoke.py \
     tests/test_skyvern_cloud_overlay_tests.py \
     tests/test_skyvern_alias_command.py \
@@ -154,10 +148,12 @@ sampled() {
     tests/test_skyvern_cloud_overlay_tests.py \
     tests/test_skyvern_alias_command.py \
     tests/test_skyvern_prompt_overlay_smoke.py \
-    tests/test_project_status_tools.py
-  run "$PYTHON_BIN" tools/run_parity_cases.py \
+    tests/test_repository_tools.py
+  run "$PYTHON_BIN" benchmarks/run_benchmarks.py \
     --impl rustwright \
     --reference-path "$REFERENCE_PATH" \
+    --suite parity \
+    --iterations 1 \
     --case context_viewport_screen_device_option_validation_matches_playwright \
     --case context_no_viewport_and_viewport_none_disable_viewport_emulation \
     --case context_environment_and_emulate_media_validation_matches_playwright \
@@ -202,9 +198,11 @@ sampled() {
     --case mouse_dblclick_delay_reuses_click_count_sequence_like_playwright \
     --case drag_and_drop_dispatches_native_pointer_mouse_events_like_playwright \
     --json
-  run "$PYTHON_BIN" tools/run_parity_cases.py \
+  run "$PYTHON_BIN" benchmarks/run_benchmarks.py \
     --impl playwright \
     --reference-path "$REFERENCE_PATH" \
+    --suite parity \
+    --iterations 1 \
     --case context_viewport_screen_device_option_validation_matches_playwright \
     --case context_string_header_and_http_credentials_validation_matches_playwright \
     --case geolocation_option_validation_matches_playwright \
@@ -260,38 +258,73 @@ focused() {
 parity() {
   pycompile
   local has_reference_path=0
+  local impl_count=0
+  local next_is_impl=0
+  local selected_impl=""
   local arg
   for arg in "$@"; do
+    if [ "$next_is_impl" -eq 1 ]; then
+      selected_impl="$arg"
+      next_is_impl=0
+      continue
+    fi
     case "$arg" in
+      --impl)
+        impl_count=$((impl_count + 1))
+        next_is_impl=1
+        ;;
+      --impl=*)
+        impl_count=$((impl_count + 1))
+        selected_impl="${arg#--impl=}"
+        ;;
       --reference-path|--reference-path=*)
         has_reference_path=1
         ;;
+      --suite|--suite=*|--iterations|--iterations=*|--lifecycle|--lifecycle=*)
+        echo "parity mode owns --suite, --iterations, and --lifecycle" >&2
+        exit 2
+        ;;
     esac
   done
+  if [ "$next_is_impl" -eq 1 ] || [ "$impl_count" -ne 1 ]; then
+    echo "parity mode requires exactly one --impl value" >&2
+    exit 2
+  fi
+  case "$selected_impl" in
+    rustwright|playwright)
+      ;;
+    *)
+      echo "parity mode requires --impl rustwright or --impl playwright" >&2
+      exit 2
+      ;;
+  esac
   if [ "$has_reference_path" -eq 1 ]; then
-    run "$PYTHON_BIN" tools/run_parity_cases.py "$@"
+    run "$PYTHON_BIN" benchmarks/run_benchmarks.py "$@" \
+      --suite parity --iterations 1 --lifecycle warm-browser
   else
-    run "$PYTHON_BIN" tools/run_parity_cases.py --reference-path "$REFERENCE_PATH" "$@"
+    run "$PYTHON_BIN" benchmarks/run_benchmarks.py "$@" \
+      --reference-path "$REFERENCE_PATH" \
+      --suite parity --iterations 1 --lifecycle warm-browser
   fi
 }
 
 full() {
   pycompile
   run_pytest -q
-  run "$PYTHON_BIN" tools/run_parity_cases.py \
+  run "$PYTHON_BIN" benchmarks/run_benchmarks.py \
     --impl rustwright \
     --reference-path "$REFERENCE_PATH" \
+    --suite parity \
+    --iterations 1 \
     --json
-  run "$PYTHON_BIN" tools/run_parity_cases.py \
+  run "$PYTHON_BIN" benchmarks/run_benchmarks.py \
     --impl playwright \
     --reference-path "$REFERENCE_PATH" \
+    --suite parity \
+    --iterations 1 \
     --json
 }
 
-phase1() {
-  sampled
-  run "$PYTHON_BIN" tools/check_phase1_gate.py --current-docker-run --require-docker --pretty
-}
 
 bench() {
   local impl_args=(--impl all)
@@ -373,10 +406,6 @@ case "$MODE" in
     enforce_container_memory_limit
     sampled "$@"
     ;;
-  phase1)
-    enforce_container_memory_limit
-    phase1 "$@"
-    ;;
   focused)
     enforce_container_memory_limit
     focused "$@"
@@ -412,25 +441,22 @@ case "$MODE" in
   *)
     cat >&2 <<'USAGE'
 Usage inside the container:
-  docker run --rm --memory=8g --memory-swap=8g rustwright-verify [pycompile|focused|parity|sampled|phase1|full|bench|mind2web|webvoyager|antibot|antibot-smoke]
+  docker run --rm --memory=8g --memory-swap=8g rustwright-verify [pycompile|focused|parity|sampled|full|bench|mind2web|webvoyager|antibot|antibot-smoke]
   Uncapped Docker runs, or runs with a memory cap above 8GB, exit before verification starts.
 
 Preferred host usage:
-  tools/docker_test.sh [pycompile|focused|parity|sampled|phase1|full|bench|bench-full|mind2web|mind2web-full|webvoyager|webvoyager-full|antibot|antibot-smoke]
+  tools/docker_test.sh [pycompile|focused|parity|sampled|full|bench|bench-full|mind2web|webvoyager|antibot|antibot-smoke]
 
 Modes:
   pycompile       Compile Python sources used by the verification loops.
   focused         Compile Python sources, then run the supplied pytest selector.
   parity          Compile Python sources, then run supplied shared parity cases.
   sampled         Focused tests plus a stratified option/event/anti-bot/async parity sample.
-  phase1          Run sampled, then require tools/check_phase1_gate.py to pass in the current capped Docker container.
   full            Full pytest plus full Rustwright and Playwright parity.
   bench           Comparable benchmark run; set BENCHMARK_ITERATIONS to tune. Set RUSTWRIGHT_BENCH_REBUILD=1 to rebuild Rustwright release wheel for Rustwright/all runs.
   bench-full      Host wrapper mode only: one capped Docker container per benchmark implementation.
   mind2web        Imported Mind2Web quality benchmark run; set MIND2WEB_ITERATIONS to tune.
-  mind2web-full   Host wrapper mode only: one capped Docker container per Mind2Web implementation.
   webvoyager      Imported WebVoyager reliability benchmark run; set WEBVOYAGER_ITERATIONS to tune.
-  webvoyager-full Host wrapper mode only: one capped Docker container per WebVoyager implementation.
   antibot         Run tools/run_antibot_benchmarks.py with supplied arguments.
   antibot-smoke   Tier 0 smoke, local Tier 2 network, and fresh/warm matrix anti-bot checks.
 USAGE

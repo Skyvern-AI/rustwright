@@ -764,7 +764,6 @@ Missing async exports: `FormData`, `ScreencastFrame`, `ScreencastSize`, `Virtual
 | `Video` | yes | yes |
 | `async_playwright` | no | yes |
 | `backend_marker` | yes | yes |
-| `disable_playwright_compat` | no | no |
 | `enable_playwright_compat` | no | no |
 | `expect` | yes | yes |
 | `sync_playwright` | yes | no |
@@ -813,9 +812,9 @@ This table is parsed from `node/README.md`; it does not infer capabilities from 
 - The reference surface was introspected from real Playwright Python 1.61.0. When Playwright is unavailable to the invoking interpreter, the generator uses the ignored `.venv-parity` environment and installs the pinned fallback `playwright==1.61.0`. It never installs into `.venv`.
 - API classes are discovered from `sync_api`, `async_api`, and their generated modules. Public methods and properties declared on those classes are compared with matching Rustwright classes. Inherited event-emitter implementation helpers are excluded. Names are converted to snake_case before exact matching; normalization collisions fail generation.
 - Method totals count methods, not properties. Properties remain in the detailed tables because they are part of the usable API and because their return annotations make chained receiver types resolvable.
-- The exercised state starts only from the 520 functions actually present in the `CASES` registry. The generator verifies that `tests/test_playwright_parity_cases.py` imports that registry, runs `_run_parity` for a `playwright` parameter, and checks `len(CASES)`.
+- The exercised state starts only from the 522 functions in the `CASES` registry. The generator verifies that `tests/test_playwright_parity_cases.py` imports the registry and runs the canonical `benchmarks/run_benchmarks.py --suite parity` entry point for both backends.
 - Exercise detection is conservative static analysis. It propagates `Page` and `Playwright` case parameters through assignments, reference return annotations, property chains, collection indexing, local helper calls, callback annotations, and literal event names. A member becomes green only when its receiver resolves to one reference class. Dynamic `getattr`, aliases returned through untyped helpers, and callbacks with ambiguous receiver types remain yellow even if a case reaches them at runtime.
 - 4 call site(s) had more than one plausible reference receiver class and were left uncredited rather than guessed.
 - A green mark means the shared suite invokes or reads the member while running the same registered case against real Playwright and Rustwright. It does not prove all options, errors, events, browser engines, or edge cases match.
 - The limitations and Node.js sections are parsed from `LIMITATIONS.md` and `node/README.md` on each run.
-- Source digest (case registry, parity test, limitations, Node README): `73532a56375f4be0`.
+- Source digest (case registry, canonical runner, parity test, limitations, Node README): `4f0f11f4960a4451`.

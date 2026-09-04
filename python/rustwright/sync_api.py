@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import collections.abc
 import copy
 import functools
@@ -50,7 +51,6 @@ _HISTORY_EVENT_DRAIN_TIMEOUT_SECONDS = 0.02
 _CONSOLE_HISTORY_SETTLE_TIMEOUT_SECONDS = 0.001
 _CONSOLE_HISTORY_BUFFER = "__console_history__"
 _PAGE_ERROR_HISTORY_BUFFER = "__page_error_history__"
-_UNSAFE_DOM_FASTPATH_ENV = "RUSTWRIGHT_UNSAFE_DOM_FASTPATH"
 _MULTIPART_BOUNDARY_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB"
 _CHECKED_STATE_JS = """(el) => {
 const tagName = String(el && el.tagName || '').toUpperCase();
@@ -2818,9 +2818,6 @@ def _json(value: Dict[str, Any]) -> str:
     return json.dumps(value, separators=(",", ":"))
 
 
-def _unsafe_dom_fastpath_enabled() -> bool:
-    value = os.environ.get(_UNSAFE_DOM_FASTPATH_ENV, "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _normalize_nth_index(index: Any) -> Any:
@@ -3762,6 +3759,47 @@ def _invalid_role_level(role: Any, symbol: str, *, value: Any = None, selector: 
     return {"kind": "invalid_role_level", "symbol": symbol, "selector": selector}
 
 
+_EVENT_DISPATCH_SEQUENCE: contextvars.ContextVar[
+    Optional[tuple[Any, Any]]
+] = contextvars.ContextVar(
+    "rustwright_event_dispatch_sequence",
+    default=None,
+)
+
+def _running_asyncio_loop_and_task() -> tuple[Any, Any]:
+    import asyncio
+
+    try:
+        loop = asyncio.get_running_loop()
+        return loop, asyncio.current_task(loop=loop)
+    except RuntimeError:
+        return None, None
+
+_EVENT_DISPATCH_OWNER: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "rustwright_event_dispatch_owner",
+    default=None,
+)
+_EVENT_DISPATCH_REGISTRATION: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "rustwright_event_dispatch_registration",
+    default=None,
+)
+_EVENT_DISPATCH_DEFERRED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "rustwright_event_dispatch_deferred",
+    default=False,
+)
+
+
+class _EventHandlerRegistration:
+    __slots__ = ("event", "handler", "pending", "executing", "cancelled")
+
+    def __init__(self, event: str, handler: Callable[..., Any]) -> None:
+        self.event = event
+        self.handler = handler
+        self.pending = 0
+        self.executing: dict[Any, int] = {}
+        self.cancelled = False
+
+
 class _EventEmitter:
     def _event_handlers_for_emitter(self) -> dict[str, list[Callable[..., Any]]]:
         handlers = getattr(self, "_event_handlers", None)
@@ -3770,6 +3808,7 @@ class _EventEmitter:
         handlers = {}
         setattr(self, "_event_handlers", handlers)
         return handlers
+
 
     def on(self, event: str, f: Callable[..., Any]) -> None:
         _add_listener_to_handlers(self, event, f, self._event_handlers_for_emitter())
@@ -3782,21 +3821,99 @@ class _EventEmitter:
 
     def _emit_local_event(self, event: str, *args: Any) -> None:
         _emit_event(self._event_handlers_for_emitter(), event, *args)
+_EVENT_DIALOG_DISPATCH: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "rustwright_event_dialog_dispatch",
+    default=None,
+)
 
+
+class _DialogDispatch:
+    __slots__ = (
+        "page",
+        "dialog",
+        "remaining",
+        "finished",
+        "captured",
+        "handled",
+        "fallback_started",
+        "lock",
+    )
+
+    def __init__(self, page: Any, dialog: Any, remaining: int) -> None:
+        self.page = page
+        self.dialog = dialog
+        self.remaining = remaining
+        self.finished = False
+        self.captured = False
+        self.handled = False
+        self.fallback_started = False
+        self.lock = threading.Lock()
+
+    def capture(self) -> None:
+        with self.lock:
+            self.captured = True
+
+    def mark_handled(self) -> None:
+        with self.lock:
+            self.handled = True
+        self.page._forget_dialog_dispatch(self)
+
+    def settle(self) -> None:
+        finished = False
+        with self.lock:
+            if self.finished:
+                return
+            self.remaining = max(self.remaining - 1, 0)
+            if self.remaining == 0:
+                self.finished = True
+                finished = True
+        if finished:
+            self.page._dialog_dispatch_finished(self)
+
+    def finish_if_idle(self) -> None:
+        finished = False
+        with self.lock:
+            if self.remaining == 0 and not self.finished:
+                self.finished = True
+                finished = True
+        if finished:
+            self.page._dialog_dispatch_finished(self)
+
+    def maybe_fallback(self) -> None:
+        with self.lock:
+            if (
+                not self.finished
+                or self.captured
+                or self.handled
+                or self.fallback_started
+            ):
+                return
+            if self.page._dialog_fallback_suppressed(self.dialog):
+                return
+            self.fallback_started = True
+        self.page._dismiss_dialog_if_unhandled(self.dialog)
 
 def _register_once_listener(owner: Any, event: str, f: Callable[..., Any]) -> None:
-    owner.remove_listener(event, f)
+    def register() -> None:
+        owner.remove_listener(event, f)
 
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        owner.remove_listener(event, wrapper)
-        return f(*args, **kwargs)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            owner.remove_listener(event, wrapper)
+            return f(*args, **kwargs)
 
-    owner.on(event, wrapper)
-    wrappers = getattr(owner, "_once_event_wrappers", None)
-    if not isinstance(wrappers, list):
-        wrappers = []
-        setattr(owner, "_once_event_wrappers", wrappers)
-    wrappers.append((event, f, wrapper))
+        owner.on(event, wrapper)
+        wrappers = getattr(owner, "_once_event_wrappers", None)
+        if not isinstance(wrappers, list):
+            wrappers = []
+            setattr(owner, "_once_event_wrappers", wrappers)
+        wrappers.append((event, f, wrapper))
+
+    dispatch_lock = getattr(owner, "_event_dispatch_lock", None)
+    if dispatch_lock is None:
+        register()
+    else:
+        with dispatch_lock:
+            register()
 
 
 def _pop_once_listener_wrapper(owner: Any, event: str, f: Callable[..., Any]) -> Optional[Callable[..., Any]]:
@@ -4993,6 +5110,8 @@ def _wait_for_ready_event_or_owner_close(
     event: str,
     timeout_ms: Optional[float],
     timeout_display: str,
+    *,
+    deadline: Any = _UNSET,
 ) -> None:
     if owner is not None and threading.current_thread() in _owner_event_pump_threads(owner):
         # This wait's event is delivered by one of the owner's event pump
@@ -5010,7 +5129,8 @@ def _wait_for_ready_event_or_owner_close(
         )
     if owner is not None:
         _prepare_owner_event_rejection(owner)
-    deadline = None if timeout_ms is None else time.monotonic() + (timeout_ms / 1000)
+    if deadline is _UNSET:
+        deadline = None if timeout_ms is None else time.monotonic() + (timeout_ms / 1000)
     while True:
         if owner is not None:
             _raise_if_owner_unavailable(owner, use_close_reason=True)
@@ -6435,6 +6555,20 @@ class Response(_EventEmitter):
     def headers_array(self) -> list[dict[str, str]]:
         return list(self._headers_array_cache)
 
+    def _set_body_from_payload(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        body = payload.get("body", "")
+        if payload.get("base64Encoded"):
+            self._body_cache = base64.b64decode(body)
+        else:
+            self._body_cache = str(body).encode("utf-8")
+        if self.request is not None:
+            self.request._sizes = {
+                **(self.request._sizes or {}),
+                "responseBodySize": len(self._body_cache),
+            }
+
     def _cache_body(self, timeout_ms: Optional[float] = None) -> bytes:
         if self._body_cache is not None:
             return self._body_cache
@@ -6452,16 +6586,7 @@ class Response(_EventEmitter):
                 self._page._default_timeout if timeout_ms is None else timeout_ms,
             )
         )
-        body = payload.get("body", "")
-        if payload.get("base64Encoded"):
-            self._body_cache = base64.b64decode(body)
-        else:
-            self._body_cache = str(body).encode("utf-8")
-        if self.request is not None:
-            self.request._sizes = {
-                **(self.request._sizes or {}),
-                "responseBodySize": len(self._body_cache),
-            }
+        self._set_body_from_payload(payload)
         return self._body_cache
 
     def body(self) -> bytes:
@@ -7991,6 +8116,16 @@ def _console_event_matches(matcher: Any, event: "ConsoleMessage") -> bool:
         return True
     if callable(matcher):
         return bool(matcher(event))
+    if isinstance(matcher, dict):
+        native_matcher = _native_event_matcher("console", matcher)
+        if native_matcher is not None:
+            event_type = native_matcher["event_type"]
+            text = native_matcher["text"]
+            if event_type is not None and event.type != event_type:
+                return False
+            if text is None:
+                return True
+            return event.text == text if native_matcher["exact_text"] else text in event.text
     return str(matcher) in event.text
 
 
@@ -8050,6 +8185,16 @@ def _page_error_event_matches(matcher: Any, event: Error) -> bool:
         return True
     if callable(matcher):
         return bool(matcher(event))
+    if isinstance(matcher, dict):
+        native_matcher = _native_event_matcher("pageerror", matcher)
+        if native_matcher is not None:
+            event_type = native_matcher["event_type"]
+            text = native_matcher["text"]
+            if event_type is not None and getattr(event, "name", "Error") != event_type:
+                return False
+            if text is None:
+                return True
+            return str(event) == text if native_matcher["exact_text"] else text in str(event)
     return str(matcher) in str(event)
 
 
@@ -8107,9 +8252,23 @@ def _event_handler_positional_args(handler: Callable[..., Any], args: tuple[Any,
     return args
 
 
-def _emit_event(handlers: dict[str, list[Callable[..., Any]]], event: str, *args: Any) -> None:
+def _emit_event(
+    handlers: dict[str, list[Callable[..., Any]]],
+    event: str,
+    *args: Any,
+    isolate_exceptions: bool = False,
+) -> None:
+    first_error: Optional[BaseException] = None
     for handler in list(handlers.get(event, [])):
-        handler(*_event_handler_positional_args(handler, args))
+        try:
+            handler(*_event_handler_positional_args(handler, args))
+        except BaseException as exc:
+            if not isolate_exceptions:
+                raise
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
 
 
 _DEFAULT_EVENT_TIMEOUT_MESSAGE = 'Timeout {timeout}ms exceeded while waiting for event "{event}"'
@@ -8127,6 +8286,60 @@ def _json_event_payload(payload: Any) -> Any:
 
 def _callable_event_matches(_target: Any, matcher: Any, value: Any) -> bool:
     return matcher is None or bool(matcher(value))
+
+
+def _event_matcher_kind(kind: str) -> str:
+    return kind.rsplit(".", 1)[-1]
+
+
+def _validate_event_matcher(kind: str, matcher: Any, *, method: str) -> None:
+    if (
+        _event_matcher_kind(kind) not in {"console", "pageerror"}
+        or matcher is None
+        or callable(matcher)
+        or isinstance(matcher, str)
+    ):
+        return
+    if not isinstance(matcher, dict):
+        return
+    allowed = {"text", "event_type", "type", "contains", "exact"}
+    for key in matcher:
+        if key not in allowed:
+            raise Error(f"{method}: predicate: unexpected key {key!r}")
+    for key in ("text", "event_type", "type"):
+        if key in matcher and not isinstance(matcher[key], str):
+            raise Error(
+                f"{method}: predicate.{key}: expected string, got {_playwright_type_name(matcher[key])}"
+            )
+    for key in ("contains", "exact"):
+        if key in matcher and not isinstance(matcher[key], bool):
+            raise Error(
+                f"{method}: predicate.{key}: expected boolean, got {_playwright_type_name(matcher[key])}"
+            )
+    if not any(key in matcher for key in ("text", "event_type", "type")):
+        raise Error(f"{method}: predicate: expected text or event_type")
+
+
+def _native_event_matcher(kind: str, matcher: Any) -> Optional[dict[str, Any]]:
+    """Return the lossless matcher subset that the Rust waiter can evaluate."""
+    if _event_matcher_kind(kind) not in {"console", "pageerror"} or matcher is None or callable(matcher):
+        return None
+    if isinstance(matcher, str):
+        return {"text": matcher, "exact_text": False}
+    if not isinstance(matcher, dict):
+        return None
+    _validate_event_matcher(kind, matcher, method="event matcher")
+    text = matcher.get("text")
+    event_type = matcher.get("event_type", matcher.get("type"))
+    contains = matcher.get("contains", False)
+    exact = matcher.get("exact", False)
+    if "contains" in matcher:
+        exact = not contains
+    return {
+        "event_type": event_type,
+        "text": text,
+        "exact_text": exact,
+    }
 
 
 def _network_event_from_payload(page: "Page", payload: dict[str, Any], kind: str) -> Request | Response:
@@ -8170,16 +8383,26 @@ def _network_log_values(page: "Page", state: dict[str, Any], kind: str) -> Itera
     return ()
 
 
-def _page_console_waiter(page: "Page") -> Any:
-    waiter = page._core.console_event_waiter()
+def _page_console_waiter(page: "Page", timeout_ms: Optional[float] = None) -> Any:
+    waiter = _call(page._core.console_event_waiter, timeout_ms)
     page._runtime_observation_enabled = True
     return waiter
 
 
 def _page_console_from_payload(page: "Page", payload: dict[str, Any]) -> ConsoleMessage:
-    event = ConsoleMessage(page, payload)
+    session_id = str(payload.get("session_id") or "")
+    worker = next(
+        (
+            candidate
+            for candidate in page._workers.values()
+            if session_id and candidate._session_id == session_id
+        ),
+        None,
+    )
+    event = ConsoleMessage(page, payload, worker=worker)
     page._record_console_message(event)
     return event
+
 
 
 def _page_error_from_event_payload(page: "Page", payload: dict[str, Any]) -> Error:
@@ -8230,16 +8453,22 @@ def _emit_websocket_value(websocket: "WebSocket", event: str, value: Any) -> Non
 
 
 def _mark_worker_closed(worker: "Worker") -> None:
-    if worker._closed:
-        return
-    worker._closed = True
-    _emit_event(worker._event_handlers_for_emitter(), "close", worker)
+    _emit_worker_value(worker, "close", worker)
+
 
 
 def _emit_worker_value(worker: "Worker", event: str, value: Any) -> None:
     if event == "close":
-        worker._closed = True
+        with worker._event_thread_lock:
+            if getattr(worker, "_close_event_fired", False) or worker._closed:
+                return
+            worker._close_event_fired = True
+            worker._closed = True
+            handlers = list(worker._event_handlers_for_emitter().get(event, []))
+        _emit_event({event: handlers}, event, value, isolate_exceptions=True)
+        return
     worker._emit_local_event(event, value)
+
 
 
 def _enter_page_cdp_event_context(page: "Page") -> None:
@@ -8306,7 +8535,7 @@ _EVENT_WAITER_DESCRIPTORS: dict[str, _EventWaiterDescriptor] = {
         waiter_factory=_page_console_waiter,
         payload_to_value=_page_console_from_payload,
         matches=lambda _page, matcher, event: _console_event_matches(matcher, event),
-        context_manager="listener",
+        context_manager="native",
     ),
     "dialog": _EventWaiterDescriptor(
         event="dialog",
@@ -8508,6 +8737,32 @@ def _descriptor_remaining_ms(
         raise TimeoutError(_descriptor_timeout_message(descriptor, timeout_display))
     return remaining
 
+def _create_descriptor_waiter(
+    target: Any,
+    descriptor: _EventWaiterDescriptor,
+    deadline: Optional[float],
+    timeout_display: str,
+) -> Any:
+    def setup_timeout() -> Optional[float]:
+        if deadline is None:
+            return None
+        return _descriptor_remaining_ms(descriptor, timeout_display, deadline)
+
+    def setup_call(factory: Callable[[Optional[float]], Any]) -> Any:
+        try:
+            return factory(setup_timeout())
+        except TimeoutError:
+            raise TimeoutError(_descriptor_timeout_message(descriptor, timeout_display)) from None
+
+    if descriptor.event == "console" and target.__class__.__name__ == "Page":
+        arm_worker_auto_attach = getattr(target, "_worker_event_waiter", None)
+        if callable(arm_worker_auto_attach):
+            setup_call(lambda remaining: arm_worker_auto_attach(timeout_ms=remaining))
+        return setup_call(lambda remaining: _page_console_waiter(target, remaining))
+    if descriptor.event == "pageerror" and target.__class__.__name__ == "Page":
+        return setup_call(lambda remaining: target._page_error_event_waiter(remaining))
+    return descriptor.waiter_factory(target)
+
 
 def _wait_for_descriptor_event(
     target: Any,
@@ -8520,16 +8775,83 @@ def _wait_for_descriptor_event(
     reject_on_close: bool = True,
     method: Optional[str] = None,
     state: Optional[dict[str, Any]] = None,
+    deadline: Any = _UNSET,
+    timeout_display: Optional[str] = None,
+) -> Any:
+    release = None
+    dialog_release = None
+    if (
+        waiter is None
+        and target.__class__.__name__ == "Page"
+        and kind == "dialog"
+    ):
+        acquire = getattr(target, "_acquire_dialog_waiter", None)
+        if callable(acquire):
+            dialog_release = acquire()
+    if (
+        waiter is None
+        and target.__class__.__name__ == "Page"
+        and kind in {"console", "worker"}
+    ):
+        acquire = getattr(target, "_acquire_worker_waiter_interest", None)
+        if callable(acquire):
+            release = acquire()
+    try:
+        value = _wait_for_descriptor_event_impl(
+            target,
+            kind,
+            matcher,
+            timeout=timeout,
+            waiter=waiter,
+            competing_waiter=competing_waiter,
+            reject_on_close=reject_on_close,
+            method=method,
+            state=state,
+            deadline=deadline,
+            timeout_display=timeout_display,
+        )
+        if dialog_release is not None and isinstance(value, Dialog):
+            target._capture_dialog(value, dialog_release)
+            dialog_release = None
+        return value
+    finally:
+        if release is not None:
+            release()
+        if dialog_release is not None:
+            dialog_release()
+
+def _wait_for_descriptor_event_impl(
+    target: Any,
+    kind: str,
+    matcher: Any = None,
+    *,
+    timeout: Optional[float] = None,
+    waiter: Any = None,
+    competing_waiter: Any = None,
+    reject_on_close: bool = True,
+    method: Optional[str] = None,
+    state: Optional[dict[str, Any]] = None,
+    deadline: Any = _UNSET,
+    timeout_display: Optional[str] = None,
 ) -> Any:
     """Drive a typed native waiter without duplicating deadline or predicate policy."""
 
     descriptor = _event_waiter_descriptor(kind)
-    deadline, timeout_display = _event_deadline_for_target(
-        target,
-        timeout,
-        method=method or descriptor.timeout_method,
-    )
-    waiter = waiter or descriptor.waiter_factory(target)
+    _validate_event_matcher(kind, matcher, method=method or descriptor.timeout_method)
+    if deadline is _UNSET:
+        deadline, timeout_display = _event_deadline_for_target(
+            target,
+            timeout,
+            method=method or descriptor.timeout_method,
+        )
+    elif timeout_display is None:
+        _, timeout_display = _event_timeout_for_target(
+            target,
+            timeout,
+            method=method or descriptor.timeout_method,
+        )
+    if waiter is None:
+        waiter = _create_descriptor_waiter(target, descriptor, deadline, timeout_display)
     if descriptor.competing_waiter_factory is not None:
         competing_waiter = competing_waiter or descriptor.competing_waiter_factory(target)
     owner = (
@@ -8540,6 +8862,9 @@ def _wait_for_descriptor_event(
         else None
     )
     event_state = state or {}
+    native_wait_matching = getattr(waiter, "wait_matching", None)
+    native_wait = kind in {"console", "pageerror"} and callable(native_wait_matching)
+    native_matcher = _native_event_matcher(kind, matcher) if native_wait else None
     while True:
         if descriptor.buffered_values is not None:
             for buffered_value in descriptor.buffered_values(target, event_state):
@@ -8548,19 +8873,27 @@ def _wait_for_descriptor_event(
                         descriptor.on_match(target, buffered_value)
                     return buffered_value
         remaining = _descriptor_remaining_ms(descriptor, timeout_display, deadline)
-        step = _event_wait_step(remaining, owner)
-        if descriptor.max_wait_ms is not None:
-            step = min(step, descriptor.max_wait_ms)
+        if native_wait:
+            # A disabled Python timeout is represented by a long native wait. The
+            # native waiter still wakes on its owner and broadcast notifications.
+            step = remaining if deadline is not None else 24 * 60 * 60 * 1000.0
+        else:
+            step = _event_wait_step(remaining, owner)
+            if descriptor.max_wait_ms is not None:
+                step = min(step, descriptor.max_wait_ms)
         poll_started = time.monotonic()
         try:
-            raw_payload = _call(waiter.wait, step)
+            if native_matcher is not None:
+                raw_payload = _call(native_wait_matching, step, **native_matcher)
+            else:
+                raw_payload = _call(waiter.wait, step)
         except TimeoutError:
             if competing_waiter is not None:
                 try:
                     _call(competing_waiter.wait, 1.0)
                 except TimeoutError:
                     if descriptor.recreate_waiter_on_timeout:
-                        waiter = descriptor.waiter_factory(target)
+                        waiter = _create_descriptor_waiter(target, descriptor, deadline, timeout_display)
                         competing_waiter = descriptor.competing_waiter_factory(target)
                 else:
                     if descriptor.on_competing_event is not None:
@@ -8570,11 +8903,24 @@ def _wait_for_descriptor_event(
                 _raise_if_owner_unavailable(owner, use_close_reason=True)
             if deadline is not None and (deadline - time.monotonic()) <= 0:
                 raise TimeoutError(_descriptor_timeout_message(descriptor, timeout_display)) from None
+            if native_wait:
+                continue
             poll_deadline = poll_started + 0.02
             if deadline is not None:
                 poll_deadline = min(poll_deadline, deadline)
             _sleep_until_next_poll(poll_deadline)
             continue
+        except Error:
+            if owner is not None:
+                try:
+                    _raise_if_owner_unavailable(owner, use_close_reason=True)
+                except Error:
+                    raise
+                if getattr(owner, "_closing", False):
+                    close_reason = getattr(owner, "_closed_reason", None)
+                    if close_reason:
+                        raise Error(str(close_reason))
+            raise
         payload = descriptor.decode_payload(raw_payload)
         if descriptor.payload_filter is not None and not descriptor.payload_filter(target, payload):
             continue
@@ -8583,8 +8929,10 @@ def _wait_for_descriptor_event(
             if descriptor.on_match is not None:
                 descriptor.on_match(target, value)
             return value
+        # Python callables intentionally keep the Python predicate path. The
+        # same waiter is reused, so a rejected event only costs one next wait.
         if descriptor.recreate_waiter_on_rejection:
-            waiter = descriptor.waiter_factory(target)
+            waiter = _create_descriptor_waiter(target, descriptor, deadline, timeout_display)
 
 
 class _NativeEventContextManager:
@@ -8599,52 +8947,112 @@ class _NativeEventContextManager:
         self._defer_to_local_context = False
         self._value: Any = None
         self._complete = False
+        self._deadline: Optional[float] = None
+        self._release_dialog_interest: Optional[Callable[[], None]] = None
+        self._timeout_display = ""
+        self._release_worker_interest: Optional[Callable[[], None]] = None
+
+    def _release_worker_interest_lease(self) -> None:
+        release = self._release_worker_interest
+        self._release_worker_interest = None
+        if release is not None:
+            release()
+
+    def _release_dialog_interest_lease(self) -> None:
+        release = self._release_dialog_interest
+        self._release_dialog_interest = None
+        if release is not None:
+            release()
 
     def __enter__(self) -> "_NativeEventContextManager":
         descriptor = _event_waiter_descriptor(self._kind)
+        _validate_event_matcher(self._kind, self._matcher, method=descriptor.timeout_method)
+        self._deadline, self._timeout_display = _event_deadline_for_target(
+            self._target,
+            self._timeout,
+            method=descriptor.timeout_method,
+        )
         if descriptor.local_context_if_owner_closed and _owner_is_closed(self._target):
             self._defer_to_local_context = True
             return self
         if descriptor.on_context_enter is not None:
             descriptor.on_context_enter(self._target)
-        if descriptor.context_state_factory is not None:
-            self._state = descriptor.context_state_factory(self._target)
-        self._waiter = descriptor.waiter_factory(self._target)
-        if descriptor.competing_waiter_factory is not None:
-            self._competing_waiter = descriptor.competing_waiter_factory(self._target)
+        if self._kind == "dialog" and self._target.__class__.__name__ == "Page":
+            self._release_dialog_interest = self._target._acquire_dialog_waiter()
+        if (
+            self._target.__class__.__name__ == "Page"
+            and descriptor.event in {"console", "worker"}
+        ):
+            acquire = getattr(self._target, "_acquire_worker_waiter_interest", None)
+            if callable(acquire):
+                self._release_worker_interest = acquire()
+        try:
+            if descriptor.context_state_factory is not None:
+                self._state = descriptor.context_state_factory(self._target)
+            self._waiter = _create_descriptor_waiter(
+                self._target,
+                descriptor,
+                self._deadline,
+                self._timeout_display,
+            )
+            if descriptor.competing_waiter_factory is not None:
+                self._competing_waiter = descriptor.competing_waiter_factory(self._target)
+        except BaseException:
+            self._release_worker_interest_lease()
+            self._release_dialog_interest_lease()
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         descriptor = _event_waiter_descriptor(self._kind)
         if self._defer_to_local_context:
-            if exc_type is None:
-                local_context = _LocalEventContextManager(
-                    self._target,
-                    descriptor.event,
-                    self._matcher,
-                    self._timeout,
-                )
-                local_context.__enter__()
-                local_context.__exit__(exc_type, exc, tb)
-                self._value = local_context.value
-                self._complete = True
-            self._defer_to_local_context = False
+            try:
+                if exc_type is None:
+                    local_context = _LocalEventContextManager(
+                        self._target,
+                        descriptor.event,
+                        self._matcher,
+                        self._timeout,
+                    )
+                    local_context.__enter__()
+                    local_context.__exit__(exc_type, exc, tb)
+                    self._value = local_context.value
+                    self._complete = True
+            finally:
+                self._defer_to_local_context = False
+                self._release_worker_interest_lease()
+                self._release_dialog_interest_lease()
             return
-        if descriptor.on_context_exit is not None:
-            descriptor.on_context_exit(self._target)
-        if exc_type is None:
-            self._value = _wait_for_descriptor_event(
-                self._target,
-                self._kind,
-                self._matcher,
-                timeout=self._timeout,
-                waiter=self._waiter,
-                competing_waiter=self._competing_waiter,
-                state=self._state,
-            )
-            self._complete = True
-        self._waiter = None
-        self._competing_waiter = None
+        try:
+            if descriptor.on_context_exit is not None:
+                descriptor.on_context_exit(self._target)
+            if exc_type is None:
+                self._value = _wait_for_descriptor_event(
+                    self._target,
+                    self._kind,
+                    self._matcher,
+                    timeout=self._timeout,
+                    waiter=self._waiter,
+                    competing_waiter=self._competing_waiter,
+                    state=self._state,
+                    deadline=self._deadline,
+                    timeout_display=self._timeout_display,
+                )
+                if self._release_dialog_interest is not None:
+                    if isinstance(self._value, Dialog):
+                        self._target._capture_dialog(
+                            self._value,
+                            self._release_dialog_interest,
+                        )
+                        self._release_dialog_interest = None
+                    else:
+                        self._release_dialog_interest_lease()
+                self._complete = True
+        finally:
+            self._waiter = None
+            self._competing_waiter = None
+            self._release_worker_interest_lease()
+            self._release_dialog_interest_lease()
 
     @property
     def value(self) -> Any:
@@ -8760,44 +9168,71 @@ class _ListenerEventContextManager:
         self._value: Any = None
         self._ready = threading.Event()
         self._handler: Optional[Callable[..., Any]] = None
+        self._deadline: Optional[float] = None
+        self._timeout_display = ""
+        self._dialog_owner_release: Optional[Callable[[], None]] = None
 
     def __enter__(self) -> "_ListenerEventContextManager":
         descriptor = _event_waiter_descriptor(self._kind)
+        _validate_event_matcher(self._kind, self._matcher, method=descriptor.timeout_method)
+        self._deadline, self._timeout_display = _event_deadline_for_target(
+            self._page,
+            self._timeout,
+            method=descriptor.timeout_method,
+        )
+        if self._kind == "dialog":
+            self._dialog_owner_release = self._page._acquire_dialog_waiter()
 
         def handler(value: Any) -> None:
             if self._value is None and descriptor.matches(self._page, self._matcher, value):
+                owner_release = self._dialog_owner_release
+                self._dialog_owner_release = None
+                if self._kind == "dialog" and isinstance(value, Dialog):
+                    self._page._capture_dialog(value, owner_release)
+                elif owner_release is not None:
+                    owner_release()
                 self._value = value
                 self._ready.set()
 
         self._handler = handler
-        self._page.on(descriptor.event, handler)
-        if self._include_existing and self._kind == "console":
-            for value in list(self._page._console_messages):
-                handler(value)
-                if self._ready.is_set():
-                    break
+        try:
+            self._page.on(descriptor.event, handler)
+            if self._include_existing and self._kind == "console":
+                for value in list(self._page._console_messages):
+                    handler(value)
+                    if self._ready.is_set():
+                        break
+        except BaseException:
+            if self._dialog_owner_release is not None:
+                self._dialog_owner_release()
+                self._dialog_owner_release = None
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         descriptor = _event_waiter_descriptor(self._kind)
         try:
             if exc_type is None:
-                timeout_ms, timeout_display = _event_timeout_for_target(
-                    self._page,
-                    self._timeout,
-                    method=descriptor.timeout_method,
+                timeout_ms = (
+                    None
+                    if self._deadline is None
+                    else max((self._deadline - time.monotonic()) * 1000, 0)
                 )
                 _wait_for_ready_event_or_owner_close(
                     self._ready,
                     self._page,
                     descriptor.event,
                     timeout_ms,
-                    timeout_display,
+                    self._timeout_display,
+                    deadline=self._deadline,
                 )
         finally:
             if self._handler is not None:
                 self._page.remove_listener(descriptor.event, self._handler)
             self._handler = None
+            if self._dialog_owner_release is not None:
+                self._dialog_owner_release()
+                self._dialog_owner_release = None
 
     @property
     def value(self) -> Any:
@@ -8861,9 +9296,26 @@ def _event_context_manager(
     kind: str,
     matcher: Any,
     timeout: Optional[float],
+    *,
+    prefer_native: bool = True,
 ) -> Any:
-    strategy = _event_waiter_descriptor(kind).context_manager
+    descriptor = _event_waiter_descriptor(kind)
+    _validate_event_matcher(kind, matcher, method=descriptor.timeout_method)
+    strategy = descriptor.context_manager
     if strategy == "native":
+        # A page-level console waiter observes the persistent Rust stream directly.
+        # Keep the listener bridge only when an existing page listener owns dispatch.
+        if (
+            kind == "console"
+            and (
+                not prefer_native
+                or (
+                    target.__class__.__name__ == "Page"
+                    and target._event_handlers.get("console")
+                )
+            )
+        ):
+            return _ListenerEventContextManager(target, kind, matcher, timeout)
         return _NativeEventContextManager(target, kind, matcher, timeout)
     if strategy == "listener":
         return _ListenerEventContextManager(target, kind, matcher, timeout)
@@ -9005,19 +9457,30 @@ class _ContextDialogEventContextManager:
         self._value: Optional[Dialog] = None
         self._context_handler: Optional[Callable[..., Any]] = None
         self._page_handlers: dict[Page, Callable[..., Any]] = {}
+        self._page_owner_releases: dict[Page, Callable[[], None]] = {}
 
     def __enter__(self) -> "_ContextDialogEventContextManager":
         def page_handler(page: "Page") -> None:
             if page in self._page_handlers or page.is_closed():
                 return
+            owner_release = page._acquire_dialog_waiter()
+            self._page_owner_releases[page] = owner_release
 
             def dialog_handler(dialog: Dialog) -> None:
                 if self._value is None and _dialog_event_matches(self._predicate, dialog):
+                    owner_release = self._page_owner_releases.pop(page, None)
+                    page._capture_dialog(dialog, owner_release)
                     self._value = dialog
                     self._ready.set()
 
             self._page_handlers[page] = dialog_handler
-            page.on("dialog", dialog_handler)
+            try:
+                page.on("dialog", dialog_handler)
+            except BaseException:
+                self._page_handlers.pop(page, None)
+                self._page_owner_releases.pop(page, None)
+                owner_release()
+                raise
 
         for page in self._context.pages:
             page_handler(page)
@@ -9047,6 +9510,10 @@ class _ContextDialogEventContextManager:
             for page, handler in list(self._page_handlers.items()):
                 page.remove_listener("dialog", handler)
             self._page_handlers.clear()
+            releases = list(self._page_owner_releases.values())
+            self._page_owner_releases.clear()
+            for release in releases:
+                release()
 
     @property
     def value(self) -> Dialog:
@@ -9642,29 +10109,71 @@ class Dialog(_EventEmitter):
         default_value = payload.get("default_value")
         self.default_value = "" if default_value is None else str(default_value)
         self._handled = False
+        self._fallback_lock = threading.Lock()
+        self._handle_lock = threading.Lock()
+        self._fallback_attempted = False
+        self._captured = False
+        self._dispatch: Optional[_DialogDispatch] = None
+        self._owner_releases: list[Callable[[], None]] = []
 
     @property
     def page(self) -> "Page":
         return self._page
 
+    def _attach_dispatch(self, dispatch: _DialogDispatch) -> None:
+        self._dispatch = dispatch
+        if self._captured:
+            dispatch.capture()
+
+    def _capture(self, owner_release: Optional[Callable[[], None]] = None) -> None:
+        release_now = False
+        with self._fallback_lock:
+            self._captured = True
+            if owner_release is not None:
+                if self._handled:
+                    release_now = True
+                else:
+                    self._owner_releases.append(owner_release)
+        dispatch = self._dispatch
+        if dispatch is not None:
+            dispatch.capture()
+        if release_now:
+            owner_release()
+
+    def _mark_handled(self) -> None:
+        with self._fallback_lock:
+            if self._handled:
+                return
+            self._handled = True
+            releases = self._owner_releases
+            self._owner_releases = []
+        dispatch = self._dispatch
+        if dispatch is not None:
+            dispatch.mark_handled()
+        self._page._dialog_was_handled(self)
+        for release in releases:
+            release()
+
     def accept(self, prompt_text: Optional[str] = None) -> None:
-        if self._handled:
-            raise Error("Dialog.accept: Cannot accept dialog which is already handled!")
-        if prompt_text is not None and not isinstance(prompt_text, str):
-            raise Error(f"Dialog.accept: prompt_text: expected string, got {_playwright_type_name(prompt_text)}")
-        _call(
-            self._page._core.handle_dialog,
-            True,
-            self.default_value if prompt_text is None and self.type == "prompt" else prompt_text,
-            self._page._default_timeout,
-        )
-        self._handled = True
+        with self._handle_lock:
+            if self._handled:
+                raise Error("Dialog.accept: Cannot accept dialog which is already handled!")
+            if prompt_text is not None and not isinstance(prompt_text, str):
+                raise Error(f"Dialog.accept: prompt_text: expected string, got {_playwright_type_name(prompt_text)}")
+            _call(
+                self._page._core.handle_dialog,
+                True,
+                self.default_value if prompt_text is None and self.type == "prompt" else prompt_text,
+                self._page._default_timeout,
+            )
+            self._mark_handled()
 
     def dismiss(self) -> None:
-        if self._handled:
-            raise Error("Dialog.dismiss: Cannot dismiss dialog which is already handled!")
-        _call(self._page._core.handle_dialog, False, None, self._page._default_timeout)
-        self._handled = True
+        with self._handle_lock:
+            if self._handled:
+                raise Error("Dialog.dismiss: Cannot dismiss dialog which is already handled!")
+            _call(self._page._core.handle_dialog, False, None, self._page._default_timeout)
+            self._mark_handled()
 
 
 def _console_arg_handle_payload(value: Any) -> dict[str, Any]:
@@ -9688,11 +10197,24 @@ class ConsoleMessage(_EventEmitter):
     def __init__(self, page: Optional["Page"], payload: dict[str, Any], *, worker: Optional["Worker"] = None):
         self.page = page
         self._worker = worker
+        event_sequence = payload.get("__rustwright_cdp_event_seq")
+        self._event_sequence = (
+            event_sequence
+            if isinstance(event_sequence, int) and not isinstance(event_sequence, bool)
+            else None
+        )
         self.type = str(payload.get("type") or "log")
         self.text = str(payload.get("text") or "")
         self.timestamp = float(payload.get("timestamp") or time.time() * 1000)
+        raw_args = list(payload.get("args") or [])
         owner_frame = None
-        if page is not None and worker is None:
+        has_remote_object_arg = any(
+            isinstance(value, dict)
+            and isinstance(remote := value.get("__rustwright_cdp_remote_object__"), dict)
+            and bool(remote.get("objectId"))
+            for value in raw_args
+        )
+        if page is not None and worker is None and has_remote_object_arg:
             session_id = payload.get("session_id")
             execution_context_id = payload.get("execution_context_id")
             if session_id is not None and execution_context_id is not None:
@@ -9707,7 +10229,7 @@ class ConsoleMessage(_EventEmitter):
                     owner_frame = None
         self.args = [
             JSHandle(page or worker, _console_arg_handle_payload(arg), owner_frame=owner_frame)
-            for arg in list(payload.get("args") or [])
+            for arg in raw_args
         ]
         location = payload.get("location")
         self.location = dict(location) if isinstance(location, dict) else {
@@ -11221,17 +11743,7 @@ class Browser:
             )
         if "downloads_path" not in effective_options and "downloadsPath" not in effective_options and self._launch_downloads_path is not None:
             effective_options["downloads_path"] = self._launch_downloads_path
-        if effective_options.get("proxy") is not None or self._launch_proxy is not None:
-            context = self._new_context_from_options(effective_options, method="Browser.new_page")
-            try:
-                page = context._new_page(method="Browser.new_page")
-            except Exception:
-                context.close()
-                raise
-            page._owns_context = True
-            return page
-        context = BrowserContext(None, browser=self, options=effective_options)
-        self._contexts.append(context)
+        context = self._new_context_from_options(effective_options, method="Browser.new_page")
         try:
             page = context._new_page(method="Browser.new_page")
         except Exception:
@@ -15209,6 +15721,7 @@ class Page:
         self._video: Optional[Video] = None
         self._request = context.request if context is not None else APIRequestContext()
         self._event_handlers: dict[str, list[Callable[..., Any]]] = {}
+        self._event_handler_cursors: dict[tuple[str, int], Optional[int]] = {}
         self._main_frame = Frame(self, name="", url="", is_main=True)
         self._set_content_html_document_known: Optional[bool] = True
         self._frame_object_cache: dict[str, Frame] = {}
@@ -15255,6 +15768,12 @@ class Page:
         self._proxy_auth_credentials: Optional[tuple[str, str]] = None
         self._http_auth_credentials: Optional[tuple[str, str, Optional[str]]] = None
         self._dialog_dispatch_count = 0
+        self._dialog_state_lock = threading.Lock()
+        self._dialog_waiter_count = 0
+        self._dialog_operation_count = 0
+        self._pending_dialog_dispatches: set[_DialogDispatch] = set()
+        self._page_cdp_event_condition = threading.Condition()
+        self._page_cdp_event_generations: dict[str, int] = {}
         self._crash_thread: Optional[threading.Thread] = None
         self._crash_session: Optional[CDPSession] = None
         self._crash_waiter: Any = None
@@ -15290,9 +15809,18 @@ class Page:
         self._pick_locator_state_name = _page_internal_global("pickLocator")
         self._pick_locator_cancelled = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
+        self._worker_thread_stop = threading.Event()
+        self._worker_thread_lock = threading.Lock()
+        self._worker_auto_attach_configured = False
         self._worker_waiter: Any = None
         self._workers: dict[str, Worker] = {}
-        self._worker_console_targets: set[str] = set()
+        self._worker_console_forwards: dict[str, tuple[Worker, Callable[[ConsoleMessage], None]]] = {}
+        self._worker_state_lock = threading.RLock()
+        self._worker_console_forward_lock = threading.RLock()
+        self._worker_interest_lock = threading.Lock()
+        self._worker_listener_interest = False
+        self._worker_waiter_interest_count = 0
+        self._worker_core_interest = False
         self._bindings: dict[str, tuple[Callable[..., Any], bool, bool]] = {}
         self._context_binding_names: set[str] = set()
         self._binding_server: Optional[ThreadingHTTPServer] = None
@@ -15316,6 +15844,9 @@ class Page:
         self._closed_reason: Optional[str] = None
         self._event_pump_stop_lock = threading.Lock()
         self._event_pump_stopped = False
+        self._event_dispatch_lock = threading.RLock()
+        self._event_dispatch_condition = threading.Condition(self._event_dispatch_lock)
+        self._event_handler_registrations: dict[tuple[str, int], _EventHandlerRegistration] = {}
         self._event_stream = self._core.combined_event_stream()
         self._event_pump_thread: Optional[threading.Thread] = None
         if _start_event_pump:
@@ -15747,8 +16278,11 @@ class Page:
     def _navigation_timeout(self, timeout: Optional[float]) -> float:
         return _validate_timeout_value(_effective_navigation_timeout_value(self, timeout), method="Page")
 
-    def _mark_navigation_history_boundary(self) -> None:
-        self._drain_history_buffers()
+    def _mark_navigation_history_boundary(self, before: Optional[tuple[int, int]] = None) -> None:
+        if before is not None and self._runtime_observation_enabled:
+            self._console_messages_navigation_index = before[0]
+            self._page_errors_navigation_index = before[1]
+            return
         self._console_messages_navigation_index = len(self._console_messages)
         self._page_errors_navigation_index = len(self._page_errors)
 
@@ -15831,6 +16365,71 @@ class Page:
             retained.append(response)
         self._navigation_responses = retained[-20:]
 
+    def _navigation_response_request_ids(self) -> list[str]:
+        request_ids: list[str] = []
+        for response in self._navigation_responses:
+            if response._body_cache is not None:
+                continue
+            if response._request_id:
+                request_ids.append(str(response._request_id))
+            else:
+                response._body_cache = b""
+        return request_ids
+
+    def _apply_retained_navigation_response_bodies(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        retained = payload.get("response_bodies")
+        if not isinstance(retained, dict):
+            return
+        responses = {
+            str(response._request_id): response
+            for response in self._navigation_responses
+            if response._request_id and response._body_cache is None
+        }
+        for request_id, body_payload in retained.items():
+            response = responses.get(str(request_id))
+            if response is None:
+                continue
+            try:
+                response._set_body_from_payload(body_payload)
+            except (TypeError, ValueError):
+                continue
+
+    def _record_drained_history_payload(self, payload: Any) -> None:
+        if self._runtime_observation_enabled or not isinstance(payload, dict):
+            return
+        console_payloads = payload.get("console")
+        if isinstance(console_payloads, list):
+            for item in console_payloads:
+                if isinstance(item, dict):
+                    self._record_console_message(ConsoleMessage(self, item))
+        page_error_payloads = payload.get("page_errors")
+        if isinstance(page_error_payloads, list):
+            for item in page_error_payloads:
+                if isinstance(item, dict):
+                    self._record_page_error(_page_error_from_history_payload(item))
+
+    def _prepare_navigation(self) -> tuple[tuple[int, int], dict[str, Any]]:
+        before = (len(self._console_messages), len(self._page_errors))
+        request_ids = self._navigation_response_request_ids()
+        try:
+            payload = json.loads(
+                _call(
+                    self._core.prepare_navigation,
+                    _CONSOLE_HISTORY_BUFFER,
+                    _PAGE_ERROR_HISTORY_BUFFER,
+                    json.dumps(request_ids),
+                )
+            )
+        except (Error, TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        self._apply_retained_navigation_response_bodies(payload)
+        self._record_drained_history_payload(payload)
+        return before, payload
+
     def _uses_single_process_fallback(self) -> bool:
         browser = self._context._browser if self._context is not None else None
         if browser is None:
@@ -15848,6 +16447,7 @@ class Page:
     def _mark_request_cookie_sync_required(self) -> None:
         if self._context is not None:
             self._context._mark_request_cookie_sync_required()
+
 
     def goto(
         self,
@@ -15870,6 +16470,7 @@ class Page:
             normalized_referer = _normalize_string_option(referer, method="Page.goto", name="referer")
         target_url = self._resolve_url(url)
         self._mark_request_cookie_sync_required()
+        self._set_content_html_document_known = None
         call_id = self._trace_begin_action(
             "goto",
             {
@@ -15883,9 +16484,6 @@ class Page:
             self._uses_single_process_fallback() and target_url.lower().startswith("chrome://crash")
         )
         try:
-            self._retain_navigation_response_bodies()
-            self._mark_navigation_history_boundary()
-            self._set_content_html_document_known = None
             try:
                 target_scheme = url_parse.urlparse(target_url).scheme.lower()
             except ValueError:
@@ -15893,15 +16491,31 @@ class Page:
             download_waiter = (
                 self._download_event_waiter() if target_scheme in {"http", "https"} else None
             )
+            lifecycle_event = (
+                "domcontentloaded"
+                if normalized_state == "domcontentloaded"
+                else None
+                if normalized_state == "commit"
+                else "load"
+            )
+            lifecycle_generation = (
+                self._page_cdp_event_generation(lifecycle_event)
+                if lifecycle_event is not None
+                else None
+            )
+            before, _ = self._prepare_navigation()
+            self._mark_navigation_history_boundary(before)
             try:
-                payload = json.loads(_call_wait_with_playwright_timeout(
-                    "Page.goto",
-                    self._core.goto,
-                    target_url,
-                    normalized_state,
-                    navigation_timeout,
-                    normalized_referer,
-                ))
+                payload = json.loads(
+                    _call_wait_with_playwright_timeout(
+                        "Page.goto",
+                        self._core.goto,
+                        target_url,
+                        normalized_state,
+                        navigation_timeout,
+                        normalized_referer,
+                    )
+                )
             except Error as exc:
                 message = str(exc).splitlines()[0]
                 if (
@@ -15937,6 +16551,12 @@ class Page:
                     self._trace_end_action(call_id, result={"response": {"url": response.url, "status": response.status}})
                     return self._remember_navigation_response(response)
                 raise
+            if lifecycle_event is not None and lifecycle_generation is not None:
+                self._wait_for_page_cdp_event_dispatch(
+                    lifecycle_event,
+                    lifecycle_generation,
+                    navigation_timeout,
+                )
             if payload is None or target_url.lower().startswith(("about:", "data:")):
                 if self._context is not None:
                     self._context._apply_storage_state_to_page(self)
@@ -15978,8 +16598,8 @@ class Page:
             prior_time_origin = self.evaluate("() => performance.timeOrigin")
         except Error:
             prior_time_origin = None
-        self._retain_navigation_response_bodies()
-        self._mark_navigation_history_boundary()
+        before, _ = self._prepare_navigation()
+        self._mark_navigation_history_boundary(before)
         self._set_content_html_document_known = None
         waiter = self._core.network_event_waiter("response")
         payload = json.loads(_call_wait_with_playwright_timeout("Page.reload", self._core.reload, "commit", reload_timeout))
@@ -16109,10 +16729,10 @@ class Page:
     ) -> Optional[Response]:
         navigation_timeout = _navigation_timeout_for_method(self, timeout, method="Page.go_back")
         normalized_state = _normalize_lifecycle_state(wait_until, label="wait_until", method="Page.go_back")
-        boundary = self._navigation_history_boundary()
-        self._retain_navigation_response_bodies()
-        self._mark_navigation_history_boundary()
         self._set_content_html_document_known = None
+        boundary = self._navigation_history_boundary()
+        before, _ = self._prepare_navigation()
+        self._mark_navigation_history_boundary(before)
         before_url = self.url
         try:
             payload = json.loads(_call_wait_with_playwright_timeout(
@@ -16143,8 +16763,8 @@ class Page:
         navigation_timeout = _navigation_timeout_for_method(self, timeout, method="Page.go_forward")
         normalized_state = _normalize_lifecycle_state(wait_until, label="wait_until", method="Page.go_forward")
         boundary = self._navigation_history_boundary()
-        self._retain_navigation_response_bodies()
-        self._mark_navigation_history_boundary()
+        before, _ = self._prepare_navigation()
+        self._mark_navigation_history_boundary(before)
         self._set_content_html_document_known = None
         before_url = self.url
         try:
@@ -16329,11 +16949,10 @@ class Page:
             reject_on_close=reject_on_close,
         )
 
-    def _page_error_event_waiter(self) -> Any:
-        session = _call(self._core.cdp_session)
-        _call(session.send, "Runtime.enable", json_module_dumps({}), self._default_timeout)
+    def _page_error_event_waiter(self, timeout_ms: Optional[float] = None) -> Any:
+        waiter = _call(self._core.page_error_event_waiter, timeout_ms)
         self._runtime_observation_enabled = True
-        return session.event_waiter("Runtime.exceptionThrown")
+        return waiter
 
     def _wait_for_page_error_event(
         self,
@@ -16518,87 +17137,242 @@ class Page:
     def expect_websocket(self, predicate: Any = None, *, timeout: Optional[float] = None) -> _WebSocketEventContextManager:
         return _event_context_manager(self, "websocket", predicate, timeout)
 
-    def _worker_event_waiter(self) -> Any:
-        return self._core.worker_event_waiter(self._default_timeout)
+    def _sync_worker_event_interest_locked(self) -> None:
+        interested = self._worker_listener_interest or self._worker_waiter_interest_count > 0
+        if interested == self._worker_core_interest:
+            return
+        setter = getattr(self._core, "set_worker_event_interest", None)
+        if callable(setter):
+            _call(setter, interested, self._default_timeout)
+        self._worker_core_interest = interested
+
+    def _sync_worker_event_interest(self) -> None:
+        with self._worker_interest_lock:
+            self._sync_worker_event_interest_locked()
+
+    def _set_worker_event_interest(self, interested: bool) -> None:
+        with self._worker_interest_lock:
+            self._worker_listener_interest = bool(interested)
+            self._sync_worker_event_interest_locked()
+
+    def _set_worker_forwarding_interest(self, interested: bool) -> None:
+        setter = getattr(self._core, "set_worker_forwarding_interest", None)
+        if not callable(setter):
+            return
+        _call(setter, bool(interested), self._default_timeout)
+
+    def _acquire_worker_waiter_interest(self) -> Callable[[], None]:
+        with self._worker_interest_lock:
+            self._worker_waiter_interest_count += 1
+            try:
+                self._sync_worker_event_interest_locked()
+            except BaseException:
+                self._worker_waiter_interest_count -= 1
+                raise
+        released = False
+        release_lock = threading.Lock()
+
+        def release() -> None:
+            nonlocal released
+            with release_lock:
+                if released:
+                    return
+                released = True
+            with self._worker_interest_lock:
+                self._worker_waiter_interest_count = max(
+                    self._worker_waiter_interest_count - 1,
+                    0,
+                )
+                self._sync_worker_event_interest_locked()
+
+        return release
+
+    def _worker_event_waiter(
+        self,
+        *,
+        configure: Optional[bool] = None,
+        timeout_ms: Optional[float] = None,
+    ) -> Any:
+        if configure is None:
+            configure = not self._worker_auto_attach_configured
+        setup_timeout = self._default_timeout if timeout_ms is None else timeout_ms
+        waiter = _call(self._core.worker_event_waiter, setup_timeout, configure=configure)
+        if configure:
+            self._worker_auto_attach_configured = True
+        return waiter
+
+    @staticmethod
+    def _worker_forward_key(worker: "Worker") -> str:
+        return worker._target_id or worker.url or str(id(worker))
+
+    def _remove_worker(self, worker: "Worker") -> None:
+        target_id = worker._target_id
+        if target_id:
+            with self._worker_state_lock:
+                if self._workers.get(target_id) is worker:
+                    self._workers.pop(target_id, None)
+        key = self._worker_forward_key(worker)
+        with self._worker_console_forward_lock:
+            forward = self._worker_console_forwards.get(key)
+            if forward is None or forward[0] is not worker:
+                return
+            self._worker_console_forwards.pop(key, None)
+            try:
+                worker.remove_listener("console", forward[1])
+            except Exception:
+                pass
+
+    def _drop_worker_close_cleanup(self, worker: "Worker") -> None:
+        callback = getattr(worker, "_rustwright_page_close_handler", None)
+        if callback is None:
+            return
+        try:
+            worker.remove_listener("close", callback)
+        except Exception:
+            pass
+        try:
+            delattr(worker, "_rustwright_page_close_handler")
+        except AttributeError:
+            pass
+
+    def _cache_worker(self, worker: "Worker") -> "Worker":
+        target_id = worker._target_id
+        previous: Optional[Worker] = None
+        if target_id:
+            with self._worker_state_lock:
+                previous = self._workers.get(target_id)
+                self._workers[target_id] = worker
+        if previous is not None and previous is not worker:
+            self._remove_worker(previous)
+            self._drop_worker_close_cleanup(previous)
+        if isinstance(worker, Worker) and getattr(worker, "_rustwright_page_close_handler", None) is None:
+            def on_close(_closed_worker: "Worker") -> None:
+                self._remove_worker(worker)
+
+            setattr(worker, "_rustwright_page_close_handler", on_close)
+            try:
+                worker.on("close", on_close)
+            except Exception:
+                if getattr(worker, "_closed", False):
+                    self._remove_worker(worker)
+        return worker
 
     def _worker_from_core(self, core: Any) -> "Worker":
         target_id = str(getattr(core, "target_id", "") or "")
-        worker = Worker(core=core, page=self)
+        session_id = str(getattr(core, "session_id", "") or "")
+        worker: Optional[Worker] = None
         if target_id:
-            self._workers[target_id] = worker
-        self._attach_worker_console_propagation(worker)
+            with self._worker_state_lock:
+                existing = self._workers.get(target_id)
+            if (
+                existing is not None
+                and not existing._closed
+                and existing._session_id == session_id
+            ):
+                worker = existing
+        if worker is None:
+            worker = Worker(core=core, page=self)
+        self._cache_worker(worker)
+        attach_succeeded = False
+        claimed = True
+        try:
+            claim = getattr(worker, "_claim_capture_handoff", None)
+            if callable(claim):
+                claimed = claim()
+            self._attach_worker_console_propagation(worker)
+            mark_ready = getattr(worker, "_mark_capture_ready", None)
+            if callable(mark_ready):
+                mark_ready()
+            attach_succeeded = True
+            if claimed and not worker._resume_if_waiting_for_debugger():
+                raise RuntimeError("worker debugger resume failed")
+        except BaseException:
+            if claimed:
+                fail = getattr(worker, "_fail_capture_handoff", None)
+                if callable(fail):
+                    try:
+                        fail()
+                    except BaseException:
+                        pass
+            if not attach_succeeded:
+                self._remove_worker(worker)
         return worker
 
+
     def _attach_worker_console_propagation(self, worker: "Worker") -> None:
-        if not self._event_handlers.get("console"):
-            return
-        key = worker._target_id or worker.url or str(id(worker))
-        if key in self._worker_console_targets:
-            return
-        self._worker_console_targets.add(key)
+        key = self._worker_forward_key(worker)
 
         def forward(message: ConsoleMessage) -> None:
             self._record_console_message(message)
-            for handler in list(self._event_handlers.get("console", [])):
+            self._dispatch_event_handlers(
+                "console",
+                message,
+                event_sequence=getattr(message, "_event_sequence", None),
+            )
+
+        with self._worker_console_forward_lock:
+            with self._event_dispatch_condition:
+                if not self._event_handlers.get("console"):
+                    return
+                if key in self._worker_console_forwards:
+                    return
+                self._worker_console_forwards[key] = (worker, forward)
+            try:
+                worker.on("console", forward)
+            except BaseException:
+                with self._event_dispatch_condition:
+                    if self._worker_console_forwards.get(key) == (worker, forward):
+                        self._worker_console_forwards.pop(key, None)
                 try:
-                    handler(message)
+                    worker.remove_listener("console", forward)
+                finally:
+                    raise
+
+    def _detach_worker_console_propagation(self, *, force: bool = False) -> None:
+        with self._worker_console_forward_lock:
+            with self._event_dispatch_condition:
+                if not force and self._event_handlers.get("console"):
+                    return
+                forwards = list(self._worker_console_forwards.values())
+                self._worker_console_forwards.clear()
+                drop_close_cleanup = force or not (
+                    self._event_handlers.get("console") or self._event_handlers.get("worker")
+                )
+            for worker, forward in forwards:
+                try:
+                    worker.remove_listener("console", forward)
                 except Exception:
-                    continue
+                    pass
+        if drop_close_cleanup:
+            with self._worker_state_lock:
+                workers = list(self._workers.values())
+            for worker in workers:
+                self._drop_worker_close_cleanup(worker)
 
-        worker.on("console", forward)
-
-    def _evaluate_history_buffer(self, expression: str, arg: Any) -> Any:
+    def _drain_history_buffers(
+        self,
+        *,
+        record_console: bool = True,
+        record_page_errors: bool = True,
+    ) -> None:
         try:
-            payload = _call(self._core.evaluate, expression, json.dumps(arg), 250.0)
-            return _decode_json_result_json(payload)
+            payload = json.loads(
+                _call(
+                    self._core.prepare_navigation,
+                    _CONSOLE_HISTORY_BUFFER,
+                    _PAGE_ERROR_HISTORY_BUFFER,
+                    "[]",
+                )
+            )
         except (Error, TypeError, ValueError):
-            return None
-
-    def _drain_history_buffers(self) -> None:
-        self._drain_console_history_buffer()
-        self._drain_page_error_history_buffer()
-
-    def _drain_console_history_buffer(self) -> None:
-        payloads = self._evaluate_history_buffer(
-            """(name) => {
-              try {
-                const history = console && console[name];
-                if (!Array.isArray(history) || history.length === 0) return [];
-                return history.splice(0, history.length);
-              } catch (_) {
-                return [];
-              }
-            }""",
-            _CONSOLE_HISTORY_BUFFER,
-        )
-        if not isinstance(payloads, list):
             return
-        if self._runtime_observation_enabled:
+        if not isinstance(payload, dict):
             return
-        for payload in payloads:
-            if isinstance(payload, dict):
-                self._record_console_message(ConsoleMessage(self, payload))
-
-    def _drain_page_error_history_buffer(self, *, record: bool = True) -> None:
-        payloads = self._evaluate_history_buffer(
-            """(name) => {
-              try {
-                const history = window && window[name];
-                if (!Array.isArray(history) || history.length === 0) return [];
-                return history.splice(0, history.length);
-              } catch (_) {
-                return [];
-              }
-            }""",
-            _PAGE_ERROR_HISTORY_BUFFER,
-        )
-        if not isinstance(payloads, list):
-            return
-        if not record or self._runtime_observation_enabled:
-            return
-        for payload in payloads:
-            if isinstance(payload, dict):
-                self._record_page_error(_page_error_from_history_payload(payload))
+        if not record_console:
+            payload["console"] = []
+        if not record_page_errors:
+            payload["page_errors"] = []
+        self._record_drained_history_payload(payload)
 
     def _record_console_message(self, message: ConsoleMessage) -> None:
         self._console_messages_skip_wait_until = 0.0
@@ -16623,13 +17397,19 @@ class Page:
             self._console_messages_condition.notify_all()
 
     def _attach_existing_worker_console_propagation(self) -> None:
-        for worker in list(self._workers.values()):
-            self._attach_worker_console_propagation(worker)
         try:
-            for worker in self.workers:
+            workers = self.workers
+        except Exception:
+            with self._worker_state_lock:
+                workers = list(self._workers.values())
+        for worker in workers:
+            if getattr(worker, "_closed", False):
+                self._remove_worker(worker)
+                continue
+            try:
                 self._attach_worker_console_propagation(worker)
-        except Error:
-            pass
+            except Exception:
+                self._remove_worker(worker)
 
     def _wait_for_worker_event(
         self,
@@ -16884,7 +17664,7 @@ class Page:
         if event in {"requestfinished", "requestfailed"}:
             return _event_context_manager(self, event, predicate, timeout)
         if event == "console":
-            return self.expect_console_message(predicate, timeout=timeout)
+            return _event_context_manager(self, "console", predicate, timeout)
         if event == "dialog":
             return _event_context_manager(self, "dialog", predicate, timeout)
         if event == "pageerror":
@@ -17842,6 +18622,7 @@ class Page:
             _ensure_evaluate_argument_context(self, self._main_frame, arg, method=method)
         self._mark_request_cookie_sync_required()
         self._mark_history_events_may_arrive()
+        dialog_operation_release = self._begin_dialog_operation()
         console_marker = self._console_dispatch_marker_if_listening()
         trace_params = None
         if self._context is not None and self._context.tracing._recording:
@@ -17881,8 +18662,10 @@ class Page:
                 else:
                     value = _decode_json_result_json(result)
         except Exception as exc:
+            dialog_operation_release()
             self._trace_end_action(call_id, error=exc)
             raise
+        dialog_operation_release()
         self._trace_end_action(call_id, result={"value": value})
         self._settle_console_dispatch_after_action(console_marker)
         return value
@@ -18235,6 +19018,7 @@ class Page:
             "click",
             {"selector": selector, "timeout": self._default_timeout if timeout is None else timeout, **action_options},
         )
+        dialog_operation_release = self._begin_dialog_operation()
         try:
             self._selector_locator(selector, {"strict": strict})._click_impl(
                 "Page.click",
@@ -18249,8 +19033,10 @@ class Page:
                 trial=trial,
             )
         except Exception as exc:
+            dialog_operation_release()
             self._trace_end_action(call_id, error=exc)
             raise
+        dialog_operation_release()
         self._trace_end_action(call_id)
 
     def dblclick(
@@ -19099,6 +19885,7 @@ class Page:
             tagged=tagged,
             outline=outline,
         )
+
         encoded = _call(
             self._core.pdf,
             normalized_path,
@@ -19106,6 +19893,36 @@ class Page:
             json.dumps(pdf_options, separators=(",", ":")),
         )
         return base64.b64decode(encoded)
+
+    @property
+    def workers(self) -> list[Any]:
+        try:
+            core_workers = _call(self._core.list_workers, self._default_timeout)
+        except Exception:
+            with self._worker_state_lock:
+                return list(self._workers.values())
+        live_target_ids: set[str] = set()
+        for core_worker in core_workers:
+            target_id = str(getattr(core_worker, "target_id", "") or "")
+            if not target_id:
+                continue
+            try:
+                worker = self._worker_from_core(core_worker)
+            except Exception:
+                continue
+            if getattr(worker, "_closed", False):
+                continue
+            live_target_ids.add(target_id)
+        with self._worker_state_lock:
+            stale_workers = [
+                worker
+                for target_id, worker in self._workers.items()
+                if target_id not in live_target_ids
+            ]
+        for worker in stale_workers:
+            self._remove_worker(worker)
+        with self._worker_state_lock:
+            return list(self._workers.values())
 
     def wait_for_timeout(self, timeout: float) -> None:
         time.sleep(_normalize_wait_timeout(timeout, method="Page.wait_for_timeout") / 1000)
@@ -19129,6 +19946,22 @@ class Page:
         if pump is not None and pump is not threading.current_thread():
             pump.join(timeout=1.0)
 
+    def _stop_worker_thread(self) -> None:
+        lock = getattr(self, "_worker_thread_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._worker_thread_lock = lock
+        with lock:
+            self._worker_thread_stop.set()
+            worker = self._worker_thread
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=0.2)
+
+    def _reap_worker_event_threads(self) -> None:
+        for worker in list(self._workers.values()):
+            worker._closed = True
+            worker._reap_event_threads()
+
     def _mark_owned_cdp_sessions_closed(self) -> None:
         sessions = list(self._owned_cdp_sessions)
         self._owned_cdp_sessions.clear()
@@ -19141,13 +19974,6 @@ class Page:
     def opener(self) -> Optional["Page"]:
         return self._opener
 
-    @property
-    def workers(self) -> list[Any]:
-        if self._workers:
-            return list(self._workers.values())
-        for core_worker in _call(self._core.list_workers, self._default_timeout):
-            self._worker_from_core(core_worker)
-        return list(self._workers.values())
 
     def requests(self) -> list[Request]:
         if not self._closed and time.monotonic() < self._request_history_wait_until:
@@ -19169,7 +19995,7 @@ class Page:
     def console_messages(self, *, filter: Optional[str] = None) -> list[ConsoleMessage]:
         if filter not in {None, "all", "since-navigation"}:
             raise Error("Page.console_messages: filter: expected one of (all|since-navigation)")
-        self._drain_console_history_buffer()
+        self._drain_history_buffers()
         messages = self._console_messages_snapshot(filter)
         if not self._closed:
             if messages:
@@ -19235,7 +20061,7 @@ class Page:
     def page_errors(self, *, filter: Optional[str] = None) -> list[Any]:
         if filter not in {None, "all", "since-navigation"}:
             raise Error("Page.page_errors: filter: expected one of (all|since-navigation)")
-        self._drain_page_error_history_buffer()
+        self._drain_history_buffers()
         errors = self._page_errors_snapshot(filter)
         if not errors and not self._closed:
             generation = self._page_errors_generation
@@ -19243,12 +20069,12 @@ class Page:
                 with self._page_errors_condition:
                     if self._page_errors_generation == generation:
                         self._page_errors_condition.wait(timeout=_HISTORY_EVENT_DRAIN_TIMEOUT_SECONDS)
-                self._drain_page_error_history_buffer()
+                self._drain_history_buffers()
                 errors = self._page_errors_snapshot(filter)
         return errors
 
     def clear_page_errors(self) -> None:
-        self._drain_page_error_history_buffer(record=False)
+        self._drain_history_buffers(record_page_errors=False)
         self._page_errors.clear()
         self._page_errors_navigation_index = 0
         self._page_errors_skip_wait_until = time.monotonic() + _HISTORY_EVENT_DRAIN_TIMEOUT_SECONDS
@@ -19561,6 +20387,9 @@ class Page:
                     time.sleep(0.01)
         finally:
             self._stop_event_pump()
+            self._detach_worker_console_propagation(force=True)
+            self._stop_worker_thread()
+            self._reap_worker_event_threads()
         self._closed = True
         self._closing = True
         self._mark_owned_cdp_sessions_closed()
@@ -19618,32 +20447,429 @@ class Page:
     def get_by_title(self, text: str, *, exact: bool = False) -> "Locator":
         return Locator(self, {"kind": "title", "value": _attribute_text_matcher(text), "exact": exact})
 
+    @staticmethod
+    def _event_dispatch_owner() -> Any:
+        owner = _EVENT_DISPATCH_OWNER.get()
+        return owner if owner is not None else threading.get_ident()
+
+    def _retire_event_handler_registration_locked(self, state: _EventHandlerRegistration) -> None:
+        if not state.cancelled or state.pending or state.executing:
+            return
+        key = (state.event, id(state.handler))
+        if self._event_handler_registrations.get(key) is state:
+            self._event_handler_registrations.pop(key, None)
+
+    def _cancel_event_handler_locked(
+        self,
+        event: str,
+        handler: Callable[..., Any],
+    ) -> Optional[_EventHandlerRegistration]:
+        key = (event, id(handler))
+        state = self._event_handler_registrations.get(key)
+        if state is None or state.handler is not handler:
+            return None
+        state.cancelled = True
+        state.pending = 0
+        self._retire_event_handler_registration_locked(state)
+        self._event_dispatch_condition.notify_all()
+        return state
+
+    def _activate_event_handler(
+        self,
+        state: _EventHandlerRegistration,
+        owner: Any,
+    ) -> bool:
+        with self._event_dispatch_condition:
+            if state.cancelled or state.pending <= 0:
+                self._retire_event_handler_registration_locked(state)
+                return False
+            state.pending -= 1
+            state.executing[owner] = state.executing.get(owner, 0) + 1
+            return True
+
+    def _defer_current_event_handler(self) -> Optional[_EventHandlerRegistration]:
+        state = _EVENT_DISPATCH_REGISTRATION.get()
+        owner = self._event_dispatch_owner()
+        if not isinstance(state, _EventHandlerRegistration):
+            return None
+        with self._event_dispatch_condition:
+            if state.cancelled or state.executing.get(owner, 0) <= 0:
+                return None
+            count = state.executing[owner] - 1
+            if count:
+                state.executing[owner] = count
+            else:
+                state.executing.pop(owner, None)
+            state.pending += 1
+            _EVENT_DISPATCH_DEFERRED.set(True)
+            self._event_dispatch_condition.notify_all()
+            return state
+
+    def _activate_deferred_event_handler(
+        self,
+        state: _EventHandlerRegistration,
+        owner: Any,
+    ) -> bool:
+        activated = self._activate_event_handler(state, owner)
+        if not activated:
+            dispatch = _EVENT_DIALOG_DISPATCH.get()
+            if isinstance(dispatch, _DialogDispatch):
+                dispatch.settle()
+        return activated
+
+    def _release_deferred_event_handler(self, state: _EventHandlerRegistration) -> None:
+        with self._event_dispatch_condition:
+            if state.pending > 0:
+                state.pending -= 1
+            self._retire_event_handler_registration_locked(state)
+            self._event_dispatch_condition.notify_all()
+        dispatch = _EVENT_DIALOG_DISPATCH.get()
+        if isinstance(dispatch, _DialogDispatch):
+            dispatch.settle()
+
+    def _finish_event_handler(
+        self,
+        state: _EventHandlerRegistration,
+        owner: Any = None,
+    ) -> None:
+        owner = self._event_dispatch_owner() if owner is None else owner
+        with self._event_dispatch_condition:
+            count = state.executing.get(owner, 0)
+            if count <= 1:
+                state.executing.pop(owner, None)
+            else:
+                state.executing[owner] = count - 1
+            self._retire_event_handler_registration_locked(state)
+            self._event_dispatch_condition.notify_all()
+        dispatch = _EVENT_DIALOG_DISPATCH.get()
+        if isinstance(dispatch, _DialogDispatch):
+            dispatch.settle()
+
+    def _wait_for_event_handler_removal(
+        self,
+        event: str,
+        handler: Callable[..., Any],
+    ) -> None:
+        owner = self._event_dispatch_owner()
+        key = (event, id(handler))
+        current_loop, current_task = _running_asyncio_loop_and_task()
+        with self._event_dispatch_condition:
+            while True:
+                state = self._event_handler_registrations.get(key)
+                if state is None or state.handler is not handler:
+                    return
+                if state.executing.get(owner, 0) and (
+                    current_task is None or owner is current_task
+                ):
+                    return
+                if current_loop is not None:
+                    loop_owned = False
+                    for executing_owner in state.executing:
+                        if executing_owner is current_task:
+                            continue
+                        get_loop = getattr(executing_owner, "get_loop", None)
+                        if not callable(get_loop):
+                            continue
+                        try:
+                            executing_loop = get_loop()
+                        except Exception:
+                            continue
+                        if executing_loop is not current_loop:
+                            continue
+                        loop_owned = True
+                        cancel = getattr(executing_owner, "cancel", None)
+                        if callable(cancel):
+                            cancel()
+                    if loop_owned:
+                        return
+                if not state.executing:
+                    self._retire_event_handler_registration_locked(state)
+                    return
+                self._event_dispatch_condition.wait()
+
+    def _listener_registration_cursor(self, event: str) -> Optional[int]:
+        dispatch_context = _EVENT_DISPATCH_SEQUENCE.get()
+        if isinstance(dispatch_context, tuple) and len(dispatch_context) == 2:
+            dispatch_source, dispatch_sequence = dispatch_context
+            if (
+                dispatch_source is self
+                and isinstance(dispatch_sequence, int)
+                and not isinstance(dispatch_sequence, bool)
+            ):
+                return dispatch_sequence + 1
+        cursor_method = getattr(self._core, "event_cursor", None)
+        if callable(cursor_method):
+            try:
+                return int(cursor_method())
+            except (Error, TypeError, ValueError):
+                pass
+        return None
+
+    def _dialog_fallback_suppressed(self, dialog: Dialog) -> bool:
+        if getattr(dialog, "_captured", False):
+            return True
+        with self._dialog_state_lock:
+            return self._dialog_waiter_count > 0 or self._dialog_operation_count > 0
+
+    def _dialog_dispatch_finished(self, dispatch: _DialogDispatch) -> None:
+        if getattr(dispatch.dialog, "_handled", False):
+            return
+        with self._dialog_state_lock:
+            self._pending_dialog_dispatches.add(dispatch)
+        dispatch.maybe_fallback()
+
+    def _forget_dialog_dispatch(self, dispatch: _DialogDispatch) -> None:
+        with self._dialog_state_lock:
+            self._pending_dialog_dispatches.discard(dispatch)
+
+    def _dialog_was_handled(self, _dialog: Dialog) -> None:
+        with self._dialog_state_lock:
+            pending = list(self._pending_dialog_dispatches)
+            self._pending_dialog_dispatches.clear()
+        for dispatch in pending:
+            dispatch.mark_handled()
+
+    def _maybe_fallback_pending_dialogs(self) -> None:
+        with self._dialog_state_lock:
+            pending = list(self._pending_dialog_dispatches)
+        for dispatch in pending:
+            dispatch.maybe_fallback()
+
+    def _acquire_dialog_waiter(self) -> Callable[[], None]:
+        with self._dialog_state_lock:
+            self._dialog_waiter_count += 1
+        released = False
+        release_lock = threading.Lock()
+
+        def release() -> None:
+            nonlocal released
+            with release_lock:
+                if released:
+                    return
+                released = True
+            with self._dialog_state_lock:
+                self._dialog_waiter_count = max(self._dialog_waiter_count - 1, 0)
+            self._maybe_fallback_pending_dialogs()
+
+        return release
+
+    def _begin_dialog_operation(self) -> Callable[[], None]:
+        with self._dialog_state_lock:
+            self._dialog_operation_count += 1
+        released = False
+        release_lock = threading.Lock()
+
+        def release() -> None:
+            nonlocal released
+            with release_lock:
+                if released:
+                    return
+                released = True
+            with self._dialog_state_lock:
+                self._dialog_operation_count = max(self._dialog_operation_count - 1, 0)
+            self._maybe_fallback_pending_dialogs()
+
+        return release
+
+    def _capture_dialog(
+        self,
+        dialog: Dialog,
+        owner_release: Optional[Callable[[], None]] = None,
+    ) -> None:
+        dialog._capture(owner_release)
+
+    def _dialog_operation_active(self) -> bool:
+        with self._dialog_state_lock:
+            return self._dialog_operation_count > 0
+
+    def _dispatch_event_handlers(
+        self,
+        event: str,
+        *args: Any,
+        event_sequence: Optional[int] = None,
+        _dialog_dispatch: Optional[_DialogDispatch] = None,
+    ) -> bool:
+        registrations = self._snapshot_event_handlers(event, event_sequence=event_sequence)
+        dialog_dispatch = _dialog_dispatch
+        if dialog_dispatch is None and event == "dialog" and args:
+            dialog_dispatch = _DialogDispatch(self, args[0], len(registrations))
+            attach_dispatch = getattr(args[0], "_attach_dispatch", None)
+            if callable(attach_dispatch):
+                attach_dispatch(dialog_dispatch)
+        activated = False
+        for state in registrations:
+            owner = threading.get_ident()
+            if not self._activate_event_handler(state, owner):
+                if dialog_dispatch is not None:
+                    dialog_dispatch.settle()
+                continue
+            activated = True
+            if event == "dialog" and args and self._dialog_operation_active():
+                capture = getattr(args[0], "_capture", None)
+                if callable(capture):
+                    capture()
+            sequence_token = _EVENT_DISPATCH_SEQUENCE.set((self, event_sequence))
+            owner_token = _EVENT_DISPATCH_OWNER.set(owner)
+            registration_token = _EVENT_DISPATCH_REGISTRATION.set(state)
+            deferred_token = _EVENT_DISPATCH_DEFERRED.set(False)
+            dialog_token = _EVENT_DIALOG_DISPATCH.set(dialog_dispatch)
+            try:
+                try:
+                    state.handler(*args)
+                except Exception:
+                    continue
+            finally:
+                deferred = _EVENT_DISPATCH_DEFERRED.get()
+                _EVENT_DISPATCH_DEFERRED.reset(deferred_token)
+                _EVENT_DISPATCH_REGISTRATION.reset(registration_token)
+                _EVENT_DISPATCH_OWNER.reset(owner_token)
+                _EVENT_DISPATCH_SEQUENCE.reset(sequence_token)
+                if not deferred:
+                    self._finish_event_handler(state, owner)
+                _EVENT_DIALOG_DISPATCH.reset(dialog_token)
+        if dialog_dispatch is not None:
+            dialog_dispatch.finish_if_idle()
+        return activated
+
+    def _dismiss_dialog_if_unhandled(self, dialog: Dialog) -> None:
+        with dialog._fallback_lock:
+            if dialog._handled or dialog._fallback_attempted:
+                return
+            dialog._fallback_attempted = True
+        try:
+            dialog.dismiss()
+        except Exception:
+            pass
+        finally:
+            dispatch = getattr(dialog, "_dispatch", None)
+            if dispatch is not None:
+                self._forget_dialog_dispatch(dispatch)
+
+    def _handle_dialog_event(self, payload: dict[str, Any]) -> None:
+        dialog = Dialog(self, payload)
+        self._dispatch_event_handlers("dialog", dialog)
+        self._dialog_dispatch_count += 1
+
+    def _snapshot_event_handlers(
+        self,
+        event: str,
+        *,
+        event_sequence: Optional[int] = None,
+    ) -> list[_EventHandlerRegistration]:
+        detach_worker_forwards = False
+        with self._event_dispatch_condition:
+            registrations: list[_EventHandlerRegistration] = []
+            for handler in self._event_handlers.get(event, []):
+                if event in {"console", "pageerror"} and event_sequence is not None:
+                    cursor = self._event_handler_cursors.get((event, id(handler)))
+                    if cursor is None and (event, id(handler)) not in self._event_handler_cursors:
+                        continue
+                    if cursor is not None and event_sequence < cursor:
+                        continue
+                state = self._event_handler_registrations.get((event, id(handler)))
+                if state is None or state.handler is not handler:
+                    state = _EventHandlerRegistration(event, handler)
+                    self._event_handler_registrations[(event, id(handler))] = state
+                if state.cancelled:
+                    continue
+                state.pending += 1
+                registrations.append(state)
+            once_wrappers = getattr(self, "_once_event_wrappers", None)
+            if isinstance(once_wrappers, list):
+                claimed_ids = {
+                    id(wrapper)
+                    for stored_event, _original, wrapper in once_wrappers
+                    if stored_event == event
+                    and any(state.handler is wrapper for state in registrations)
+                }
+                if claimed_ids:
+                    self._event_handlers[event] = [
+                        handler
+                        for handler in self._event_handlers.get(event, [])
+                        if id(handler) not in claimed_ids
+                    ]
+                    detach_worker_forwards = (
+                        event == "console" and not self._event_handlers.get("console")
+                    )
+                    if event == "console" and not self._event_handlers.get("console"):
+                        try:
+                            self._set_worker_forwarding_interest(False)
+                        except Exception:
+                            pass
+                    if event in {"console", "worker"} and not (
+                        self._event_handlers.get("console") or self._event_handlers.get("worker")
+                    ):
+                        try:
+                            self._set_worker_event_interest(False)
+                        except Exception:
+                            pass
+        if detach_worker_forwards:
+            self._detach_worker_console_propagation()
+        return registrations
+
+
+
     def on(self, event: str, f: Callable[..., Any]) -> None:
-        _add_listener_to_handlers(self, event, f, self._event_handlers)
+        with self._event_dispatch_condition:
+            if event == "console":
+                self._set_worker_forwarding_interest(True)
+            if event in {"console", "worker"}:
+                self._set_worker_event_interest(True)
+            if event == "console":
+                self._ensure_console_thread()
+            elif event == "pageerror":
+                self._ensure_page_error_thread()
+            removed = _remove_listener_from_handlers(self, event, f, self._event_handlers)
+            self._cancel_event_handler_locked(event, removed)
+            self._event_handlers.setdefault(event, []).append(f)
+            if event in {"console", "pageerror"}:
+                self._event_handler_cursors[(event, id(f))] = self._listener_registration_cursor(event)
+            self._event_handler_registrations[(event, id(f))] = _EventHandlerRegistration(event, f)
         if event == "console":
-            self._ensure_console_thread()
+            self._ensure_worker_thread()
             self._attach_existing_worker_console_propagation()
-            self._ensure_worker_thread()
-        if event == "pageerror":
-            self._ensure_page_error_thread()
-        if event == "download":
+        elif event == "download":
             self._ensure_download_thread()
-        if event == "filechooser":
+        elif event == "filechooser":
             self._ensure_file_chooser_thread()
-        if event == "popup":
+        elif event == "popup":
             self._ensure_popup_thread()
-        if event == "websocket":
+        elif event == "websocket":
             self._ensure_websocket_thread()
-        if event == "worker":
+        elif event == "worker":
             self._ensure_worker_thread()
-        if event == "crash":
+        elif event == "crash":
             self._ensure_crash_thread()
 
     def once(self, event: str, f: Callable[..., Any]) -> None:
         _register_once_listener(self, event, f)
-
     def remove_listener(self, event: str, f: Callable[..., Any]) -> None:
-        _remove_listener_from_handlers(self, event, f, self._event_handlers)
+        detach_worker_forwards = False
+        with self._event_dispatch_condition:
+            removed = _remove_listener_from_handlers(self, event, f, self._event_handlers)
+            self._cancel_event_handler_locked(event, removed)
+            if event in {"console", "pageerror"}:
+                self._event_handler_cursors.pop((event, id(f)), None)
+                if removed is not f:
+                    self._event_handler_cursors.pop((event, id(removed)), None)
+            if event == "console" and not self._event_handlers.get("console"):
+                detach_worker_forwards = True
+                try:
+                    self._set_worker_forwarding_interest(False)
+                except Exception:
+                    pass
+            if event in {"console", "worker"} and not (
+                self._event_handlers.get("console") or self._event_handlers.get("worker")
+            ):
+                try:
+                    self._set_worker_event_interest(False)
+                except Exception:
+                    pass
+                with self._worker_thread_lock:
+                    self._worker_thread_stop.set()
+        self._wait_for_event_handler_removal(event, removed)
+        if detach_worker_forwards:
+            self._detach_worker_console_propagation()
 
     def _event_pump(self) -> None:
         while self._event_listeners_active():
@@ -19664,7 +20890,14 @@ class Page:
                     continue
                 if kind not in _PAGE_OBSERVATION_EVENTS:
                     continue
-                self._handle_observation_event(kind, envelope.get("payload"))
+                event_sequence = envelope.get("seq")
+                if isinstance(event_sequence, bool) or not isinstance(event_sequence, int):
+                    event_sequence = None
+                self._handle_observation_event(
+                    kind,
+                    envelope.get("payload"),
+                    event_sequence=event_sequence,
+                )
                 if not self._event_listeners_active():
                     return
 
@@ -19689,16 +20922,22 @@ class Page:
         except Error:
             pass
 
-    def _handle_observation_event(self, event: str, payload: Any) -> None:
+    def _handle_observation_event(
+        self,
+        event: str,
+        payload: Any,
+        *,
+        event_sequence: Optional[int] = None,
+    ) -> None:
         payload = payload if isinstance(payload, dict) else {}
         if event in {"request", "response", "requestfinished", "requestfailed"}:
             self._handle_network_event(event, payload)
         elif event == "dialog":
             self._handle_dialog_event(payload)
         elif event == "console":
-            self._handle_console_event(payload)
+            self._handle_console_event(payload, event_sequence=event_sequence)
         elif event == "pageerror":
-            self._handle_page_error_event(payload)
+            self._handle_page_error_event(payload, event_sequence=event_sequence)
         elif event in {"load", "domcontentloaded"}:
             self._handle_page_cdp_event(event)
         elif event == "framenavigated":
@@ -19722,60 +20961,78 @@ class Page:
     def _dispatch_network_value(self, event: str, value: Request | Response) -> None:
         if isinstance(value, Request):
             self._note_network_lifecycle_event(event, value)
-        for handler in list(self._event_handlers.get(event, [])):
-            try:
-                handler(value)
-            except Exception:
-                continue
+        self._dispatch_event_handlers(event, value)
 
-    def _handle_dialog_event(self, payload: dict[str, Any]) -> None:
-        dialog = Dialog(self, payload)
-        handlers = list(self._event_handlers.get("dialog", []))
-        for handler in handlers:
-            try:
-                handler(dialog)
-            except Exception:
-                continue
-        if not handlers and not dialog._handled:
-            try:
-                dialog.dismiss()
-            except Error:
-                pass
-        self._dialog_dispatch_count += 1
 
-    def _handle_console_event(self, payload: dict[str, Any]) -> None:
+    def _handle_console_event(
+        self,
+        payload: dict[str, Any],
+        *,
+        event_sequence: Optional[int] = None,
+    ) -> None:
+        if event_sequence is not None:
+            payload = dict(payload)
+            payload["__rustwright_cdp_event_seq"] = event_sequence
         event = ConsoleMessage(self, payload)
         self._record_console_message(event)
-        self._dispatch_console_event(event)
+        self._dispatch_console_event(event, event_sequence=event_sequence)
 
-    def _dispatch_console_event(self, event: ConsoleMessage) -> None:
-        for handler in list(self._event_handlers.get("console", [])):
-            try:
-                handler(event)
-            except Exception:
-                continue
+    def _dispatch_console_event(
+        self,
+        event: ConsoleMessage,
+        *,
+        event_sequence: Optional[int] = None,
+    ) -> None:
+        self._dispatch_event_handlers("console", event, event_sequence=event_sequence)
         with self._console_dispatch_condition:
             self._console_dispatch_generation += 1
             self._console_dispatch_condition.notify_all()
 
-    def _handle_page_error_event(self, payload: dict[str, Any]) -> None:
+    def _handle_page_error_event(
+        self,
+        payload: dict[str, Any],
+        *,
+        event_sequence: Optional[int] = None,
+    ) -> None:
         event = _page_error_from_payload(payload)
         self._record_page_error(event)
-        self._dispatch_page_error_event(event)
+        self._dispatch_page_error_event(event, event_sequence=event_sequence)
 
-    def _dispatch_page_error_event(self, event: Error) -> None:
-        for handler in list(self._event_handlers.get("pageerror", [])):
-            try:
-                handler(event)
-            except Exception:
-                continue
+    def _dispatch_page_error_event(
+        self,
+        event: Error,
+        *,
+        event_sequence: Optional[int] = None,
+    ) -> None:
+        self._dispatch_event_handlers("pageerror", event, event_sequence=event_sequence)
+
+    def _page_cdp_event_generation(self, event: str) -> int:
+        with self._page_cdp_event_condition:
+            return self._page_cdp_event_generations.get(event, 0)
+
+    def _wait_for_page_cdp_event_dispatch(
+        self,
+        event: str,
+        generation: int,
+        timeout: float,
+    ) -> None:
+        if not self._event_handlers.get(event):
+            return
+        deadline = time.monotonic() + min(max(timeout, 0.0) / 1000, 0.5)
+        with self._page_cdp_event_condition:
+            while self._page_cdp_event_generations.get(event, 0) <= generation:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._page_cdp_event_condition.wait(timeout=remaining)
 
     def _handle_page_cdp_event(self, event: str) -> None:
-        for handler in list(self._event_handlers.get(event, [])):
-            try:
-                handler(self)
-            except Exception:
-                continue
+        self._dispatch_event_handlers(event, self)
+        with self._page_cdp_event_condition:
+            self._page_cdp_event_generations[event] = (
+                self._page_cdp_event_generations.get(event, 0) + 1
+            )
+            self._page_cdp_event_condition.notify_all()
 
     def _handle_frame_navigated_event(self, payload: dict[str, Any]) -> None:
         frame = self._frame_from_navigated_payload(
@@ -19785,11 +21042,7 @@ class Page:
         self._dispatch_frame_navigated_event(frame)
 
     def _dispatch_frame_navigated_event(self, frame: Frame) -> None:
-        for handler in list(self._event_handlers.get("framenavigated", [])):
-            try:
-                handler(frame)
-            except Exception:
-                continue
+        self._dispatch_event_handlers("framenavigated", frame)
 
     def _handle_frame_lifecycle_event(self, event: str, payload: dict[str, Any]) -> None:
         envelope = {"params": payload}
@@ -19797,11 +21050,7 @@ class Page:
         self._dispatch_frame_lifecycle_event(event, frame)
 
     def _dispatch_frame_lifecycle_event(self, event: str, frame: Frame) -> None:
-        for handler in list(self._event_handlers.get(event, [])):
-            try:
-                handler(frame)
-            except Exception:
-                continue
+        self._dispatch_event_handlers(event, frame)
 
     def _record_request(self, request: Request) -> Request:
         request = self._adopt_request(request)
@@ -19905,10 +21154,14 @@ class Page:
                 self._fulfilled_route_bodies.pop(old_request_id, None)
 
     def _ensure_console_thread(self) -> None:
+        if self._runtime_observation_enabled:
+            return
         self._event_stream.enable_runtime()
         self._runtime_observation_enabled = True
 
     def _ensure_page_error_thread(self) -> None:
+        if self._runtime_observation_enabled:
+            return
         self._event_stream.enable_runtime()
         self._runtime_observation_enabled = True
 
@@ -20014,11 +21267,7 @@ class Page:
                 continue
             except Error:
                 break
-            for handler in list(self._event_handlers.get("download", [])):
-                try:
-                    handler(event)
-                except Exception:
-                    continue
+            self._dispatch_event_handlers("download", event)
 
     def _ensure_file_chooser_thread(self) -> None:
         existing = self._file_chooser_thread
@@ -20046,11 +21295,7 @@ class Page:
                 break
             if not self._should_dispatch_file_chooser_listener_event(event):
                 continue
-            for handler in list(self._event_handlers.get("filechooser", [])):
-                try:
-                    handler(event)
-                except Exception:
-                    continue
+            self._dispatch_event_handlers("filechooser", event)
 
     def _should_dispatch_file_chooser_listener_event(self, event: FileChooser) -> bool:
         key = (
@@ -20085,11 +21330,7 @@ class Page:
                 continue
             except Error:
                 break
-            for handler in list(self._event_handlers.get("popup", [])):
-                try:
-                    handler(event)
-                except Exception:
-                    continue
+            self._dispatch_event_handlers("popup", event)
 
     def _ensure_websocket_thread(self) -> None:
         existing = self._websocket_thread
@@ -20111,38 +21352,83 @@ class Page:
                 continue
             except Error:
                 break
-            for handler in list(self._event_handlers.get("websocket", [])):
-                try:
-                    handler(event)
-                except Exception:
-                    continue
+            self._dispatch_event_handlers("websocket", event)
 
     def _ensure_worker_thread(self) -> None:
-        existing = self._worker_thread
-        if existing is not None and existing.is_alive():
-            return
-        self._worker_waiter = self._worker_event_waiter()
-        thread = threading.Thread(target=self._worker_loop, daemon=True, name="rustwright-worker-listener")
-        self._worker_thread = thread
-        thread.start()
+        lock = getattr(self, "_worker_thread_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._worker_thread_lock = lock
+        with lock:
+            existing = self._worker_thread
+            if existing is not None and existing.is_alive():
+                self._worker_thread_stop.clear()
+                return
+            self._worker_thread_stop.clear()
+            self._worker_waiter = self._worker_event_waiter(
+                configure=not self._worker_auto_attach_configured,
+            )
+            thread = threading.Thread(target=self._worker_loop, daemon=True, name="rustwright-worker-listener")
+            self._worker_thread = thread
+            thread.start()
 
     def _worker_loop(self) -> None:
-        while self._event_listeners_active():
-            if not self._event_handlers.get("worker") and not self._event_handlers.get("console"):
-                time.sleep(0.05)
-                continue
-            try:
-                event = self._wait_for_worker_event(timeout=500.0, waiter=self._worker_waiter)
-            except TimeoutError:
-                continue
-            except Error:
-                break
-            self._attach_worker_console_propagation(event)
-            for handler in list(self._event_handlers.get("worker", [])):
-                try:
-                    handler(event)
-                except Exception:
+        current_thread = threading.current_thread()
+        try:
+            while self._event_listeners_active():
+                lock = getattr(self, "_worker_thread_lock", None)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._worker_thread_lock = lock
+                with lock:
+                    if self._worker_thread is not current_thread:
+                        return
+                    has_handlers = bool(self._event_handlers.get("worker") or self._event_handlers.get("console"))
+                    if self._worker_thread_stop.is_set() and not has_handlers:
+                        self._worker_thread = None
+                        return
+                if not has_handlers:
+                    self._worker_thread_stop.wait(0.05)
                     continue
+                try:
+                    event = self._wait_for_worker_event(timeout=50.0, waiter=self._worker_waiter)
+                except TimeoutError:
+                    continue
+                except Error:
+                    break
+                self._cache_worker(event)
+                attach_succeeded = False
+                claimed = True
+                try:
+                    claim = getattr(event, "_claim_capture_handoff", None)
+                    if callable(claim):
+                        claimed = claim()
+                    mark_ready = getattr(event, "_mark_capture_ready", None)
+                    if callable(mark_ready):
+                        mark_ready()
+                    attach_succeeded = True
+                    if claimed and not event._resume_if_waiting_for_debugger():
+                        raise RuntimeError("worker debugger resume failed")
+                except BaseException:
+                    if claimed:
+                        fail = getattr(event, "_fail_capture_handoff", None)
+                        if callable(fail):
+                            try:
+                                fail()
+                            except BaseException:
+                                pass
+                    if not attach_succeeded:
+                        self._remove_worker(event)
+                self._dispatch_event_handlers("worker", event)
+
+        finally:
+            lock = getattr(self, "_worker_thread_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                self._worker_thread_lock = lock
+            with lock:
+                if self._worker_thread is current_thread:
+                    self._worker_thread = None
 
 
 class _ScreenshotMaskCleanupHandle:
@@ -22241,7 +23527,6 @@ return __rw_fn(matches, __rw_arg);
         trial = _normalize_action_boolean(trial, method=method, name="trial")
         no_wait_after = _normalize_action_boolean(no_wait_after, method=method, name="no_wait_after")
         forced = bool(force)
-        unsafe_dom_fastpath = _unsafe_dom_fastpath_enabled()
 
         def run_post_action_locator_handlers() -> None:
             if not any(entry.get("no_wait_after") for entry in getattr(self._page, "_locator_handlers", [])):
@@ -22250,17 +23535,6 @@ return __rw_fn(matches, __rw_arg);
             deadline = time.monotonic() + max(timeout_ms, 1.0) / 1000
             self._page._run_locator_handlers(deadline)
 
-        if (
-            unsafe_dom_fastpath
-            and not forced
-            and not trial
-            and not any(value is not None for value in (modifiers, position, delay, button, click_count, steps))
-            and getattr(self._page, "_active_page_cdp_event_contexts", 0) <= 0
-            and self._try_fast_named_button_role_dom_click(timeout=timeout)
-        ):
-            run_post_action_locator_handlers()
-            self._page._slow_mo()
-            return
         target_info: Optional[dict[str, Any]] = None
         if forced:
             target_info = self._wait_for_forced_visible_pointer_action(
@@ -22329,46 +23603,6 @@ return __rw_fn(matches, __rw_arg);
                     click_count=None,
                     steps=None,
                 )
-            run_post_action_locator_handlers()
-            self._page._slow_mo()
-            return
-        if unsafe_dom_fastpath and self._try_fast_simple_css_dom_click(timeout=timeout):
-            run_post_action_locator_handlers()
-            self._page._slow_mo()
-            return
-        if unsafe_dom_fastpath and self._should_mouse_click_editable_control(method=method, timeout=timeout):
-            point = self._mouse_point_from_target_state(target_info, position=None, timeout=timeout) if target_info else None
-            if point is None:
-                self._mouse_click(
-                    timeout=timeout,
-                    modifiers=None,
-                    position=None,
-                    delay=None,
-                    button=None,
-                    click_count=None,
-                    steps=None,
-                )
-            else:
-                self._mouse_click_at_point(
-                    point[0],
-                    point[1],
-                    timeout=timeout,
-                    modifiers=None,
-                    delay=None,
-                    button=None,
-                    click_count=None,
-                    steps=None,
-                )
-            run_post_action_locator_handlers()
-            self._page._slow_mo()
-            return
-        if unsafe_dom_fastpath:
-            _call(
-                self._page._core.click,
-                _json(self._spec),
-                self._index,
-                self._page._default_timeout if timeout is None else timeout,
-            )
             run_post_action_locator_handlers()
             self._page._slow_mo()
             return
@@ -22748,362 +23982,10 @@ return {
             position=position,
         )
 
-    def _try_fast_fill(
-        self,
-        operation: str,
-        value: str,
-        *,
-        action: str,
-        timeout: Optional[float],
-        force: Optional[bool],
-    ) -> bool:
-        if not _unsafe_dom_fastpath_enabled():
-            return False
-        result = self._native_locator_fast_path(
-            operation,
-            timeout=timeout,
-            method=f"Locator.{action}",
-            args={"value": str(value), "forced": bool(force)},
-        )
-        if not isinstance(result, dict):
-            return False
-        result_type = result.get("type")
-        if result.get("ok"):
-            self._page._slow_mo()
-            return True
-        if result_type in {"fallback", "not-applicable", "pending"}:
-            return False
-        if result_type == "strict":
-            count = int(result.get("count") or 0)
-            raise Error(f"strict mode violation: locator resolved to {count} elements while trying to {action}")
-        if result_type == "number-text":
-            raise Error(f"Locator.{action}: Error: Cannot type text into input[type=number]")
-        if result_type == "malformed":
-            raise Error(f"Locator.{action}: Error: Malformed value")
-        if result_type == "not-editable":
-            raise Error(f"Locator.{action}: Error: Element is not editable")
-        info = result.get("info") if isinstance(result.get("info"), dict) else {}
-        if result_type == "input-type":
-            info = {**info, "non_fillable_input": True, "input_type": result.get("inputType") or info.get("input_type")}
-        if result_type == "select":
-            info = {**info, "is_select": True}
-        raise self._fill_type_error(action, info, force=result_type == "force-non-fillable")
 
-    def _try_fast_simple_css_fill(
-        self,
-        value: str,
-        *,
-        action: str,
-        timeout: Optional[float],
-        force: Optional[bool],
-    ) -> bool:
-        return self._try_fast_fill(
-            "css_fill",
-            value,
-            action=action,
-            timeout=timeout,
-            force=force,
-        )
 
-    def _try_fast_simple_css_dom_click(self, *, timeout: Optional[float]) -> bool:
-        if not _unsafe_dom_fastpath_enabled():
-            return False
-        selector = self._simple_css_fast_path_selector()
-        if selector is None or self._explicit_index or self._strict:
-            return False
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-const el = document.querySelector(String(payload.selector || ''));
-if (!el) return false;
-if (el.tagName !== 'BUTTON') return false;
-el.focus({ preventScroll: true });
-el.click();
-return true;
-}""",
-            {"selector": selector, "index": int(self._index)},
-            timeout=timeout,
-            method="Locator.click",
-        )
-        return bool(result)
 
-    def _try_fast_simple_css_select_option(
-        self,
-        *,
-        values: list[str],
-        labels: list[str],
-        indexes: list[int],
-        timeout: Optional[float],
-        force: Optional[bool],
-        method: str,
-    ) -> Optional[list[str]]:
-        if not _unsafe_dom_fastpath_enabled():
-            return None
-        payload = self._simple_css_indexed_read_payload()
-        if payload is None:
-            return None
-        payload = {**payload, "values": values, "labels": labels, "indexes": indexes, "forced": bool(force)}
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-try {
-  const allElements = document.querySelectorAll('*');
-  for (let i = 0; i < allElements.length; i++) {
-    if (allElements[i].shadowRoot) return { ok: false, type: 'fallback' };
-  }
-  const visible = el => {
-    if (!el || !el.isConnected) return false;
-    const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-    const style = view.getComputedStyle(el);
-    if (style.visibility === 'hidden' || style.display === 'none') return false;
-    const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  };
-  const disabledState = el => {
-    if (typeof el.matches === 'function' && el.matches(':disabled')) return true;
-    let current = el;
-    while (current && current.nodeType === 1) {
-      if (String(current.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return true;
-      current = current.parentElement;
-    }
-    return false;
-  };
-  const matches = Array.from(document.querySelectorAll(String(payload.selector || '')));
-  if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-  let index = Number(payload.index || 0);
-  if (index < 0) index = matches.length + index;
-  const el = matches[index] || null;
-  if (!el) return { ok: false, type: 'fallback' };
-  if (String(el.tagName || '').toUpperCase() !== 'SELECT') return { ok: false, type: 'fallback' };
-  if (disabledState(el)) return { ok: false, type: 'fallback' };
-  if (!payload.forced && !visible(el)) return { ok: false, type: 'fallback' };
-  const values = Array.isArray(payload.values) ? payload.values.map(String) : [];
-  const labels = Array.isArray(payload.labels) ? payload.labels.map(String) : [];
-  const indexes = Array.isArray(payload.indexes) ? payload.indexes.map(Number) : [];
-  const options = Array.from(el.options);
-  const foundValues = new Set();
-  const foundLabels = new Set();
-  const foundIndexes = new Set();
-  const selectedOptions = [];
-  for (const option of options) {
-    let matched = false;
-    for (const value of values) {
-      if (option.value === value || option.label === value) {
-        foundValues.add(value);
-        matched = true;
-      }
-    }
-    for (const label of labels) {
-      if (option.label === label) {
-        foundLabels.add(label);
-        matched = true;
-      }
-    }
-    for (const optionIndex of indexes) {
-      if (option.index === optionIndex) {
-        foundIndexes.add(optionIndex);
-        matched = true;
-      }
-    }
-    if (matched) selectedOptions.push(option);
-  }
-  const hasRequests = values.length > 0 || labels.length > 0 || indexes.length > 0;
-  const allRequestedFound =
-    values.every(value => foundValues.has(value)) &&
-    labels.every(label => foundLabels.has(label)) &&
-    indexes.every(optionIndex => foundIndexes.has(optionIndex));
-  const ready = !hasRequests || (el.multiple ? allRequestedFound : selectedOptions.length > 0);
-  if (!ready) return { ok: false, type: 'fallback' };
-  for (const option of options) option.selected = false;
-  if (el.multiple) {
-    for (const option of selectedOptions) option.selected = true;
-  } else if (selectedOptions.length) {
-    selectedOptions[0].selected = true;
-  }
-  el.dispatchEvent(new Event('input', { bubbles: true }));
-  el.dispatchEvent(new Event('change', { bubbles: true }));
-  return { ok: true, selected: Array.from(el.selectedOptions).map(option => option.value) };
-} catch (_) {
-  return { ok: false, type: 'fallback' };
-}
-}""",
-            payload,
-            timeout=timeout,
-            method=method,
-        )
-        if not isinstance(result, dict):
-            return None
-        if result.get("ok"):
-            self._page._slow_mo()
-            return [str(item) for item in result.get("selected") or []]
-        if result.get("type") == "strict":
-            count = int(result.get("count") or 0)
-            raise Error(f"strict mode violation: locator resolved to {count} elements while trying to select option")
-        return None
 
-    def _should_mouse_click_editable_control(self, *, method: str, timeout: Optional[float]) -> bool:
-        return bool(
-            self._eval(
-                """
-if (!el) return false;
-const tagName = String(el.tagName || '').toUpperCase();
-if (tagName === 'TEXTAREA' || el.isContentEditable) return true;
-if (tagName !== 'INPUT') return false;
-const type = String(el.type || 'text').toLowerCase();
-return ['text', 'search', 'url', 'tel', 'email', 'password', 'number'].includes(type);
-""",
-                timeout,
-                method=method,
-            )
-        )
-
-    def _try_fast_named_button_role_dom_click(self, *, timeout: Optional[float]) -> bool:
-        if not _unsafe_dom_fastpath_enabled():
-            return False
-        spec = self._spec
-        if (
-            self._explicit_index
-            or spec.get("kind") != "role"
-            or spec.get("role") != "button"
-            or spec.get("include_hidden")
-            or getattr(self._page, "_locator_handlers", None)
-        ):
-            return False
-        if any(spec.get(key) is not None for key in ("checked", "disabled", "selected", "expanded", "pressed", "level")):
-            return False
-        name = spec.get("name")
-        if not isinstance(name, str):
-            return False
-        payload = {
-            "name": name,
-            "exact": bool(spec.get("exact")),
-            "strict": bool(self._strict),
-            "index": int(self._index),
-        }
-        result = self._evaluate_simple_css_fast_path(
-            """(payload) => {
-const normalize = value => String(value ?? '').replace(/[\\u200b\\u00ad]/g, '').replace(/\\s+/g, ' ').trim();
-const includesText = (value, needle, exact) => {
-  const left = normalize(value);
-  const right = normalize(needle);
-  return exact ? left === right : left.toLowerCase().includes(right.toLowerCase());
-};
-if (Array.from(document.querySelectorAll('*')).some(el => el.shadowRoot)) {
-  return { ok: false, type: 'fallback' };
-}
-const referencedText = el => {
-  const ids = String(el.getAttribute('aria-labelledby') || '').trim().split(/\\s+/).filter(Boolean);
-  if (!ids.length) return '';
-  const doc = el.ownerDocument || document;
-  return normalize(ids.map(id => {
-    const node = doc.getElementById(id);
-    return node ? (node.innerText || node.textContent || '') : '';
-  }).join(' '));
-};
-const explicitRoleOf = el => {
-  for (const token of String(el.getAttribute('role') || '').trim().split(/\\s+/).filter(Boolean)) {
-    if (token === 'button') return 'button';
-  }
-  return '';
-};
-const buttonRoleOf = el => {
-  if (!el || el.nodeType !== 1) return '';
-  const explicit = explicitRoleOf(el);
-  if (explicit) return explicit;
-  const tag = String(el.tagName || '').toUpperCase();
-  const type = String(el.getAttribute('type') || 'text').toLowerCase();
-  if (tag === 'BUTTON') return 'button';
-  if (tag === 'INPUT' && ['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
-  return '';
-};
-const accessibleName = el => {
-  const tag = String(el.tagName || '').toUpperCase();
-  const type = String(el.getAttribute('type') || 'text').toLowerCase();
-  const explicit = referencedText(el) || normalize(el.getAttribute('aria-label') || '');
-  if (explicit) return explicit;
-  if (tag === 'INPUT' && type === 'image') return normalize(el.getAttribute('alt') || el.getAttribute('title') || 'Submit');
-  if (el.labels && el.labels.length) {
-    const labelText = Array.from(el.labels).map(label => label.innerText || label.textContent || '').join(' ');
-    if (normalize(labelText)) return normalize(labelText);
-  }
-  if (tag === 'INPUT') {
-    const value = el.value || el.getAttribute('value') || '';
-    if (value) return normalize(value);
-    if (type === 'submit') return 'Submit';
-    if (type === 'reset') return 'Reset';
-  }
-  return normalize(el.innerText || el.textContent || el.getAttribute('title') || '');
-};
-const visible = el => {
-  if (!el || !el.isConnected) return false;
-  const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-  const style = view.getComputedStyle(el);
-  if (style.visibility === 'hidden' || style.display === 'none') return false;
-  const rect = el.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
-};
-const disabledState = el => {
-  if (typeof el.matches === 'function' && el.matches(':disabled')) return true;
-  let current = el;
-  while (current && current.nodeType === 1) {
-    if (String(current.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return true;
-    current = current.parentElement;
-  }
-  return false;
-};
-const targetContains = (target, node) => {
-  let current = node;
-  while (current) {
-    if (current === target) return true;
-    const root = current.getRootNode ? current.getRootNode() : null;
-    current = current.parentElement || (root && root.host) || null;
-  }
-  return false;
-};
-const deepElementFromPoint = (doc, x, y) => {
-  let hit = doc.elementFromPoint(x, y);
-  while (hit && hit.shadowRoot) {
-    const nested = hit.shadowRoot.elementFromPoint(x, y);
-    if (!nested || nested === hit) break;
-    hit = nested;
-  }
-  return hit;
-};
-const candidates = Array.from(document.querySelectorAll('button,input,[role]'));
-const matches = candidates.filter(el => {
-  if (buttonRoleOf(el) !== 'button') return false;
-  if (!visible(el)) return false;
-  return includesText(accessibleName(el), payload.name, !!payload.exact);
-});
-if (payload.strict && matches.length > 1) return { ok: false, type: 'strict', count: matches.length };
-const el = matches[Number(payload.index || 0)] || null;
-if (!el) return { ok: false, type: 'fallback' };
-if (disabledState(el)) return { ok: false, type: 'fallback' };
-el.scrollIntoView({ block: 'center', inline: 'center' });
-const doc = el.ownerDocument || document;
-const view = doc.defaultView || window;
-const rect = el.getBoundingClientRect();
-if (!rect || rect.width <= 0 || rect.height <= 0) return { ok: false, type: 'fallback' };
-const point = {
-  x: Math.min(Math.max(rect.left + rect.width / 2, 0), Math.max(view.innerWidth - 1, 0)),
-  y: Math.min(Math.max(rect.top + rect.height / 2, 0), Math.max(view.innerHeight - 1, 0)),
-};
-const hit = deepElementFromPoint(doc, point.x, point.y);
-if (!targetContains(el, hit)) return { ok: false, type: 'fallback' };
-if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-el.click();
-return { ok: true };
-}""",
-            payload,
-            timeout=timeout,
-            method="Locator.click",
-        )
-        if not isinstance(result, dict):
-            return False
-        if result.get("ok"):
-            return True
-        if result.get("type") == "strict":
-            count = int(result.get("count") or 0)
-            raise Error(f"strict mode violation: locator resolved to {count} elements while trying to click")
-        return False
 
     def _label_fast_path_payload(self) -> Optional[dict[str, Any]]:
         spec = self._spec
@@ -23284,205 +24166,14 @@ return {{ ok: true, value: __rw_fn(matches, payload.arg) }};
             return result.get("value")
         return _MISSING
 
-    @staticmethod
-    def _fast_placeholder_control_script(action_body: str) -> str:
-        return f"""(payload) => {{
-const allElements = document.querySelectorAll('*');
-for (let i = 0; i < allElements.length; i++) {{
-  if (allElements[i].shadowRoot) return {{ ok: false, type: 'fallback' }};
-}}
-const includesText = (value, needle, exact) => {{
-  const left = String(value ?? '');
-  const right = String(needle ?? '');
-  return exact ? left === right : left.toLowerCase().includes(right.toLowerCase());
-}};
-const visible = el => {{
-  if (!el || !el.isConnected) return false;
-  const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-  const style = view.getComputedStyle(el);
-  if (style.visibility === 'hidden' || style.display === 'none') return false;
-  const rect = el.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
-}};
-const disabledState = el => {{
-  if (typeof el.matches === 'function' && el.matches(':disabled')) return true;
-  let current = el;
-  while (current && current.nodeType === 1) {{
-    if (String(current.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return true;
-    current = current.parentElement;
-  }}
-  return false;
-}};
-const matches = Array.from(document.querySelectorAll('[placeholder]')).filter(el =>
-  includesText(el.getAttribute('placeholder') || '', payload.placeholder, !!payload.exact)
-);
-if (payload.strict && matches.length > 1) return {{ ok: false, type: 'strict', count: matches.length }};
-const el = matches[Number(payload.index || 0)] || null;
-if (!el) return {{ ok: false, type: 'fallback' }};
-{action_body}
-}}"""
 
-    def _try_fast_simple_label_fill(
-        self,
-        value: str,
-        *,
-        action: str,
-        timeout: Optional[float],
-        force: Optional[bool],
-    ) -> bool:
-        return self._try_fast_fill(
-            "label_fill",
-            value,
-            action=action,
-            timeout=timeout,
-            force=force,
-        )
 
-    def _try_fast_simple_label_check(self, *, timeout: Optional[float]) -> bool:
-        if not _unsafe_dom_fastpath_enabled():
-            return False
-        payload = self._label_fast_path_payload()
-        if payload is None:
-            return False
-        result = self._evaluate_simple_css_fast_path(
-            self._fast_label_control_script(
-                """
-const tagName = String(el.tagName || '').toUpperCase();
-const inputType = tagName === 'INPUT' ? String(el.type || '').toLowerCase() : '';
-if (tagName !== 'INPUT' || !['checkbox', 'radio'].includes(inputType)) return { ok: false, type: 'fallback' };
-if (!visible(el) || disabledState(el)) return { ok: false, type: 'fallback' };
-el.scrollIntoView({ block: 'center', inline: 'center' });
-if (!el.checked) {
-  el.checked = true;
-  el.dispatchEvent(new Event('input', { bubbles: true }));
-  el.dispatchEvent(new Event('change', { bubbles: true }));
-}
-return { ok: true };
-"""
-            ),
-            payload,
-            timeout=timeout,
-            method="Locator.check",
-        )
-        if not isinstance(result, dict):
-            return False
-        if result.get("ok"):
-            self._page._slow_mo()
-            return True
-        if result.get("type") == "strict":
-            count = int(result.get("count") or 0)
-            raise Error(f"strict mode violation: locator resolved to {count} elements while trying to check")
-        return False
 
-    def _try_fast_simple_label_select_option(
-        self,
-        *,
-        values: list[str],
-        labels: list[str],
-        indexes: list[int],
-        timeout: Optional[float],
-        force: Optional[bool],
-    ) -> Optional[list[str]]:
-        if not _unsafe_dom_fastpath_enabled():
-            return None
-        payload = self._label_fast_path_payload()
-        if payload is None:
-            return None
-        payload = {**payload, "values": values, "labels": labels, "indexes": indexes, "forced": bool(force)}
-        result = self._evaluate_simple_css_fast_path(
-            self._fast_label_control_script(
-                """
-const tagName = String(el.tagName || '').toUpperCase();
-if (tagName !== 'SELECT') return { ok: false, type: 'fallback' };
-if (disabledState(el)) return { ok: false, type: 'fallback' };
-if (!payload.forced && !visible(el)) return { ok: false, type: 'fallback' };
-const values = Array.isArray(payload.values) ? payload.values.map(String) : [];
-const labels = Array.isArray(payload.labels) ? payload.labels.map(String) : [];
-const indexes = Array.isArray(payload.indexes) ? payload.indexes.map(Number) : [];
-const options = Array.from(el.options);
-const foundValues = new Set();
-const foundLabels = new Set();
-const foundIndexes = new Set();
-const selectedOptions = [];
-for (const option of options) {
-  let matched = false;
-  for (const value of values) {
-    if (option.value === value || option.label === value) {
-      foundValues.add(value);
-      matched = true;
-    }
-  }
-  for (const label of labels) {
-    if (option.label === label) {
-      foundLabels.add(label);
-      matched = true;
-    }
-  }
-  for (const index of indexes) {
-    if (option.index === index) {
-      foundIndexes.add(index);
-      matched = true;
-    }
-  }
-  if (matched) selectedOptions.push(option);
-}
-const hasRequests = values.length > 0 || labels.length > 0 || indexes.length > 0;
-const allRequestedFound =
-  values.every(value => foundValues.has(value)) &&
-  labels.every(label => foundLabels.has(label)) &&
-  indexes.every(index => foundIndexes.has(index));
-const ready = !hasRequests || (el.multiple ? allRequestedFound : selectedOptions.length > 0);
-if (!ready) return { ok: false, type: 'fallback' };
-for (const option of options) option.selected = false;
-if (el.multiple) {
-  for (const option of selectedOptions) option.selected = true;
-} else if (selectedOptions.length) {
-  selectedOptions[0].selected = true;
-}
-el.dispatchEvent(new Event('input', { bubbles: true }));
-el.dispatchEvent(new Event('change', { bubbles: true }));
-return { ok: true, selected: Array.from(el.selectedOptions).map(option => option.value) };
-"""
-            ),
-            payload,
-            timeout=timeout,
-            method="Locator.select_option",
-        )
-        if not isinstance(result, dict):
-            return None
-        if result.get("ok"):
-            self._page._slow_mo()
-            return [str(item) for item in result.get("selected") or []]
-        if result.get("type") == "strict":
-            count = int(result.get("count") or 0)
-            raise Error(f"strict mode violation: locator resolved to {count} elements while trying to select option")
-        return None
 
-    def _try_fast_simple_placeholder_fill(
-        self,
-        value: str,
-        *,
-        action: str,
-        timeout: Optional[float],
-        force: Optional[bool],
-    ) -> bool:
-        return self._try_fast_fill(
-            "placeholder_fill",
-            value,
-            action=action,
-            timeout=timeout,
-            force=force,
-        )
 
     def _fill(self, value: str, *, action: str, timeout: Optional[float] = None, force: Optional[bool] = None) -> None:
         self._raise_if_frame_locator_in_composite(f"Locator.{action}")
         timeout_ms = _default_timeout_for_method(self._page, timeout, method=_locator_method_for_action(action))
-        if self._try_fast_simple_css_fill(value, action=action, timeout=timeout_ms, force=force):
-            return
-        if self._try_fast_simple_label_fill(value, action=action, timeout=timeout_ms, force=force):
-            return
-        if self._try_fast_simple_placeholder_fill(value, action=action, timeout=timeout_ms, force=force):
-            return
         on_poll = (
             self._page._run_locator_handlers_for_remaining
             if getattr(self._page, "_locator_handlers", None)
@@ -24162,26 +24853,6 @@ return true;
         raw_values = _normalize_select_string_options(value, method=method, field="valueOrLabel")
         raw_labels = _normalize_select_string_options(label, method=method, field="label")
         raw_indexes = _normalize_select_index_options(index, method=method)
-        if element is None:
-            fast_selected = self._try_fast_simple_css_select_option(
-                values=raw_values,
-                labels=raw_labels,
-                indexes=raw_indexes,
-                timeout=timeout_ms,
-                force=force,
-                method=method,
-            )
-            if fast_selected is not None:
-                return fast_selected
-            fast_selected = self._try_fast_simple_label_select_option(
-                values=raw_values,
-                labels=raw_labels,
-                indexes=raw_indexes,
-                timeout=timeout_ms,
-                force=force,
-            )
-            if fast_selected is not None:
-                return fast_selected
         try:
             self._wait_for_single("select option", state="enabled" if forced else "selectable", timeout=timeout_ms)
         except TimeoutError:
@@ -27020,10 +27691,16 @@ class Worker(_EventEmitter):
         self._core = core
         self._url = str(url or (getattr(core, "url", "") if core is not None else ""))
         self._target_id = str(getattr(core, "target_id", "") or "")
+        self._session_id = str(getattr(core, "session_id", "") or "")
         self._page = page
         self._default_timeout = page._default_timeout if page is not None else 30_000.0
         self._closed = False
+        self._close_event_fired = False
         self._event_threads: dict[str, threading.Thread] = {}
+        self._event_thread_stops: dict[str, threading.Event] = {}
+        self._event_thread_generations: dict[str, int] = {}
+        self._next_event_thread_generation = 0
+        self._event_thread_lock = threading.Lock()
         if not self._url and self._core is not None:
             try:
                 self._url = str(self.evaluate("() => self.location.href"))
@@ -27093,6 +27770,38 @@ class Worker(_EventEmitter):
             raise Error("worker is not attached")
         return self._core.close_event_waiter()
 
+    def _claim_capture_handoff(self) -> bool:
+        if self._core is None:
+            return True
+        claim = getattr(self._core, "claim_capture_handoff", None)
+        if not callable(claim):
+            return True
+        return bool(_call(claim))
+    def _mark_capture_ready(self) -> bool:
+        if self._core is None:
+            return True
+        mark_ready = getattr(self._core, "mark_capture_ready", None)
+        if not callable(mark_ready):
+            return True
+        return bool(_call(mark_ready))
+
+    def _fail_capture_handoff(self) -> None:
+        if self._core is None:
+            return
+        fail = getattr(self._core, "fail_capture_handoff", None)
+        if callable(fail):
+            _call(fail)
+
+    def _resume_if_waiting_for_debugger(self) -> bool:
+        if self._core is None:
+            return True
+        try:
+            _call(self._core.run_if_waiting_for_debugger, self._default_timeout)
+        except Exception:
+            return False
+        return True
+
+
     def _wait_for_event(
         self,
         event: str,
@@ -27146,10 +27855,27 @@ class Worker(_EventEmitter):
     def once(self, event: str, f: Callable[..., Any]) -> None:
         _register_once_listener(self, event, f)
 
-    def _ensure_event_thread(self, event: str) -> None:
-        existing = self._event_threads.get(event)
-        if existing is not None and existing.is_alive():
+    def remove_listener(self, event: str, f: Callable[..., Any]) -> None:
+        super().remove_listener(event, f)
+        if event not in {"close", "console"}:
             return
+        if self._event_handlers_for_emitter().get(event):
+            return
+        with self._event_thread_lock:
+            stop = self._event_thread_stops.get(event)
+        if stop is not None:
+            stop.set()
+
+    def _ensure_event_thread(self, event: str) -> None:
+        with self._event_thread_lock:
+            existing = self._event_threads.get(event)
+            if existing is not None and existing.is_alive():
+                stop = self._event_thread_stops.get(event)
+                if stop is not None:
+                    stop.clear()
+                return
+            self._next_event_thread_generation += 1
+            generation = self._next_event_thread_generation
         descriptor = _event_waiter_descriptor(f"worker.{event}")
         waiter = descriptor.waiter_factory(self)
         close_waiter = (
@@ -27157,35 +27883,92 @@ class Worker(_EventEmitter):
             if descriptor.competing_waiter_factory is not None
             else None
         )
+        stop = threading.Event()
         thread = threading.Thread(
             target=self._event_loop,
-            args=(event, waiter, close_waiter),
+            args=(event, waiter, close_waiter, stop, generation),
             daemon=True,
             name=f"rustwright-worker-{event}-listener",
         )
-        self._event_threads[event] = thread
+        with self._event_thread_lock:
+            existing = self._event_threads.get(event)
+            if existing is not None and existing.is_alive():
+                return
+            self._event_thread_stops[event] = stop
+            self._event_thread_generations[event] = generation
+            self._event_threads[event] = thread
         thread.start()
 
-    def _event_loop(self, event: str, waiter: Any, close_waiter: Any) -> None:
-        while not self._closed:
-            if not self._event_handlers_for_emitter().get(event):
-                time.sleep(0.05)
-                continue
-            try:
-                self._wait_for_event(
-                    event,
-                    timeout=500.0,
-                    waiter=waiter,
-                    close_waiter=close_waiter,
+    def _event_loop(
+        self,
+        event: str,
+        waiter: Any,
+        close_waiter: Any,
+        stop: threading.Event,
+        generation: int,
+    ) -> None:
+        current_thread = threading.current_thread()
+        stop_decided = False
+        try:
+            while not self._closed:
+                with self._event_thread_lock:
+                    if (
+                        self._event_threads.get(event) is not current_thread
+                        or self._event_thread_generations.get(event) != generation
+                    ):
+                        return
+                    handlers = self._event_handlers_for_emitter().get(event)
+                    if stop.is_set() and not handlers:
+                        stop_decided = True
+                        return
+                if not handlers:
+                    stop.wait(0.05)
+                    continue
+                try:
+                    self._wait_for_event(
+                        event,
+                        timeout=50.0,
+                        waiter=waiter,
+                        close_waiter=close_waiter,
+                    )
+                except TimeoutError:
+                    continue
+                except Error:
+                    return
+                except Exception:
+                    return
+                if event == "close":
+                    return
+        finally:
+            restart = False
+            with self._event_thread_lock:
+                owns_thread = (
+                    self._event_threads.get(event) is current_thread
+                    and self._event_thread_generations.get(event) == generation
                 )
-            except TimeoutError:
-                continue
-            except Error:
-                return
-            except Exception:
-                return
-            if event == "close":
-                return
+                if owns_thread:
+                    handlers = self._event_handlers_for_emitter().get(event)
+                    self._event_threads.pop(event, None)
+                    self._event_thread_stops.pop(event, None)
+                    self._event_thread_generations.pop(event, None)
+                    restart = stop_decided and bool(handlers) and not self._closed
+            if restart:
+                self._ensure_event_thread(event)
+
+    def _reap_event_threads(self) -> None:
+        with self._event_thread_lock:
+            for stop in self._event_thread_stops.values():
+                stop.set()
+            threads = list(self._event_threads.values())
+        for thread in threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=1.0)
+        with self._event_thread_lock:
+            for event, thread in list(self._event_threads.items()):
+                if not thread.is_alive():
+                    self._event_threads.pop(event, None)
+                    self._event_thread_stops.pop(event, None)
+                    self._event_thread_generations.pop(event, None)
 
 
 def _required_expectation_arg(value: Any, method: str, name: str) -> Any:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import inspect
 import json
 import os
 import platform
@@ -17,6 +18,7 @@ from typing import Callable
 
 from automation_cases import BENCHMARK_CASES as EQUIVALENT_CASES
 from automation_cases import BENCHMARK_STRICT_CASES
+from automation_cases import CASES as PARITY_CASES
 from process_tree_memory import attach_peak_process_tree_rss
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -189,6 +191,8 @@ def select_cases(suite: str) -> list[Callable]:
         return list(EQUIVALENT_CASES)
     if suite == "strict":
         return list(BENCHMARK_STRICT_CASES)
+    if suite == "parity":
+        return list(PARITY_CASES)
     raise ValueError(f"unknown benchmark suite: {suite}")
 
 
@@ -212,6 +216,8 @@ def filter_cases(cases: list[Callable], requested: list[str] | None) -> list[Cal
 def comparison_mode(suite: str, implementation: str) -> str:
     if suite == "strict":
         return "strict_playwright_api"
+    if suite == "parity":
+        return "playwright_api_parity_cases"
     if implementation in {"rustwright", "playwright", "typescript-playwright"}:
         return "playwright_api_equivalent_cases"
     return "lower_level_equivalent_workflows"
@@ -235,20 +241,26 @@ def benchmark_metadata(implementation: str, suite: str, lifecycle: str, cases: l
     }
 
 
-def run_once(sync_playwright: Callable, cases: list[Callable]) -> dict[str, float]:
-    timings = {}
-    with sync_playwright() as p:
-        browser = launch_chromium(p)
-        try:
-            for case in cases:
-                page = browser.new_page()
-                started = time.perf_counter()
-                case(page)
-                timings[case.__name__] = time.perf_counter() - started
-                page.close()
-        finally:
-            browser.close()
-    return timings
+def is_connected(browser) -> bool:
+    try:
+        return bool(browser.is_connected())
+    except Exception:
+        return False
+
+
+def close_quietly(target) -> None:
+    try:
+        target.close()
+    except Exception:
+        pass
+
+
+def invoke_case(case: Callable, page, playwright) -> None:
+    if "playwright" in inspect.signature(case).parameters:
+        case(page, playwright=playwright)
+    else:
+        case(page)
+
 
 
 def find_chromium_executable() -> str:
@@ -370,6 +382,8 @@ def run_playwright_like(
     samples: list[dict[str, float]] = []
     browser_version = None
     effective_lifecycle = "warm-browser" if lifecycle == "cold-container" else lifecycle
+    if suite == "parity" and effective_lifecycle != "warm-browser":
+        raise ValueError("the parity suite supports only the warm-browser lifecycle")
     with sync_playwright() as p:
         if effective_lifecycle == "warm-browser":
             browser = launch_chromium(p)
@@ -378,16 +392,32 @@ def run_playwright_like(
                 for _ in range(iterations):
                     timings = {}
                     for case in cases:
-                        page = browser.new_page()
+                        if suite == "parity" and not is_connected(browser):
+                            close_quietly(browser)
+                            browser = launch_chromium(p)
+                        try:
+                            page = browser.new_page()
+                        except Exception:
+                            if suite != "parity" or is_connected(browser):
+                                raise
+                            close_quietly(browser)
+                            browser = launch_chromium(p)
+                            page = browser.new_page()
                         started = time.perf_counter()
                         try:
-                            case(page)
+                            invoke_case(case, page, p)
                             timings[case.__name__] = time.perf_counter() - started
                         finally:
-                            page.close()
+                            if suite == "parity":
+                                close_quietly(page)
+                            else:
+                                page.close()
                     samples.append(timings)
             finally:
-                browser.close()
+                if suite == "parity":
+                    close_quietly(browser)
+                else:
+                    browser.close()
         elif effective_lifecycle == "warm-page":
             browser = launch_chromium(p)
             browser_version = getattr(browser, "version", None)
@@ -398,7 +428,7 @@ def run_playwright_like(
                     try:
                         for case in cases:
                             started = time.perf_counter()
-                            case(page)
+                            invoke_case(case, page, p)
                             timings[case.__name__] = time.perf_counter() - started
                     finally:
                         page.close()
@@ -415,7 +445,7 @@ def run_playwright_like(
                     try:
                         page = browser.new_page()
                         try:
-                            case(page)
+                            invoke_case(case, page, p)
                             timings[case.__name__] = time.perf_counter() - started
                         finally:
                             page.close()
@@ -1533,7 +1563,7 @@ def typescript_puppeteer_code(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument(
         "--impl",
         choices=[
@@ -1551,7 +1581,7 @@ def main() -> int:
         default=str(ROOT / ".audit-playwright"),
         help="Path containing a real Playwright installation for --impl playwright or --impl all.",
     )
-    parser.add_argument("--suite", choices=["equivalent", "strict"], default="equivalent")
+    parser.add_argument("--suite", choices=["equivalent", "strict", "parity"], default="equivalent")
     parser.add_argument(
         "--lifecycle",
         choices=["warm-browser", "warm-page", "cold-browser", "cold-container"],
@@ -1568,6 +1598,10 @@ def main() -> int:
 
     if args.suite == "strict" and args.impl not in STRICT_IMPLS | {"all"}:
         raise SystemExit("--suite strict currently supports only --impl rustwright, --impl playwright, or --impl all")
+    if args.suite == "parity" and args.impl not in STRICT_IMPLS | {"all"}:
+        raise SystemExit("--suite parity supports only --impl rustwright, --impl playwright, or --impl all")
+    if args.suite == "parity" and args.lifecycle != "warm-browser":
+        raise SystemExit("--suite parity supports only --lifecycle warm-browser")
     if args.impl == "all":
         results = [
             run_playwright_like(

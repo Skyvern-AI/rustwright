@@ -6111,298 +6111,17 @@ fn bounded_network_detail_text(text: &str, max_bytes: usize, label: &str, inline
     rendered
 }
 
-#[derive(Clone)]
-enum NetworkRegexAtom {
-    Literal(char),
-    Any,
-    Digit,
-    Word,
-    Space,
-    Class {
-        negated: bool,
-        ranges: Vec<(char, char)>,
-    },
-}
-
-#[derive(Clone, Copy)]
-enum NetworkRegexQuantifier {
-    One,
-    ZeroOrOne,
-    ZeroOrMore,
-    OneOrMore,
-}
-
-#[derive(Clone)]
-struct NetworkRegexToken {
-    atom: NetworkRegexAtom,
-    quantifier: NetworkRegexQuantifier,
-}
-
-struct NetworkRegexBranch {
-    tokens: Vec<NetworkRegexToken>,
-    start_anchor: bool,
-    end_anchor: bool,
-}
-
-struct NetworkRegex {
-    branches: Vec<NetworkRegexBranch>,
-    case_insensitive: bool,
-}
+struct NetworkRegex(regex::Regex);
 
 impl NetworkRegex {
     fn compile(pattern: &str) -> Result<Self, String> {
-        let (pattern, case_insensitive) = pattern
-            .strip_prefix("(?i)")
-            .map_or((pattern, false), |pattern| (pattern, true));
-        let pattern = if case_insensitive {
-            pattern.to_ascii_lowercase()
-        } else {
-            pattern.to_owned()
-        };
-        let branches = split_network_regex_alternatives(&pattern)?
-            .into_iter()
-            .map(|branch| parse_network_regex_branch(&branch))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            branches,
-            case_insensitive,
-        })
+        regex::Regex::new(pattern)
+            .map(Self)
+            .map_err(|error| error.to_string())
     }
 
     fn is_match(&self, text: &str) -> bool {
-        let text = if self.case_insensitive {
-            text.to_ascii_lowercase()
-        } else {
-            text.to_owned()
-        };
-        self.branches
-            .iter()
-            .any(|branch| network_regex_branch_matches(branch, &text))
-    }
-}
-
-fn split_network_regex_alternatives(pattern: &str) -> Result<Vec<String>, String> {
-    let mut alternatives = Vec::new();
-    let mut current = String::new();
-    let mut escaped = false;
-    let mut in_class = false;
-    for character in pattern.chars() {
-        if escaped {
-            current.push(character);
-            escaped = false;
-            continue;
-        }
-        match character {
-            '\\' => {
-                current.push(character);
-                escaped = true;
-            }
-            '[' => {
-                in_class = true;
-                current.push(character);
-            }
-            ']' if in_class => {
-                in_class = false;
-                current.push(character);
-            }
-            '|' if !in_class => alternatives.push(std::mem::take(&mut current)),
-            '(' | ')' if !in_class => {
-                return Err("groups and lookarounds are not supported".to_owned());
-            }
-            _ => current.push(character),
-        }
-    }
-    if escaped {
-        return Err("trailing escape".to_owned());
-    }
-    if in_class {
-        return Err("unterminated character class".to_owned());
-    }
-    alternatives.push(current);
-    Ok(alternatives)
-}
-
-fn parse_network_regex_branch(pattern: &str) -> Result<NetworkRegexBranch, String> {
-    let mut chars = pattern.chars().peekable();
-    let start_anchor = chars.next_if_eq(&'^').is_some();
-    let mut tokens = Vec::new();
-    let mut end_anchor = false;
-    while let Some(character) = chars.next() {
-        if character == '$' && chars.peek().is_none() {
-            end_anchor = true;
-            break;
-        }
-        let atom = match character {
-            '.' => NetworkRegexAtom::Any,
-            '\\' => match chars.next().ok_or_else(|| "trailing escape".to_owned())? {
-                'd' => NetworkRegexAtom::Digit,
-                'w' => NetworkRegexAtom::Word,
-                's' => NetworkRegexAtom::Space,
-                unsupported if unsupported.is_ascii_alphanumeric() => {
-                    return Err(format!("escape \\{unsupported} is not supported"));
-                }
-                escaped => NetworkRegexAtom::Literal(escaped),
-            },
-            '[' => parse_network_regex_class(&mut chars)?,
-            '*' | '+' | '?' => {
-                return Err(format!("quantifier {character:?} has no preceding atom"));
-            }
-            '{' | '}' => {
-                return Err("counted quantifiers are not supported".to_owned());
-            }
-            '^' | '$' => {
-                return Err("anchors are only supported at branch boundaries".to_owned());
-            }
-            literal => NetworkRegexAtom::Literal(literal),
-        };
-        let quantifier = match chars.peek().copied() {
-            Some('*') => {
-                chars.next();
-                NetworkRegexQuantifier::ZeroOrMore
-            }
-            Some('+') => {
-                chars.next();
-                NetworkRegexQuantifier::OneOrMore
-            }
-            Some('?') => {
-                chars.next();
-                NetworkRegexQuantifier::ZeroOrOne
-            }
-            _ => NetworkRegexQuantifier::One,
-        };
-        tokens.push(NetworkRegexToken { atom, quantifier });
-    }
-    Ok(NetworkRegexBranch {
-        tokens,
-        start_anchor,
-        end_anchor,
-    })
-}
-
-fn parse_network_regex_class(
-    chars: &mut std::iter::Peekable<impl Iterator<Item = char>>,
-) -> Result<NetworkRegexAtom, String> {
-    let negated = chars.next_if_eq(&'^').is_some();
-    let mut values = Vec::new();
-    let mut closed = false;
-    while let Some(character) = chars.next() {
-        if character == ']' && !values.is_empty() {
-            closed = true;
-            break;
-        }
-        let character = if character == '\\' {
-            let escaped = chars
-                .next()
-                .ok_or_else(|| "trailing escape in character class".to_owned())?;
-            if escaped.is_ascii_alphanumeric() {
-                return Err(format!(
-                    "escape \\{escaped} in a character class is not supported"
-                ));
-            }
-            escaped
-        } else {
-            character
-        };
-        values.push(character);
-    }
-    if !closed {
-        return Err("unterminated or empty character class".to_owned());
-    }
-    let mut ranges = Vec::new();
-    let mut index = 0;
-    while index < values.len() {
-        if index + 2 < values.len() && values[index + 1] == '-' {
-            if values[index] > values[index + 2] {
-                return Err("character class range is reversed".to_owned());
-            }
-            ranges.push((values[index], values[index + 2]));
-            index += 3;
-        } else {
-            ranges.push((values[index], values[index]));
-            index += 1;
-        }
-    }
-    Ok(NetworkRegexAtom::Class { negated, ranges })
-}
-
-fn network_regex_branch_matches(branch: &NetworkRegexBranch, text: &str) -> bool {
-    let chars = text.chars().collect::<Vec<_>>();
-    let starts: Box<dyn Iterator<Item = usize>> = if branch.start_anchor {
-        Box::new(std::iter::once(0))
-    } else {
-        Box::new(0..=chars.len())
-    };
-    starts.into_iter().any(|start| {
-        match_network_regex_tokens(&branch.tokens, 0, &chars, start, branch.end_anchor)
-    })
-}
-
-fn match_network_regex_tokens(
-    tokens: &[NetworkRegexToken],
-    token_index: usize,
-    text: &[char],
-    text_index: usize,
-    end_anchor: bool,
-) -> bool {
-    if token_index == tokens.len() {
-        return !end_anchor || text_index == text.len();
-    }
-    let token = &tokens[token_index];
-    let matches_one = |index: usize| {
-        text.get(index)
-            .is_some_and(|character| network_regex_atom_matches(&token.atom, *character))
-    };
-    match token.quantifier {
-        NetworkRegexQuantifier::One => {
-            matches_one(text_index)
-                && match_network_regex_tokens(
-                    tokens,
-                    token_index + 1,
-                    text,
-                    text_index + 1,
-                    end_anchor,
-                )
-        }
-        NetworkRegexQuantifier::ZeroOrOne => {
-            match_network_regex_tokens(tokens, token_index + 1, text, text_index, end_anchor)
-                || (matches_one(text_index)
-                    && match_network_regex_tokens(
-                        tokens,
-                        token_index + 1,
-                        text,
-                        text_index + 1,
-                        end_anchor,
-                    ))
-        }
-        NetworkRegexQuantifier::ZeroOrMore | NetworkRegexQuantifier::OneOrMore => {
-            let minimum = matches!(token.quantifier, NetworkRegexQuantifier::OneOrMore) as usize;
-            let mut end = text_index;
-            while matches_one(end) {
-                end += 1;
-            }
-            if end.saturating_sub(text_index) < minimum {
-                return false;
-            }
-            (text_index + minimum..=end).rev().any(|next| {
-                match_network_regex_tokens(tokens, token_index + 1, text, next, end_anchor)
-            })
-        }
-    }
-}
-
-fn network_regex_atom_matches(atom: &NetworkRegexAtom, character: char) -> bool {
-    match atom {
-        NetworkRegexAtom::Literal(literal) => character == *literal,
-        NetworkRegexAtom::Any => character != '\n',
-        NetworkRegexAtom::Digit => character.is_ascii_digit(),
-        NetworkRegexAtom::Word => character.is_ascii_alphanumeric() || character == '_',
-        NetworkRegexAtom::Space => character.is_whitespace(),
-        NetworkRegexAtom::Class { negated, ranges } => {
-            let contained = ranges
-                .iter()
-                .any(|(start, end)| (*start..=*end).contains(&character));
-            contained != *negated
-        }
+        self.0.is_match(text)
     }
 }
 
@@ -9022,15 +8741,18 @@ mod tests {
     }
 
     #[test]
-    fn network_filter_compiles_once_and_matches_supported_regex_surface() {
-        let regex = NetworkRegex::compile("(?i)api/data$|large-text$").unwrap();
+    fn network_filter_uses_standard_regex_syntax() {
+        let regex = NetworkRegex::compile(r"(?i)(?:api/data|large-text)$").unwrap();
         assert!(regex.is_match("https://example.test/API/DATA"));
         assert!(regex.is_match("https://example.test/large-text"));
         assert!(!regex.is_match("https://example.test/image.png"));
+        assert!(
+            NetworkRegex::compile(r"\bapi\b")
+                .unwrap()
+                .is_match("/api/data")
+        );
+        assert!(NetworkRegex::compile("api{2}").unwrap().is_match("/apii"));
         assert!(NetworkRegex::compile("[").is_err());
-        assert!(NetworkRegex::compile("(group)").is_err());
-        assert!(NetworkRegex::compile(r"\bapi\b").is_err());
-        assert!(NetworkRegex::compile("api{2}").is_err());
     }
 
     #[test]

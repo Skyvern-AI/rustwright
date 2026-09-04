@@ -93,10 +93,7 @@ def test_rustwright_import_does_not_install_legacy_aliases():
     assert report["after_rustwright"] == expected_roots
     assert report["after_direct_compat"] == expected_roots
     assert report["direct_compat_identity"] is True
-    assert report["rustwright_all"] == [
-        "disable_playwright_compat",
-        "enable_playwright_compat",
-    ]
+    assert report["rustwright_all"] == ["enable_playwright_compat"]
 
 
 def test_clean_python_without_pytest_enables_core_aliases_only():
@@ -143,7 +140,7 @@ def test_clean_python_without_pytest_enables_core_aliases_only():
     assert report["plugin_targets_loaded"] == []
 
 
-def test_enable_disable_leave_sys_meta_path_untouched():
+def test_enable_leaves_sys_meta_path_untouched():
     report = _run_probe(
         """
         import json
@@ -154,21 +151,16 @@ def test_enable_disable_leave_sys_meta_path_untouched():
         before = list(sys.meta_path)
         rustwright.enable_playwright_compat()
         after_enable = list(sys.meta_path)
-        rustwright.disable_playwright_compat()
-        after_disable = list(sys.meta_path)
 
         print(json.dumps({
             "enable_unchanged": len(before) == len(after_enable) and all(
                 left is right for left, right in zip(before, after_enable)
             ),
-            "disable_unchanged": len(before) == len(after_disable) and all(
-                left is right for left, right in zip(before, after_disable)
-            ),
         }, sort_keys=True))
         """
     )
 
-    assert report == {"disable_unchanged": True, "enable_unchanged": True}
+    assert report == {"enable_unchanged": True}
 
 
 def test_pytest_playwright_callback_type_export_is_eager_and_exact():
@@ -240,7 +232,7 @@ def test_pytest_playwright_callback_static_type_export(tmp_path, monkeypatch):
     assert not any("Any" in line or "builtins.object" in line for line in revealed)
 
 
-def test_enable_disable_two_cycles_restore_aliases_and_reload_child():
+def test_repeated_enable_is_idempotent_and_preserves_alias_identity():
     report = _run_probe(
         """
         import importlib
@@ -260,48 +252,33 @@ def test_enable_disable_two_cycles_restore_aliases_and_reload_child():
             "patchright.pytest_plugin",
             "pytest_playwright.pytest_playwright",
         ]
-        cycles = []
-        for _ in range(2):
-            result = rustwright.enable_playwright_compat()
-            child = importlib.import_module("playwright.sync_api")
-            target = importlib.import_module("rustwright._compat.playwright.sync_api")
-            reloaded = importlib.reload(child)
-            cycles.append({
-                "all_registered": all(name in sys.modules for name in tracked),
-                "child_is_target": child is target,
-                "reload_identity": reloaded is child,
-                "registered_result": all(
-                    name in result.registered_aliases for name in tracked
-                ),
-                "skipped": list(result.skipped_aliases),
-            })
-            rustwright.disable_playwright_compat()
-            cycles[-1]["all_restored"] = not any(
-                name in sys.modules for name in tracked
-            )
+        first = rustwright.enable_playwright_compat()
+        child = importlib.import_module("playwright.sync_api")
+        target = importlib.import_module("rustwright._compat.playwright.sync_api")
+        second = rustwright.enable_playwright_compat()
+        reloaded = importlib.reload(child)
 
-        print(json.dumps({"cycles": cycles}, sort_keys=True))
+        print(json.dumps({
+            "all_registered": all(name in sys.modules for name in tracked),
+            "child_is_target": child is target,
+            "reload_identity": reloaded is child,
+            "results_equal": first == second,
+            "registered_result": all(
+                name in second.registered_aliases for name in tracked
+            ),
+            "skipped": list(second.skipped_aliases),
+        }, sort_keys=True))
         """
     )
 
-    assert report["cycles"] == [
-        {
-            "all_registered": True,
-            "all_restored": True,
-            "child_is_target": True,
-            "registered_result": True,
-            "reload_identity": True,
-            "skipped": [],
-        },
-        {
-            "all_registered": True,
-            "all_restored": True,
-            "child_is_target": True,
-            "registered_result": True,
-            "reload_identity": True,
-            "skipped": [],
-        },
-    ]
+    assert report == {
+        "all_registered": True,
+        "child_is_target": True,
+        "registered_result": True,
+        "reload_identity": True,
+        "results_equal": True,
+        "skipped": [],
+    }
 
 
 def test_enable_import_failure_leaves_aliases_and_state_unchanged():
@@ -336,8 +313,6 @@ def test_enable_import_failure_leaves_aliases_and_state_unchanged():
             "enabled": compat._ENABLED,
             "pytest_enabled": compat._PYTEST_ALIASES_ENABLED,
             "result": compat._LAST_ENABLE_RESULT,
-            "modules": dict(compat._PREVIOUS_MODULES),
-            "attributes": dict(compat._PREVIOUS_PARENT_ATTRIBUTES),
         }
         real_import_module = importlib.import_module
 
@@ -372,8 +347,6 @@ def test_enable_import_failure_leaves_aliases_and_state_unchanged():
                 compat._ENABLED is state_snapshot["enabled"]
                 and compat._PYTEST_ALIASES_ENABLED is state_snapshot["pytest_enabled"]
                 and compat._LAST_ENABLE_RESULT is state_snapshot["result"]
-                and compat._PREVIOUS_MODULES == state_snapshot["modules"]
-                and compat._PREVIOUS_PARENT_ATTRIBUTES == state_snapshot["attributes"]
             ),
         }, sort_keys=True))
         """
@@ -510,13 +483,11 @@ def test_concurrent_double_enable_is_deterministic():
             and results[0] == results[1]
             and all(name in sys.modules for name in aliases)
         )
-        rustwright.disable_playwright_compat()
 
         print(json.dumps({
             "all_threads_finished": not any(thread.is_alive() for thread in threads),
             "enabled_consistently": enabled_consistently,
             "errors": errors,
-            "restored": not any(name in sys.modules for name in aliases),
         }, sort_keys=True))
         """
     )
@@ -525,11 +496,10 @@ def test_concurrent_double_enable_is_deterministic():
         "all_threads_finished": True,
         "enabled_consistently": True,
         "errors": [],
-        "restored": True,
     }
 
 
-def test_reenable_upgrades_skipped_pytest_aliases_and_restores_baseline():
+def test_reenable_upgrades_skipped_pytest_aliases_without_republishing_core():
     report = _run_probe(
         """
         import importlib.util
@@ -608,45 +578,15 @@ def test_reenable_upgrades_skipped_pytest_aliases_and_restores_baseline():
             ),
             "skipped": list(second.skipped_aliases),
         }
-        rustwright.disable_playwright_compat()
-        after_disable = {
-            "all_module_identities_restored": all(
-                sys.modules.get(name, missing) is module
-                for name, module in module_snapshot.items()
-            ),
-            "canonical_playwright_attribute_restored": (
-                canonical_playwright.sync_api is canonical_playwright_attribute
-            ),
-            "playwright_attribute_restored": (
-                foreign_playwright.sync_api is playwright_attribute
-            ),
-            "pytest_attribute_restored": (
-                foreign_pytest_playwright.pytest_playwright is pytest_attribute
-            ),
-            "state_disabled": (
-                not compat._ENABLED
-                and not compat._PYTEST_ALIASES_ENABLED
-                and not compat._PREVIOUS_MODULES
-                and not compat._PREVIOUS_PARENT_ATTRIBUTES
-            ),
-        }
 
         print(json.dumps({
             "before_upgrade": before_upgrade,
             "after_upgrade": after_upgrade,
-            "after_disable": after_disable,
         }, sort_keys=True))
         """
     )
 
     assert report == {
-        "after_disable": {
-            "canonical_playwright_attribute_restored": True,
-            "all_module_identities_restored": True,
-            "playwright_attribute_restored": True,
-            "pytest_attribute_restored": True,
-            "state_disabled": True,
-        },
         "after_upgrade": {
             "core_root_unchanged": True,
             "pytest_aliases_registered": True,

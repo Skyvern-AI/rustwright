@@ -11062,7 +11062,11 @@ def browser_type_launch_ignore_default_args_filters_selected_defaults(page):
             browser.close()
 
     assert "--mute-audio" not in launch_args
-    assert "--disable-features=RustwrightIgnoreDefaultArgsProbe" in launch_args
+    assert any(
+        arg.startswith("--disable-features=")
+        and "RustwrightIgnoreDefaultArgsProbe" in arg
+        for arg in launch_args
+    )
 
 
 @case
