@@ -75,6 +75,9 @@ from .sync_api import (
     _default_timeout_for_method,
     _emit_event,
     _event_handler_positional_args,
+    _EVENT_DISPATCH_OWNER,
+    _EVENT_DISPATCH_REGISTRATION,
+    _EVENT_DISPATCH_SEQUENCE,
     _json,
     _is_ignorable_close_error,
     _navigation_timeout_for_method,
@@ -89,8 +92,9 @@ from .sync_api import (
     _options_from_explicit_kwargs,
     _response_from_payload,
     _translate_error,
-    _unsafe_dom_fastpath_enabled,
     _validate_timeout_value,
+    _CONSOLE_HISTORY_BUFFER,
+    _PAGE_ERROR_HISTORY_BUFFER,
 )
 from .sync_api import sync_playwright as _sync_playwright
 from ._async_generated import (
@@ -1237,8 +1241,8 @@ def _wrap_async_event_value(event: str, value: Any) -> Any:
 
 
 def _wrap_async_event_predicate(event: str, predicate: Any = None, owner: Any = None) -> Any:
-    if predicate is None:
-        return None
+    if predicate is None or not callable(predicate):
+        return predicate
 
     owner_loop = getattr(owner, "_loop", None)
 
@@ -1255,8 +1259,6 @@ def _wrap_async_url_or_predicate(event: str, url_or_predicate: Any, owner: Any =
     if callable(url_or_predicate):
         return _wrap_async_event_predicate(event, url_or_predicate, owner)
     return url_or_predicate
-
-
 def _wrap_async_event_handler(owner: Any, event: str, handler: Any) -> Any:
     wrappers = getattr(owner, "_event_handler_wrappers", None)
     if wrappers is None:
@@ -1267,9 +1269,89 @@ def _wrap_async_event_handler(owner: Any, event: str, handler: Any) -> Any:
             return wrapped
 
     def wrapper(*args: Any) -> None:
+        sync_owner = getattr(owner, "_sync", None)
+
         def call_handler() -> Any:
             mapped_args = tuple(_wrap_async_event_value(event, arg) for arg in args)
             return handler(*_event_handler_positional_args(handler, mapped_args))
+
+        def run_awaitable_with_state(result: Any, state: Any, loop: asyncio.AbstractEventLoop) -> None:
+            async def await_result() -> Any:
+                task = asyncio.current_task()
+                if state is not None:
+                    activate = getattr(sync_owner, "_activate_deferred_event_handler", None)
+                    if not callable(activate) or not activate(state, task):
+                        if inspect.iscoroutine(result):
+                            result.close()
+                        return None
+                owner_token = _EVENT_DISPATCH_OWNER.set(task)
+                try:
+                    return await result
+                finally:
+                    _EVENT_DISPATCH_OWNER.reset(owner_token)
+                    if state is not None:
+                        finish = getattr(sync_owner, "_finish_event_handler", None)
+                        if callable(finish):
+                            finish(state, task)
+
+            loop.create_task(await_result())
+
+        def invoke_on_loop(callback_owner: Any, state: Any) -> None:
+            owner_token = _EVENT_DISPATCH_OWNER.set(callback_owner)
+            active = False
+            deferred = False
+            try:
+                if state is not None:
+                    activate = getattr(sync_owner, "_activate_deferred_event_handler", None)
+                    if not callable(activate) or not activate(state, callback_owner):
+                        return
+                    active = True
+                result = call_handler()
+                if _should_await_callback_result(result):
+                    if state is not None:
+                        deferred_state = getattr(sync_owner, "_defer_current_event_handler", lambda: None)()
+                        if deferred_state is None:
+                            if inspect.iscoroutine(result):
+                                result.close()
+                            return
+                        deferred = True
+                        try:
+                            run_awaitable_with_state(result, deferred_state, loop)
+                        except BaseException:
+                            release = getattr(sync_owner, "_release_deferred_event_handler", None)
+                            if callable(release):
+                                release(deferred_state)
+                            raise
+                    else:
+                        _run_awaitable_on_loop(loop, result)
+            finally:
+                if active and not deferred:
+                    finish = getattr(sync_owner, "_finish_event_handler", None)
+                    if callable(finish):
+                        finish(state, callback_owner)
+                _EVENT_DISPATCH_OWNER.reset(owner_token)
+
+        def invoke_in_current_loop() -> None:
+            result = call_handler()
+            if not _should_await_callback_result(result):
+                return
+            state = _EVENT_DISPATCH_REGISTRATION.get()
+            defer = getattr(sync_owner, "_defer_current_event_handler", None)
+            deferred_state = defer() if callable(defer) else None
+            if state is not None and deferred_state is None:
+                if inspect.iscoroutine(result):
+                    result.close()
+                return
+            if deferred_state is not None:
+                try:
+                    run_awaitable_with_state(result, deferred_state, loop)
+                except BaseException:
+                    release = getattr(sync_owner, "_release_deferred_event_handler", None)
+                    if callable(release):
+                        release(deferred_state)
+                    raise
+            else:
+                _run_awaitable_on_loop(loop, result)
 
         loop = getattr(owner, "_loop", None)
         if loop is not None and loop.is_running():
@@ -1278,19 +1360,24 @@ def _wrap_async_event_handler(owner: Any, event: str, handler: Any) -> Any:
             except RuntimeError:
                 current_loop = None
             if current_loop is loop:
-                result = call_handler()
-                _run_awaitable_on_loop(loop, result)
+                invoke_in_current_loop()
                 return
 
-            def run_on_loop() -> None:
-                try:
-                    result = call_handler()
-                    if _should_await_callback_result(result):
-                        loop.create_task(result)
-                except BaseException:
-                    pass
+            defer = getattr(sync_owner, "_defer_current_event_handler", None)
+            state = defer() if callable(defer) else None
+            callback_context = contextvars.copy_context()
 
-            loop.call_soon_threadsafe(run_on_loop)
+            def run_on_loop() -> None:
+                callback_context.run(invoke_on_loop, object(), state)
+
+            try:
+                loop.call_soon_threadsafe(run_on_loop)
+            except BaseException:
+                if state is not None:
+                    release = getattr(sync_owner, "_release_deferred_event_handler", None)
+                    if callable(release):
+                        release(state)
+                raise
             return
 
         result = call_handler()
@@ -2044,14 +2131,17 @@ class AsyncBrowser(_AsyncBrowserGeneratedMixin, _AsyncWrapper):
             and not options
             and not self._sync._launch_proxy
             and not self._sync._launch_downloads_path
+            and not self._sync._browser_download_behavior
+            and not bool(self._sync._core.single_process_fallback())
         ):
-            context = SyncBrowserContext(None, browser=self._sync, options={})
+            core = await _await_native(self._sync._core.new_context_async(None))
+            context = SyncBrowserContext(core, browser=self._sync, options={})
             self._sync._contexts.append(context)
             try:
-                core = await _await_native(self._sync._core.new_page_async())
-                page = await _finish_native_page(context, core)
+                page_core = await _await_native(core.new_page_async())
+                page = await _finish_native_page(context, page_core)
             except BaseException:
-                self._sync._contexts.remove(context)
+                await _run_sync_call(context.close)
                 raise
             page._owns_context = True
             return _wrap_async_page(page)
@@ -2389,10 +2479,14 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
                         envelope.get("payload"),
                     )
                     continue
+                event_sequence = envelope.get("seq")
+                if isinstance(event_sequence, bool) or not isinstance(event_sequence, int):
+                    event_sequence = None
                 await _run_sync_call(
                     self._sync._handle_observation_event,
                     kind,
                     envelope.get("payload"),
+                    event_sequence=event_sequence,
                 )
                 if not self._sync._event_listeners_active():
                     break
@@ -2564,8 +2658,8 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
         )
         target = self._sync._resolve_url(target)
         self._sync._mark_request_cookie_sync_required()
-        await _run_sync_call(self._sync._retain_navigation_response_bodies)
-        await _run_sync_call(self._sync._mark_navigation_history_boundary)
+        before, _ = await _run_sync_call(self._sync._prepare_navigation)
+        await _run_sync_call(self._sync._mark_navigation_history_boundary, before)
         self._sync._set_content_html_document_known = None
         download_waiter = (
             await _run_sync_call(self._sync._download_event_waiter)
@@ -2748,17 +2842,6 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
         normalized_selector = _native_normalize_selector(selector, method="Page.click")
         timeout_ms = _default_timeout_for_method(self._sync, timeout, method="Page.click")
         locator = _native_selector_locator(self._sync, normalized_selector, strict, method="Page.click")
-        if _unsafe_dom_fastpath_enabled():
-            await _await_native_method(
-                "Page.click",
-                self._sync._core.click_async(
-                    _json(locator._spec),
-                    locator._index,
-                    timeout_ms,
-                    locator._strict,
-                ),
-            )
-            return
         point_info = await _await_native_action(
             "Page.click",
             self._sync._core.click_actionable_wait_async(
@@ -2778,18 +2861,22 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
         mouse._x = target_x
         mouse._y = target_y
         mouse._buttons &= ~1
-        await _await_native_action(
-            "Page.click",
-            self._sync._core.dispatch_mouse_click_async(
-                target_x,
-                target_y,
-                start_x,
-                start_y,
-                initial_buttons,
-                modifiers,
-                float(point_info[2]),
-            ),
-        )
+        dialog_operation_release = self._sync._begin_dialog_operation()
+        try:
+            await _await_native_action(
+                "Page.click",
+                self._sync._core.dispatch_mouse_click_async(
+                    target_x,
+                    target_y,
+                    start_x,
+                    start_y,
+                    initial_buttons,
+                    modifiers,
+                    float(point_info[2]),
+                ),
+            )
+        finally:
+            dialog_operation_release()
 
     async def fill(
         self,
@@ -2807,18 +2894,6 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
             or no_wait_after is not None
             or force is not None
         )
-        if sync_fallback and _unsafe_dom_fastpath_enabled():
-            await _run_sync_wait_sliced(
-                self._sync,
-                self._sync.fill,
-                selector,
-                value,
-                timeout=timeout,
-                no_wait_after=no_wait_after,
-                strict=strict,
-                force=force,
-            )
-            return
         normalized_selector = _native_normalize_selector(selector, method="Page.fill")
         normalized_value = _normalize_required_string_argument(
             value,
@@ -2828,18 +2903,6 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
         )
         timeout_ms = _default_timeout_for_method(self._sync, timeout, method="Page.fill")
         locator = _native_selector_locator(self._sync, normalized_selector, strict, method="Page.fill")
-        if _unsafe_dom_fastpath_enabled():
-            await _await_native_method(
-                "Page.fill",
-                self._sync._core.fill_async(
-                    _json(locator._spec),
-                    locator._index,
-                    normalized_value,
-                    timeout_ms,
-                    locator._strict,
-                ),
-            )
-            return
         if sync_fallback:
             # Cancelling an executor Future does not stop its running sync call. Carry
             # cancellation into Rust so the fill future—and its guard owner—is dropped.
