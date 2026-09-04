@@ -211,9 +211,7 @@ Before using a benchmark in launch-facing latency copy or progress claims, run:
 
 ```bash
 python tools/check_benchmark_artifacts.py --source testbox --runner blacksmith-testbox --artifact <artifact-name> --run-url <run-url> --enforce-phase2 --enforce-launch --json
-python tools/check_launch_latency_claim.py
 python tools/check_launch_latency_claim.py --benchmark-json .benchmark-data/results/<testbox-bench-full-strict>.json --source testbox --artifact <artifact-name> --run-url <run-url>
-python tools/render_project_tables.py --table launch
 ```
 
 The checker is intentionally stricter than a benchmark smoke. It rejects
@@ -307,14 +305,10 @@ case means. The `click_button` case measured 89.61 ms for Rustwright versus
 662.44 ms for Python Playwright after the fix.
 
 The attempted local `strict` 3-iteration comparison failed before producing
-timing because the current Python Playwright reference returned a timeout call
-log for `check_and_uncheck` where the existing benchmark assertion expected an
-`Element is not visible` message. The attempted
-`RUSTWRIGHT_UNSAFE_DOM_FASTPATH=1` old-behavior proxy also failed setup on
-three local runs at `Browser.new_page: timed out after 5000 ms`, so no honest
-local before-fastpath timing sample is recorded here. Treat previous DOM
-fast-path benchmark claims as tainted until reproduced with trusted default
-input in a capped Testbox/Docker run.
+timing. The Python Playwright reference returned a timeout call log for
+`check_and_uncheck`, while the benchmark expected `Element is not visible`.
+Treat earlier synthetic DOM fast-path claims as tainted. The removed path cannot
+serve as a valid baseline. Reproduce trusted input in a capped Testbox run.
 
 ## Client Memory: Form-Fill Diagnostic
 
