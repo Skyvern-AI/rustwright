@@ -7525,7 +7525,11 @@ def test_launch_ignore_default_args_filters_selected_defaults(playwright, tmp_pa
         assert "--use-mock-keychain" not in launch_args
         assert "--password-store=basic" in launch_args
         assert "--no-sandbox" in launch_args
-        assert "--disable-features=RustwrightIgnoreDefaultArgsProbe" in launch_args
+        disable_features = [
+            arg for arg in launch_args if arg.startswith("--disable-features=")
+        ]
+        assert len(disable_features) == 1
+        assert "RustwrightIgnoreDefaultArgsProbe" in disable_features[0]
     finally:
         browser.close()
 
@@ -12857,7 +12861,6 @@ def test_click_updates_dom(page):
 
 
 def test_locator_click_dispatches_trusted_mouse_sequence_by_default(page, monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <button id="go" onclick="document.body.dataset.clicked = 'yes'">Go</button>
@@ -12902,34 +12905,6 @@ def test_locator_click_dispatches_trusted_mouse_sequence_by_default(page, monkey
     assert page.evaluate("document.body.dataset.clicked") == "yes"
     assert page.evaluate("document.activeElement.id") == "go"
 
-
-def test_locator_click_unsafe_dom_fastpath_opt_in_restores_dom_click(page, monkeypatch):
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-    page.set_content(
-        """
-        <button id="go" onclick="document.body.dataset.clicked = 'yes'">Go</button>
-        <script>
-        window.events = [];
-        for (const type of [
-          'pointerover', 'pointerenter', 'mouseover', 'mouseenter',
-          'pointermove', 'mousemove', 'pointerdown', 'mousedown',
-          'focus', 'pointerup', 'mouseup', 'click'
-        ]) {
-          document.querySelector('#go').addEventListener(type, event => {
-            window.events.push({ type, trusted: event.isTrusted });
-          });
-        }
-        </script>
-        """
-    )
-
-    page.locator("#go").click(timeout=1_000)
-
-    events = page.evaluate("window.events")
-    assert [event["type"] for event in events] == ["focus", "click"]
-    assert events[0]["trusted"] is True
-    assert events[1]["trusted"] is False
-    assert page.evaluate("document.body.dataset.clicked") == "yes"
 
 
 def test_native_actionability_templates_are_core_owned_and_structured_results_keep_shapes(page):
@@ -13205,20 +13180,6 @@ def test_locator_fill_apply_reaches_react_value_tracker_through_browser_input(pa
     _assert_fill_uses_browser_input_pipeline(page, core_fill)
 
 
-def test_locator_simple_css_fast_fill_reaches_react_value_tracker_through_browser_input(page, monkeypatch):
-    from rustwright.sync_api import Locator
-
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-
-    def reject_core_fallback(*args, **kwargs):
-        raise AssertionError("simple-CSS fill unexpectedly fell through to Locator._fill_apply")
-
-    monkeypatch.setattr(Locator, "_fill_apply", reject_core_fallback)
-
-    def simple_css_fill(selector, value):
-        page.locator(selector).fill(value, timeout=500)
-
-    _assert_fill_uses_browser_input_pipeline(page, simple_css_fill)
 
 
 def test_locator_fill_routes_deadline_retry_and_result_classification_through_core():
@@ -13374,7 +13335,6 @@ def test_sync_and_async_fill_accept_page_committed_value_from_canceled_beforeinp
 def test_locator_fill_rejects_pre_settle_value_as_canceled_unchanged_commit(
     page, monkeypatch
 ):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="target" value="old">
@@ -13458,18 +13418,7 @@ def test_locator_fill_accepts_canceled_beforeinput_custom_commit_once(
     assert page.evaluate("() => window.__audit.handlerCount") == 1
 
 
-@pytest.mark.parametrize(
-    "unsafe_fastpath",
-    [False, True],
-    ids=["standard-loop", "fastpath-loop"],
-)
-def test_locator_fill_strict_observe_ignores_temporary_duplicate(
-    page, monkeypatch, unsafe_fastpath
-):
-    if unsafe_fastpath:
-        monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-    else:
-        monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
+def test_locator_fill_strict_observe_ignores_temporary_duplicate(page):
     page.set_content(
         """
         <input id="target" value="old">
@@ -13508,7 +13457,6 @@ def test_locator_fill_strict_observe_ignores_temporary_duplicate(
 
 
 def test_locator_fill_slow_async_commit_dispatches_once(page, monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="target" value="old">
@@ -14097,7 +14045,6 @@ def test_locator_fill_guard_renews_once_after_lease_while_renderer_is_blocked(
 def test_locator_fill_records_own_input_when_capture_formatter_expires_guard(
     page, monkeypatch
 ):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="target" value="old">
@@ -14155,7 +14102,6 @@ def test_locator_fill_records_own_input_when_capture_formatter_expires_guard(
 def test_locator_fill_records_beforeinput_that_passivates_active_guard(
     page, monkeypatch
 ):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="target" value="old">
@@ -14212,7 +14158,6 @@ def test_locator_fill_records_beforeinput_that_passivates_active_guard(
 def test_locator_fill_records_window_capture_formatter_after_stop_propagation(
     page, monkeypatch
 ):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="target" value="old">
@@ -14245,7 +14190,6 @@ def test_locator_fill_records_window_capture_formatter_after_stop_propagation(
 def test_locator_fill_pins_dispatching_frame_when_frame_locator_retargets(
     page, monkeypatch
 ):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <iframe id="frame-a" data-fill-target></iframe>
@@ -14300,7 +14244,6 @@ def test_locator_fill_pins_dispatching_frame_when_frame_locator_retargets(
 
 
 def test_locator_value_like_fill_retry_keeps_retargeted_frame_pin(page, monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <iframe id="frame-a" data-fill-target></iframe>
@@ -14368,63 +14311,11 @@ def test_locator_fill_timeout_distinguishes_missing_dispatch_confirmation_from_e
     assert page.locator("#target").input_value() == "old"
 
 
-@pytest.mark.parametrize("page_commits", [False, True], ids=["no-commit", "moved-commit"])
-def test_locator_fast_fill_pending_dispatch_observes_single_dispatch(
-    page, monkeypatch, page_commits
-):
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-    page.set_content(
-        """
-        <input id="a" value="old">
-        <input id="b">
-        <script>
-        const target = document.querySelector('#a');
-        window.__fillAudit = { trustedBeforeInput: 0, pageCommits: false };
-        target.addEventListener('beforeinput', event => {
-          if (!event.isTrusted) return;
-          const requested = event.data;
-          window.__fillAudit.trustedBeforeInput++;
-          event.preventDefault();
-          if (!window.__fillAudit.pageCommits) return;
-          setTimeout(() => {
-            target.value = `moved-${requested}`;
-            target.dispatchEvent(new InputEvent('input', {
-              bubbles: true,
-              composed: true,
-              data: requested,
-              inputType: event.inputType,
-            }));
-          }, 50);
-        });
-        </script>
-        """
-    )
-    page.evaluate(
-        "(pageCommits) => { window.__fillAudit.pageCommits = pageCommits; }",
-        page_commits,
-    )
-
-    if page_commits:
-        page.locator("#a").fill("blocked", timeout=500)
-        assert page.locator("#a").input_value() == "moved-blocked"
-    else:
-        with pytest.raises(TimeoutError):
-            page.locator("#a").fill("blocked", timeout=250)
-
-    assert page.evaluate("window.__fillAudit.trustedBeforeInput") == 1
-    assert page.evaluate(
-        """() => Object.getOwnPropertyNames(globalThis).filter(
-          key => key.startsWith('__rustwright_fill_guard_')
-        )"""
-    ) == []
-    page.locator("#b").fill("works", timeout=1_000)
-    assert page.locator("#b").input_value() == "works"
 
 
 def test_locator_fill_timeout_does_not_interfere_with_sequential_fill(
     page, monkeypatch
 ):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="a" value="old">
@@ -14445,7 +14336,6 @@ def test_locator_fill_timeout_does_not_interfere_with_sequential_fill(
 
 
 def test_locator_fill_ignores_pre_dispatch_synthetic_input_noise(page, monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="target" value="old">
@@ -15889,7 +15779,6 @@ def test_native_value_fill_input_event_crosses_shadow_boundary(page):
 
 
 def test_native_value_fill_evaluator_retry_dispatches_events_once(page, monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
     page.set_content(
         """
         <input id="target" type="date" value="2025-01-01">
@@ -16076,148 +15965,6 @@ def test_locator_single_target_actions_are_strict(page):
 
     assert page.evaluate("document.body.dataset.clicked || null") is None
 
-
-def test_named_role_button_click_fast_path_preserves_click_and_strictness(page, monkeypatch):
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-    page.set_content(
-        """
-        <button aria-label="Save record" onclick="document.body.dataset.clicked = 'save'">Save</button>
-        <button aria-label="Duplicate action" onclick="document.body.dataset.clicked = 'first'">One</button>
-        <button aria-label="Duplicate action" onclick="document.body.dataset.clicked = 'second'">Two</button>
-        """
-    )
-
-    assert page.get_by_role("button", name="Save record")._try_fast_named_button_role_dom_click(timeout=500) is True
-    assert page.evaluate("document.body.dataset.clicked") == "save"
-
-    with pytest.raises(Error, match="strict mode violation: locator resolved to 2 elements"):
-        page.get_by_role("button", name="Duplicate action")._try_fast_named_button_role_dom_click(timeout=500)
-
-    assert page.evaluate("document.body.dataset.clicked") == "save"
-
-
-def test_label_control_fast_paths_fill_check_and_preserve_strictness(page, monkeypatch):
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-    page.set_content(
-        """
-        <label>Email <input id="email"></label>
-        <label><input id="urgent" type="checkbox"> Urgent only</label>
-        <label>Duplicate <input id="first-duplicate"></label>
-        <label>Duplicate <input id="second-duplicate"></label>
-        <input id="aria-email" aria-label="ARIA Address">
-        """
-    )
-
-    assert page.get_by_label("Email")._try_fast_simple_label_fill("ada@example.com", action="fill", timeout=500, force=None) is True
-    assert page.locator("#email").input_value() == "ada@example.com"
-
-    assert page.get_by_label("ARIA Address")._try_fast_simple_label_fill("aria@example.com", action="fill", timeout=500, force=None) is True
-    assert page.locator("#aria-email").input_value() == "aria@example.com"
-
-    assert page.get_by_label("Urgent only")._try_fast_simple_label_check(timeout=500) is True
-    assert page.locator("#urgent").is_checked()
-
-    with pytest.raises(Error, match="strict mode violation: locator resolved to 2 elements"):
-        page.get_by_label("Duplicate")._try_fast_simple_label_fill("nope", action="fill", timeout=500, force=None)
-
-    assert page.locator("#first-duplicate").input_value() == ""
-    assert page.locator("#second-duplicate").input_value() == ""
-
-
-def test_placeholder_fill_fast_path_preserves_fill_and_strictness(page, monkeypatch):
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-    page.set_content(
-        """
-        <input id="query" placeholder="Search catalog">
-        <textarea id="notes" placeholder="Order notes"></textarea>
-        <input id="first-duplicate" placeholder="Duplicate field">
-        <input id="second-duplicate" placeholder="Duplicate field">
-        """
-    )
-
-    assert page.get_by_placeholder("Search catalog")._try_fast_simple_placeholder_fill(
-        "travel",
-        action="fill",
-        timeout=500,
-        force=None,
-    ) is True
-    assert page.locator("#query").input_value() == "travel"
-
-    assert page.get_by_placeholder("notes")._try_fast_simple_placeholder_fill(
-        "leave at desk",
-        action="fill",
-        timeout=500,
-        force=None,
-    ) is True
-    assert page.locator("#notes").input_value() == "leave at desk"
-
-    with pytest.raises(Error, match="strict mode violation: locator resolved to 2 elements"):
-        page.get_by_placeholder("Duplicate")._try_fast_simple_placeholder_fill(
-            "nope",
-            action="fill",
-            timeout=500,
-            force=None,
-        )
-
-    assert page.locator("#first-duplicate").input_value() == ""
-    assert page.locator("#second-duplicate").input_value() == ""
-
-
-def test_label_select_option_fast_path_preserves_selection_and_strictness(page, monkeypatch):
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-    page.set_content(
-        """
-        <label>Category
-          <select id="category">
-            <option value="all">All</option>
-            <option value="travel">Travel</option>
-            <option value="office">Office</option>
-          </select>
-        </label>
-        <label>Priority
-          <select id="priority" multiple>
-            <option value="p0">P0</option>
-            <option value="p1">P1</option>
-            <option value="p2">P2</option>
-          </select>
-        </label>
-        <label>Duplicate <select id="first-duplicate"><option value="one">One</option></select></label>
-        <label>Duplicate <select id="second-duplicate"><option value="one">One</option></select></label>
-        """
-    )
-
-    assert page.get_by_label("Category")._try_fast_simple_label_select_option(
-        values=["travel"],
-        labels=[],
-        indexes=[],
-        timeout=500,
-        force=None,
-    ) == ["travel"]
-    assert page.locator("#category").input_value() == "travel"
-
-    assert page.get_by_label("Priority")._try_fast_simple_label_select_option(
-        values=[],
-        labels=["P0", "P2"],
-        indexes=[],
-        timeout=500,
-        force=None,
-    ) == ["p0", "p2"]
-    assert page.locator("#priority").evaluate("(select) => Array.from(select.selectedOptions).map(option => option.value)") == [
-        "p0",
-        "p2",
-    ]
-
-    with pytest.raises(Error, match="strict mode violation: locator resolved to 2 elements"):
-        page.get_by_label("Duplicate")._try_fast_simple_label_select_option(
-            values=["one"],
-            labels=[],
-            indexes=[],
-            timeout=500,
-            force=None,
-        )
-
-    assert page.locator("#first-duplicate").input_value() == "one"
-    assert page.locator("#second-duplicate").input_value() == "one"
 
 
 def test_locator_explicit_index_and_collection_helpers_allow_multiple_matches(page):
@@ -24446,6 +24193,46 @@ def test_console_messages_support_navigation_filter(page):
     assert since_messages == current
     with pytest.raises(Error, match="expected one of"):
         page.console_messages(filter="bogus")
+
+
+def test_failed_navigation_preserves_buffered_console_history_sync_and_async(
+    playwright, http_server
+):
+    sync_marker = "buffered console survives sync failed goto"
+    browser = playwright.chromium.launch(headless=True)
+    try:
+        page = browser.new_page()
+        page.set_content("<main>ready</main>")
+        page.evaluate("(marker) => console.log(marker)", sync_marker)
+        with pytest.raises(TimeoutError, match=r"Page\.goto: Timeout \d+ms exceeded\."):
+            page.goto(f"{http_server}/slow-timeout", timeout=50)
+        assert any(message.text == sync_marker for message in page.console_messages(filter="all"))
+        page.close()
+    finally:
+        browser.close()
+
+    async def run_async() -> None:
+        from playwright.async_api import TimeoutError as AsyncTimeoutError
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as async_manager:
+            async_browser = await async_manager.chromium.launch(headless=True)
+            try:
+                async_page = await async_browser.new_page()
+                await async_page.set_content("<main>ready</main>")
+                async_marker = "buffered console survives async failed goto"
+                await async_page.evaluate("(marker) => console.log(marker)", async_marker)
+                with pytest.raises(
+                    AsyncTimeoutError, match=r"Page\.goto: Timeout \d+ms exceeded\."
+                ):
+                    await async_page.goto(f"{http_server}/slow-timeout", timeout=50)
+                messages = await async_page.console_messages(filter="all")
+                assert any(message.text == async_marker for message in messages)
+                await async_page.close()
+            finally:
+                await async_browser.close()
+
+    asyncio.run(run_async())
 
 
 def test_pageerror_event_and_page_errors_storage(page):
@@ -33358,9 +33145,9 @@ def test_async_native_goto_setup_never_blocks_owner_loop(http_server):
             original_boundary = page._sync._mark_navigation_history_boundary
             original_download_waiter = page._sync._download_event_waiter
 
-            def slow_boundary():
+            def slow_boundary(before=None):
                 time.sleep(0.2)
-                return original_boundary()
+                return original_boundary(before)
 
             def slow_download_waiter():
                 time.sleep(0.2)
@@ -41218,7 +41005,6 @@ def test_async_locator_strictness_and_page_selector_default():
 
 
 def test_async_page_click_default_waits_for_receives_events(monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
 
     async def run() -> None:
         from playwright.async_api import TimeoutError, async_playwright
@@ -41246,7 +41032,6 @@ def test_async_page_click_default_waits_for_receives_events(monkeypatch):
 
 
 def test_async_page_fill_default_rejects_readonly_input(monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
 
     async def run() -> None:
         from playwright.async_api import TimeoutError, async_playwright
@@ -41270,42 +41055,10 @@ def test_async_page_fill_default_rejects_readonly_input(monkeypatch):
     asyncio.run(run())
 
 
-def test_async_page_click_and_fill_unsafe_dom_fastpath_stays_native(monkeypatch):
-    import rustwright.async_api as async_api
-
-    monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-
-    async def reject_sync_dispatch(*args, **kwargs):
-        raise AssertionError("unsafe optionless page click/fill should stay on the native path")
-
-    monkeypatch.setattr(async_api, "_run_sync_wait_sliced", reject_sync_dispatch)
-
-    async def run() -> None:
-        from playwright.async_api import async_playwright
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.set_content(
-                """
-                <button id="target" onclick="document.body.dataset.clicked = String(event.isTrusted)">Target</button>
-                <input id="x" value="old">
-                """
-            )
-
-            await page.click("#target", timeout=1_000)
-            await page.fill("#x", "new", timeout=1_000)
-            assert await page.evaluate("document.body.dataset.clicked") == "false"
-            assert await page.locator("#x").input_value() == "new"
-            await browser.close()
-
-    asyncio.run(run())
-
 
 def test_async_page_click_default_dispatches_native_trusted_sequence(monkeypatch):
     import rustwright.async_api as async_api
 
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
 
     async def reject_sync_dispatch(*args, **kwargs):
         raise AssertionError("optionless page click should use native actionability")
@@ -41363,7 +41116,6 @@ def test_async_page_click_default_dispatches_native_trusted_sequence(monkeypatch
 def test_async_page_fill_default_commits_natively_without_synthetic_change(monkeypatch):
     import rustwright.async_api as async_api
 
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
 
     async def reject_sync_dispatch(*args, **kwargs):
         raise AssertionError("optionless page fill should use native actionability")
@@ -41413,7 +41165,6 @@ def test_async_page_fill_default_commits_natively_without_synthetic_change(monke
 
 
 def test_async_page_actionable_error_messages_match_sync(monkeypatch):
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
 
     async def run() -> None:
         from playwright.async_api import Error, TimeoutError, async_playwright
@@ -41472,7 +41223,7 @@ def test_async_page_actionable_error_messages_match_sync(monkeypatch):
     asyncio.run(run())
 
 
-def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monkeypatch):
+def test_async_page_click_and_fill_native_eligibility_matches_sync(monkeypatch):
     import rustwright.async_api as async_api
 
     class FakeCore:
@@ -41506,17 +41257,6 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
         def locator_fill_actionable(self, *args):
             self.calls.append(("locator_fill_actionable", args))
 
-        def click_async(self, *args):
-            async def run():
-                self.calls.append(("click", args))
-
-            return run()
-
-        def fill_async(self, *args):
-            async def run():
-                self.calls.append(("fill", args))
-
-            return run()
 
     class FakeSyncPage:
         def __init__(self):
@@ -41540,6 +41280,9 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
         def _slow_mo(self):
             return None
 
+        def _begin_dialog_operation(self):
+            return lambda: None
+
     class FakeLocator:
         _spec = {"kind": "css", "selector": "#target"}
         _index = 0
@@ -41558,7 +41301,6 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
     monkeypatch.setattr(async_api, "_run_sync_wait_sliced", record_sync_dispatch)
 
     async def run() -> None:
-        monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
         await page.click("#target")
         await page.fill("#target", "value")
         assert [call[0] for call in sync_page._core.calls] == [
@@ -41577,19 +41319,7 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
         assert (sync_page.mouse._x, sync_page.mouse._y) == (12.0, 34.0)
         assert sync_page.mouse._buttons == 2
 
-        monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-        await page.click("#target")
-        await page.fill("#target", "value")
-        assert [call[0] for call in sync_page._core.calls] == [
-            "click_actionable_wait",
-            "dispatch_mouse_click",
-            "fill_actionable",
-            "click",
-            "fill",
-        ]
-        assert sync_calls == []
 
-        monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
         await page.click("#target", force=False)
         await page.fill("#target", "value", force=False)
         assert [call[0] for call in sync_calls] == ["click"]
@@ -41608,17 +41338,10 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync_fastpath(monk
             "click_actionable_wait",
             "dispatch_mouse_click",
             "fill_actionable",
-            "click",
-            "fill",
             "locator_fill_actionable",
             "locator_fill_actionable",
         ]
 
-        monkeypatch.setenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", "1")
-        sync_calls.clear()
-        await page.fill("#target", "value")
-        assert [call[0] for call in sync_calls] == ["fill"]
-        assert sync_page._core.calls[-1][0] == "locator_fill_actionable"
 
     asyncio.run(run())
 
@@ -41667,7 +41390,6 @@ def test_async_page_fill_sync_fallback_cancellation_signals_rust_token(monkeypat
     monkeypatch.setattr(async_api, "_rustwright", fake_rustwright)
     monkeypatch.setattr(async_api, "_native_page_hot_path_supported", lambda _page: False)
     monkeypatch.setattr(async_api, "_native_selector_locator", lambda *args, **kwargs: FakeLocator())
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
 
     async def run() -> None:
         fill = asyncio.create_task(page.fill("#target", "value"))
@@ -41741,7 +41463,6 @@ def test_async_page_click_preserves_sync_mouse_state_on_dispatch_failure(monkeyp
     page._sync = sync_page
     monkeypatch.setattr(async_api, "_native_page_hot_path_supported", lambda _page: True)
     monkeypatch.setattr(async_api, "_native_selector_locator", lambda *args, **kwargs: FakeLocator())
-    monkeypatch.delenv("RUSTWRIGHT_UNSAFE_DOM_FASTPATH", raising=False)
 
     async def run() -> None:
         with pytest.raises(AsyncTimeoutError, match="Page.click: timed out after 5 ms"):
@@ -47745,3 +47466,1288 @@ def test_native_launch_parser_preserves_value_error():
 
     with pytest.raises(ValueError):
         _rustwright.launch_chromium("{")
+
+
+def test_page_console_expectation_captures_worker_created_after_entry(page):
+    try:
+        with page.expect_console_message("worker created during expectation", timeout=3_000) as message_info:
+            page.evaluate(
+                """() => {
+                const source = `
+                  console.log('worker created during expectation');
+                  setInterval(() => {}, 1000);
+                `;
+                const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+                window.__workerCreatedDuringExpectation = new Worker(url);
+                }"""
+            )
+
+        message = message_info.value
+        assert message.text == "worker created during expectation"
+    finally:
+        page.evaluate("() => window.__workerCreatedDuringExpectation?.terminate()")
+
+
+def test_worker_handler_can_enter_page_console_expectation(page):
+    completed = threading.Event()
+    result: dict[str, Any] = {}
+
+    def on_worker(worker):
+        try:
+            with page.expect_console_message("reentrant worker handler", timeout=3_000) as message_info:
+                page.evaluate("() => console.log('reentrant worker handler')")
+            result["message"] = message_info.value
+            result["worker"] = worker
+        except BaseException as exc:
+            result["error"] = exc
+        finally:
+            completed.set()
+
+    page.on("worker", on_worker)
+    try:
+        page.evaluate(
+            """() => {
+            const source = `setInterval(() => {}, 1000);`;
+            const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+            window.__reentrantWorker = new Worker(url);
+            }"""
+        )
+        assert completed.wait(3), "worker handler did not complete"
+        assert result.get("error") is None, result.get("error")
+        assert result["message"].text == "reentrant worker handler"
+    finally:
+        page.remove_listener("worker", on_worker)
+        page.evaluate("() => window.__reentrantWorker?.terminate()")
+
+
+def test_first_pageerror_wait_honors_short_timeout_on_fresh_page(page):
+    started = time.monotonic()
+    with pytest.raises(TimeoutError) as error_info:
+        page.wait_for_event("pageerror", timeout=50)
+
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0, f"short pageerror timeout exceeded budget: {error_info.value}"
+    assert "50" in str(error_info.value)
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError) as generic_error_info:
+        with page.expect_event("console", timeout=50):
+            pass
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0, f"short generic console timeout exceeded budget: {generic_error_info.value}"
+    assert "50" in str(generic_error_info.value)
+
+
+def test_page_console_listener_removes_worker_forward_and_thread(page):
+    worker = None
+
+    def on_console(_message):
+        pass
+
+    page.on("console", on_console)
+    try:
+        with page.expect_worker() as worker_info:
+            page.evaluate(
+                """() => {
+                const source = `setInterval(() => {}, 1000);`;
+                const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+                window.__cleanupWorker = new Worker(url);
+                }"""
+            )
+        worker = worker_info.value
+
+        forwards = wait_until(lambda: list(page._worker_console_forwards.values()))
+        forward_worker = forwards[0][0]
+        assert forward_worker._target_id == worker._target_id
+
+        def live_console_thread():
+            with forward_worker._event_thread_lock:
+                thread = forward_worker._event_threads.get("console")
+            return thread if thread is not None and thread.is_alive() else None
+
+        assert wait_until(live_console_thread).is_alive()
+        page.remove_listener("console", on_console)
+        assert page._worker_console_forwards == {}
+
+        def no_live_worker_event_threads():
+            with forward_worker._event_thread_lock:
+                return not any(thread.is_alive() for thread in forward_worker._event_threads.values())
+
+        assert wait_until(no_live_worker_event_threads) is True
+    finally:
+        page.remove_listener("console", on_console)
+        page.evaluate("() => window.__cleanupWorker?.terminate()")
+
+
+def test_page_listener_removal_cancels_pending_snapshot_invocation():
+    from rustwright.sync_api import Page
+
+    class Core:
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+    page = Page(Core(), _start_event_pump=False)
+    page._ensure_console_thread = lambda: None
+    page._attach_existing_worker_console_propagation = lambda: None
+    page._ensure_worker_thread = lambda: None
+
+    seen: list[object] = []
+
+    def listener(event):
+        seen.append(event)
+
+    page.on("console", listener)
+    snapshot_ready = threading.Event()
+    allow_snapshot_return = threading.Event()
+    original_snapshot = page._snapshot_event_handlers
+
+    def blocked_snapshot(event, **kwargs):
+        handlers = original_snapshot(event, **kwargs)
+        snapshot_ready.set()
+        assert allow_snapshot_return.wait(2)
+        return handlers
+
+    page._snapshot_event_handlers = blocked_snapshot
+    dispatch_thread = threading.Thread(
+        target=page._dispatch_console_event,
+        args=(object(),),
+        daemon=True,
+    )
+    dispatch_thread.start()
+    assert snapshot_ready.wait(2)
+
+    remove_returned = threading.Event()
+
+    def remove():
+        page.remove_listener("console", listener)
+        remove_returned.set()
+
+    remove_thread = threading.Thread(target=remove, daemon=True)
+    remove_thread.start()
+    assert remove_returned.wait(1), "pending listener removal did not return"
+    allow_snapshot_return.set()
+    dispatch_thread.join(timeout=2)
+    remove_thread.join(timeout=2)
+
+    assert not dispatch_thread.is_alive()
+    assert not remove_thread.is_alive()
+    assert seen == []
+
+
+def test_page_listener_removal_skips_later_same_dispatch_handler():
+    from rustwright.sync_api import Page
+
+    class Core:
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+    page = Page(Core(), _start_event_pump=False)
+    page._ensure_console_thread = lambda: None
+    page._attach_existing_worker_console_propagation = lambda: None
+    page._ensure_worker_thread = lambda: None
+    seen: list[str] = []
+
+    def first(_event):
+        seen.append("first")
+        page.remove_listener("console", second)
+
+    def second(_event):
+        seen.append("second")
+
+    page.on("console", first)
+    page.on("console", second)
+    page._dispatch_event_handlers("console", object())
+    assert seen == ["first"]
+
+
+def test_page_listener_concurrent_self_removal_does_not_deadlock():
+    from rustwright.sync_api import Page
+
+    class Core:
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+    page = Page(Core(), _start_event_pump=False)
+    page._ensure_console_thread = lambda: None
+    page._attach_existing_worker_console_propagation = lambda: None
+    page._ensure_worker_thread = lambda: None
+    entered = threading.Barrier(2)
+    completed: list[int] = []
+
+    def listener(_event):
+        entered.wait(2)
+        page.remove_listener("console", listener)
+        completed.append(1)
+
+    page.on("console", listener)
+    threads = [
+        threading.Thread(
+            target=page._dispatch_event_handlers,
+            args=("console", object()),
+            daemon=True,
+        )
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(completed) == 2
+
+
+def test_page_console_listener_ignores_event_log_history_before_registration():
+    from rustwright.sync_api import Page
+
+    class EventStream:
+        def __init__(self):
+            self._calls = 0
+
+        def wait_batch(self, _timeout_ms, _max_events):
+            self._calls += 1
+            if self._calls == 1:
+                return json.dumps(
+                    [
+                        {
+                            "seq": 4,
+                            "kind": "console",
+                            "payload": {"type": "log", "text": "stale history"},
+                        }
+                    ]
+                )
+            return json.dumps([{"seq": 5, "kind": "_closed", "payload": None}])
+
+    class Core:
+        def __init__(self):
+            self.event_stream = EventStream()
+
+        def combined_event_stream(self):
+            return self.event_stream
+
+        def event_cursor(self):
+            return 5
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+    page = Page(Core(), _start_event_pump=False)
+    page._ensure_console_thread = lambda: None
+    page._attach_existing_worker_console_propagation = lambda: None
+    page._ensure_worker_thread = lambda: None
+    seen: list[str] = []
+    page.on("console", lambda message: seen.append(message.text))
+
+    pump = threading.Thread(target=page._event_pump, daemon=True)
+    pump.start()
+    pump.join(timeout=2)
+
+    assert not pump.is_alive()
+    assert seen == []
+
+
+def test_page_listener_added_during_worker_forward_detach_keeps_forward():
+    from rustwright.sync_api import Page
+
+    class Core:
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+    class WorkerStub:
+        _target_id = "worker-target"
+        url = "blob://worker"
+
+        def __init__(self):
+            self.listener = None
+
+        def on(self, event, callback):
+            assert event == "console"
+            assert self.listener is None
+            self.listener = callback
+
+        def remove_listener(self, event, callback):
+            assert event == "console"
+            if self.listener is callback:
+                self.listener = None
+
+    page = Page(Core(), _start_event_pump=False)
+    worker = WorkerStub()
+    page._workers[worker._target_id] = worker
+
+    first_listener = lambda _message: None
+    second_messages = []
+
+    def second_listener(message):
+        second_messages.append(message.text)
+
+    page._event_handlers["console"] = [first_listener]
+    page._once_event_wrappers = [("console", first_listener, first_listener)]
+    page._attach_worker_console_propagation(worker)
+
+    detach_started = threading.Event()
+    allow_detach = threading.Event()
+    original_detach = page._detach_worker_console_propagation
+
+    def controlled_detach():
+        detach_started.set()
+        assert allow_detach.wait(2)
+        original_detach()
+
+    page._detach_worker_console_propagation = controlled_detach
+    page._ensure_console_thread = lambda: None
+    page._attach_existing_worker_console_propagation = lambda: None
+    page._ensure_worker_thread = lambda: None
+
+    snapshot_errors = []
+
+    def snapshot():
+        try:
+            page._snapshot_event_handlers("console")
+        except BaseException as exc:
+            snapshot_errors.append(exc)
+
+    snapshot_thread = threading.Thread(target=snapshot, daemon=True)
+    snapshot_thread.start()
+    assert detach_started.wait(2)
+
+    listener_thread = threading.Thread(
+        target=page.on,
+        args=("console", second_listener),
+        daemon=True,
+    )
+    listener_thread.start()
+    listener_thread.join(timeout=2)
+    assert not listener_thread.is_alive()
+
+    allow_detach.set()
+    snapshot_thread.join(timeout=2)
+    assert not snapshot_thread.is_alive()
+    assert snapshot_errors == []
+    assert worker.listener is not None
+
+    class Message:
+        type = "log"
+        text = "worker survives listener race"
+        timestamp = 1.0
+        location = None
+
+    message = Message()
+    message.worker = worker
+    worker.listener(message)
+    assert second_messages == ["worker survives listener race"]
+
+
+def test_worker_forward_install_failure_removes_callback_and_mapping():
+    from rustwright.sync_api import Page
+
+    class Core:
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+    class WorkerStub:
+        _target_id = "worker-target"
+        url = "blob://worker"
+
+        def __init__(self):
+            self.listener = None
+
+        def on(self, event, callback):
+            assert event == "console"
+            self.listener = callback
+            raise RuntimeError("worker listener install failed")
+
+        def remove_listener(self, event, callback):
+            assert event == "console"
+            if self.listener is callback:
+                self.listener = None
+
+    page = Page(Core(), _start_event_pump=False)
+    page._event_handlers["console"] = [lambda _message: None]
+    worker = WorkerStub()
+
+    with pytest.raises(RuntimeError, match="worker listener install failed"):
+        page._attach_worker_console_propagation(worker)
+
+    assert worker.listener is None
+    assert page._worker_console_forwards == {}
+
+
+def test_async_listener_removal_cancels_queued_loop_callback():
+    from rustwright.async_api import _wrap_async_event_handler
+    from rustwright.sync_api import Page
+
+    class Core:
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        page = Page(Core(), _start_event_pump=False)
+        owner = type("AsyncOwner", (), {})()
+        owner._sync = page
+        owner._loop = loop
+        owner._event_handler_wrappers = []
+        page._ensure_console_thread = lambda: None
+        page._attach_existing_worker_console_propagation = lambda: None
+        page._ensure_worker_thread = lambda: None
+        seen: list[str] = []
+
+        async def listener(_event):
+            seen.append("called")
+
+        wrapped = _wrap_async_event_handler(owner, "console", listener)
+        page.on("console", wrapped)
+        dispatch_thread = threading.Thread(
+            target=page._dispatch_event_handlers,
+            args=("console", object()),
+            kwargs={"event_sequence": 1},
+            daemon=True,
+        )
+        dispatch_thread.start()
+        dispatch_thread.join(timeout=2)
+        assert not dispatch_thread.is_alive()
+        page.remove_listener("console", wrapped)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert seen == []
+
+    asyncio.run(run())
+
+
+def test_async_coroutine_registration_keeps_dispatch_horizon():
+    from rustwright.async_api import _wrap_async_event_handler
+    from rustwright.sync_api import Page
+
+    class Core:
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        page = Page(Core(), _start_event_pump=False)
+        owner = type("AsyncOwner", (), {})()
+        owner._sync = page
+        owner._loop = loop
+        owner._event_handler_wrappers = []
+        page._ensure_console_thread = lambda: None
+        page._attach_existing_worker_console_propagation = lambda: None
+        page._ensure_worker_thread = lambda: None
+        cursors: list[int | None] = []
+        seen: list[str] = []
+
+        async def second(_event):
+            seen.append("second")
+
+        async def first(_event):
+            await asyncio.sleep(0)
+            cursors.append(page._listener_registration_cursor("console"))
+            page.on("console", _wrap_async_event_handler(owner, "console", second))
+
+        page.on("console", _wrap_async_event_handler(owner, "console", first))
+        page._dispatch_event_handlers("console", object(), event_sequence=10)
+        for _ in range(5):
+            await asyncio.sleep(0)
+            if cursors:
+                break
+        assert cursors == [11]
+        page._dispatch_event_handlers("console", object(), event_sequence=11)
+        for _ in range(5):
+            await asyncio.sleep(0)
+            if seen:
+                break
+        assert seen == ["second"]
+
+    asyncio.run(run())
+
+
+def test_worker_close_snapshot_runs_after_first_handler_raises():
+    from rustwright.sync_api import Worker, _emit_worker_value
+
+    worker = Worker("blob://worker")
+    seen: list[str] = []
+
+    def first(_worker):
+        seen.append("first")
+        raise RuntimeError("first close handler failed")
+
+    def second(_worker):
+        seen.append("second")
+
+    worker._event_handlers = {"close": [first, second]}
+    with pytest.raises(RuntimeError, match="first close handler failed"):
+        _emit_worker_value(worker, "close", worker)
+    assert seen == ["first", "second"]
+    assert worker._closed
+
+def test_async_event_string_and_dict_matchers_for_named_and_generic_apis():
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+
+                async with page.expect_console_message("named async string") as named_string_info:
+                    await page.evaluate("() => console.log('named async string')")
+                assert named_string_info.value.text == "named async string"
+
+                async with page.expect_console_message(
+                    {"text": "named async dictionary", "contains": True}
+                ) as named_dict_info:
+                    await page.evaluate("() => console.log('named async dictionary payload')")
+                assert named_dict_info.value.text == "named async dictionary payload"
+
+                async with page.expect_event("console", "generic async string") as generic_string_info:
+                    await page.evaluate("() => console.log('generic async string')")
+                assert generic_string_info.value.text == "generic async string"
+
+                async with page.expect_event(
+                    "console",
+                    {"text": "generic async dictionary", "contains": True},
+                ) as generic_dict_info:
+                    await page.evaluate("() => console.log('generic async dictionary payload')")
+                assert generic_dict_info.value.text == "generic async dictionary payload"
+
+                await page.evaluate(
+                    "() => setTimeout(() => console.log('generic async wait string'), 500)"
+                )
+                waited_string = await page.wait_for_event(
+                    "console", "generic async wait string", timeout=3_000
+                )
+                assert waited_string.text == "generic async wait string"
+
+                await page.evaluate(
+                    "() => setTimeout(() => console.log('generic async wait dictionary payload'), 500)"
+                )
+                waited_dict = await page.wait_for_event(
+                    "console",
+                    {"text": "generic async wait dictionary", "contains": True},
+                    timeout=3_000,
+                )
+                assert waited_dict.text == "generic async wait dictionary payload"
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_page_console_expectation_captures_cross_origin_oopif_sync(page, oopif_test_server):
+    page.goto(f"{oopif_test_server['top']}/oopif-top")
+    child = next(frame for frame in page.frames if frame.url.endswith("/oopif-child"))
+    marker = "sync oopif console"
+
+    with page.expect_console_message(marker, timeout=3_000) as message_info:
+        child.evaluate("(marker) => console.log(marker)", marker)
+
+    message = message_info.value
+    assert message.text == marker
+    assert message.page is page
+    assert message.worker is None
+
+
+def test_page_console_expectation_captures_cross_origin_oopif_async(
+    oopif_test_server,
+):
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.goto(f"{oopif_test_server['top']}/oopif-top")
+                child = next(frame for frame in page.frames if frame.url.endswith("/oopif-child"))
+                marker = "async oopif console"
+
+                async with page.expect_console_message(marker, timeout=3_000) as message_info:
+                    await child.evaluate("(marker) => console.log(marker)", marker)
+
+                message = message_info.value
+                assert message.text == marker
+                assert message.page is page
+                assert message.worker is None
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_page_console_expectation_enables_preexisting_worker(page):
+    with page.expect_worker() as worker_info:
+        page.evaluate(
+            """() => {
+            const source = `setInterval(() => {}, 1000);`;
+            const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+            window.__preexistingConsoleWorker = new Worker(url);
+            }"""
+        )
+    worker = worker_info.value
+    marker = "preexisting worker console"
+    try:
+        with page.expect_console_message(marker, timeout=3_000) as message_info:
+            worker.evaluate("(marker) => console.log(marker)", marker)
+        assert message_info.value.text == marker
+        assert message_info.value.worker is worker
+    finally:
+        page.evaluate("() => window.__preexistingConsoleWorker?.terminate()")
+
+
+def test_overlapping_page_console_expectations_keep_session_boundaries(page):
+    barrier = threading.Barrier(2)
+    results: dict[str, str] = {}
+    errors: list[BaseException] = []
+
+    def wait_for_marker(marker: str) -> None:
+        try:
+            with page.expect_console_message(marker, timeout=3_000) as message_info:
+                barrier.wait(timeout=2)
+                page.evaluate("(marker) => console.log(marker)", marker)
+            results[marker] = message_info.value.text
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=wait_for_marker, args=(marker,), daemon=True)
+        for marker in ("overlap console one", "overlap console two")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not errors, errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert results == {
+        "overlap console one": "overlap console one",
+        "overlap console two": "overlap console two",
+    }
+
+
+@pytest.mark.parametrize(
+    ("matcher", "message_part"),
+    [
+        ({"text": 123}, "predicate.text"),
+        ({"event_type": 123}, "predicate.event_type"),
+        ({"contains": "yes", "text": "x"}, "predicate.contains"),
+        ({"exact": 0, "text": "x"}, "predicate.exact"),
+        ({"unknown": "x", "text": "x"}, "unexpected key"),
+        ({"contains": True}, "expected text or event_type"),
+    ],
+)
+def test_console_dictionary_matchers_validate_before_waiter_creation(
+    page, matcher, message_part
+):
+    with pytest.raises(Error, match=re.escape(message_part)):
+        page.wait_for_event("console", matcher, timeout=1)
+    with pytest.raises(Error, match=re.escape(message_part)):
+        page.expect_console_message(matcher)
+
+
+def test_page_error_message_preserves_typeerror_without_suffix():
+    from rustwright.sync_api import _page_error_message_from_description
+
+    assert _page_error_message_from_description("TypeError:") == "TypeError:"
+
+
+def test_async_console_dictionary_matchers_validate_before_waiter_creation():
+    async def run() -> None:
+        from playwright.async_api import Error as AsyncError
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                matcher = {"text": 123}
+                with pytest.raises(AsyncError, match="predicate.text"):
+                    await page.wait_for_event("console", matcher, timeout=1)
+                with pytest.raises(AsyncError, match="predicate.text"):
+                    page.expect_console_message(matcher)
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_page_console_listener_added_during_batch_uses_next_dispatch_sequence():
+    from rustwright.sync_api import Page
+
+    class EventStream:
+        def __init__(self):
+            self.calls = 0
+
+        def wait_batch(self, _timeout_ms, _max_events):
+            self.calls += 1
+            if self.calls == 1:
+                return json.dumps(
+                    [
+                        {
+                            "seq": 10,
+                            "kind": "console",
+                            "payload": {"type": "log", "text": "first"},
+                        },
+                        {
+                            "seq": 11,
+                            "kind": "console",
+                            "payload": {"type": "log", "text": "second"},
+                        },
+                    ]
+                )
+            return json.dumps([{"seq": 12, "kind": "_closed", "payload": None}])
+
+    class Core:
+        def __init__(self):
+            self.event_stream = EventStream()
+
+        def combined_event_stream(self):
+            return self.event_stream
+
+        def event_cursor(self):
+            return 10
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+    page = Page(Core(), _start_event_pump=False)
+    page._ensure_console_thread = lambda: None
+    page._ensure_worker_thread = lambda: None
+    page._attach_existing_worker_console_propagation = lambda: None
+    seen: list[tuple[str, str]] = []
+
+    def first(message):
+        seen.append(("first", message.text))
+        if message.text == "first":
+            page.on("console", lambda second: seen.append(("second", second.text)))
+
+    page.on("console", first)
+    pump = threading.Thread(target=page._event_pump, daemon=True)
+    pump.start()
+    pump.join(timeout=2)
+
+    assert not pump.is_alive()
+    assert seen == [("first", "first"), ("first", "second"), ("second", "second")]
+
+
+def test_async_event_pump_preserves_envelope_sequence_for_sync_dispatch():
+    from rustwright.async_api import AsyncPage
+
+    class EventStream:
+        def __init__(self):
+            self.acknowledged = False
+
+        def ack_batch(self):
+            self.acknowledged = True
+
+        def rollback_batch(self):
+            raise AssertionError("batch unexpectedly rolled back")
+
+    class SyncPage:
+        def __init__(self):
+            self._event_stream = EventStream()
+            self.calls: list[dict[str, Any]] = []
+
+        def _event_listeners_active(self):
+            return True
+
+        def _reconcile_event_stream_overflow(self, _payload):
+            pass
+
+        def _handle_observation_event(self, *_args, **kwargs):
+            self.calls.append(kwargs)
+
+    async def run() -> None:
+        sync_page = SyncPage()
+        async_page = object.__new__(AsyncPage)
+        async_page._sync = sync_page
+        closed = await async_page._consume_event_batch(
+            [
+                {"seq": 7, "kind": "console", "payload": {}},
+                {"seq": True, "kind": "console", "payload": {}},
+            ]
+        )
+        assert closed is False
+        assert sync_page._event_stream.acknowledged
+        assert sync_page.calls == [{"event_sequence": 7}, {"event_sequence": None}]
+
+    asyncio.run(run())
+
+
+def test_page_persistent_console_listener_captures_cross_origin_oopif(page, oopif_test_server):
+    messages: list[Any] = []
+    page.on("console", messages.append)
+    page.goto(f"{oopif_test_server['top']}/oopif-top")
+    child = next(frame for frame in page.frames if frame.url.endswith("/oopif-child"))
+    marker = "persistent oopif console"
+
+    child.evaluate("(marker) => console.log(marker)", marker)
+
+    message = wait_until(
+        lambda: next((message for message in messages if message.text == marker), None)
+    )
+    assert message.page is page
+    assert message.worker is None
+
+
+def test_page_worker_listener_captures_worker_created_in_cross_origin_oopif(
+    page, oopif_test_server
+):
+    page.goto(f"{oopif_test_server['top']}/oopif-top")
+    child = next(frame for frame in page.frames if frame.url.endswith("/oopif-child"))
+    worker_seen: list[Any] = []
+    console_seen: list[Any] = []
+    page.on("worker", worker_seen.append)
+    page.on("console", console_seen.append)
+    marker = "oopif worker console"
+
+    child.evaluate(
+        """(marker) => {
+          const source = `console.log(${JSON.stringify(marker)}); setInterval(() => {}, 1000);`;
+          const url = URL.createObjectURL(new Blob([source], {type: 'text/javascript'}));
+          window.__oopifWorker = new Worker(url);
+        }""",
+        marker,
+    )
+
+    worker = wait_until(lambda: next(iter(worker_seen), None))
+    message = wait_until(
+        lambda: next((message for message in console_seen if message.text == marker), None)
+    )
+    assert worker in page.workers
+    assert message.worker is worker
+    child.evaluate("() => window.__oopifWorker?.terminate()")
+
+
+def test_page_once_and_remove_listener_for_console(page):
+    for index in range(200):
+        seen: list[str] = []
+
+        def listener(message, seen=seen):
+            seen.append(message.text)
+
+        page.once("console", listener)
+        page.evaluate("(index) => console.log(`once-${index}`)", index)
+        assert wait_until(lambda: seen) == [f"once-{index}"]
+        page.remove_listener("console", listener)
+
+
+def test_async_listener_removal_from_unrelated_loop_task_cancels_suspended_handler():
+    from rustwright.async_api import _wrap_async_event_handler
+    from rustwright.sync_api import Page
+
+    class Core:
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        page = Page(Core(), _start_event_pump=False)
+        owner = type("AsyncOwner", (), {})()
+        owner._sync = page
+        owner._loop = loop
+        owner._event_handler_wrappers = []
+        page._ensure_console_thread = lambda: None
+        page._attach_existing_worker_console_propagation = lambda: None
+        page._ensure_worker_thread = lambda: None
+        entered = asyncio.Event()
+        after_await: list[str] = []
+        never = asyncio.Event()
+
+        async def listener(_event):
+            entered.set()
+            await never.wait()
+            after_await.append("invoked")
+
+        wrapped = _wrap_async_event_handler(owner, "console", listener)
+        page.on("console", wrapped)
+        dispatch_thread = threading.Thread(
+            target=page._dispatch_event_handlers,
+            args=("console", object()),
+            kwargs={"event_sequence": 1},
+            daemon=True,
+        )
+        dispatch_thread.start()
+        dispatch_thread.join(timeout=2)
+        assert not dispatch_thread.is_alive()
+        await asyncio.wait_for(entered.wait(), timeout=1)
+
+        async def remove_from_unrelated_task():
+            page.remove_listener("console", wrapped)
+
+        await asyncio.wait_for(asyncio.create_task(remove_from_unrelated_task()), timeout=1)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert after_await == []
+        with page._event_dispatch_condition:
+            assert not page._event_handler_registrations
+
+    asyncio.run(run())
+
+
+def test_async_dispatch_horizon_is_scoped_to_source_page():
+    from rustwright.async_api import _wrap_async_event_handler
+    from rustwright.sync_api import Page
+
+    class Core:
+        def __init__(self, cursor):
+            self.cursor = cursor
+
+        def combined_event_stream(self):
+            return object()
+
+        def event_cursor(self):
+            return self.cursor
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        page_a = Page(Core(10_001), _start_event_pump=False)
+        page_b = Page(Core(7), _start_event_pump=False)
+        for page in (page_a, page_b):
+            page._ensure_console_thread = lambda: None
+            page._attach_existing_worker_console_propagation = lambda: None
+            page._ensure_worker_thread = lambda: None
+        owner = type("AsyncOwner", (), {})()
+        owner._sync = page_a
+        owner._loop = loop
+        owner._event_handler_wrappers = []
+        registered = asyncio.Event()
+        seen: list[str] = []
+
+        async def second(_event):
+            seen.append("second")
+
+        wrapped_second = _wrap_async_event_handler(owner, "console", second)
+
+        async def first(_event):
+            await asyncio.sleep(0)
+            page_b.on("console", wrapped_second)
+            registered.set()
+
+        page_a.on("console", _wrap_async_event_handler(owner, "console", first))
+        page_a._dispatch_event_handlers("console", object(), event_sequence=10_001)
+        await asyncio.wait_for(registered.wait(), timeout=1)
+        assert page_b._event_handler_cursors[("console", id(wrapped_second))] == 7
+
+        page_b._dispatch_event_handlers("console", object(), event_sequence=6)
+        await asyncio.sleep(0)
+        assert seen == []
+        page_b._dispatch_event_handlers("console", object(), event_sequence=7)
+        for _ in range(5):
+            await asyncio.sleep(0)
+            if seen:
+                break
+        assert seen == ["second"]
+
+    asyncio.run(run())
+
+def test_worker_listener_claims_before_real_worker_forwarding_and_resume():
+    import rustwright.sync_api as sync_api
+
+    class Waiter:
+        def wait(self, _timeout=None):
+            raise sync_api.Error("test waiter complete")
+
+    handoff_order: list[str] = []
+    claim_entered = threading.Event()
+    capture_ready = threading.Event()
+
+    class Core:
+        target_id = "worker-target"
+        session_id = "worker-session"
+        url = "blob://worker"
+
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def set_worker_event_interest(self, _interested, _timeout_ms):
+            return None
+
+        def set_worker_forwarding_interest(self, _interested, _timeout_ms):
+            return None
+
+        def claim_capture_handoff(self):
+            handoff_order.append("claim")
+            claim_entered.set()
+            return True
+
+        def console_event_waiter(self, _timeout_ms):
+            assert claim_entered.is_set()
+            handoff_order.append("attach")
+            return Waiter()
+
+        def close_event_waiter(self):
+            return Waiter()
+
+        def mark_capture_ready(self):
+            assert handoff_order == ["claim", "attach"]
+            handoff_order.append("ready")
+            capture_ready.set()
+            return True
+
+        def run_if_waiting_for_debugger(self, _timeout_ms):
+            assert capture_ready.is_set()
+            handoff_order.append("resume")
+
+    page = sync_api.Page(Core(), _start_event_pump=False)
+    page._ensure_console_thread = lambda: None
+    page._ensure_worker_thread = lambda: None
+    page._attach_existing_worker_console_propagation = lambda: None
+    page.on("console", lambda _event: None)
+    worker = page._worker_from_core(Core())
+
+    assert worker is page._workers[Core.target_id]
+    assert handoff_order == ["claim", "attach", "ready", "resume"]
+    page.remove_listener("console", page._event_handlers["console"][0])
+
+def test_page_event_waiter_interest_is_released_on_context_exit():
+    from rustwright.sync_api import Page
+
+    class Waiter:
+        def wait(self, _timeout=None):
+            raise AssertionError("the canceled context must not wait")
+
+    class Core:
+        def __init__(self):
+            self.interest = []
+
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def set_worker_event_interest(self, interested, _timeout_ms):
+            self.interest.append(interested)
+
+        def worker_event_waiter(self, _timeout_ms, configure=True):
+            return Waiter()
+
+    core = Core()
+    page = Page(core, _start_event_pump=False)
+
+    try:
+        with page.expect_worker():
+            assert core.interest == [True]
+            raise RuntimeError("cancel waiter")
+    except RuntimeError:
+        pass
+    assert core.interest == [True, False]
+
+def test_fully_canceled_dialog_snapshot_is_dismissed():
+    from rustwright.sync_api import Page
+
+    class Core:
+        def __init__(self):
+            self.dismissals = []
+
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def handle_dialog(self, accepted, prompt_text, timeout_ms):
+            self.dismissals.append((accepted, prompt_text, timeout_ms))
+
+    core = Core()
+    page = Page(core, _start_event_pump=False)
+    handler_called = []
+
+    def handler(_dialog):
+        handler_called.append(True)
+
+    page.on("dialog", handler)
+    original_activate = page._activate_event_handler
+
+    def cancel_before_activation(state, owner):
+        page.remove_listener("dialog", handler)
+        return original_activate(state, owner)
+
+    page._activate_event_handler = cancel_before_activation
+    page._handle_dialog_event({"type": "alert", "message": "blocked"})
+    assert handler_called == []
+    assert core.dismissals == [(False, None, page._default_timeout)]
+def test_dialog_handler_exception_is_auto_dismissed_once():
+    from rustwright.sync_api import Page
+
+    class Core:
+        def __init__(self):
+            self.dismissals = []
+
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def handle_dialog(self, accepted, prompt_text, timeout_ms):
+            self.dismissals.append((accepted, prompt_text, timeout_ms))
+
+    core = Core()
+    page = Page(core, _start_event_pump=False)
+
+    def handler(_dialog):
+        raise RuntimeError("dialog handler failed")
+
+    page.on("dialog", handler)
+    page._handle_dialog_event({"type": "alert", "message": "raises"})
+    assert core.dismissals == [(False, None, page._default_timeout)]
+
+
+def test_dialog_handler_that_returns_without_handling_is_auto_dismissed_once():
+    from rustwright.sync_api import Page
+
+    class Core:
+        def __init__(self):
+            self.dismissals = []
+
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def handle_dialog(self, accepted, prompt_text, timeout_ms):
+            self.dismissals.append((accepted, prompt_text, timeout_ms))
+
+    core = Core()
+    page = Page(core, _start_event_pump=False)
+    page.on("dialog", lambda _dialog: None)
+    page._handle_dialog_event({"type": "alert", "message": "unhandled"})
+    assert core.dismissals == [(False, None, page._default_timeout)]
+
+
+def test_async_dialog_handler_cancellation_after_activation_is_auto_dismissed_once():
+    from rustwright.async_api import _wrap_async_event_handler
+    from rustwright.sync_api import Page
+
+    class Core:
+        def __init__(self):
+            self.dismissals = []
+
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def handle_dialog(self, accepted, prompt_text, timeout_ms):
+            self.dismissals.append((accepted, prompt_text, timeout_ms))
+
+    async def run():
+        core = Core()
+        page = Page(core, _start_event_pump=False)
+        owner = type("AsyncOwner", (), {})()
+        owner._sync = page
+        owner._loop = asyncio.get_running_loop()
+        owner._event_handler_wrappers = []
+        entered = asyncio.Event()
+        never = asyncio.Event()
+
+        async def handler(_dialog):
+            entered.set()
+            await never.wait()
+
+        wrapped = _wrap_async_event_handler(owner, "dialog", handler)
+        page.on("dialog", wrapped)
+        page._handle_dialog_event({"type": "alert", "message": "canceled"})
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        page.remove_listener("dialog", wrapped)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert core.dismissals == [(False, None, page._default_timeout)]
+
+    asyncio.run(run())
+
+
+def test_worker_interest_turns_off_after_last_console_or_worker_listener():
+    from rustwright.sync_api import Page
+
+    class Core:
+        def __init__(self):
+            self.interest = []
+
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def set_worker_event_interest(self, interested, _timeout_ms):
+            self.interest.append(interested)
+
+    core = Core()
+    page = Page(core, _start_event_pump=False)
+    page._ensure_console_thread = lambda: None
+    page._ensure_worker_thread = lambda: None
+    page._attach_existing_worker_console_propagation = lambda: None
+
+    console = lambda _event: None
+    worker = lambda _event: None
+    page.on("console", console)
+    page.on("worker", worker)
+    page.remove_listener("console", console)
+    assert core.interest[-1] is True
+    page.remove_listener("worker", worker)
+    assert core.interest[-1] is False
+    once_worker = lambda _event: None
+    page.once("worker", once_worker)
+    assert core.interest[-1] is True
+    page._dispatch_event_handlers("worker", object())
+    assert core.interest[-1] is False
+
+
+def test_worker_close_consumers_fire_terminal_snapshot_once():
+    from rustwright.sync_api import Worker, _emit_worker_value
+
+    worker = Worker("blob://worker")
+    seen: list[str] = []
+    start = threading.Barrier(3)
+
+    def on_close(_worker):
+        seen.append("close")
+
+    worker._event_handlers = {"close": [on_close]}
+
+    def consume():
+        start.wait(timeout=2)
+        _emit_worker_value(worker, "close", worker)
+
+    threads = [threading.Thread(target=consume, daemon=True) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=2)
+    for thread in threads:
+        thread.join(timeout=2)
+    assert all(not thread.is_alive() for thread in threads)
+    assert seen == ["close"]
