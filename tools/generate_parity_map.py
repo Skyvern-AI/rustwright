@@ -31,6 +31,7 @@ if sys.version_info < (3, 9):
 ROOT = Path(__file__).resolve().parents[1]
 DOC_PATH = ROOT / "docs" / "PARITY.md"
 CASES_PATH = ROOT / "benchmarks" / "automation_cases.py"
+RUNNER_PATH = ROOT / "benchmarks" / "run_benchmarks.py"
 SUITE_PATH = ROOT / "tests" / "test_playwright_parity_cases.py"
 LIMITATIONS_PATH = ROOT / "LIMITATIONS.md"
 NODE_README_PATH = ROOT / "node" / "README.md"
@@ -383,14 +384,13 @@ def validate_suite_uses_real_playwright_registry() -> None:
         isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_run_parity"
         for node in ast.walk(tree)
     )
-    checks_registry_length = any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "len"
-        and any(isinstance(arg, ast.Name) and arg.id == "CASES" for arg in node.args)
+    constants = {
+        node.value
         for node in ast.walk(tree)
-    )
-    if not all((imports_cases, mentions_playwright, runs_parity, checks_registry_length)):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    uses_canonical_runner = "run_benchmarks.py" in constants and "parity" in constants
+    if not all((imports_cases, mentions_playwright, runs_parity, uses_canonical_runner)):
         raise RuntimeError("the shared parity test no longer proves that real Playwright runs the CASES registry")
 
 
@@ -906,7 +906,8 @@ def render(
 
     source_digest = hashlib.sha256(
         b"\0".join(
-            path.read_bytes() for path in (CASES_PATH, SUITE_PATH, LIMITATIONS_PATH, NODE_README_PATH)
+            path.read_bytes()
+            for path in (CASES_PATH, RUNNER_PATH, SUITE_PATH, LIMITATIONS_PATH, NODE_README_PATH)
         )
     ).hexdigest()[:16]
     lines.extend(
@@ -925,9 +926,9 @@ def render(
             "- Method totals count methods, not properties. Properties remain in the detailed tables because "
             "they are part of the usable API and because their return annotations make chained receiver "
             "types resolvable.",
-            f"- The exercised state starts only from the {len(cases)} functions actually present in the `CASES` "
-            "registry. The generator verifies that `tests/test_playwright_parity_cases.py` imports that registry, "
-            "runs `_run_parity` for a `playwright` parameter, and checks `len(CASES)`.",
+            f"- The exercised state starts only from the {len(cases)} functions in the `CASES` registry. "
+            "The generator verifies that the parity test imports that registry and runs the canonical "
+            "`benchmarks/run_benchmarks.py --suite parity` entry point for both backends.",
             "- Exercise detection is conservative static analysis. It propagates `Page` and `Playwright` case "
             "parameters through assignments, reference return annotations, property chains, collection indexing, "
             "local helper calls, callback annotations, and literal event names. A member becomes green only when "
@@ -940,7 +941,7 @@ def render(
             "case against real Playwright and Rustwright. It does not prove all options, errors, events, browser "
             "engines, or edge cases match.",
             "- The limitations and Node.js sections are parsed from `LIMITATIONS.md` and `node/README.md` on each run.",
-            f"- Source digest (case registry, parity test, limitations, Node README): `{source_digest}`.",
+            f"- Source digest (case registry, canonical runner, parity test, limitations, Node README): `{source_digest}`.",
             "",
         ]
     )
