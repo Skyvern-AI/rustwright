@@ -6,8 +6,6 @@ use rustwright_agent::{
     ActorConfig, BrowserActor as NativeBrowserActor, BrowserStartup, RequestId as ActorRequestId,
 };
 
-use crate::config::FeatureConfig;
-
 pub(crate) use rustwright_agent::{
     BrowserError, BrowserOp, BrowserOutput, BrowserResult, FillField, FillFieldKind, RegexSpec,
     ScreenshotType, TabAction,
@@ -28,13 +26,13 @@ pub(crate) struct BrowserActor {
 }
 
 impl BrowserActor {
-    pub(crate) fn spawn_with_features(features: FeatureConfig) -> Self {
+    pub(crate) fn spawn() -> Self {
         let startup = browser_startup_from_env();
         let config = ActorConfig {
-            distill: features.distill,
-            header: features.header,
-            console_dedup: features.console_dedup,
-            net_note: features.net_note,
+            distill: true,
+            header: true,
+            console_dedup: true,
+            net_note: true,
             default_timeout: tool_timeout_from_env(),
             workspace: env::var_os("RUSTWRIGHT_MCP_WORKSPACE").map(Into::into),
         };
