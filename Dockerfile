@@ -54,9 +54,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY src ./src
 COPY python ./python
-# The root Cargo.toml declares `node`, `capi`, and `rust-native` as workspace
-# members, so cargo must be able to load each member manifest (and its lib
-# sources) to resolve the workspace before maturin builds the Python
+# The root Cargo.toml declares `node`, `capi`, `rust-native`, and `agent` as
+# workspace members, so cargo must be able to load each member manifest (and its
+# lib sources) to resolve the workspace before maturin builds the Python
 # extension — even though this image never builds those crates. Copy just the
 # crate manifests and sources, not node_modules or build output.
 COPY node/Cargo.toml node/build.rs ./node/
@@ -65,6 +65,8 @@ COPY capi/Cargo.toml ./capi/
 COPY capi/src ./capi/src
 COPY rust-native/Cargo.toml ./rust-native/
 COPY rust-native/src ./rust-native/src
+COPY agent/Cargo.toml ./agent/
+COPY agent/src ./agent/src
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/usr/local/cargo/registry \
