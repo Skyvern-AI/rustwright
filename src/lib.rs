@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::LazyLock;
 #[cfg(feature = "python")]
 use std::sync::OnceLock;
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -366,6 +366,7 @@ struct PendingCommandGuard {
     pending: CdpPendingMap,
     outstanding: CdpOutstandingMap,
     traffic_log: Arc<Mutex<CdpTrafficLog>>,
+    retention_gate: Arc<CdpRetentionGate>,
 }
 
 struct QueuedCdpCommand {
@@ -412,18 +413,25 @@ impl PendingCommandGuard {
         pending: &CdpPendingMap,
         outstanding: &CdpOutstandingMap,
         traffic_log: &Arc<Mutex<CdpTrafficLog>>,
+        retention_gate: &Arc<CdpRetentionGate>,
     ) -> Self {
         Self {
             id,
             pending: Arc::clone(pending),
             outstanding: Arc::clone(outstanding),
             traffic_log: Arc::clone(traffic_log),
+            retention_gate: Arc::clone(retention_gate),
         }
     }
 }
 
 impl Drop for PendingCommandGuard {
     fn drop(&mut self) {
+        let Some(_retention_guard) = self.retention_gate.lock_for_write() else {
+            self.pending.lock().unwrap().remove(&self.id);
+            self.outstanding.lock().unwrap().remove(&self.id);
+            return;
+        };
         let was_pending = self.pending.lock().unwrap().remove(&self.id).is_some();
         let outstanding = self.outstanding.lock().unwrap().remove(&self.id);
         if was_pending {
@@ -444,7 +452,12 @@ impl Drop for SpawnedTaskAbortGuard {
 }
 
 const CDP_EVENT_LOG_LIMIT: usize = 8192;
+const CDP_EVENT_LOG_MAX_BYTES: usize = 8 * 1024 * 1024;
+const CDP_EVENT_LOG_MAX_ENTRY_BYTES: usize = 64 * 1024;
+const CDP_RETAINED_STRING_MAX_BYTES: usize = 8 * 1024;
+const CDP_RETAINED_ARRAY_MAX_ITEMS: usize = 128;
 const CDP_DIAGNOSTIC_TRAFFIC_LIMIT: usize = 32;
+const CDP_EVENT_UNREPLAYABLE_MARKER: &str = "__rustwright_cdp_event_unreplayable";
 const CDP_DIAGNOSTIC_LIST_LIMIT: usize = 32;
 const CDP_DIAGNOSTIC_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const TIMEOUT_DIAGNOSTIC_BANNER: &str = "RUSTWRIGHT TIMEOUT DIAGNOSTIC";
@@ -9946,6 +9959,7 @@ multiline-compatible = """4.5.6"""
             cursor_slot: Arc::clone(&cursor_slot),
             requests: Arc::clone(&shared_requests),
             working_requests: Arc::clone(&working_requests),
+            page: None,
         };
 
         drop(lease);
@@ -9972,6 +9986,7 @@ multiline-compatible = """4.5.6"""
             cursor_slot: Arc::clone(&cursor_slot),
             requests: Arc::clone(&shared_requests),
             working_requests,
+            page: None,
         };
         {
             let mut live = shared_requests.lock().unwrap();
@@ -10033,6 +10048,117 @@ multiline-compatible = """4.5.6"""
 
     #[cfg(feature = "python")]
     #[test]
+    fn delivered_page_event_lease_does_not_merge_after_page_release() {
+        let harness = navigation_test_harness(4);
+        let page = Arc::clone(&harness.page);
+        let shared_requests = Arc::clone(&page.network_requests);
+        let mut working_store = NetworkRequestStore::new(2);
+        let snapshot = NetworkRequestSnapshot {
+            seq: 1,
+            request: json!({ "url": "https://example.test/late" }),
+            redirect_ancestry: Vec::new(),
+        };
+        working_store.requests.insert(
+            "request-1".to_string(),
+            NetworkRequestEntry {
+                current: snapshot.clone(),
+                applied_by_seq: BTreeMap::from([(1, snapshot)]),
+            },
+        );
+        working_store
+            .applied_order
+            .push_back((1, "request-1".to_string()));
+        let working_requests = Arc::new(Mutex::new(working_store));
+        let (_sender, receiver) = broadcast::channel(4);
+        let receiver_slot = Arc::new(Mutex::new(None));
+        let state_slot = Arc::new(Mutex::new(None));
+        let cursor_slot = Arc::new(Mutex::new(0));
+        let lease = PageEventStreamLease {
+            receiver: Some(receiver),
+            state: Some(PageEventStreamState::new()),
+            rollback_state: Some(PageEventStreamState::new()),
+            cursor: 2,
+            rollback_cursor: 0,
+            delivered: true,
+            receiver_slot,
+            state_slot,
+            cursor_slot,
+            requests: Arc::clone(&shared_requests),
+            working_requests,
+            page: Some(page.clone()),
+        };
+
+        page.release_memory_buffers();
+        drop(lease);
+
+        assert!(shared_requests.lock().unwrap().requests.is_empty());
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn network_backfill_tombstone_resets_store_and_reports_overflow() {
+        fn request_event(url: &str) -> Value {
+            json!({
+                "sessionId": "page-session",
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": url,
+                    "request": {
+                        "url": url,
+                        "method": "GET",
+                        "headers": {},
+                    },
+                },
+            })
+        }
+
+        let mut event_log = CdpEventLog::new();
+        event_log.push(request_event("https://example.test/before"));
+        let mut tombstone = json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "tombstone",
+                "request": {
+                    "url": "https://example.test/tombstone",
+                    "method": "POST",
+                    "headers": {"x-tombstone": "must-not-apply"},
+                },
+            },
+        });
+        tombstone
+            .as_object_mut()
+            .unwrap()
+            .insert(CDP_EVENT_UNREPLAYABLE_MARKER.to_string(), Value::Bool(true));
+        event_log.push(tombstone);
+        event_log.push(request_event("https://example.test/current"));
+        let current_event = event_log.entries_since(0)[2].1.clone();
+        let event_log = Arc::new(Mutex::new(event_log));
+        let requests = Arc::new(Mutex::new(NetworkRequestStore::new(0)));
+        let mut state = NetworkObservationState::new();
+
+        let result = process_network_observation_event(
+            2,
+            &current_event,
+            &event_log,
+            "page-session",
+            &requests,
+            true,
+            &mut state,
+        );
+
+        assert_eq!(result, Err(1));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.next_applied_seq, 3);
+        assert!(requests.requests.is_empty());
+        assert!(requests.applied_order.is_empty());
+        drop(requests);
+        assert!(state.pending_responses.is_empty());
+        assert!(state.response_extra_infos.is_empty());
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
     fn stale_page_event_ack_does_not_restore_requests_cleared_by_overflow() {
         fn store(url: &str, next_seq: u64) -> NetworkRequestStore {
             let mut store = NetworkRequestStore::new(next_seq);
@@ -10074,6 +10200,7 @@ multiline-compatible = """4.5.6"""
             cursor_slot,
             requests: Arc::clone(&shared_requests),
             working_requests,
+            page: None,
         };
 
         shared_requests.lock().unwrap().reset_after_overflow(20);
@@ -10240,6 +10367,7 @@ multiline-compatible = """4.5.6"""
             cursor_slot: Arc::new(Mutex::new(7_999)),
             requests: Arc::clone(&shared_requests),
             working_requests,
+            page: None,
         };
 
         shared_requests.lock().unwrap().reset_after_overflow(8_000);
@@ -10336,6 +10464,7 @@ multiline-compatible = """4.5.6"""
             cursor_slot: Arc::new(Mutex::new(7_999)),
             requests: Arc::clone(&shared_requests),
             working_requests,
+            page: None,
         };
 
         shared_requests.lock().unwrap().reset_after_overflow(8_000);
@@ -10630,6 +10759,33 @@ multiline-compatible = """4.5.6"""
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0]["kind"], "console");
         assert_eq!(batch[0]["payload"]["text"], "after failed capture");
+    }
+
+    #[tokio::test]
+    async fn release_memory_buffers_clears_console_capture_after_setup_settles() {
+        let mut harness = navigation_test_harness(16);
+        let page = Arc::clone(&harness.page);
+        page.console_capture.requested.store(true, Ordering::SeqCst);
+        let capture_page = Arc::clone(&page);
+        let capture = tokio::spawn(async move {
+            enable_console_capture_for_session(
+                &capture_page,
+                "page-session",
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        let enable = harness.next_command("Runtime.enable").await;
+        page.release_memory_buffers();
+        harness.reply(&enable, json!({}));
+
+        assert!(matches!(
+            capture.await.unwrap(),
+            Err(RwError::TargetClosed(TargetClosedKind::Page))
+        ));
+        assert!(!page.console_capture.requested.load(Ordering::SeqCst));
+        let enabled_sessions = page.console_capture.enabled_sessions.lock().await;
+        assert!(enabled_sessions.is_empty());
     }
 
     #[tokio::test]
@@ -16487,6 +16643,128 @@ return this.dataset.mainWorldOverride === "observed";
 
         harness.reply_error(&focus, "setup deliberately withheld");
         harness.reply_error(&file_chooser, "setup deliberately withheld");
+    }
+
+    #[tokio::test]
+    async fn manual_oopif_attachment_does_not_repopulate_released_page() {
+        let mut harness = navigation_test_harness(8);
+        let page = Arc::clone(&harness.page);
+        let target_info = json!({
+            "type": "iframe",
+            "targetId": "released-child-frame",
+            "parentFrameId": "root-frame",
+        });
+        let resolver_page = Arc::clone(&page);
+        let resolver = tokio::spawn(async move {
+            attach_iframe_target_for_frame(
+                resolver_page,
+                "released-child-frame",
+                &target_info,
+                "page-session",
+                OperationDeadline::new(Duration::from_secs(2)),
+            )
+            .await
+        });
+
+        let attach = harness.next_command("Target.attachToTarget").await;
+        page.release_memory_buffers();
+        harness.reply(&attach, json!({ "sessionId": "released-child-session" }));
+
+        let detach = harness.next_command("Target.detachFromTarget").await;
+        assert_eq!(
+            detach["params"],
+            json!({ "sessionId": "released-child-session" })
+        );
+        let result = resolver.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(RwError::TargetClosed(TargetClosedKind::Page))
+        ));
+        let state = harness.page.frame_state.lock().unwrap();
+        assert!(state.frames.is_empty());
+        assert!(state.frame_sessions.is_empty());
+        assert!(state.session_frames.is_empty());
+        assert!(state.frame_session_waiters.is_empty());
+    }
+
+    #[test]
+    fn page_event_tombstone_rebuilds_child_session_ownership() {
+        let harness = navigation_test_harness(8);
+        {
+            let mut frame_state = harness.page.frame_state.lock().unwrap();
+            frame_state.record_frame(
+                "main-frame".to_string(),
+                None,
+                None,
+                Some("https://example.test/".to_string()),
+                "page-session".to_string(),
+            );
+            frame_state.record_session_for_frame("child-frame", "child-session");
+            frame_state.record_frame(
+                "child-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                Some("https://child.example.test/".to_string()),
+                "child-session".to_string(),
+            );
+        }
+        let oversized_attachment = json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "child-session",
+                "waitingForDebugger": vec!["x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES); 16],
+                "targetInfo": {
+                    "type": "iframe",
+                    "targetId": "x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES),
+                    "subtype": "x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES),
+                    "title": "x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES),
+                    "url": "x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES),
+                    "openerId": "x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES),
+                    "parentFrameId": "x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES),
+                },
+            },
+        });
+        let (tombstone, _) = compact_retained_cdp_event(oversized_attachment);
+        assert!(is_unreplayable_cdp_event(&tombstone));
+        let mut stream_state = PageEventStreamState::for_session("page-session".to_string());
+        stream_state
+            .owned_sessions
+            .insert("stale-session".to_string());
+        let console = json!({
+            "sessionId": "child-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "string", "value": "after overflow"}],
+            },
+        });
+
+        process_page_observation_event_with_page(
+            0,
+            &tombstone,
+            &harness.event_log,
+            "page-session",
+            &harness.page.network_requests,
+            &mut stream_state,
+            Some(&harness.page),
+        );
+        assert!(stream_state.owned_sessions.contains("child-session"));
+        assert!(!stream_state.owned_sessions.contains("stale-session"));
+        process_page_observation_event_with_page(
+            1,
+            &console,
+            &harness.event_log,
+            "page-session",
+            &harness.page.network_requests,
+            &mut stream_state,
+            Some(&harness.page),
+        );
+        let mut batch = Vec::new();
+        append_ready_page_events(&mut batch, &mut stream_state, 8);
+        assert_eq!(batch[0]["kind"], "_overflow");
+        assert_eq!(batch[1]["kind"], "console");
+        assert_eq!(batch[1]["payload"]["text"], "after overflow");
     }
 
     #[tokio::test]
@@ -22644,6 +22922,295 @@ return this.dataset.mainWorldOverride === "observed";
             .action_dispatch_receipts
             .is_empty());
     }
+    #[test]
+    fn cdp_event_log_bounds_retained_payloads_without_changing_live_events() {
+        let mut log = CdpEventLog::new();
+        let event = json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{ "value": "x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES * 2) }]
+            }
+        });
+        let live = log.push(event.clone());
+        assert_eq!(
+            live.pointer("/params/args/0/value")
+                .and_then(Value::as_str)
+                .map(str::len),
+            Some(CDP_EVENT_LOG_MAX_ENTRY_BYTES * 2)
+        );
+        let retained = log.entries_since(0);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].0, 0);
+        assert!(retained[0]
+            .1
+            .pointer("/params/args/0/value")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.len() <= CDP_RETAINED_STRING_MAX_BYTES));
+        assert!(log.retained_bytes <= CDP_EVENT_LOG_MAX_BYTES);
+        assert_eq!(log.cursor_after_event(0, &live), 1);
+    }
+    #[test]
+    fn cdp_event_log_tombstones_payloads_that_remain_oversized_after_compaction() {
+        let mut log = CdpEventLog::new();
+        let event = json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": (0..9)
+                    .map(|index| json!({ "type": "string", "value": format!("{index}:{}", "x".repeat(8_193)) }))
+                    .collect::<Vec<_>>()
+            }
+        });
+
+        let live = log.push(event);
+        let retained = log.entries_since(0);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].0, 0);
+        assert_eq!(live["method"], "Runtime.consoleAPICalled");
+        assert_eq!(retained[0].1["method"], "Runtime.consoleAPICalled");
+        assert_eq!(retained[0].1["sessionId"], "page-session");
+        assert_eq!(retained[0].1["__rustwright_cdp_event_seq"], 0);
+        assert_eq!(
+            retained[0].1[CDP_EVENT_UNREPLAYABLE_MARKER],
+            Value::Bool(true)
+        );
+        assert!(retained[0].1.pointer("/params/args").is_none());
+        assert!(retained_cdp_event_size(&retained[0].1) <= CDP_EVENT_LOG_MAX_ENTRY_BYTES);
+    }
+
+    #[test]
+    fn page_event_stream_turns_compacted_tombstone_into_explicit_overflow() {
+        let mut log = CdpEventLog::new();
+        let event = json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "request-1",
+                "request": {
+                    "url": "https://example.test/large",
+                    "method": "GET",
+                    "headers": (0..9)
+                        .map(|index| format!("{index}:{}", "x".repeat(8_193)))
+                        .collect::<Vec<_>>()
+                }
+            }
+        });
+        log.push(event);
+        let retained = log.entries_since(0).remove(0).1;
+        let event_log = Arc::new(Mutex::new(log));
+        let requests = Arc::new(Mutex::new(NetworkRequestStore::new(0)));
+        let mut state = PageEventStreamState::new();
+
+        process_page_observation_event(
+            0,
+            &retained,
+            &event_log,
+            "page-session",
+            &requests,
+            &mut state,
+        );
+
+        assert_eq!(state.ready.get(&0).unwrap()["kind"], "_overflow");
+        assert_eq!(
+            state.ready.get(&0).unwrap()["payload"]["reason"],
+            "unreplayable_event"
+        );
+        assert_eq!(requests.lock().unwrap().next_applied_seq, 1);
+    }
+
+    #[test]
+    fn cdp_event_log_byte_horizon_uses_stored_entry_sizes() {
+        let mut log = CdpEventLog::new();
+        for index in 0..CDP_EVENT_LOG_LIMIT {
+            log.push(json!({
+                "method": "Test.byteHorizon",
+                "params": { "index": index, "payload": "x".repeat(4_096) }
+            }));
+        }
+
+        assert!(log.events.len() < CDP_EVENT_LOG_LIMIT);
+        assert!(log.oldest_seq() > 0);
+        assert!(log.retained_bytes <= CDP_EVENT_LOG_MAX_BYTES);
+        assert_eq!(
+            log.retained_bytes,
+            log.events
+                .iter()
+                .map(|entry| entry.retained_bytes)
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn terminal_event_log_release_shrinks_backing_storage() {
+        let mut log = CdpEventLog::new();
+        log.push(json!({ "method": "Test.retained", "params": { "value": "x" } }));
+        assert!(log.events.capacity() > 0);
+        log.clear_retained();
+        assert!(log.events.is_empty());
+        assert_eq!(log.events.capacity(), 0);
+        assert_eq!(log.retained_bytes, 0);
+    }
+
+    #[test]
+    fn late_dispatch_after_terminal_release_cannot_resurrect_retained_state() {
+        let harness = navigation_test_harness(4);
+        let client = Arc::clone(&harness.page.browser.client);
+        client.release_memory_buffers();
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": { "type": "log", "args": [{ "value": "late" }] }
+        }));
+
+        assert!(harness.event_log.lock().unwrap().events.is_empty());
+        assert!(harness
+            .page
+            .browser
+            .client
+            .traffic_log
+            .lock()
+            .unwrap()
+            .entries
+            .is_empty());
+        assert!(harness
+            .page
+            .browser
+            .client
+            .runtime_state
+            .lock()
+            .unwrap()
+            .serializers
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_flight_page_event_after_terminal_release_cannot_resurrect_page_state() {
+        let harness = navigation_test_harness(4);
+        let page = Arc::clone(&harness.page);
+        harness.listen_for_oopif_events();
+        let (mut entered, mut completed, released) =
+            install_page_lifecycle_test_barrier(&page, "child-session");
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "child-session",
+                "targetInfo": {
+                    "type": "iframe",
+                    "targetId": "child-frame",
+                    "parentFrameId": "main-frame",
+                },
+            },
+        }));
+        tokio::time::timeout(Duration::from_secs(1), entered.changed())
+            .await
+            .expect("page event handler must reach the lifecycle barrier")
+            .expect("lifecycle barrier sender must remain connected");
+
+        page.release_memory_buffers();
+        page.browser.client.release_memory_buffers();
+        released.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), completed.changed())
+            .await
+            .expect("page event handler must leave the lifecycle barrier")
+            .expect("lifecycle completion sender must remain connected");
+
+        assert!(!page
+            .frame_state
+            .lock()
+            .unwrap()
+            .owns_session("child-session"));
+        assert!(page
+            .browser
+            .client
+            .event_log
+            .lock()
+            .unwrap()
+            .events
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn console_worker_waiter_drops_attachment_after_terminal_release() {
+        let harness = navigation_test_harness(4);
+        let page = Arc::clone(&harness.page);
+        let event_log = Arc::clone(&harness.event_log);
+        let (mut entered, mut completed, released) =
+            install_page_lifecycle_test_barrier(&page, "worker-session");
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "worker-session",
+                "targetInfo": {
+                    "type": "worker",
+                    "targetId": "worker-target",
+                },
+            },
+        }));
+        let event = event_log
+            .lock()
+            .unwrap()
+            .entries_since(0)
+            .last()
+            .expect("worker attachment event")
+            .1
+            .clone();
+        let waiter_page = Arc::clone(&page);
+        let waiter_log = Arc::clone(&event_log);
+        let waiter = tokio::spawn(async move {
+            let mut cursor = 0;
+            let replay_until = HashMap::new();
+            process_console_wait_event(
+                event,
+                &mut cursor,
+                0,
+                &waiter_log,
+                "page-session",
+                &replay_until,
+                "console",
+                Some(waiter_page),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.changed())
+            .await
+            .expect("console waiter must reach the lifecycle barrier")
+            .expect("lifecycle barrier sender must remain connected");
+
+        page.release_memory_buffers();
+        released.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), completed.changed())
+            .await
+            .expect("console waiter must leave the lifecycle barrier")
+            .expect("lifecycle barrier sender must remain connected");
+        assert_eq!(waiter.await.unwrap().unwrap(), None);
+        assert!(!page
+            .frame_state
+            .lock()
+            .unwrap()
+            .owns_session("worker-session"));
+        assert_eq!(
+            remove_page_worker_session_from_detachment(
+                &page,
+                &json!({
+                    "method": "Target.detachedFromTarget",
+                    "params": {"sessionId": "worker-session"},
+                }),
+            ),
+            None
+        );
+    }
 
     #[test]
     fn commencing_receipt_is_terminal_only_for_single_evaluation_dispatch() {
@@ -23372,6 +23939,8 @@ return this.dataset.mainWorldOverride === "observed";
         let mut log = CdpEventLog {
             next_seq: 10,
             events: VecDeque::with_capacity(CDP_EVENT_LOG_LIMIT),
+            retained_bytes: 0,
+            retention_gate: Arc::new(CdpRetentionGate::new()),
             action_dispatch_receipts: HashMap::new(),
             console_replay_cutoffs: HashMap::new(),
             console_replay_cutoff_generations: HashMap::new(),
@@ -24309,6 +24878,10 @@ impl CdpTrafficLog {
     fn snapshot(&self) -> Vec<CdpTrafficEntry> {
         self.entries.iter().cloned().collect()
     }
+    fn clear_for_close(&mut self) {
+        self.entries = VecDeque::new();
+        self.last_page_navigate = HashMap::new();
+    }
 
     fn page_navigate_waiting_for(
         &self,
@@ -24670,6 +25243,14 @@ impl CdpRuntimeState {
         self.frame_loaders
             .retain(|(loader_session_id, _), _| loader_session_id != session_id);
     }
+    fn clear_for_close(&mut self) {
+        self.serializers = HashMap::new();
+        self.serializer_install_locks = HashMap::new();
+        self.serializer_generations = HashMap::new();
+        self.execution_realms = HashMap::new();
+        self.session_realms = HashMap::new();
+        self.frame_loaders = HashMap::new();
+    }
 }
 
 fn spawn_serializer_release_pump(
@@ -24913,9 +25494,273 @@ fn merge_console_replay_cutoff(stored: &mut u64, cutoff: u64) {
     }
 }
 
+fn compact_retained_cdp_value(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            if text.len() > CDP_RETAINED_STRING_MAX_BYTES {
+                let mut end = CDP_RETAINED_STRING_MAX_BYTES;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+            }
+        }
+        Value::Array(values) => {
+            values.truncate(CDP_RETAINED_ARRAY_MAX_ITEMS);
+            for value in values {
+                compact_retained_cdp_value(value);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                compact_retained_cdp_value(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn retained_cdp_event_size(event: &Value) -> usize {
+    let mut writer = CountingWriter { bytes: 0 };
+    serde_json::to_writer(&mut writer, event).map_or(usize::MAX, |_| writer.bytes)
+}
+
+fn retained_object_fields(value: &Value, fields: &[&str]) -> Value {
+    let mut retained = serde_json::Map::new();
+    if let Some(object) = value.as_object() {
+        for field in fields {
+            if let Some(value) = object.get(*field) {
+                retained.insert((*field).to_string(), value.clone());
+            }
+        }
+    }
+    Value::Object(retained)
+}
+
+fn retained_cdp_event_params(method: &str, params: &Value) -> Option<Value> {
+    let mut retained = serde_json::Map::new();
+    let fields: &[&str] = match method {
+        "Page.frameAttached" => &["frameId", "parentFrameId"],
+        "Page.frameDetached" => &["frameId", "reason"],
+        "Page.navigatedWithinDocument" => &["frameId", "url", "navigationType"],
+        "Page.frameNavigated" => &["frame"],
+        "Target.attachedToTarget" => &["sessionId", "targetInfo", "waitingForDebugger"],
+        "Target.detachedFromTarget" => &["sessionId", "targetId"],
+        "Runtime.executionContextCreated" => &["context"],
+        "Runtime.executionContextDestroyed" => &["executionContextId", "executionContextUniqueId"],
+        "Network.requestWillBeSent" => &[
+            "requestId",
+            "loaderId",
+            "documentURL",
+            "type",
+            "frameId",
+            "hasUserGesture",
+            "redirectHasExtraInfo",
+        ],
+        "Network.requestWillBeSentExtraInfo" => &["requestId"],
+        "Network.responseReceived" => &["requestId", "loaderId", "type", "frameId", "hasExtraInfo"],
+        "Network.responseReceivedExtraInfo" => {
+            &["requestId", "statusCode", "resourceIPAddressSpace"]
+        }
+        "Network.loadingFinished" | "Network.loadingFailed" => &[
+            "requestId",
+            "encodedDataLength",
+            "errorText",
+            "blockedReason",
+            "canceled",
+        ],
+        "Runtime.consoleAPICalled" => &[
+            "type",
+            "executionContextId",
+            "timestamp",
+            "exceptionId",
+            "stackTrace",
+        ],
+        "Runtime.exceptionThrown" => &["timestamp", "exceptionDetails"],
+        _ => &[],
+    };
+    if let Some(object) = params.as_object() {
+        for field in fields {
+            if let Some(value) = object.get(*field) {
+                let value = match (*field, method) {
+                    ("frame", "Page.frameNavigated") => retained_object_fields(
+                        value,
+                        &[
+                            "id",
+                            "parentId",
+                            "loaderId",
+                            "url",
+                            "name",
+                            "securityOrigin",
+                            "mimeType",
+                            "unreachableUrl",
+                            "adFrameType",
+                        ],
+                    ),
+                    ("targetInfo", "Target.attachedToTarget") => retained_object_fields(
+                        value,
+                        &[
+                            "targetId",
+                            "type",
+                            "subtype",
+                            "title",
+                            "url",
+                            "openerId",
+                            "parentFrameId",
+                        ],
+                    ),
+                    ("context", "Runtime.executionContextCreated") => {
+                        let mut context = retained_object_fields(
+                            value,
+                            &["id", "uniqueId", "name", "origin", "auxData"],
+                        );
+                        if let Some(aux_data) = value.get("auxData") {
+                            if let Some(object) = context.as_object_mut() {
+                                object.insert(
+                                    "auxData".to_string(),
+                                    retained_object_fields(
+                                        aux_data,
+                                        &["frameId", "isDefault", "type"],
+                                    ),
+                                );
+                            }
+                        }
+                        context
+                    }
+                    _ => value.clone(),
+                };
+                retained.insert((*field).to_string(), value);
+            }
+        }
+        if method == "Network.requestWillBeSent" {
+            if let Some(request) = object.get("request") {
+                retained.insert(
+                    "request".to_string(),
+                    retained_object_fields(
+                        request,
+                        &["url", "method", "initialPriority", "referrerPolicy"],
+                    ),
+                );
+            }
+        } else if method == "Network.responseReceived" {
+            if let Some(response) = object.get("response") {
+                retained.insert(
+                    "response".to_string(),
+                    retained_object_fields(
+                        response,
+                        &[
+                            "url",
+                            "status",
+                            "statusText",
+                            "mimeType",
+                            "protocol",
+                            "securityState",
+                            "encodedDataLength",
+                        ],
+                    ),
+                );
+            }
+        }
+    }
+    (!retained.is_empty()).then_some(Value::Object(retained))
+}
+
+fn compact_retained_cdp_event(mut event: Value) -> (Value, usize) {
+    let original_size = retained_cdp_event_size(&event);
+    if original_size <= CDP_EVENT_LOG_MAX_ENTRY_BYTES {
+        return (event, original_size);
+    }
+    compact_retained_cdp_value(&mut event);
+    if retained_cdp_event_size(&event) > CDP_EVENT_LOG_MAX_ENTRY_BYTES {
+        let mut retained = serde_json::Map::new();
+        for key in ["sessionId", "method", "__rustwright_cdp_event_seq"] {
+            if let Some(value) = event.get(key) {
+                retained.insert(key.to_string(), value.clone());
+            }
+        }
+        let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+        if let Some(mut params) = event
+            .get("params")
+            .and_then(|params| retained_cdp_event_params(method, params))
+        {
+            compact_retained_cdp_value(&mut params);
+            let mut candidate = retained.clone();
+            candidate.insert("params".to_string(), params.clone());
+            if retained_cdp_event_size(&Value::Object(candidate)) <= CDP_EVENT_LOG_MAX_ENTRY_BYTES {
+                retained.insert("params".to_string(), params);
+            }
+        }
+        retained.insert(CDP_EVENT_UNREPLAYABLE_MARKER.to_string(), Value::Bool(true));
+        event = Value::Object(retained);
+    }
+    let retained_size = retained_cdp_event_size(&event);
+    (event, retained_size)
+}
+
+fn is_unreplayable_cdp_event(event: &Value) -> bool {
+    event
+        .get(CDP_EVENT_UNREPLAYABLE_MARKER)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+struct CdpRetentionGate {
+    write_lock: Mutex<()>,
+    enabled: AtomicBool,
+}
+
+impl CdpRetentionGate {
+    fn new() -> Self {
+        Self {
+            write_lock: Mutex::new(()),
+            enabled: AtomicBool::new(true),
+        }
+    }
+
+    fn lock_for_write(&self) -> Option<MutexGuard<'_, ()>> {
+        let guard = self.write_lock.lock().unwrap();
+        self.enabled.load(Ordering::SeqCst).then_some(guard)
+    }
+    fn lock_for_release(&self) -> MutexGuard<'_, ()> {
+        self.write_lock.lock().unwrap()
+    }
+
+    fn disable(&self) {
+        let _guard = self.write_lock.lock().unwrap();
+        self.enabled.store(false, Ordering::SeqCst);
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
+    }
+}
+
+struct CdpEventLogEntry {
+    sequence: u64,
+    event: Value,
+    retained_bytes: usize,
+}
+
 struct CdpEventLog {
     next_seq: u64,
-    events: VecDeque<(u64, Value)>,
+    events: VecDeque<CdpEventLogEntry>,
+    retained_bytes: usize,
+    retention_gate: Arc<CdpRetentionGate>,
     action_dispatch_receipts: HashMap<String, ActionDispatchReceiptMap>,
     console_replay_cutoffs: HashMap<String, u64>,
     console_replay_cutoff_generations: HashMap<String, u64>,
@@ -24928,6 +25773,8 @@ impl CdpEventLog {
         Self {
             next_seq: 0,
             events: VecDeque::with_capacity(CDP_EVENT_LOG_LIMIT),
+            retained_bytes: 0,
+            retention_gate: Arc::new(CdpRetentionGate::new()),
             action_dispatch_receipts: HashMap::new(),
             console_replay_cutoff_cancellations: HashMap::new(),
             console_replay_cutoffs: HashMap::new(),
@@ -25023,9 +25870,20 @@ impl CdpEventLog {
                 Value::Number(seq.into()),
             );
         }
-        self.events.push_back((seq, event.clone()));
-        while self.events.len() > CDP_EVENT_LOG_LIMIT {
-            self.events.pop_front();
+        let (retained_event, retained_bytes) = compact_retained_cdp_event(event.clone());
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.events.push_back(CdpEventLogEntry {
+            sequence: seq,
+            event: retained_event,
+            retained_bytes,
+        });
+        while self.events.len() > CDP_EVENT_LOG_LIMIT
+            || self.retained_bytes > CDP_EVENT_LOG_MAX_BYTES
+        {
+            let Some(evicted) = self.events.pop_front() else {
+                break;
+            };
+            self.retained_bytes = self.retained_bytes.saturating_sub(evicted.retained_bytes);
         }
         // Cutoff pruning is low-water driven, not part of the hot event path. A bounded batch
         // keeps the map inexpensive under high-volume Runtime/Network traffic.
@@ -25079,6 +25937,15 @@ impl CdpEventLog {
         result
     }
 
+    fn clear_retained(&mut self) {
+        self.events = VecDeque::new();
+        self.retained_bytes = 0;
+        self.action_dispatch_receipts = HashMap::new();
+        self.console_replay_cutoffs = HashMap::new();
+        self.console_replay_cutoff_generations = HashMap::new();
+        self.console_replay_cutoff_cancellations = HashMap::new();
+    }
+
     fn entries_since(&self, cursor: u64) -> Vec<(u64, Value)> {
         self.entries_since_limited(cursor, usize::MAX)
     }
@@ -25090,7 +25957,7 @@ impl CdpEventLog {
             .iter()
             .skip(start)
             .take(limit)
-            .map(|(seq, event)| (*seq, event.clone()))
+            .map(|entry| (entry.sequence, entry.event.clone()))
             .collect()
     }
 
@@ -25101,22 +25968,27 @@ impl CdpEventLog {
             .iter()
             .skip(start_index)
             .take(end.saturating_sub(start) as usize)
-            .map(|(seq, event)| (*seq, event.clone()))
+            .map(|entry| (entry.sequence, entry.event.clone()))
             .collect()
     }
-
     fn cursor_after_event(&self, cursor: u64, event: &Value) -> u64 {
+        if let Some(sequence) = cdp_event_sequence(event) {
+            return sequence
+                .checked_add(1)
+                .filter(|next| *next > cursor)
+                .unwrap_or(cursor);
+        }
         self.events
             .iter()
-            .find(|(seq, candidate)| *seq >= cursor && candidate == event)
-            .map(|(seq, _)| seq.wrapping_add(1))
+            .find(|entry| entry.sequence >= cursor && entry.event == *event)
+            .map(|entry| entry.sequence.wrapping_add(1))
             .unwrap_or(cursor)
     }
 
     fn oldest_seq(&self) -> u64 {
         self.events
             .front()
-            .map(|(seq, _)| *seq)
+            .map(|entry| entry.sequence)
             .unwrap_or(self.next_seq)
     }
 }
@@ -25131,6 +26003,10 @@ fn dispatch_cdp_payload_with_diagnostics(
     runtime_state: Arc<Mutex<CdpRuntimeState>>,
     playwright_like_first_reply: Option<&AtomicBool>,
 ) {
+    let retention_gate = event_log.lock().unwrap().retention_gate.clone();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
     if let Some(id) = payload.get("id").and_then(Value::as_u64) {
         let sender = pending.lock().unwrap().remove(&id);
         let command = outstanding.lock().unwrap().remove(&id);
@@ -25219,7 +26095,12 @@ fn close_pending_cdp_commands(
     pending: CdpPendingMap,
     outstanding: CdpOutstandingMap,
     traffic_log: Arc<Mutex<CdpTrafficLog>>,
+    event_log: Arc<Mutex<CdpEventLog>>,
 ) {
+    let retention_gate = event_log.lock().unwrap().retention_gate.clone();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
     let pending_commands = {
         let mut pending = pending.lock().unwrap();
         pending.drain().collect::<Vec<_>>()
@@ -25547,6 +26428,7 @@ impl CdpClient {
         let (events, _) = broadcast::channel(4096);
         let events_reader = events.clone();
         let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let event_log_writer = Arc::clone(&event_log);
         let event_log_reader = Arc::clone(&event_log);
         let traffic_log = Arc::new(Mutex::new(CdpTrafficLog::new()));
         let traffic_log_writer = Arc::clone(&traffic_log);
@@ -25594,10 +26476,14 @@ impl CdpClient {
                         }
                         if written {
                             if let Some(diagnostic) = diagnostic {
-                                traffic_log_writer
-                                    .lock()
-                                    .unwrap()
-                                    .push(diagnostic.traffic_entry("sent"));
+                                let retention_gate =
+                                    event_log_writer.lock().unwrap().retention_gate.clone();
+                                if let Some(_retention_guard) = retention_gate.lock_for_write() {
+                                    traffic_log_writer
+                                        .lock()
+                                        .unwrap()
+                                        .push(diagnostic.traffic_entry("sent"));
+                                };
                             }
                         }
                         if !written {
@@ -25639,7 +26525,12 @@ impl CdpClient {
             }
             alive_reader.store(false, Ordering::SeqCst);
             alive_tx_reader.send_replace(false);
-            close_pending_cdp_commands(pending_reader, outstanding_reader, traffic_log_reader);
+            close_pending_cdp_commands(
+                pending_reader,
+                outstanding_reader,
+                traffic_log_reader,
+                event_log_reader,
+            );
         });
 
         Ok(Arc::new(Self {
@@ -25675,6 +26566,7 @@ impl CdpClient {
         let (events, _) = broadcast::channel(4096);
         let events_dispatcher = events.clone();
         let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let event_log_writer = Arc::clone(&event_log);
         let event_log_dispatcher = Arc::clone(&event_log);
         let traffic_log = Arc::new(Mutex::new(CdpTrafficLog::new()));
         let traffic_log_writer = Arc::clone(&traffic_log);
@@ -25720,10 +26612,14 @@ impl CdpClient {
                         }
                         if written {
                             if let Some(diagnostic) = diagnostic {
-                                traffic_log_writer
-                                    .lock()
-                                    .unwrap()
-                                    .push(diagnostic.traffic_entry("sent"));
+                                let retention_gate =
+                                    event_log_writer.lock().unwrap().retention_gate.clone();
+                                if let Some(_retention_guard) = retention_gate.lock_for_write() {
+                                    traffic_log_writer
+                                        .lock()
+                                        .unwrap()
+                                        .push(diagnostic.traffic_entry("sent"));
+                                };
                             }
                         }
                         if !written {
@@ -25782,6 +26678,7 @@ impl CdpClient {
                 pending_dispatcher,
                 outstanding_dispatcher,
                 traffic_log_dispatcher,
+                event_log_dispatcher,
             );
         });
 
@@ -25822,6 +26719,13 @@ impl CdpClient {
         dispatch_id: &str,
         token: &str,
     ) -> RwResult<PendingActionDispatchGuard<'a>> {
+        let retention_gate = self.retention_gate();
+        let Some(_retention_guard) = retention_gate.lock_for_write() else {
+            return Err(RwError::Disconnected);
+        };
+        if !self.is_connected() {
+            return Err(RwError::Disconnected);
+        }
         let registered = self.event_log.lock().unwrap().register_action_dispatch(
             session_id,
             dispatch_id.to_string(),
@@ -25862,6 +26766,14 @@ impl CdpClient {
         self.alive.load(Ordering::SeqCst)
     }
 
+    fn retention_gate(&self) -> Arc<CdpRetentionGate> {
+        self.event_log.lock().unwrap().retention_gate.clone()
+    }
+
+    fn retention_enabled(&self) -> bool {
+        self.retention_gate().is_enabled()
+    }
+
     fn close(&self) {
         self.alive.store(false, Ordering::SeqCst);
         self.alive_tx.send_replace(false);
@@ -25871,6 +26783,17 @@ impl CdpClient {
     fn mark_closed(&self) {
         self.alive.store(false, Ordering::SeqCst);
         self.alive_tx.send_replace(false);
+    }
+
+    fn release_memory_buffers(&self) {
+        // Serialize terminal release with every dispatcher and page-event write. Once disabled,
+        // no reader or in-flight handler can repopulate the stores after this clear.
+        self.retention_gate().disable();
+        self.event_log.lock().unwrap().clear_retained();
+        self.traffic_log.lock().unwrap().clear_for_close();
+        self.runtime_state.lock().unwrap().clear_for_close();
+        self.pending.lock().unwrap().clear();
+        self.outstanding.lock().unwrap().clear();
     }
 
     fn record_sent_command(&self, method: &str) {
@@ -25992,6 +26915,10 @@ impl CdpClient {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> RwResult<QueuedCdpCommand> {
+        let retention_gate = self.retention_gate();
+        let retention_guard = retention_gate
+            .lock_for_write()
+            .ok_or(RwError::Disconnected)?;
         if !self.is_connected() {
             return Err(RwError::Disconnected);
         }
@@ -26008,8 +26935,13 @@ impl CdpClient {
                 write_state: Arc::new(CdpWriteState::new()),
             },
         );
-        let pending_guard =
-            PendingCommandGuard::new(id, &self.pending, &self.outstanding, &self.traffic_log);
+        let pending_guard = PendingCommandGuard::new(
+            id,
+            &self.pending,
+            &self.outstanding,
+            &self.traffic_log,
+            &retention_gate,
+        );
 
         let mut payload = json!({
             "id": id,
@@ -26033,10 +26965,12 @@ impl CdpClient {
             })
         };
         if send_result.is_err() {
+            drop(retention_guard);
             self.mark_closed();
             return Err(RwError::Disconnected);
         }
         self.record_sent_command(method);
+        drop(retention_guard);
         Ok(QueuedCdpCommand {
             method: method.to_string(),
             timeout,
@@ -26115,6 +27049,10 @@ impl CdpClient {
         tracker: Option<CdpWriteTracker>,
         event_cursor: Option<&mut u64>,
     ) -> RwResult<Value> {
+        let retention_gate = self.retention_gate();
+        let retention_guard = retention_gate
+            .lock_for_write()
+            .ok_or(RwError::Disconnected)?;
         if !self.is_connected() {
             return Err(RwError::Disconnected);
         }
@@ -26135,8 +27073,13 @@ impl CdpClient {
                 write_state,
             },
         );
-        let _pending_guard =
-            PendingCommandGuard::new(id, &self.pending, &self.outstanding, &self.traffic_log);
+        let _pending_guard = PendingCommandGuard::new(
+            id,
+            &self.pending,
+            &self.outstanding,
+            &self.traffic_log,
+            &retention_gate,
+        );
 
         let mut payload = json!({
             "id": id,
@@ -26166,10 +27109,12 @@ impl CdpClient {
             None => self.write_tx.send(outgoing),
         };
         if send_result.is_err() {
+            drop(retention_guard);
             self.mark_closed();
             return Err(RwError::Disconnected);
         }
         self.record_sent_command(method);
+        drop(retention_guard);
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result.map_err(|error| wrap_cdp_command_error(method, error)),
@@ -26185,9 +27130,18 @@ impl CdpClient {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> RwResult<Value> {
+        let retention_gate = self.retention_gate();
+        let retention_guard = retention_gate
+            .lock_for_write()
+            .ok_or(RwError::Disconnected)?;
         if !self.is_connected() {
             return Err(RwError::Disconnected);
         }
+        let method_json = serde_json::to_string(method)?;
+        let session_id_json = match session_id {
+            Some(session_id) => Some(serde_json::to_string(session_id)?),
+            None => None,
+        };
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -26201,12 +27155,15 @@ impl CdpClient {
                 write_state: Arc::new(CdpWriteState::new()),
             },
         );
-        let _pending_guard =
-            PendingCommandGuard::new(id, &self.pending, &self.outstanding, &self.traffic_log);
+        let _pending_guard = PendingCommandGuard::new(
+            id,
+            &self.pending,
+            &self.outstanding,
+            &self.traffic_log,
+            &retention_gate,
+        );
 
-        let method_json = serde_json::to_string(method)?;
-        let payload = if let Some(session_id) = session_id {
-            let session_id_json = serde_json::to_string(session_id)?;
+        let payload = if let Some(session_id_json) = &session_id_json {
             format!(
                 "{{\"id\":{id},\"method\":{method_json},\"params\":{params_json},\"sessionId\":{session_id_json}}}"
             )
@@ -26223,10 +27180,12 @@ impl CdpClient {
             })
             .is_err()
         {
+            drop(retention_guard);
             self.mark_closed();
             return Err(RwError::Disconnected);
         }
         self.record_sent_command(method);
+        drop(retention_guard);
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result.map_err(|error| match error {
@@ -26248,14 +27207,18 @@ impl CdpClient {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> RwResult<Vec<Value>> {
-        if !self.is_connected() {
-            return Err(RwError::Disconnected);
-        }
         let method_json = serde_json::to_string(method)?;
         let session_id_json = match session_id {
             Some(session_id) => Some(serde_json::to_string(session_id)?),
             None => None,
         };
+        let retention_gate = self.retention_gate();
+        let retention_guard = retention_gate
+            .lock_for_write()
+            .ok_or(RwError::Disconnected)?;
+        if !self.is_connected() {
+            return Err(RwError::Disconnected);
+        }
         let mut receivers = Vec::with_capacity(params_json_list.len());
         for params_json in params_json_list {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
@@ -26271,8 +27234,13 @@ impl CdpClient {
                     write_state: Arc::new(CdpWriteState::new()),
                 },
             );
-            let pending_guard =
-                PendingCommandGuard::new(id, &self.pending, &self.outstanding, &self.traffic_log);
+            let pending_guard = PendingCommandGuard::new(
+                id,
+                &self.pending,
+                &self.outstanding,
+                &self.traffic_log,
+                &retention_gate,
+            );
 
             let payload = if let Some(session_id_json) = &session_id_json {
                 format!(
@@ -26291,12 +27259,14 @@ impl CdpClient {
                 })
                 .is_err()
             {
+                drop(retention_guard);
                 self.mark_closed();
                 return Err(RwError::Disconnected);
             }
             self.record_sent_command(method);
             receivers.push((id, rx, pending_guard));
         }
+        drop(retention_guard);
 
         let mut results = Vec::with_capacity(receivers.len());
         for (_id, rx, _pending_guard) in receivers {
@@ -27071,6 +28041,7 @@ async fn close_browser_cleanup(browser: Arc<BrowserInner>) -> RwResult<()> {
             .await;
     }
     browser.client.close();
+    browser.client.release_memory_buffers();
     browser.attached_pages.clear();
 
     tokio::task::spawn_blocking(move || -> RwResult<()> {
@@ -27411,7 +28382,7 @@ struct PageInner {
 #[derive(Default)]
 struct ConsoleCaptureState {
     requested: AtomicBool,
-    enabled_sessions: tokio::sync::Mutex<HashSet<String>>,
+    enabled_sessions: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 struct CreatedTargetGuard {
@@ -27584,10 +28555,55 @@ impl PageInner {
         self.iframe_setup_tasks.abort_all();
     }
     fn clear_worker_resume_handoffs(&self) {
+        let retention_gate = self.browser.client.retention_gate();
+        let Some(_retention_guard) = retention_gate.lock_for_write() else {
+            return;
+        };
+        self.clear_worker_resume_handoffs_locked();
+    }
+
+    fn clear_worker_resume_handoffs_locked(&self) {
         self.frame_state
             .lock()
             .unwrap()
             .clear_worker_resume_handoffs();
+    }
+
+    fn release_memory_buffers(&self) {
+        self.target_closed.store(true, Ordering::SeqCst);
+        let retention_gate = self.browser.client.retention_gate();
+        let _retention_guard = retention_gate.lock_for_release();
+        self.network_requests.lock().unwrap().clear_for_close();
+        self.native_network_records
+            .lock()
+            .unwrap()
+            .clear_for_close();
+        self.console_records.lock().unwrap().clear_for_close();
+        self.console_replay_until_event_cursor
+            .lock()
+            .unwrap()
+            .clear();
+        self.frame_state.lock().unwrap().clear_for_close();
+        self.console_capture
+            .requested
+            .store(false, Ordering::SeqCst);
+        let enabled_sessions = Arc::clone(&self.console_capture.enabled_sessions);
+        let sessions_cleared = match enabled_sessions.try_lock() {
+            Ok(mut enabled_sessions_guard) => {
+                enabled_sessions_guard.clear();
+                true
+            }
+            Err(_) => false,
+        };
+        if !sessions_cleared {
+            if let Some(runtime) = self.browser.runtime.0.as_ref() {
+                runtime.spawn(async move {
+                    enabled_sessions.lock().await.clear();
+                });
+            }
+        }
+        self.background_override_active
+            .store(false, Ordering::SeqCst);
     }
 
     fn close_in_background(&self) {
@@ -27692,6 +28708,9 @@ impl NetworkRequestStore {
         self.applied_order.clear();
         self.reset_generation = self.reset_clock.fetch_add(1, Ordering::SeqCst) + 1;
         self.reset_cursor = next_applied_seq;
+    }
+    fn clear_for_close(&mut self) {
+        self.reset_after_overflow(self.next_applied_seq);
     }
 
     fn record_applied_request(&mut self, seq: u64, request_id: String) {
@@ -27864,6 +28883,21 @@ struct ConsoleRecordStore {
 }
 
 impl ConsoleRecordStore {
+    fn clear_for_close(&mut self) {
+        self.accepted_navigation_epochs = AcceptedNavigationEpochs::default();
+        self.navigation_epoch = 0;
+        self.records = VecDeque::new();
+        self.evictions_by_epoch = HashMap::new();
+        self.evictions_total = 0;
+    }
+    fn reset_after_unreplayable(&mut self) {
+        let epoch = self.navigation_epoch;
+        self.accepted_navigation_epochs = AcceptedNavigationEpochs::default();
+        self.records.clear();
+        self.evictions_by_epoch.clear();
+        self.evictions_by_epoch.insert(epoch, 1);
+        self.evictions_total = self.evictions_total.saturating_add(1);
+    }
     fn record_navigation(&mut self, sequence: Option<u64>, epoch: u64) -> bool {
         if !self.accepted_navigation_epochs.accepts(sequence) {
             return false;
@@ -27994,6 +29028,23 @@ impl NativeNetworkRecordStore {
             active_by_request: HashMap::new(),
             evictions_by_epoch: HashMap::new(),
         }
+    }
+    fn clear_for_close(&mut self) {
+        self.accepted_navigation_epochs = AcceptedNavigationEpochs::default();
+        self.navigation_epoch = 0;
+        self.navigation_start_index = 0;
+        self.current_loader_id = None;
+        self.records = VecDeque::new();
+        self.active_by_request = HashMap::new();
+        self.evictions_by_epoch = HashMap::new();
+    }
+    fn reset_after_unreplayable(&mut self) {
+        let epoch = self.navigation_epoch;
+        self.accepted_navigation_epochs = AcceptedNavigationEpochs::default();
+        self.records.clear();
+        self.active_by_request.clear();
+        self.evictions_by_epoch.clear();
+        self.evictions_by_epoch.insert(epoch, 1);
     }
 
     fn begin_document_navigation(
@@ -28429,6 +29480,42 @@ impl PageFrameState {
             locator_resolution_reresolve_count: 0,
             frame_tree_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             session_updates,
+        }
+    }
+    fn clear_for_close(&mut self) {
+        self.frame_sessions = HashMap::new();
+        self.worker_sessions = HashSet::new();
+        self.worker_target_sessions = HashMap::new();
+        self.worker_session_event_sequences = HashMap::new();
+        self.worker_resume_handoffs = HashMap::new();
+        self.frame_attachment_generations = HashMap::new();
+        self.frame_swaps = HashMap::new();
+        self.frame_session_waiters = HashMap::new();
+        self.frame_attachment_locks = HashMap::new();
+        self.session_frames = HashMap::new();
+        self.frames = HashMap::new();
+        self.child_order = HashMap::new();
+        self.frame_loader_ids = HashMap::new();
+        self.execution_contexts = HashMap::new();
+        self.frame_session_errors = HashMap::new();
+        self.iframe_sessions_armed = HashSet::new();
+        self.iframe_sessions_routable = HashSet::new();
+        self.iframe_sessions_ready = HashSet::new();
+        self.iframe_setup_started = HashSet::new();
+        self.page_domain_enabled_sessions = HashSet::new();
+        self.frame_tree_populated_sessions = HashSet::new();
+        self.frame_tree_dirty_sessions = HashSet::new();
+        self.frame_tree_generations = HashMap::new();
+        self.frame_invalidation_sequences = HashMap::new();
+        self.worker_forwarding_interest = false;
+        self.worker_event_interest = false;
+        self.worker_auto_attach_requested = false;
+        self.frame_event_listener_registered = false;
+        self.frame_ownership_generation = 0;
+        self.frame_event_cursor = 0;
+        #[cfg(test)]
+        {
+            self.locator_resolution_reresolve_count = 0;
         }
     }
 
@@ -30077,6 +31164,7 @@ struct PyWorker {
 #[pyclass(name = "_NetworkEventWaiter")]
 struct PyNetworkEventWaiter {
     browser: Arc<BrowserInner>,
+    page: Arc<PageInner>,
     receiver: Mutex<Option<broadcast::Receiver<Value>>>,
     event_log: Arc<Mutex<CdpEventLog>>,
     cursor: Mutex<u64>,
@@ -30125,6 +31213,7 @@ struct PageEventStreamLease {
     cursor_slot: Arc<Mutex<u64>>,
     requests: Arc<Mutex<NetworkRequestStore>>,
     working_requests: Arc<Mutex<NetworkRequestStore>>,
+    page: Option<Arc<PageInner>>,
 }
 
 #[cfg(feature = "python")]
@@ -30154,6 +31243,18 @@ impl PageEventStreamLease {
     fn deliver(mut self) {
         self.delivered = true;
     }
+
+    fn commit_delivered(&mut self) {
+        *self.state_slot.lock().unwrap() = self.state.take();
+        *self.cursor_slot.lock().unwrap() = self.cursor;
+        let committed = self.working_requests.lock().unwrap().clone();
+        self.requests.lock().unwrap().merge_committed(&committed);
+    }
+
+    fn restore_rollback(&mut self) {
+        *self.state_slot.lock().unwrap() = self.rollback_state.take();
+        *self.cursor_slot.lock().unwrap() = self.rollback_cursor;
+    }
 }
 
 #[cfg(feature = "python")]
@@ -30161,13 +31262,22 @@ impl Drop for PageEventStreamLease {
     fn drop(&mut self) {
         *self.receiver_slot.lock().unwrap() = self.receiver.take();
         if self.delivered {
-            *self.state_slot.lock().unwrap() = self.state.take();
-            *self.cursor_slot.lock().unwrap() = self.cursor;
-            let committed = self.working_requests.lock().unwrap().clone();
-            self.requests.lock().unwrap().merge_committed(&committed);
+            if let Some(page) = self.page.as_ref().map(Arc::clone) {
+                let retention_gate = page.browser.client.retention_gate();
+                let Some(_retention_guard) = retention_gate.lock_for_write() else {
+                    self.restore_rollback();
+                    return;
+                };
+                if page.lifecycle.is_closing_or_closed()
+                    || page.target_closed.load(Ordering::SeqCst)
+                {
+                    self.restore_rollback();
+                    return;
+                }
+            }
+            self.commit_delivered();
         } else {
-            *self.state_slot.lock().unwrap() = self.rollback_state.take();
-            *self.cursor_slot.lock().unwrap() = self.rollback_cursor;
+            self.restore_rollback();
         }
     }
 }
@@ -30240,10 +31350,36 @@ impl PageEventStreamState {
         let replay_generations = event_log.console_replay_cutoff_generations.clone();
         let replay_cancellations = event_log.console_replay_cutoff_cancellations.clone();
         drop(event_log);
+        let retention_gate = client.retention_gate();
+        let Some(_retention_guard) = retention_gate.lock_for_write() else {
+            return (receiver, event_cursor, PageEventStreamState::for_page(page));
+        };
+        if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+            return (receiver, event_cursor, PageEventStreamState::for_page(page));
+        }
         let mut page_state = PageEventStreamState::for_page(page);
         for (sequence, event) in entries {
             if sequence >= event_cursor {
                 break;
+            }
+            if is_unreplayable_cdp_event(&event) {
+                page_state.reset_after_overflow();
+                page.network_requests
+                    .lock()
+                    .unwrap()
+                    .reset_after_overflow(sequence.saturating_add(1));
+                page_state.ready.insert(
+                    sequence,
+                    page_event_envelope(
+                        sequence,
+                        "_overflow",
+                        json!({
+                            "dropped": 1,
+                            "reason": "unreplayable_event",
+                        }),
+                    ),
+                );
+                continue;
             }
             page_state.apply_target_transition(&event, &page.session_id);
         }
@@ -34904,10 +36040,12 @@ impl Drop for FrameAttachmentLockLease {
         let Some(page) = self.page.upgrade() else {
             return;
         };
-        page.frame_state
-            .lock()
-            .unwrap()
-            .reclaim_attachment_lock(&self.frame_id, &self.attachment_lock);
+        let _ = with_live_page_retention(&page, || {
+            page.frame_state
+                .lock()
+                .unwrap()
+                .reclaim_attachment_lock(&self.frame_id, &self.attachment_lock);
+        });
     }
 }
 
@@ -34968,14 +36106,18 @@ async fn attach_iframe_target_for_frame(
         let Some(session_id) = attached.get("sessionId").and_then(Value::as_str) else {
             return Ok(None);
         };
-        let expected_session = match claim_manual_attached_iframe_session(
+        let Some(claim) = claim_manual_attached_iframe_session(
             &page,
             frame_id,
             parent_frame_id,
             session_id,
             target_name,
             target_url,
-        ) {
+        ) else {
+            detach_session_best_effort(Arc::clone(&page.browser), session_id.to_string());
+            return Err(RwError::TargetClosed(TargetClosedKind::Page));
+        };
+        let expected_session = match claim {
             FrameSessionOwnershipClaim::Claimed(pin) => {
                 spawn_attached_iframe_session_initialization(
                     &page,
@@ -35232,7 +36374,7 @@ async fn wait_for_frame_session(
     expected_session: Option<FrameSessionPin>,
     deadline: OperationDeadline,
 ) -> RwResult<Option<String>> {
-    let (mut updates, mut expected_session) = {
+    let Some((mut updates, mut expected_session)) = with_live_page_retention(page, || {
         let mut state = page.frame_state.lock().unwrap();
         let expected_session = expected_session.or_else(|| {
             state
@@ -35243,6 +36385,8 @@ async fn wait_for_frame_session(
             state.register_frame_session_waiter(frame_id, pin.generation);
         }
         (state.subscribe_session_updates(), expected_session)
+    }) else {
+        return Err(RwError::TargetClosed(TargetClosedKind::Page));
     };
     let mut _waiter_registration =
         expected_session
@@ -35253,7 +36397,7 @@ async fn wait_for_frame_session(
                 generation: pin.generation,
             });
     loop {
-        let outcome = {
+        let Some(outcome) = with_live_page_retention(page, || {
             let mut state = page.frame_state.lock().unwrap();
             if expected_session.is_none() {
                 if let Some(pin) = state
@@ -35283,6 +36427,8 @@ async fn wait_for_frame_session(
                     .routable_session_pin_for_frame(frame_id, different_from_session_id)
                     .map(|pin| Ok(Some(pin.session_id)))
             }
+        }) else {
+            return Err(RwError::TargetClosed(TargetClosedKind::Page));
         };
         if let Some(outcome) = outcome {
             return outcome;
@@ -35308,10 +36454,12 @@ struct FrameSessionWaiterRegistration {
 impl Drop for FrameSessionWaiterRegistration {
     fn drop(&mut self) {
         if let Some(page) = self.page.upgrade() {
-            page.frame_state
-                .lock()
-                .unwrap()
-                .unregister_frame_session_waiter(&self.frame_id, self.generation);
+            let _ = with_live_page_retention(&page, || {
+                page.frame_state
+                    .lock()
+                    .unwrap()
+                    .unregister_frame_session_waiter(&self.frame_id, self.generation);
+            });
         }
     }
 }
@@ -37378,6 +38526,7 @@ async fn page_close_cleanup(
         Arc::as_ptr(&page),
     );
     page.close_target_on_drop.store(false, Ordering::SeqCst);
+    page.release_memory_buffers();
     Ok(())
 }
 
@@ -40229,6 +41378,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                 let client = Arc::clone(&self.inner.browser.client);
                 Ok(PyNetworkEventWaiter {
                     browser: Arc::clone(&self.inner.browser),
+                    page: Arc::clone(&self.inner),
                     receiver: Mutex::new(Some(client.subscribe())),
                     event_log: Arc::clone(&client.event_log),
                     cursor: Mutex::new(client.event_cursor()),
@@ -40615,7 +41765,11 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         let timeout = BrowserInner::command_timeout(timeout_ms);
         browser
             .block_on(async move {
-                register_page_owned_workers_from_event_log(&page_for_task).await;
+                if register_page_owned_workers_from_event_log(&page_for_task).await {
+                    return Err(RwError::Message(
+                        "CDP event log contains unreplayable worker history".to_string(),
+                    ));
+                }
                 let result = client
                     .send("Target.getTargets", json!({}), None, timeout)
                     .await?;
@@ -41488,6 +42642,7 @@ impl PyNetworkEventWaiter {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("network waiter is already waiting"))?;
         let browser = Arc::clone(&self.browser);
+        let page = Arc::clone(&self.page);
         let session_id = self.session_id.clone();
         let kind = self.kind.clone();
         let requests = Arc::clone(&self.requests);
@@ -41502,6 +42657,7 @@ impl PyNetworkEventWaiter {
                 &session_id,
                 &kind,
                 requests,
+                page,
                 timeout,
             ));
             (result, receiver, cursor)
@@ -41686,6 +42842,7 @@ impl PyPageEventStream {
             cursor_slot: Arc::clone(&self.cursor),
             requests: Arc::clone(&self.requests),
             working_requests: Arc::clone(&working_requests),
+            page: Some(Arc::clone(&self.page)),
         };
         let closed = Arc::clone(&self.closed);
         let pending_batch = Arc::clone(&self.pending_batch);
@@ -43876,6 +45033,11 @@ impl RustwrightPage {
                 }
                 for (sequence, event) in entries {
                     cursor = sequence.saturating_add(1);
+                    if is_unreplayable_cdp_event(&event) {
+                        reset_page_history_after_unreplayable(&page, sequence);
+                        task_queue.record_upstream_drop(1);
+                        continue;
+                    }
                     if let Some(detail) = native_navigation_detail_from_cdp(&page, &event) {
                         // `sequence + 1` uses the same convention as the event
                         // log cursor: all events ingressed before cursor C have
@@ -47217,22 +48379,24 @@ fn claim_manual_attached_iframe_session(
     child_session_id: &str,
     target_name: Option<String>,
     target_url: Option<String>,
-) -> FrameSessionOwnershipClaim {
-    let mut state = page.frame_state.lock().unwrap();
-    match state.claim_manual_session_for_frame(frame_id, child_session_id) {
-        FrameSessionOwnershipClaim::Existing(pin) => FrameSessionOwnershipClaim::Existing(pin),
-        FrameSessionOwnershipClaim::Claimed(pin) => {
-            state.record_frame(
-                frame_id.to_string(),
-                parent_frame_id,
-                None,
-                None,
-                child_session_id.to_string(),
-            );
-            state.seed_attached_frame_metadata(frame_id, &pin, target_name, target_url);
-            FrameSessionOwnershipClaim::Claimed(pin)
+) -> Option<FrameSessionOwnershipClaim> {
+    with_live_page_retention(page, || {
+        let mut state = page.frame_state.lock().unwrap();
+        match state.claim_manual_session_for_frame(frame_id, child_session_id) {
+            FrameSessionOwnershipClaim::Existing(pin) => FrameSessionOwnershipClaim::Existing(pin),
+            FrameSessionOwnershipClaim::Claimed(pin) => {
+                state.record_frame(
+                    frame_id.to_string(),
+                    parent_frame_id,
+                    None,
+                    None,
+                    child_session_id.to_string(),
+                );
+                state.seed_attached_frame_metadata(frame_id, &pin, target_name, target_url);
+                FrameSessionOwnershipClaim::Claimed(pin)
+            }
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -47267,12 +48431,12 @@ fn register_attached_iframe_session_at_sequence(
     event_sequence: Option<u64>,
     timeout: Duration,
 ) -> RwResult<Option<FrameSessionPin>> {
-    let session_pin = {
+    let Some((session_pin, previous_generation)) = with_live_page_retention(&page, || {
         let mut state = page.frame_state.lock().unwrap();
         if !state.owns_session(&parent_session_id)
             || !state.mark_frame_cache_dirty_at_sequence(&parent_session_id, event_sequence)
         {
-            return Ok(None);
+            return None;
         }
         let previous_generation = state
             .session_pin_for_frame(&frame_id)
@@ -47289,13 +48453,15 @@ fn register_attached_iframe_session_at_sequence(
             None,
             child_session_id,
         );
-        drop(state);
-        if previous_generation.is_some_and(|generation| generation != session_pin.generation) {
-            page.iframe_setup_tasks
-                .abort_generations(previous_generation);
-        }
-        session_pin
+        Some((session_pin, previous_generation))
+    })
+    .flatten() else {
+        return Ok(None);
     };
+    if previous_generation.is_some_and(|generation| generation != session_pin.generation) {
+        page.iframe_setup_tasks
+            .abort_generations(previous_generation);
+    }
     spawn_attached_iframe_session_initialization(&page, frame_id, session_pin.clone(), timeout);
     Ok(Some(session_pin))
 }
@@ -47371,6 +48537,13 @@ fn enqueue_focus_emulation(
 
 async fn clear_console_capture_for_session(page: &PageInner, session_id: &str) {
     let mut enabled_sessions = page.console_capture.enabled_sessions.lock().await;
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return;
+    }
     enabled_sessions.remove(session_id);
     page.console_replay_until_event_cursor
         .lock()
@@ -47378,7 +48551,7 @@ async fn clear_console_capture_for_session(page: &PageInner, session_id: &str) {
         .remove(session_id);
 }
 
-async fn register_page_owned_iframes_from_event_log(page: &PageInner) {
+async fn register_page_owned_iframes_from_event_log(page: &PageInner) -> bool {
     let events = page
         .browser
         .client
@@ -47386,10 +48559,15 @@ async fn register_page_owned_iframes_from_event_log(page: &PageInner) {
         .lock()
         .unwrap()
         .entries_since(0);
-    let detached_sessions = {
+    let Some((detached_sessions, unreplayable_sequence)) = with_live_page_retention(page, || {
         let mut state = page.frame_state.lock().unwrap();
         let mut detached_sessions = Vec::new();
+        let mut unreplayable_sequence = None;
         for (sequence, event) in events {
+            if is_unreplayable_cdp_event(&event) {
+                unreplayable_sequence = Some(sequence);
+                break;
+            }
             match event.get("method").and_then(Value::as_str) {
                 Some("Target.attachedToTarget") => {
                     let target_info = event.pointer("/params/targetInfo").unwrap_or(&Value::Null);
@@ -47450,8 +48628,14 @@ async fn register_page_owned_iframes_from_event_log(page: &PageInner) {
                 _ => {}
             }
         }
-        detached_sessions
+        (detached_sessions, unreplayable_sequence)
+    }) else {
+        return true;
     };
+    if let Some(sequence) = unreplayable_sequence {
+        reset_page_history_after_unreplayable(page, sequence);
+        return true;
+    }
     for (session_id, cutoff) in detached_sessions {
         page.browser
             .client
@@ -47461,9 +48645,10 @@ async fn register_page_owned_iframes_from_event_log(page: &PageInner) {
             .finalize_console_replay_cutoff_on_detach(&session_id, cutoff);
         clear_console_capture_for_session(page, &session_id).await;
     }
+    false
 }
 
-async fn register_page_owned_workers_from_event_log(page: &PageInner) {
+async fn register_page_owned_workers_from_event_log(page: &PageInner) -> bool {
     let events = page
         .browser
         .client
@@ -47471,10 +48656,15 @@ async fn register_page_owned_workers_from_event_log(page: &PageInner) {
         .lock()
         .unwrap()
         .entries_since(0);
-    let detached_sessions = {
+    let Some((detached_sessions, unreplayable_sequence)) = with_live_page_retention(page, || {
         let mut state = page.frame_state.lock().unwrap();
         let mut detached_sessions = Vec::new();
+        let mut unreplayable_sequence = None;
         for (sequence, event) in events {
+            if is_unreplayable_cdp_event(&event) {
+                unreplayable_sequence = Some(sequence);
+                break;
+            }
             match event.get("method").and_then(Value::as_str) {
                 Some("Target.attachedToTarget") => {
                     let target_info = event.pointer("/params/targetInfo").unwrap_or(&Value::Null);
@@ -47520,8 +48710,14 @@ async fn register_page_owned_workers_from_event_log(page: &PageInner) {
                 _ => {}
             }
         }
-        detached_sessions
+        (detached_sessions, unreplayable_sequence)
+    }) else {
+        return true;
     };
+    if let Some(sequence) = unreplayable_sequence {
+        reset_page_history_after_unreplayable(page, sequence);
+        return true;
+    }
     for (session_id, cutoff) in detached_sessions {
         page.browser
             .client
@@ -47531,6 +48727,7 @@ async fn register_page_owned_workers_from_event_log(page: &PageInner) {
             .finalize_console_replay_cutoff_on_detach(&session_id, cutoff);
         clear_console_capture_for_session(page, &session_id).await;
     }
+    false
 }
 
 async fn enable_console_capture(
@@ -47538,9 +48735,20 @@ async fn enable_console_capture(
     timeout: Duration,
 ) -> RwResult<HashMap<String, u64>> {
     let deadline = Instant::now() + timeout;
-    page.console_capture.requested.store(true, Ordering::SeqCst);
-    register_page_owned_iframes_from_event_log(page).await;
-    register_page_owned_workers_from_event_log(page).await;
+    if with_live_page_retention(page, || {
+        page.console_capture.requested.store(true, Ordering::SeqCst);
+    })
+    .is_none()
+    {
+        return Err(RwError::TargetClosed(TargetClosedKind::Page));
+    }
+    if register_page_owned_iframes_from_event_log(page).await
+        || register_page_owned_workers_from_event_log(page).await
+    {
+        return Err(RwError::Message(
+            "CDP event log contains unreplayable console history".to_string(),
+        ));
+    }
     let sessions = {
         let frame_state = page.frame_state.lock().unwrap();
         let mut sessions = frame_state.all_owned_session_ids();
@@ -47592,6 +48800,13 @@ async fn enable_console_capture_for_session(
     // single-flight and records the session before any later console_records()
     // call can send the detectable command a second time.
     let mut enabled_sessions = page.console_capture.enabled_sessions.lock().await;
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(retention_guard) = retention_gate.lock_for_write() else {
+        return Err(RwError::TargetClosed(TargetClosedKind::Page));
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return Err(RwError::TargetClosed(TargetClosedKind::Page));
+    }
     if enabled_sessions.contains(session_id) {
         return Ok(page.browser.client.event_cursor());
     }
@@ -47609,6 +48824,7 @@ async fn enable_console_capture_for_session(
         .lock()
         .unwrap()
         .insert(session_id.to_owned(), u64::MAX);
+    drop(retention_guard);
     let replay_until = match page
         .browser
         .client
@@ -47617,32 +48833,45 @@ async fn enable_console_capture_for_session(
     {
         Ok(_) => {
             let cutoff = page.browser.client.event_cursor();
-            page.browser
-                .client
-                .event_log
-                .lock()
-                .unwrap()
-                .finalize_console_replay_cutoff(session_id, cutoff_generation, cutoff);
+            let Some(cutoff) = with_live_page_retention(page, || {
+                page.browser
+                    .client
+                    .event_log
+                    .lock()
+                    .unwrap()
+                    .finalize_console_replay_cutoff(session_id, cutoff_generation, cutoff);
+                cutoff
+            }) else {
+                return Err(RwError::TargetClosed(TargetClosedKind::Page));
+            };
             cutoff
         }
         Err(error) => {
-            page.console_replay_until_event_cursor
-                .lock()
-                .unwrap()
-                .remove(session_id);
-            page.browser
-                .client
-                .event_log
-                .lock()
-                .unwrap()
-                .cancel_console_replay_cutoff(session_id, cutoff_generation);
+            let _ = with_live_page_retention(page, || {
+                page.console_replay_until_event_cursor
+                    .lock()
+                    .unwrap()
+                    .remove(session_id);
+                page.browser
+                    .client
+                    .event_log
+                    .lock()
+                    .unwrap()
+                    .cancel_console_replay_cutoff(session_id, cutoff_generation);
+            });
             return Err(error);
         }
     };
-    page.console_replay_until_event_cursor
-        .lock()
-        .unwrap()
-        .insert(session_id.to_owned(), replay_until);
+    if with_live_page_retention(page, || {
+        page.console_replay_until_event_cursor
+            .lock()
+            .unwrap()
+            .insert(session_id.to_owned(), replay_until);
+    })
+    .is_none()
+    {
+        return Err(RwError::TargetClosed(TargetClosedKind::Page));
+    }
     let remaining = timeout.saturating_sub(started.elapsed());
     if page.observation_event_cursor.load(Ordering::SeqCst) < replay_until {
         let waited = tokio::time::timeout(remaining, async {
@@ -47652,14 +48881,22 @@ async fn enable_console_capture_for_session(
         })
         .await;
         if waited.is_err() {
-            let mut replay_windows = page.console_replay_until_event_cursor.lock().unwrap();
-            if replay_windows.get(session_id) == Some(&replay_until) {
-                replay_windows.remove(session_id);
-            }
+            let _ = with_live_page_retention(page, || {
+                let mut replay_windows = page.console_replay_until_event_cursor.lock().unwrap();
+                if replay_windows.get(session_id) == Some(&replay_until) {
+                    replay_windows.remove(session_id);
+                }
+            });
             return Err(RwError::Timeout(timeout.as_millis() as u64));
         }
     }
-    enabled_sessions.insert(session_id.to_string());
+    if with_live_page_retention(page, || {
+        enabled_sessions.insert(session_id.to_string());
+    })
+    .is_none()
+    {
+        return Err(RwError::TargetClosed(TargetClosedKind::Page));
+    }
     Ok(replay_until)
 }
 
@@ -47695,6 +48932,13 @@ fn spawn_attached_iframe_session_initialization(
     session_pin: FrameSessionPin,
     timeout: Duration,
 ) {
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return;
+    }
     if !iframe_session_is_live(page, &frame_id, &session_pin) {
         return;
     }
@@ -47837,15 +49081,16 @@ fn spawn_attached_iframe_session_initialization(
             let Some(page) = weak_page.upgrade() else {
                 return Ok(());
             };
-            if !iframe_session_is_live(&page, &frame_id, &session_pin) {
-                return Ok(());
-            }
-            let Some(should_start) = page
-                .frame_state
-                .lock()
-                .unwrap()
-                .claim_iframe_session_setup(&frame_id, &session_pin)
-            else {
+            let Some(should_start) = with_live_page_retention(&page, || {
+                if !iframe_session_is_live(&page, &frame_id, &session_pin) {
+                    return None;
+                }
+                page.frame_state
+                    .lock()
+                    .unwrap()
+                    .claim_iframe_session_setup(&frame_id, &session_pin)
+            })
+            .flatten() else {
                 return Ok(());
             };
             drop(page);
@@ -47857,12 +49102,14 @@ fn spawn_attached_iframe_session_initialization(
             let Some(page) = weak_page.upgrade() else {
                 return Ok(());
             };
-            if iframe_session_is_live(&page, &frame_id, &session_pin) {
-                page.frame_state
-                    .lock()
-                    .unwrap()
-                    .mark_iframe_session_ready(&frame_id, &session_pin);
-            }
+            let _ = with_live_page_retention(&page, || {
+                if iframe_session_is_live(&page, &frame_id, &session_pin) {
+                    page.frame_state
+                        .lock()
+                        .unwrap()
+                        .mark_iframe_session_ready(&frame_id, &session_pin);
+                }
+            });
             Ok(())
         }
         .await;
@@ -47877,16 +49124,18 @@ fn spawn_attached_iframe_session_initialization(
             }
             drop(handles);
             if let Err(error) = result {
-                if iframe_session_is_live(&page, &frame_id, &session_pin) {
-                    page.frame_state
-                        .lock()
-                        .unwrap()
-                        .record_frame_session_error_if_current(
-                            &frame_id,
-                            &session_pin,
-                            error.to_string(),
-                        );
-                }
+                let _ = with_live_page_retention(&page, || {
+                    if iframe_session_is_live(&page, &frame_id, &session_pin) {
+                        page.frame_state
+                            .lock()
+                            .unwrap()
+                            .record_frame_session_error_if_current(
+                                &frame_id,
+                                &session_pin,
+                                error.to_string(),
+                            );
+                    }
+                });
             }
         }
     });
@@ -47914,27 +49163,41 @@ async fn setup_attached_iframe_session(
     let child_session_id = &session_pin.session_id;
     enable_attached_session_domains(&client, child_session_id, Duration::from_secs(5)).await?;
     let active_page = ensure_live()?;
-    active_page
-        .frame_state
-        .lock()
-        .unwrap()
-        .mark_page_domain_enabled(child_session_id);
+    let Some(true) = with_live_page_retention(&active_page, || {
+        if !iframe_session_is_live(&active_page, &frame_id, &session_pin) {
+            return false;
+        }
+        active_page
+            .frame_state
+            .lock()
+            .unwrap()
+            .mark_page_domain_enabled(child_session_id);
+        true
+    }) else {
+        return Err(RwError::Message(
+            "iframe session detached during attachment".to_string(),
+        ));
+    };
     drop(active_page);
     enable_action_dispatch_binding_for_session(&client, child_session_id, Duration::from_secs(5))
         .await?;
     let active_page = ensure_live()?;
     let focus_enqueued =
         enqueue_focus_emulation(&client, child_session_id, Duration::from_secs(5))?;
-    if !active_page
-        .frame_state
-        .lock()
-        .unwrap()
-        .mark_iframe_session_routable(&frame_id, &session_pin, focus_enqueued)
-    {
+    let Some(true) = with_live_page_retention(&active_page, || {
+        if !iframe_session_is_live(&active_page, &frame_id, &session_pin) {
+            return false;
+        }
+        active_page
+            .frame_state
+            .lock()
+            .unwrap()
+            .mark_iframe_session_routable(&frame_id, &session_pin, focus_enqueued)
+    }) else {
         return Err(RwError::Message(
             "iframe session detached during attachment".to_string(),
         ));
-    }
+    };
     drop(active_page);
     enable_file_chooser_intercept_for_session(&client, child_session_id, Duration::from_secs(5))
         .await?;
@@ -48567,6 +49830,13 @@ fn record_accepted_navigation_observation(
     observation: AcceptedNavigationObservation,
     event_sequence: Option<u64>,
 ) {
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return;
+    }
     let next_index = page
         .browser
         .next_native_network_index
@@ -48598,6 +49868,13 @@ fn prune_page_navigation_epochs_to_contiguous_progress(
     page: &PageInner,
     navigation_transition: &NavigationTransitionState,
 ) {
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return;
+    }
     let Some(low_water_mark) = navigation_transition.contiguous_event_watermark else {
         return;
     };
@@ -48658,17 +49935,22 @@ async fn resume_worker_after_claim(
         )
         .await
         .map(|_| ());
-    let mut state = page.frame_state.lock().unwrap();
-    match result {
-        Ok(()) => {
-            state.complete_worker_resume_handoff(session_id);
-            Ok(())
+    let Some(result) = with_live_page_retention(page, || {
+        let mut state = page.frame_state.lock().unwrap();
+        match result {
+            Ok(()) => {
+                state.complete_worker_resume_handoff(session_id);
+                Ok(())
+            }
+            Err(error) => {
+                state.mark_worker_resume_handoff_failed(session_id);
+                Err(error)
+            }
         }
-        Err(error) => {
-            state.mark_worker_resume_handoff_failed(session_id);
-            Err(error)
-        }
-    }
+    }) else {
+        return Err(RwError::TargetClosed(TargetClosedKind::Page));
+    };
+    result
 }
 
 fn worker_resume_page_is_live(page: &PageInner) -> bool {
@@ -48708,11 +49990,14 @@ async fn worker_resume_watchdog_step(
     if !worker_resume_page_is_live(page) {
         return false;
     }
-    let should_resume = page
-        .frame_state
-        .lock()
-        .unwrap()
-        .take_worker_resume_fallback(session_id);
+    let Some(should_resume) = with_live_page_retention(page, || {
+        page.frame_state
+            .lock()
+            .unwrap()
+            .take_worker_resume_fallback(session_id)
+    }) else {
+        return false;
+    };
     if should_resume {
         let _ = resume_worker_after_claim(page, session_id, Duration::from_secs(1)).await;
     }
@@ -48741,7 +50026,64 @@ fn spawn_worker_resume_watchdog(page: Arc<PageInner>, session_id: String) {
     });
 }
 
+fn with_live_page_retention<T>(page: &PageInner, write: impl FnOnce() -> T) -> Option<T> {
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return None;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return None;
+    }
+    Some(write())
+}
+
+fn reset_page_history_after_unreplayable(page: &PageInner, sequence: u64) {
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return;
+    }
+    reset_page_history_after_unreplayable_locked(page, sequence);
+}
+
+fn reset_page_history_after_unreplayable_locked(page: &PageInner, sequence: u64) {
+    page.network_requests
+        .lock()
+        .unwrap()
+        .reset_after_overflow(sequence.saturating_add(1));
+    page.native_network_records
+        .lock()
+        .unwrap()
+        .reset_after_unreplayable();
+    page.console_records
+        .lock()
+        .unwrap()
+        .reset_after_unreplayable();
+    page.console_replay_until_event_cursor
+        .lock()
+        .unwrap()
+        .clear();
+    page.frame_state
+        .lock()
+        .unwrap()
+        .mark_all_frame_caches_dirty();
+}
 async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
+    if page.lifecycle.is_closing_or_closed()
+        || page.target_closed.load(Ordering::SeqCst)
+        || !page.browser.client.retention_enabled()
+    {
+        return;
+    }
+    if is_unreplayable_cdp_event(&event) {
+        reset_page_history_after_unreplayable(
+            &page,
+            cdp_event_sequence(&event).unwrap_or_default(),
+        );
+        return;
+    }
     let method = event.get("method").and_then(Value::as_str).unwrap_or("");
     let event_sequence = cdp_event_sequence(&event);
     let is_page_navigation = matches!(
@@ -48750,6 +50092,12 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
     );
     if !is_page_navigation {
         record_page_observation_event(&page, &event);
+    }
+    if page.lifecycle.is_closing_or_closed()
+        || page.target_closed.load(Ordering::SeqCst)
+        || !page.browser.client.retention_enabled()
+    {
+        return;
     }
     #[cfg(test)]
     wait_for_page_lifecycle_test_barrier(&page, &event).await;
@@ -48808,7 +50156,7 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
             .and_then(Value::as_str)
             .unwrap_or("");
         if target_type == "worker" {
-            let accepted = {
+            let Some(accepted) = with_live_page_retention(&page, || {
                 let mut state = page.frame_state.lock().unwrap();
                 if let Some(target_id) = target_info.get("targetId").and_then(Value::as_str) {
                     state.record_worker_target_session_at_sequence(
@@ -48825,16 +50173,20 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
                                 event_sequence,
                             ))
                 }
+            }) else {
+                return;
             };
             if !accepted {
                 return;
             }
             let child_session_id = child_session_id.to_string();
-            let resume_without_consumer = {
+            let Some(resume_without_consumer) = with_live_page_retention(&page, || {
                 let mut state = page.frame_state.lock().unwrap();
                 state.arm_worker_resume_handoff(&child_session_id, event_sequence);
                 !state.worker_event_interest()
                     && state.take_worker_resume_fallback(&child_session_id)
+            }) else {
+                return;
             };
             if resume_without_consumer {
                 let page_for_resume = Arc::clone(&page);
@@ -48891,12 +50243,14 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
             event_sequence,
             Duration::from_secs(5),
         ) {
-            let mut state = page.frame_state.lock().unwrap();
-            if pin.session_id == child_session_id
-                && state.session_pin_still_owns_frame(frame_id, &pin)
-            {
-                state.seed_attached_frame_metadata(frame_id, &pin, target_name, target_url);
-            }
+            let _ = with_live_page_retention(&page, || {
+                let mut state = page.frame_state.lock().unwrap();
+                if pin.session_id == child_session_id
+                    && state.session_pin_still_owns_frame(frame_id, &pin)
+                {
+                    state.seed_attached_frame_metadata(frame_id, &pin, target_name, target_url);
+                }
+            });
         }
         if page
             .frame_state
@@ -48925,13 +50279,15 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
         else {
             return;
         };
-        let (worker_detached, generations) = {
+        let Some((worker_detached, generations)) = with_live_page_retention(&page, || {
             let mut state = page.frame_state.lock().unwrap();
             let worker_detached =
                 state.remove_worker_session_at_sequence(detached_session_id, event_sequence);
             let generations = state.setup_generations_for_session(detached_session_id);
             state.detach_session_at_sequence(detached_session_id, event_sequence);
             (worker_detached, generations)
+        }) else {
+            return;
         };
         page.browser
             .client
@@ -48959,10 +50315,10 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
         return;
     }
     let params = event.get("params").unwrap_or(&Value::Null);
-    match method {
+    let Some(observation) = with_live_page_retention(&page, || match method {
         "Page.frameAttached" => {
             let Some(frame_id) = params.get("frameId").and_then(Value::as_str) else {
-                return;
+                return None;
             };
             let parent_id = params
                 .get("parentFrameId")
@@ -48978,64 +50334,54 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
                     event_session_id.to_string(),
                 );
             }
+            None
         }
         "Page.frameNavigated" => {
             let _navigation_transition = page.navigation_transition_lock.lock().unwrap();
-            let observation = {
-                let mut main_frame_id = page.main_frame_id.lock().unwrap();
-                let mut state = page.frame_state.lock().unwrap();
-                apply_accepted_frame_navigation_transition(
-                    &mut state,
-                    &mut main_frame_id,
-                    &page.crashed,
-                    page.session_id.as_str(),
-                    event_session_id,
-                    event_sequence,
-                    params.get("frame").unwrap_or(&Value::Null),
-                )
-            };
-            if let Some(observation) = observation {
-                record_accepted_navigation_observation(&page, observation, event_sequence);
-            }
+            let mut main_frame_id = page.main_frame_id.lock().unwrap();
+            let mut state = page.frame_state.lock().unwrap();
+            apply_accepted_frame_navigation_transition(
+                &mut state,
+                &mut main_frame_id,
+                &page.crashed,
+                page.session_id.as_str(),
+                event_session_id,
+                event_sequence,
+                params.get("frame").unwrap_or(&Value::Null),
+            )
         }
         "Page.navigatedWithinDocument" => {
             let _navigation_transition = page.navigation_transition_lock.lock().unwrap();
-            let observation = {
-                let main_frame_id = page.main_frame_id.lock().unwrap();
-                let mut state = page.frame_state.lock().unwrap();
-                apply_accepted_same_document_navigation_transition(
-                    &mut state,
-                    &main_frame_id,
-                    page.session_id.as_str(),
-                    event_session_id,
-                    event_sequence,
-                    params,
-                )
-            };
-            if let Some(observation) = observation {
-                record_accepted_navigation_observation(&page, observation, event_sequence);
-            }
+            let main_frame_id = page.main_frame_id.lock().unwrap();
+            let mut state = page.frame_state.lock().unwrap();
+            apply_accepted_same_document_navigation_transition(
+                &mut state,
+                &main_frame_id,
+                page.session_id.as_str(),
+                event_session_id,
+                event_sequence,
+                params,
+            )
         }
         "Page.frameDetached" => {
             let reason = params.get("reason").and_then(Value::as_str).unwrap_or("");
             let mut state = page.frame_state.lock().unwrap();
             if state.mark_frame_cache_dirty_at_sequence(event_session_id, event_sequence) {
                 if let Some(frame_id) = params.get("frameId").and_then(Value::as_str) {
-                    if reason == "swap" {
+                    let removed_generations = if reason == "swap" {
                         let removed_generation =
                             state.mark_frame_swap_pending(frame_id, event_session_id);
                         state.record_frame_swap(frame_id);
-                        drop(state);
-                        page.iframe_setup_tasks
-                            .abort_generations(removed_generation);
+                        removed_generation.into_iter().collect()
                     } else {
-                        let removed_generations = state.remove_frame(frame_id);
-                        drop(state);
-                        page.iframe_setup_tasks
-                            .abort_generations(removed_generations);
-                    }
+                        state.remove_frame(frame_id)
+                    };
+                    drop(state);
+                    page.iframe_setup_tasks
+                        .abort_generations(removed_generations);
                 }
             }
+            None
         }
         "Runtime.executionContextDestroyed" => {
             if let Some(context_id) = params.get("executionContextId") {
@@ -49044,14 +50390,21 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
                     .unwrap()
                     .invalidate_execution_context(event_session_id, context_id);
             }
+            None
         }
         "Runtime.executionContextsCleared" => {
             page.frame_state
                 .lock()
                 .unwrap()
                 .invalidate_execution_contexts_for_session(event_session_id);
+            None
         }
-        _ => {}
+        _ => None,
+    }) else {
+        return;
+    };
+    if let Some(observation) = observation {
+        record_accepted_navigation_observation(&page, observation, event_sequence);
     }
 }
 
@@ -49064,6 +50417,20 @@ fn record_page_observation_event_with_ownership(
     event: &Value,
     replay_owned_session: Option<bool>,
 ) {
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return;
+    }
+    if is_unreplayable_cdp_event(event) {
+        reset_page_history_after_unreplayable_locked(
+            page,
+            cdp_event_sequence(event).unwrap_or_default(),
+        );
+        return;
+    }
     let event_sequence = cdp_event_sequence(event);
     let event_cursor = event_sequence.map(|sequence| sequence.saturating_add(1));
     let event_session_id = event.get("sessionId").and_then(Value::as_str);
@@ -49882,6 +51249,7 @@ struct ReconciledFrameCacheInvalidations {
     navigation_observations: Vec<AcceptedNavigationObservationAtSequence>,
     replayed_page_observations: Vec<ReplayedPageObservation>,
     removed_setup_generations: Vec<u64>,
+    unreplayable_sequences: Vec<u64>,
 }
 
 fn reconcile_frame_cache_invalidations_locked(
@@ -49906,6 +51274,11 @@ fn reconcile_frame_cache_invalidations_locked(
         .unwrap_or(frame_replay_cursor);
     for (sequence, event) in log.entries_since(replay_start) {
         let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+        if is_unreplayable_cdp_event(&event) {
+            reconciliation.unreplayable_sequences.push(sequence);
+            state.mark_all_frame_caches_dirty();
+            continue;
+        }
         if observation_replay_cursor.is_some_and(|cursor| sequence >= cursor)
             && !matches!(
                 method,
@@ -50166,6 +51539,13 @@ fn reconcile_frame_cache_invalidations_impl_with_hook(
     // Serializing gate commit through post-lock observation prevents a newer
     // live navigation from overtaking a replayed observation. The same guard
     // owns the one contiguous progress watermark.
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return;
+    }
     let mut navigation_transition = page.navigation_transition_lock.lock().unwrap();
     // Global page cache lock order: event_log -> main_frame_id -> frame_state.
     let (reconciliation, unknown_gap_boundary) = {
@@ -50174,9 +51554,9 @@ fn reconcile_frame_cache_invalidations_impl_with_hook(
         let mut main_frame_id = page.main_frame_id.lock().unwrap();
         let mut state = page.frame_state.lock().unwrap();
         let oldest_sequence = log.oldest_seq();
-        let unknown_gap_boundary = navigation_transition
+        let mut unknown_gap_boundary = navigation_transition
             .has_unreplayable_gap(oldest_sequence)
-            .then(|| oldest_sequence - 1);
+            .then(|| oldest_sequence.saturating_sub(1));
         if listener_gap {
             state.mark_all_frame_caches_dirty();
         }
@@ -50189,8 +51569,19 @@ fn reconcile_frame_cache_invalidations_impl_with_hook(
             None,
             listener_gap.then(|| page.observation_event_cursor.load(Ordering::SeqCst)),
         );
+        if let Some(sequence) = reconciliation.unreplayable_sequences.iter().copied().min() {
+            let marker_boundary = sequence.saturating_sub(1);
+            unknown_gap_boundary = Some(
+                unknown_gap_boundary
+                    .map_or(marker_boundary, |current| current.min(marker_boundary)),
+            );
+        }
         (reconciliation, unknown_gap_boundary)
     };
+    drop(_retention_guard);
+    for sequence in reconciliation.unreplayable_sequences.iter().copied() {
+        reset_page_history_after_unreplayable(page, sequence);
+    }
     if let Some(sequence) = unknown_gap_boundary {
         // The bounded log can no longer replay every uncovered listener event.
         // Place the conservative boundary immediately before the oldest
@@ -50358,6 +51749,13 @@ async fn refresh_frame_tree_session_locked(
     // Commit lock order is event_log -> main_frame_id -> frame_state. Holding
     // event_log prevents a transport event from being inserted between the
     // cursor barrier and the generation/registration recheck.
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return Ok(());
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     let root_frame_id = tree.root_frame_id.clone();
     let navigation_transition = page.navigation_transition_lock.lock().unwrap();
     let (reconciliation, authoritative_effects) = {
@@ -50393,6 +51791,7 @@ async fn refresh_frame_tree_session_locked(
         };
         (reconciliation, authoritative_effects)
     };
+    drop(_retention_guard);
     record_reconciled_navigation_observations(page, reconciliation.navigation_observations);
     drop(navigation_transition);
     page.iframe_setup_tasks.abort_generations(
@@ -52577,6 +53976,14 @@ fn process_network_observation_event(
     state: &mut NetworkObservationState,
 ) -> Result<Option<(u64, &'static str, Value)>, u64> {
     let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+    if is_unreplayable_cdp_event(event) {
+        requests
+            .lock()
+            .unwrap()
+            .reset_after_overflow(seq.saturating_add(1));
+        *state = NetworkObservationState::new();
+        return Err(1);
+    }
     let request_payload = {
         let mut requests = requests.lock().unwrap();
         if seq > requests.next_applied_seq {
@@ -52601,6 +54008,11 @@ fn process_network_observation_event(
                     let dropped = missed_seq.saturating_sub(expected_seq).max(1);
                     requests.reset_after_overflow(seq.saturating_add(1));
                     return Err(dropped);
+                }
+                if is_unreplayable_cdp_event(&missed_event) {
+                    requests.reset_after_overflow(seq.saturating_add(1));
+                    *state = NetworkObservationState::new();
+                    return Err(1);
                 }
                 apply_network_request_mutation(
                     missed_seq,
@@ -52762,8 +54174,39 @@ fn process_page_observation_event_with_page(
     session_id: &str,
     requests: &Arc<Mutex<NetworkRequestStore>>,
     state: &mut PageEventStreamState,
-    _page: Option<&PageInner>,
+    page: Option<&PageInner>,
 ) {
+    if page.is_some_and(|page| {
+        page.lifecycle.is_closing_or_closed()
+            || page.target_closed.load(Ordering::SeqCst)
+            || !page.browser.client.retention_enabled()
+    }) {
+        return;
+    }
+    if is_unreplayable_cdp_event(event) {
+        if let Some(page) = page {
+            reset_page_history_after_unreplayable_locked(page, seq);
+            *state = PageEventStreamState::for_page(page);
+        } else {
+            requests
+                .lock()
+                .unwrap()
+                .reset_after_overflow(seq.saturating_add(1));
+            state.reset_after_overflow();
+        }
+        state.ready.insert(
+            seq,
+            page_event_envelope(
+                seq,
+                "_overflow",
+                json!({
+                    "dropped": 1,
+                    "reason": "unreplayable_event",
+                }),
+            ),
+        );
+        return;
+    }
     state.ensure_main_session(session_id);
     state.sync_replay_cutoffs_for_event(event, event_log);
     state.apply_target_transition(event, session_id);
@@ -52898,6 +54341,13 @@ async fn wait_for_page_event_batch(
     let deadline = tokio::time::Instant::now() + timeout;
     let mut batch = Vec::with_capacity(max_events);
     loop {
+        if page.lifecycle.is_closing_or_closed()
+            || page.target_closed.load(Ordering::SeqCst)
+            || !page.browser.client.retention_enabled()
+        {
+            batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
+            return (batch, true);
+        }
         if *close_rx.borrow() {
             batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
             return (batch, true);
@@ -52925,9 +54375,14 @@ async fn wait_for_page_event_batch(
         let scanned_full_chunk = entries.len() >= raw_limit;
         if *cursor < oldest_seq {
             let dropped = oldest_seq - *cursor;
-            *cursor = oldest_seq;
-            *state = PageEventStreamState::for_page(page);
-            requests.lock().unwrap().reset_after_overflow(oldest_seq);
+            let Some(()) = with_live_page_retention(page, || {
+                *cursor = oldest_seq;
+                *state = PageEventStreamState::for_page(page);
+                requests.lock().unwrap().reset_after_overflow(oldest_seq);
+            }) else {
+                batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
+                return (batch, true);
+            };
             batch.push(page_event_envelope(
                 *cursor,
                 "_overflow",
@@ -52942,6 +54397,11 @@ async fn wait_for_page_event_batch(
                 continue;
             }
             *cursor = seq.saturating_add(1);
+            let retention_gate = page.browser.client.retention_gate();
+            let Some(_retention_guard) = retention_gate.lock_for_write() else {
+                batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
+                return (batch, true);
+            };
             process_page_observation_event_with_page(
                 seq,
                 &event,
@@ -53014,6 +54474,7 @@ async fn wait_for_network_event(
     session_id: &str,
     kind: &str,
     requests: Arc<Mutex<NetworkRequestStore>>,
+    page: Arc<PageInner>,
     timeout: Duration,
 ) -> (RwResult<String>, u64) {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -53021,6 +54482,12 @@ async fn wait_for_network_event(
     let mut state = NetworkObservationState::new();
     let mut ready_responses = BTreeMap::<u64, String>::new();
     loop {
+        if page.lifecycle.is_closing_or_closed()
+            || page.target_closed.load(Ordering::SeqCst)
+            || !page.browser.client.retention_enabled()
+        {
+            return (Err(RwError::TargetClosed(TargetClosedKind::Page)), cursor);
+        }
         let now = tokio::time::Instant::now();
         if now >= deadline {
             return (Err(RwError::Timeout(timeout.as_millis() as u64)), cursor);
@@ -53047,7 +54514,13 @@ async fn wait_for_network_event(
         };
         if cursor < oldest_seq {
             let dropped = oldest_seq - cursor;
-            requests.lock().unwrap().reset_after_overflow(oldest_seq);
+            if with_live_page_retention(&page, || {
+                requests.lock().unwrap().reset_after_overflow(oldest_seq);
+            })
+            .is_none()
+            {
+                return (Err(RwError::TargetClosed(TargetClosedKind::Page)), cursor);
+            }
             return (
                 Err(RwError::Message(format!(
                     "CDP event log overflow: dropped {dropped} event(s)"
@@ -53057,9 +54530,14 @@ async fn wait_for_network_event(
         }
         for (seq, event) in entries {
             cursor = seq.saturating_add(1);
-            let matched = match process_network_wait_event(
-                seq, &event, &event_log, session_id, kind, &requests, &mut state,
-            ) {
+            let Some(processed) = with_live_page_retention(&page, || {
+                process_network_wait_event(
+                    seq, &event, &event_log, session_id, kind, &requests, &mut state,
+                )
+            }) else {
+                return (Err(RwError::TargetClosed(TargetClosedKind::Page)), cursor);
+            };
+            let matched = match processed {
                 Ok(matched) => matched,
                 Err(dropped) => {
                     return (
@@ -53381,25 +54859,32 @@ fn page_worker_session_from_attachment(page: &PageInner, event: &Value) -> Optio
         return None;
     }
     let child_session_id = event.pointer("/params/sessionId").and_then(Value::as_str)?;
-    let mut state = page.frame_state.lock().unwrap();
-    if !state.owns_session(parent_session_id) {
-        return None;
-    }
-    let accepted = if let Some(target_id) = target_info.get("targetId").and_then(Value::as_str) {
-        state.record_worker_target_session_at_sequence(target_id, child_session_id, event_sequence)
-    } else {
-        state.worker_session_attachment_is_current(child_session_id, event_sequence)
-            && (state.worker_session_recorded_at_sequence(child_session_id, event_sequence)
-                || state.record_worker_session_at_sequence(child_session_id, event_sequence))
-    };
-    if !accepted {
-        return None;
-    }
-    state.arm_worker_resume_handoff(child_session_id, event_sequence);
-    if !state.claim_worker_resume_handoff(child_session_id) {
-        return None;
-    }
-    Some(child_session_id.to_string())
+    with_live_page_retention(page, || {
+        let mut state = page.frame_state.lock().unwrap();
+        if !state.owns_session(parent_session_id) {
+            return None;
+        }
+        let accepted = if let Some(target_id) = target_info.get("targetId").and_then(Value::as_str)
+        {
+            state.record_worker_target_session_at_sequence(
+                target_id,
+                child_session_id,
+                event_sequence,
+            )
+        } else {
+            state.worker_session_attachment_is_current(child_session_id, event_sequence)
+                && (state.worker_session_recorded_at_sequence(child_session_id, event_sequence)
+                    || state.record_worker_session_at_sequence(child_session_id, event_sequence))
+        };
+        if !accepted {
+            return None;
+        }
+        state.arm_worker_resume_handoff(child_session_id, event_sequence);
+        state
+            .claim_worker_resume_handoff(child_session_id)
+            .then(|| child_session_id.to_string())
+    })
+    .flatten()
 }
 
 fn remove_page_worker_session_from_detachment(page: &PageInner, event: &Value) -> Option<String> {
@@ -53407,11 +54892,12 @@ fn remove_page_worker_session_from_detachment(page: &PageInner, event: &Value) -
         return None;
     }
     let session_id = event.pointer("/params/sessionId").and_then(Value::as_str)?;
-    let accepted = page
-        .frame_state
-        .lock()
-        .unwrap()
-        .remove_worker_session_at_sequence(session_id, cdp_event_sequence(event));
+    let accepted = with_live_page_retention(page, || {
+        page.frame_state
+            .lock()
+            .unwrap()
+            .remove_worker_session_at_sequence(session_id, cdp_event_sequence(event))
+    })?;
     accepted.then(|| session_id.to_string())
 }
 
@@ -53428,12 +54914,24 @@ async fn process_console_wait_event(
     event_type: Option<&str>,
     text: Option<&str>,
     exact_text: bool,
-) -> Option<String> {
+) -> RwResult<Option<String>> {
+    if is_unreplayable_cdp_event(&event) {
+        let sequence = cdp_event_sequence(&event).unwrap_or_default();
+        if let Some(page) = page.as_deref() {
+            reset_page_history_after_unreplayable(page, sequence);
+        }
+        if let Some(state) = page_state.as_mut() {
+            state.reset_after_overflow();
+        }
+        return Err(RwError::Message(format!(
+            "CDP event log contains unreplayable event at sequence {sequence}"
+        )));
+    }
     let event_sequence = cdp_event_sequence(&event);
     let event_session_id = event.get("sessionId").and_then(Value::as_str);
     let method = event.get("method").and_then(Value::as_str);
     if event_sequence.is_some_and(|sequence| sequence < *event_cursor) {
-        return None;
+        return Ok(None);
     }
     if let Some(sequence) = event_sequence {
         *event_cursor = sequence.saturating_add(1);
@@ -53454,11 +54952,13 @@ async fn process_console_wait_event(
     ) && replay_cutoff.is_some_and(|cutoff| {
         event_sequence.is_some_and(|sequence| sequence < cutoff && sequence < replay_start_cursor)
     }) {
-        return None;
+        return Ok(None);
     }
 
     if let Some(page) = page.as_ref() {
         if method == Some("Target.attachedToTarget") {
+            #[cfg(test)]
+            wait_for_page_lifecycle_test_barrier(page, &event).await;
             if let Some(child_session_id) = page_worker_session_from_attachment(page, &event) {
                 let page = Arc::clone(page);
                 tokio::spawn(async move {
@@ -53476,10 +54976,12 @@ async fn process_console_wait_event(
                         )
                         .await
                     {
-                        page.frame_state
-                            .lock()
-                            .unwrap()
-                            .mark_worker_resume_handoff_failed(&child_session_id);
+                        let _ = with_live_page_retention(&page, || {
+                            page.frame_state
+                                .lock()
+                                .unwrap()
+                                .mark_worker_resume_handoff_failed(&child_session_id);
+                        });
                         return;
                     }
                     let _ =
@@ -53487,7 +54989,7 @@ async fn process_console_wait_event(
                             .await;
                 });
             }
-            return None;
+            return Ok(None);
         }
         if method == Some("Target.detachedFromTarget") {
             if let Some(detached_session_id) =
@@ -53501,7 +55003,7 @@ async fn process_console_wait_event(
                     .finalize_console_replay_cutoff_on_detach(&detached_session_id, event_sequence);
                 clear_console_capture_for_session(page, &detached_session_id).await;
             }
-            return None;
+            return Ok(None);
         }
     }
 
@@ -53517,34 +55019,36 @@ async fn process_console_wait_event(
             })
         });
     if !matches_session {
-        return None;
+        return Ok(None);
     }
     if event_kind == "console" {
         if method != Some("Runtime.consoleAPICalled")
             || !console_event_matches(&event, event_type, text, exact_text)
         {
-            return None;
+            return Ok(None);
         }
-        let mut message = console_from_event(&event)?;
+        let Some(mut message) = console_from_event(&event) else {
+            return Ok(None);
+        };
         if let Some(sequence) = event_sequence {
             if let Some(object) = message.as_object_mut() {
                 object.insert("__rustwright_cdp_event_seq".to_string(), json!(sequence));
             }
         }
-        return Some(message.to_string());
+        return Ok(Some(message.to_string()));
     }
     if method != Some("Runtime.exceptionThrown")
         || !page_error_event_matches(&event, event_type, text, exact_text)
     {
-        return None;
+        return Ok(None);
     }
-    Some(
+    Ok(Some(
         event
             .get("params")
             .cloned()
             .unwrap_or(Value::Null)
             .to_string(),
-    )
+    ))
 }
 async fn wait_for_console_event(
     events: &mut broadcast::Receiver<Value>,
@@ -53598,7 +55102,7 @@ async fn wait_for_console_event(
         };
         match received {
             Ok(event) => {
-                if let Some(result) = process_console_wait_event(
+                match process_console_wait_event(
                     event,
                     &mut event_cursor,
                     replay_start_cursor,
@@ -53614,7 +55118,9 @@ async fn wait_for_console_event(
                 )
                 .await
                 {
-                    return (Ok(result), event_cursor);
+                    Ok(Some(result)) => return (Ok(result), event_cursor),
+                    Ok(None) => {}
+                    Err(error) => return (Err(error), event_cursor),
                 }
             }
             Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -53636,7 +55142,7 @@ async fn wait_for_console_event(
                     );
                 }
                 for (_, event) in replay {
-                    if let Some(result) = process_console_wait_event(
+                    match process_console_wait_event(
                         event,
                         &mut event_cursor,
                         replay_start_cursor,
@@ -53652,7 +55158,9 @@ async fn wait_for_console_event(
                     )
                     .await
                     {
-                        return (Ok(result), event_cursor);
+                        Ok(Some(result)) => return (Ok(result), event_cursor),
+                        Ok(None) => {}
+                        Err(error) => return (Err(error), event_cursor),
                     }
                 }
             }
@@ -54269,6 +55777,12 @@ fn worker_from_attachment_event(
     browser: &Arc<BrowserInner>,
     event: &Value,
 ) -> RwResult<Option<PyWorker>> {
+    if is_unreplayable_cdp_event(event) {
+        let sequence = cdp_event_sequence(event).unwrap_or_default();
+        return Err(RwError::Message(format!(
+            "CDP event log contains unreplayable worker event at sequence {sequence}"
+        )));
+    }
     if event.get("method").and_then(Value::as_str) != Some("Target.attachedToTarget") {
         return Ok(None);
     }
@@ -54290,20 +55804,23 @@ fn worker_from_attachment_event(
         .ok_or_else(|| RwError::Message("worker target did not include sessionId".to_string()))?
         .to_string();
     let event_sequence = cdp_event_sequence(event);
-    let accepted = {
+    let Some(()) = with_live_page_retention(page, || {
         let mut state = page.frame_state.lock().unwrap();
-        state.owns_session(parent_session_id)
-            && state.record_worker_target_session_at_sequence(
+        if !state.owns_session(parent_session_id)
+            || !state.record_worker_target_session_at_sequence(
                 &target_id,
                 &session_id,
                 event_sequence,
             )
-    };
-    if !accepted {
+        {
+            return None;
+        }
+        state.arm_worker_resume_handoff(&session_id, event_sequence);
+        Some(())
+    })
+    .flatten() else {
         return Ok(None);
-    }
-    let mut state = page.frame_state.lock().unwrap();
-    state.arm_worker_resume_handoff(&session_id, event_sequence);
+    };
     let url = info
         .get("url")
         .and_then(Value::as_str)
@@ -54557,6 +56074,14 @@ async fn wait_for_worker_close(
                 continue;
             }
             event_cursor = sequence.saturating_add(1);
+            if is_unreplayable_cdp_event(event) {
+                return (
+                    Err(RwError::Message(format!(
+                        "CDP event log contains unreplayable worker-close event at sequence {sequence}"
+                    ))),
+                    event_cursor,
+                );
+            }
             let method = event.get("method").and_then(Value::as_str).unwrap_or("");
             if method == "Target.detachedFromTarget"
                 && event.pointer("/params/sessionId").and_then(Value::as_str) == Some(session_id)
@@ -54580,6 +56105,15 @@ async fn wait_for_worker_close(
                         continue;
                     }
                     event_cursor = sequence.saturating_add(1);
+                }
+                if is_unreplayable_cdp_event(&event) {
+                    let sequence = cdp_event_sequence(&event).unwrap_or_default();
+                    return (
+                        Err(RwError::Message(format!(
+                            "CDP event log contains unreplayable worker-close event at sequence {sequence}"
+                        ))),
+                        event_cursor,
+                    );
                 }
                 let method = event.get("method").and_then(Value::as_str).unwrap_or("");
                 if method == "Target.detachedFromTarget"
@@ -55232,6 +56766,12 @@ fn process_navigation_event(
     restore_initiation_cursor: Option<u64>,
     matcher: &mut NavigationEventState,
 ) -> RwResult<Option<NavigationWaitResult>> {
+    if is_unreplayable_cdp_event(event) {
+        let sequence = cdp_event_sequence(event).unwrap_or_default();
+        return Err(RwError::Message(format!(
+            "CDP event log contains unreplayable navigation event at sequence {sequence}"
+        )));
+    }
     if event.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Ok(None);
     }

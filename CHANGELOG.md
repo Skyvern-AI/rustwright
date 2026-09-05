@@ -20,6 +20,16 @@ All notable user-facing changes to Rustwright are documented in this file.
   page. Closing the page disposes its context, matching Playwright isolation.
 - Navigation internals now retain response bodies and drain console and
   page-error history before each navigation.
+- Navigation response retention now bounds page-owned navigation-response
+  entries to 20 and all page-owned response-body storage, including staged
+  fulfilled-route bodies, to 8 MiB. Evicted responses release page-owned
+  request, response, and fulfilled-body links, while a
+  caller-retained `Response` keeps its cached body readable after eviction
+  and later renderer-changing navigation.
+- Process-tree benchmark memory summaries report RSS on every platform and
+  include Linux PSS fields (`pss_tree_kb`, `pss_by_role_kb`, `pss_available`,
+  and `pss_required`) when PSS is available. Role medians are independent
+  marginal medians.
 - Chromium launches now include a broader resource-safe default switch set.
 - User-provided feature-list launch arguments now merge with defaults into one
   switch per feature flag.

@@ -3,10 +3,22 @@ from __future__ import annotations
 import functools
 import os
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, TypeVar, cast
+
+PROCESS_ROLES = (
+    "browser",
+    "renderer",
+    "gpu",
+    "utility",
+    "network",
+    "python-host",
+    "node-driver",
+    "other",
+)
 
 
 SAMPLE_INTERVAL_SECONDS = 0.05
@@ -18,10 +30,12 @@ PROC_ROOT = Path("/proc")
 class ProcessTreeRssSample:
     rss_self_kb: int | None
     rss_tree_kb: int | None
+    pss_tree_kb: int | None = None
+    pss_by_role_kb: dict[str, int] | None = None
 
 
 class ProcessTreeRssSampler:
-    """Sample peak RSS for a process and its descendants outside the timing path."""
+    """Sample peak RSS and PSS attribution for a process and its descendants."""
 
     def __init__(self, root_pid: int, sample_interval: float | None = None) -> None:
         self.root_pid = root_pid
@@ -75,15 +89,48 @@ class ProcessTreeRssSampler:
             samples = list(self.samples)
         rss_self_kb = max_optional(sample.rss_self_kb for sample in samples)
         rss_tree_kb = max_optional(sample.rss_tree_kb for sample in samples)
+        peak_sample = max(
+            (sample for sample in samples if sample.rss_tree_kb is not None),
+            key=lambda sample: sample.rss_tree_kb,
+            default=None,
+        )
+        pss_tree_kb = peak_sample.pss_tree_kb if peak_sample is not None else None
+        pss_by_role_kb = (
+            dict(peak_sample.pss_by_role_kb)
+            if peak_sample is not None and peak_sample.pss_by_role_kb is not None
+            else None
+        )
+        pss_required = sys.platform.startswith("linux")
+        pss_available = (
+            type(pss_tree_kb) is int
+            and pss_tree_kb > 0
+            and pss_by_role_kb is not None
+            and set(pss_by_role_kb) == set(PROCESS_ROLES)
+            and all(type(value) is int and value >= 0 for value in pss_by_role_kb.values())
+            and sum(pss_by_role_kb.values()) == pss_tree_kb
+        )
+        rss_available = (
+            type(rss_self_kb) is int
+            and rss_self_kb > 0
+            and type(rss_tree_kb) is int
+            and rss_tree_kb > 0
+            and rss_tree_kb >= rss_self_kb
+        )
         return {
             "rss_self_kb": rss_self_kb,
             "rss_tree_kb": rss_tree_kb,
+            "pss_tree_kb": pss_tree_kb,
+            "pss_by_role_kb": pss_by_role_kb,
+            "pss_required": pss_required,
+            "pss_available": pss_available,
+            "pss_statistic": "at_tree_rss_peak",
+            "pss_scope": "benchmark_process_and_descendants",
             "samples_collected": len(samples),
             "sampling_interval_ms": self.sample_interval * 1000,
             "statistic": "peak",
             "scope": "benchmark_process_and_descendants",
             "sampling_mode": "background_thread_procfs_or_ps",
-            "available": rss_self_kb is not None and rss_tree_kb is not None,
+            "available": rss_available and (not pss_required or pss_available),
         }
 
 
@@ -130,15 +177,10 @@ def sample_process_tree_rss(root_pid: int) -> ProcessTreeRssSample:
     )
 
 
-def procfs_process_tree_rss(
+def _process_tree_from_table(
     root_pid: int,
-    proc_root: Path | None = None,
-) -> ProcessTreeRssSample | None:
-    process_table, complete = procfs_process_table(
-        PROC_ROOT if proc_root is None else proc_root
-    )
-    if not complete or root_pid not in process_table:
-        return None
+    process_table: dict[int, tuple[int, int | None]],
+) -> list[int]:
     children: dict[int, list[int]] = {}
     for pid, (parent_pid, _) in process_table.items():
         children.setdefault(parent_pid, []).append(pid)
@@ -150,10 +192,156 @@ def procfs_process_tree_rss(
             continue
         tree.append(pid)
         stack.extend(children.get(pid, []))
+    return tree
+
+
+def procfs_process_tree_rss(
+    root_pid: int,
+    proc_root: Path | None = None,
+) -> ProcessTreeRssSample | None:
+    resolved_root = PROC_ROOT if proc_root is None else proc_root
+    process_table, complete = procfs_process_table(resolved_root)
+    if not complete or root_pid not in process_table:
+        return None
+    tree = _process_tree_from_table(root_pid, process_table)
+    rss_self_kb = process_table[root_pid][1]
+    rss_tree_kb = sum_required(process_table[pid][1] for pid in tree)
+    if not sys.platform.startswith("linux") or rss_tree_kb is None:
+        return ProcessTreeRssSample(
+            rss_self_kb=rss_self_kb,
+            rss_tree_kb=rss_tree_kb,
+        )
+    pss = procfs_process_tree_pss(tree, resolved_root)
+    if pss is None:
+        # A process can exit between the status walk and smaps_rollup reads.
+        # Re-walk once to distinguish that race from a genuinely partial read.
+        process_table, complete = procfs_process_table(resolved_root)
+        if complete and root_pid in process_table:
+            tree = _process_tree_from_table(root_pid, process_table)
+            rss_self_kb = process_table[root_pid][1]
+            rss_tree_kb = sum_required(process_table[pid][1] for pid in tree)
+            pss = (
+                procfs_process_tree_pss(tree, resolved_root)
+                if rss_tree_kb is not None
+                else None
+            )
+    if pss is None:
+        return ProcessTreeRssSample(
+            rss_self_kb=rss_self_kb,
+            rss_tree_kb=rss_tree_kb,
+        )
+    pss_tree_kb, pss_by_role_kb = pss
     return ProcessTreeRssSample(
-        rss_self_kb=process_table[root_pid][1],
-        rss_tree_kb=sum_required(process_table[pid][1] for pid in tree),
+        rss_self_kb=rss_self_kb,
+        rss_tree_kb=rss_tree_kb,
+        pss_tree_kb=pss_tree_kb,
+        pss_by_role_kb=pss_by_role_kb,
     )
+
+
+def _argv_tokens(cmdline: str | bytes | list[str] | tuple[str, ...]) -> list[str]:
+    if isinstance(cmdline, bytes):
+        text = cmdline.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+        return text.split()
+    if isinstance(cmdline, str):
+        return cmdline.replace("\x00", " ").split()
+    return [str(value) for value in cmdline]
+
+
+def _argv_option(args: list[str], option: str) -> str | None:
+    for index, token in enumerate(args):
+        if token == option:
+            return args[index + 1] if index + 1 < len(args) else None
+        prefix = f"{option}="
+        if token.startswith(prefix):
+            return token[len(prefix) :]
+    return None
+
+
+def _is_chrome_executable(executable: str) -> bool:
+    return executable in {
+        "chrome",
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+        "headless_shell",
+        "chrome-headless-shell",
+    }
+
+
+def classify_process_role(cmdline: str | bytes | list[str] | tuple[str, ...]) -> str:
+    """Classify a process from its executable and exact Chromium argv tokens."""
+
+    args = _argv_tokens(cmdline)
+    if not args:
+        return "other"
+    executable = Path(args[0]).name.lower()
+    if "python" in executable:
+        return "python-host"
+    if executable in {"node", "nodejs"} or executable.startswith("node-") or executable.endswith("-node"):
+        return "node-driver"
+
+    process_type = (_argv_option(args, "--type") or "").lower()
+    utility_subtype = (_argv_option(args, "--utility-sub-type") or "").lower()
+    if utility_subtype == "network.mojom.networkservice" or process_type == "network":
+        return "network"
+    if process_type == "renderer":
+        return "renderer"
+    if process_type in {"gpu", "gpu-process"}:
+        return "gpu"
+    if process_type == "utility":
+        return "utility"
+    if _is_chrome_executable(executable) and not process_type:
+        return "browser"
+    return "other"
+
+
+def _procfs_pss_kb(process_dir: Path) -> int | None:
+    try:
+        smaps_rollup = (process_dir / "smaps_rollup").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    pss_kb: int | None = None
+    for line in smaps_rollup.splitlines():
+        if not line.startswith("Pss:"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            return None
+        try:
+            parsed = int(parts[1])
+        except ValueError:
+            return None
+        if parsed < 0:
+            return None
+        pss_kb = parsed
+        break
+    return pss_kb
+
+
+def procfs_process_tree_pss(
+    tree: list[int],
+    proc_root: Path | None = None,
+) -> tuple[int, dict[str, int]] | None:
+    """Read PSS for every tree process and aggregate it by process role."""
+
+    resolved_root = PROC_ROOT if proc_root is None else proc_root
+    by_role = {role: 0 for role in PROCESS_ROLES}
+    total = 0
+    for pid in tree:
+        process_dir = resolved_root / str(pid)
+        pss_kb = _procfs_pss_kb(process_dir)
+        if pss_kb is None:
+            return None
+        try:
+            cmdline = (process_dir / "cmdline").read_bytes()
+        except (OSError, UnicodeError):
+            cmdline = b""
+        role = classify_process_role(cmdline)
+        by_role[role] += pss_kb
+        total += pss_kb
+    return total, by_role
 
 
 def procfs_process_table(

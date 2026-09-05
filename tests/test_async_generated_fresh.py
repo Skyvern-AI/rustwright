@@ -53,7 +53,7 @@ def test_every_class_async_method_has_one_owner() -> None:
 
     assert actual_hand == expected_hand
     assert actual_hand.isdisjoint(expected_generated)
-    assert len(actual_hand | expected_generated) == 389
+    assert len(actual_hand | expected_generated) == 391
 
 
 def test_non_class_async_helpers_stay_hand_written() -> None:

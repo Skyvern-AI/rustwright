@@ -40,7 +40,7 @@ if str(REPO_ROOT) not in sys.path:
 import pytest
 
 import rustwright
-from rustwright.sync_api import Error, TimeoutError, expect, sync_playwright
+from rustwright.sync_api import Error, Response, TimeoutError, expect, sync_playwright
 
 
 rustwright.enable_playwright_compat()
@@ -1255,6 +1255,15 @@ def http_server():
                 body = json.dumps({key.lower(): value for key, value in self.headers.items()}).encode("utf-8")
                 self.send_response(200, "OK")
                 self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path.startswith("/large"):
+                body = b"retained-response-" + (b"x" * (512 * 1024 - 18))
+                self.send_response(200, "OK")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Type", "text/plain")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -5413,6 +5422,44 @@ def test_navigation_response_body_remains_readable_after_later_navigation(page, 
 
     assert second.json() == {"path": "/query", "query": {"after": ["1"]}}
     assert first.json() == {"x-test": None}
+
+
+def test_navigation_response_body_survives_count_byte_eviction_and_renderer_swap(
+    page, http_server, cross_origin_frame_server
+):
+    first = page.goto(f"{http_server}/large?first=1")
+    assert first is not None
+    expected = first.body()
+
+    for index in range(24):
+        page.goto(f"{http_server}/large?index={index}")
+    page.goto(f"{cross_origin_frame_server}/json")
+
+    assert first.body() == expected
+
+
+def test_async_navigation_response_body_survives_count_byte_eviction_and_renderer_swap(
+    http_server, cross_origin_frame_server
+):
+    async def run() -> None:
+        from rustwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
+            try:
+                first = await page.goto(f"{http_server}/large?first=1")
+                assert first is not None
+                expected = await first.body()
+                for index in range(24):
+                    await page.goto(f"{http_server}/large?index={index}")
+                await page.goto(f"{cross_origin_frame_server}/json")
+                assert await first.body() == expected
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
 
 
 def test_subframe_request_and_response_frame_attribution(page, http_server):
@@ -32286,6 +32333,7 @@ def test_async_native_close_waits_for_beforeunload_dialog_dispatch():
                 self._closed = False
                 self._closing = False
                 self.dispatch_task = None
+                self.release_calls = 0
                 self._core = FakeCore(self)
 
             def _stop_event_pump(self):
@@ -32294,6 +32342,10 @@ def test_async_native_close_waits_for_beforeunload_dialog_dispatch():
 
             def _mark_owned_cdp_sessions_closed(self):
                 pass
+
+            def _release_memory_buffers(self):
+                self.release_calls += 1
+                order.append("release")
 
         sync_page = FakePage()
         page = object.__new__(async_api.AsyncPage)
@@ -32304,9 +32356,10 @@ def test_async_native_close_waits_for_beforeunload_dialog_dispatch():
         order.append("close-complete")
         assert sync_page.dispatch_task is not None
         await sync_page.dispatch_task
-
         assert seen == ["beforeunload"]
-        assert order == ["close-command", "dialog", "stop-pump", "close-complete"]
+
+        assert sync_page.release_calls == 1
+        assert order == ["close-command", "dialog", "stop-pump", "release", "close-complete"]
 
     asyncio.run(run())
 
@@ -32321,6 +32374,10 @@ def test_async_close_is_single_flight_for_page_context_browser_and_recursive_own
 
             context = await browser.new_context()
             page = await context.new_page()
+            page._sync._response_log.append(Response(url="https://example.test/retained"))
+            page._sync._navigation_responses.append(
+                Response(url="https://example.test/navigation", _body_cache=b"body")
+            )
             page_close_events = []
             context_close_events = []
             page.on("close", page_close_events.append)
@@ -32329,6 +32386,8 @@ def test_async_close_is_single_flight_for_page_context_browser_and_recursive_own
             await asyncio.gather(page.close(), page.close())
             assert core.sent_target_close_count() - target_closes == 1
             assert len(page_close_events) == 1
+            assert page._sync._response_log == []
+            assert page._sync._navigation_responses == []
 
             context_disposals = core.sent_context_dispose_count()
             await asyncio.gather(context.close(), context.close())
@@ -32922,11 +32981,11 @@ def test_async_event_ack_preserves_concurrent_expect_response_request_state(http
             handler_entered = threading.Event()
             release_handler = threading.Event()
 
-            def block_one_pump_delivery(kind, payload):
+            def block_one_pump_delivery(kind, payload, **kwargs):
                 if not handler_entered.is_set():
                     handler_entered.set()
                     release_handler.wait(5)
-                return original_handler(kind, payload)
+                return original_handler(kind, payload, **kwargs)
 
             page._sync._handle_observation_event = block_one_pump_delivery
             try:
@@ -32997,12 +33056,12 @@ def test_async_event_batch_consumer_defers_mid_batch_cancellation_until_ack(http
             release = threading.Event()
             handled = []
 
-            def slow_first_handler(kind, payload):
+            def slow_first_handler(kind, payload, **kwargs):
                 handled.append(kind)
                 if len(handled) == 1:
                     entered.set()
                     release.wait(5)
-                return original_handler(kind, payload)
+                return original_handler(kind, payload, **kwargs)
 
             page._sync._handle_observation_event = slow_first_handler
             consumer = asyncio.create_task(
