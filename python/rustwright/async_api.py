@@ -2348,6 +2348,7 @@ class AsyncBrowserContext(_AsyncBrowserContextGeneratedMixin, _AsyncWrapper):
         if self._sync._browser is not None and self._sync in self._sync._browser._contexts:
             self._sync._browser._contexts.remove(self._sync)
         _emit_event(self._sync._event_handlers, "close", self._sync)
+        self._sync._release_memory_buffers()
 
     def is_closed(self) -> bool:
         return self._sync.is_closed()
@@ -3259,6 +3260,7 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
         if self._sync._context is not None and self._sync in self._sync._context._pages:
             self._sync._context._pages.remove(self._sync)
         _emit_event(self._sync._event_handlers, "close", self._sync)
+        self._sync._release_memory_buffers()
         if (
             self._sync._owns_context
             and self._sync._context is not None

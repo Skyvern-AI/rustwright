@@ -51,6 +51,8 @@ _HISTORY_EVENT_DRAIN_TIMEOUT_SECONDS = 0.02
 _CONSOLE_HISTORY_SETTLE_TIMEOUT_SECONDS = 0.001
 _CONSOLE_HISTORY_BUFFER = "__console_history__"
 _PAGE_ERROR_HISTORY_BUFFER = "__page_error_history__"
+_NAVIGATION_RESPONSE_RETENTION_COUNT = 20
+_NAVIGATION_RESPONSE_RETENTION_BYTES = 8 * 1024 * 1024
 _MULTIPART_BOUNDARY_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB"
 _CHECKED_STATE_JS = """(el) => {
 const tagName = String(el && el.tagName || '').toUpperCase();
@@ -6555,35 +6557,59 @@ class Response(_EventEmitter):
     def headers_array(self) -> list[dict[str, str]]:
         return list(self._headers_array_cache)
 
+    def _body_cache_was_populated(self) -> None:
+        if self._page is not None:
+            self._page._prune_navigation_responses()
+
     def _set_body_from_payload(self, payload: Any) -> None:
         if not isinstance(payload, dict):
             return
         body = payload.get("body", "")
         if payload.get("base64Encoded"):
-            self._body_cache = base64.b64decode(body)
+            decoded_body = base64.b64decode(body)
         else:
-            self._body_cache = str(body).encode("utf-8")
-        if self.request is not None:
-            self.request._sizes = {
-                **(self.request._sizes or {}),
-                "responseBodySize": len(self._body_cache),
-            }
+            decoded_body = str(body).encode("utf-8")
+        page = self._page
+        if page is None:
+            self._body_cache = decoded_body
+            if self.request is not None:
+                self.request._sizes = {
+                    **(self.request._sizes or {}),
+                    "responseBodySize": len(decoded_body),
+                }
+        else:
+            with page._network_history_lock_for():
+                self._body_cache = decoded_body
+                if self.request is not None:
+                    self.request._sizes = {
+                        **(self.request._sizes or {}),
+                        "responseBodySize": len(decoded_body),
+                    }
+        self._body_cache_was_populated()
 
     def _cache_body(self, timeout_ms: Optional[float] = None) -> bytes:
+        page = self._page
+        if page is None:
+            if self._body_cache is None:
+                self._body_cache = b""
+            return self._body_cache
+        with page._network_history_lock_for():
+            if self._body_cache is not None:
+                return self._body_cache
+            if not self._request_id:
+                self._body_cache = b""
+            else:
+                fulfilled_body = page._fulfilled_route_bodies.pop(str(self._request_id), None)
+                if fulfilled_body is not None:
+                    self._body_cache = fulfilled_body
         if self._body_cache is not None:
-            return self._body_cache
-        if self._page is None or not self._request_id:
-            self._body_cache = b""
-            return self._body_cache
-        fulfilled_body = self._page._fulfilled_route_bodies.get(str(self._request_id))
-        if fulfilled_body is not None:
-            self._body_cache = fulfilled_body
+            self._body_cache_was_populated()
             return self._body_cache
         payload = json.loads(
             _call(
-                self._page._core.response_body,
+                page._core.response_body,
                 self._request_id,
-                self._page._default_timeout if timeout_ms is None else timeout_ms,
+                page._default_timeout if timeout_ms is None else timeout_ms,
             )
         )
         self._set_body_from_payload(payload)
@@ -8365,22 +8391,16 @@ def _network_event_matches_descriptor(page: "Page", matcher: Any, event: Request
 
 
 def _network_log_state(page: "Page", kind: str) -> dict[str, Any]:
-    if kind == "request":
-        return {"log_offset": len(page._request_log)}
-    if kind == "response":
-        return {"log_offset": len(page._response_log)}
+    if kind in {"request", "response"}:
+        return {"log_sequence": page._network_log_cursor(kind)}
     return {}
 
 
 def _network_log_values(page: "Page", state: dict[str, Any], kind: str) -> Iterable[Request | Response]:
-    offset = state.get("log_offset")
-    if offset is None:
+    sequence = state.get("log_sequence")
+    if not isinstance(sequence, int):
         return ()
-    if kind == "request":
-        return page._request_log[offset:]
-    if kind == "response":
-        return page._response_log[offset:]
-    return ()
+    return page._network_log_values_since(kind, sequence)
 
 
 def _page_console_waiter(page: "Page", timeout_ms: Optional[float] = None) -> Any:
@@ -9532,7 +9552,7 @@ class _LocalEventContextManager:
         self._error: Optional[BaseException] = None
         self._handler: Optional[Callable[..., Any]] = None
         self._reject_close_handler: Optional[Callable[..., Any]] = None
-        self._page_log_offsets: dict[Page, int] = {}
+        self._page_log_sequences: dict[Page, int] = {}
         self._predicate_results: dict[int, list[tuple[Any, bool, str]]] = {}
         self._predicate_lock = threading.Lock()
 
@@ -9558,10 +9578,7 @@ class _LocalEventContextManager:
     def __enter__(self) -> "_LocalEventContextManager":
         if self._event in {"request", "response"} and hasattr(self._target, "_pages"):
             for page in list(getattr(self._target, "_pages", [])):
-                if self._event == "request":
-                    self._page_log_offsets[page] = len(page._request_log)
-                else:
-                    self._page_log_offsets[page] = len(page._response_log)
+                self._page_log_sequences[page] = page._network_log_cursor(self._event)
 
         def handler(*args: Any) -> None:
             value: Any
@@ -9603,12 +9620,12 @@ class _LocalEventContextManager:
                         self._ready.set()
                         break
                     if deadline is None:
-                        step = 0.05 if self._page_log_offsets else None
+                        step = 0.05 if self._page_log_sequences else None
                     else:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             break
-                        step = min(0.05, remaining) if self._page_log_offsets else remaining
+                        step = min(0.05, remaining) if self._page_log_sequences else remaining
                     self._ready.wait(step)
                 if not self._ready.is_set():
                     fallback = self._fallback_context_network_event()
@@ -9630,10 +9647,10 @@ class _LocalEventContextManager:
     def _fallback_context_network_event(self) -> Any:
         if self._event not in {"request", "response"}:
             return None
-        for page, offset in list(self._page_log_offsets.items()):
-            events = page._request_log if self._event == "request" else page._response_log
-            self._page_log_offsets[page] = len(events)
-            for event in events[offset:]:
+        for page, sequence in list(self._page_log_sequences.items()):
+            events, next_sequence = page._network_log_snapshot_since(self._event, sequence)
+            self._page_log_sequences[page] = next_sequence
+            for event in events:
                 if self._predicate_accepts(event, source="fallback"):
                     return event
         return None
@@ -12526,7 +12543,7 @@ class Tracing(_EventEmitter):
         self._artifact_resources: dict[str, bytes] = {}
         self._action_pages: dict[str, "Page"] = {}
         self._group_stack: list[str] = []
-        self._response_log_offsets: dict["Page", int] = {}
+        self._response_log_sequences: dict["Page", int] = {}
         self._call_counter = 0
         self._group_counter = 0
         self._event_handlers: dict[str, list[Callable[..., Any]]] = {}
@@ -12574,7 +12591,9 @@ class Tracing(_EventEmitter):
         self._artifact_resources.clear()
         self._action_pages.clear()
         self._group_stack.clear()
-        self._response_log_offsets = {page: len(page._response_log) for page in self._context.pages}
+        self._response_log_sequences = {
+            page: page._network_log_cursor("response") for page in self._context.pages
+        }
         self._call_counter = 0
         self._group_counter = 0
         self._source_file_indexes.clear()
@@ -12679,7 +12698,7 @@ class Tracing(_EventEmitter):
     def _attach_page(self, page: "Page") -> None:
         if not self._recording or page in self._network_handlers:
             return
-        self._response_log_offsets.setdefault(page, len(page._response_log))
+        self._response_log_sequences.setdefault(page, page._network_log_cursor("response"))
 
         def response_handler(_: Response) -> None:
             return None
@@ -12913,8 +12932,8 @@ class Tracing(_EventEmitter):
         seen: set[tuple[Optional[str], str, Optional[int]]] = set()
         monotonic_time = self._start_monotonic_ms
         for page in list(self._context.pages):
-            offset = self._response_log_offsets.get(page, 0)
-            for response in page._response_log[offset:]:
+            sequence = self._response_log_sequences.get(page, 0)
+            for response in page._network_log_values_since("response", sequence):
                 if url_parse.urlparse(response.url).path == "/favicon.ico":
                     continue
                 key = (response._request_id, response.url, response.status)
@@ -13384,6 +13403,22 @@ class BrowserContext:
             page.remove_listener(page_event, handler)
         handlers.clear()
 
+    def _release_memory_buffers(self) -> None:
+        self._pages.clear()
+        self._background_pages.clear()
+        self._service_workers.clear()
+        self._emitted_service_worker_ids.clear()
+        self._popup_bridge_handlers.clear()
+        self._web_error_bridge_handlers.clear()
+        self._page_load_bridge_handlers.clear()
+        self._page_close_bridge_handlers.clear()
+        self._init_scripts.clear()
+        self._routes.clear()
+        self._har_routes.clear()
+        self._websocket_routes.clear()
+        self._bindings.clear()
+        self._storage_state_origins.clear()
+
     def close(self, *, reason: Optional[str] = None) -> None:
         if self._closed:
             return
@@ -13420,6 +13455,7 @@ class BrowserContext:
         if self._browser is not None and self in self._browser._contexts:
             self._browser._contexts.remove(self)
         _emit_event(self._event_handlers, "close", self)
+        self._release_memory_buffers()
 
     def _cleanup_default_context_state(self) -> None:
         if self._core is not None or self._browser is None:
@@ -15726,14 +15762,19 @@ class Page:
         self._set_content_html_document_known: Optional[bool] = True
         self._frame_object_cache: dict[str, Frame] = {}
         self._frame_event_cache: dict[str, Frame] = {}
+        self._network_history_lock = threading.RLock()
         self._request_log: list[Request] = []
+        self._request_log_sequences: list[int] = []
+        self._next_request_log_sequence = 0
         self._request_log_keys: set[tuple[str, str]] = set()
-        self._request_log_condition = threading.Condition()
+        self._request_log_condition = threading.Condition(self._network_history_lock)
         self._request_log_generation = 0
         self._request_history_wait_until = 0.0
         self._request_history_pending_keys: set[tuple[str, str]] = set()
         self._requests_by_key: dict[tuple[str, str], Request] = {}
         self._response_log: list[Response] = []
+        self._response_log_sequences: list[int] = []
+        self._next_response_log_sequence = 0
         self._response_log_keys: set[tuple[Any, str, Any]] = set()
         self._navigation_responses: list[Response] = []
         self._fulfilled_route_bodies: dict[str, bytes] = {}
@@ -16314,15 +16355,228 @@ class Page:
                     break
                 self._console_dispatch_condition.wait(timeout=remaining)
 
+    def _network_history_lock_for(self) -> Any:
+        lock = getattr(self, "_network_history_lock", None)
+        if lock is None:
+            lock = self.__dict__.setdefault("_network_history_lock", threading.RLock())
+        return lock
+
+    def _ensure_request_log_sequences(self) -> None:
+        sequences = getattr(self, "_request_log_sequences", None)
+        if sequences is None:
+            sequences = []
+            self._request_log_sequences = sequences
+        if len(sequences) > len(self._request_log):
+            del sequences[len(self._request_log):]
+        next_sequence = max(getattr(self, "_next_request_log_sequence", 0), 0)
+        if sequences:
+            next_sequence = max(next_sequence, sequences[-1] + 1)
+        while len(sequences) < len(self._request_log):
+            sequences.append(next_sequence)
+            next_sequence += 1
+        self._next_request_log_sequence = next_sequence
+
+    def _ensure_response_log_sequences(self) -> None:
+        sequences = getattr(self, "_response_log_sequences", None)
+        if sequences is None:
+            sequences = []
+            self._response_log_sequences = sequences
+        if len(sequences) > len(self._response_log):
+            del sequences[len(self._response_log):]
+        next_sequence = max(getattr(self, "_next_response_log_sequence", 0), 0)
+        if sequences:
+            next_sequence = max(next_sequence, sequences[-1] + 1)
+        while len(sequences) < len(self._response_log):
+            sequences.append(next_sequence)
+            next_sequence += 1
+        self._next_response_log_sequence = next_sequence
+
+    def _network_log_cursor(self, kind: str) -> int:
+        with self._network_history_lock_for():
+            if kind == "request":
+                self._ensure_request_log_sequences()
+                return self._next_request_log_sequence
+            if kind == "response":
+                self._ensure_response_log_sequences()
+                return self._next_response_log_sequence
+            return 0
+
+    def _network_log_snapshot_since(
+        self,
+        kind: str,
+        sequence: int,
+    ) -> tuple[list[Request | Response], int]:
+        with self._network_history_lock_for():
+            if kind == "request":
+                self._ensure_request_log_sequences()
+                events = [
+                    event
+                    for event_sequence, event in zip(self._request_log_sequences, self._request_log)
+                    if event_sequence >= sequence
+                ]
+                return events, self._next_request_log_sequence
+            if kind == "response":
+                self._ensure_response_log_sequences()
+                events = [
+                    event
+                    for event_sequence, event in zip(self._response_log_sequences, self._response_log)
+                    if event_sequence >= sequence
+                ]
+                return events, self._next_response_log_sequence
+            return [], 0
+
+    def _network_log_values_since(
+        self,
+        kind: str,
+        sequence: int,
+    ) -> list[Request | Response]:
+        return self._network_log_snapshot_since(kind, sequence)[0]
+
     def _remember_navigation_response(self, response: Optional[Response]) -> Optional[Response]:
-        if response is not None:
+        if response is None:
+            return None
+        with self._network_history_lock_for():
             if response.request is not None:
                 response.request._response = response
             self._navigation_responses.append(response)
-            self._navigation_responses = self._navigation_responses[-20:]
             if response._request_id:
                 self._record_response(response)
+            self._prune_navigation_responses_locked()
         return response
+
+    def _drop_page_owned_response(self, response: Response) -> None:
+        with self._network_history_lock_for():
+            self._drop_page_owned_response_locked(response)
+
+    def _drop_page_owned_response_locked(self, response: Response) -> None:
+        if not hasattr(self, "_request_log"):
+            self._request_log = []
+        if not hasattr(self, "_request_log_keys"):
+            self._request_log_keys = set()
+        if not hasattr(self, "_request_history_pending_keys"):
+            self._request_history_pending_keys = set()
+        if not hasattr(self, "_requests_by_key"):
+            self._requests_by_key = {}
+        if not hasattr(self, "_response_log"):
+            self._response_log = []
+        if not hasattr(self, "_response_log_keys"):
+            self._response_log_keys = set()
+        if not hasattr(self, "_navigation_responses"):
+            self._navigation_responses = []
+        if not hasattr(self, "_fulfilled_route_bodies"):
+            self._fulfilled_route_bodies = {}
+        self._navigation_responses = [
+            candidate for candidate in self._navigation_responses if candidate is not response
+        ]
+        self._ensure_response_log_sequences()
+        retained_response_entries = [
+            (event_sequence, candidate)
+            for event_sequence, candidate in zip(self._response_log_sequences, self._response_log)
+            if candidate is not response
+        ]
+        self._response_log_sequences = [event_sequence for event_sequence, _ in retained_response_entries]
+        self._response_log = [candidate for _, candidate in retained_response_entries]
+
+        associated_request_ids: set[int] = set()
+        for request in [*self._request_log, *self._requests_by_key.values()]:
+            if request is response.request or request._response is response:
+                associated_request_ids.add(id(request))
+        self._ensure_request_log_sequences()
+        retained_request_entries = [
+            (event_sequence, request)
+            for event_sequence, request in zip(self._request_log_sequences, self._request_log)
+            if id(request) not in associated_request_ids
+        ]
+        self._request_log_sequences = [event_sequence for event_sequence, _ in retained_request_entries]
+        self._request_log = [request for _, request in retained_request_entries]
+        self._requests_by_key = {
+            key: request
+            for key, request in self._requests_by_key.items()
+            if id(request) not in associated_request_ids
+        }
+        self._request_log_keys = {
+            key
+            for request in self._request_log
+            if (key := self._request_key(request)) is not None
+        }
+        retained_request_keys = self._request_log_keys | set(self._requests_by_key)
+        self._request_history_pending_keys.intersection_update(retained_request_keys)
+
+        self._response_log_keys = {
+            (candidate._request_id, candidate.url, candidate.status)
+            for candidate in self._response_log
+        }
+        request_id = None if response._request_id is None else str(response._request_id)
+        if request_id is not None and not any(
+            candidate._request_id is not None
+            and str(candidate._request_id) == request_id
+            for candidate in [*self._navigation_responses, *self._response_log]
+        ):
+            self._fulfilled_route_bodies.pop(request_id, None)
+
+    def _page_owned_bodies_locked(self) -> dict[int, bytes]:
+        page_owned: dict[int, bytes] = {}
+        for response in self._navigation_responses:
+            if response._body_cache is not None:
+                page_owned.setdefault(id(response._body_cache), response._body_cache)
+        for response in self._response_log:
+            if response._body_cache is not None:
+                page_owned.setdefault(id(response._body_cache), response._body_cache)
+        for body in self._fulfilled_route_bodies.values():
+            page_owned.setdefault(id(body), body)
+        return page_owned
+
+    def _prune_navigation_responses(self) -> None:
+        with self._network_history_lock_for():
+            self._prune_navigation_responses_locked()
+
+    def _prune_navigation_responses_locked(self) -> None:
+        if not hasattr(self, "_navigation_responses"):
+            self._navigation_responses = []
+        if not hasattr(self, "_response_log"):
+            self._response_log = []
+        if not hasattr(self, "_response_log_keys"):
+            self._response_log_keys = set()
+        if not hasattr(self, "_fulfilled_route_bodies"):
+            self._fulfilled_route_bodies = {}
+        self._ensure_response_log_sequences()
+        if len(self._navigation_responses) > _NAVIGATION_RESPONSE_RETENTION_COUNT:
+            overflow = len(self._navigation_responses) - _NAVIGATION_RESPONSE_RETENTION_COUNT
+            evicted = self._navigation_responses[:overflow]
+            self._navigation_responses = self._navigation_responses[overflow:]
+            for response in evicted:
+                if not any(candidate is response for candidate in self._navigation_responses):
+                    self._drop_page_owned_response_locked(response)
+        while True:
+            page_owned = self._page_owned_bodies_locked()
+            total_bytes = sum(len(body) for body in page_owned.values())
+            if total_bytes <= _NAVIGATION_RESPONSE_RETENTION_BYTES:
+                break
+            response = next(
+                (
+                    candidate
+                    for candidate in self._navigation_responses
+                    if candidate._body_cache is not None
+                ),
+                None,
+            )
+            if response is None:
+                response = next(
+                    (
+                        candidate
+                        for candidate in self._response_log
+                        if candidate._body_cache is not None
+                    ),
+                    None,
+                )
+            if response is not None:
+                self._drop_page_owned_response_locked(response)
+                continue
+            if self._fulfilled_route_bodies:
+                old_request_id = next(iter(self._fulfilled_route_bodies))
+                self._fulfilled_route_bodies.pop(old_request_id, None)
+                continue
+            break
 
     def _cached_navigation_response_for_current_url(self) -> Optional[Response]:
         try:
@@ -16330,50 +16584,128 @@ class Page:
         except Exception:
             return None
         current_key = current_url.rstrip("/") if current_url.startswith(("http://", "https://")) else current_url
-        for response in reversed(self._navigation_responses):
+        with self._network_history_lock_for():
+            navigation_responses = list(self._navigation_responses)
+        for response in reversed(navigation_responses):
             response_key = response.url.rstrip("/") if response.url.startswith(("http://", "https://")) else response.url
             if response_key == current_key:
                 return self._record_response(response)
         return None
 
+    def _transfer_fulfilled_route_body_locked(self, response: Response) -> None:
+        request_id = None if response._request_id is None else str(response._request_id)
+        if request_id is None:
+            return
+        body = self._fulfilled_route_bodies.pop(request_id, None)
+        if body is None:
+            return
+        matching_response = response
+        for candidate in [*self._navigation_responses, *self._response_log]:
+            if (
+                candidate is not response
+                and candidate._request_id is not None
+                and str(candidate._request_id) == request_id
+            ):
+                matching_response = candidate
+                break
+        if matching_response._body_cache is None:
+            matching_response._body_cache = body
+
     def _record_response(self, response: Response) -> Response:
-        if response.request is not None:
-            response.request._response = response
-            response.request = self._record_request(response.request)
-        key = (response._request_id, response.url, response.status)
-        if key in self._response_log_keys:
+        with self._network_history_lock_for():
+            if response.request is not None:
+                response.request._response = response
+                response.request = self._record_request(response.request)
+            if not hasattr(self, "_response_log_keys"):
+                self._response_log_keys = set()
+            if not hasattr(self, "_response_log"):
+                self._response_log = []
+            if not hasattr(self, "_fulfilled_route_bodies"):
+                self._fulfilled_route_bodies = {}
+            self._ensure_response_log_sequences()
+            self._transfer_fulfilled_route_body_locked(response)
+            key = (response._request_id, response.url, response.status)
+            if key in self._response_log_keys:
+                return response
+            self._response_log.append(response)
+            self._response_log_sequences.append(self._next_response_log_sequence)
+            self._next_response_log_sequence += 1
+            self._response_log_keys.add(key)
+            overflow = len(self._response_log) - 100
+            if overflow > 0:
+                evicted = self._response_log[:overflow]
+                self._response_log = self._response_log[overflow:]
+                self._response_log_sequences = self._response_log_sequences[overflow:]
+                for old_response in evicted:
+                    if not any(candidate is old_response for candidate in self._navigation_responses):
+                        self._drop_page_owned_response_locked(old_response)
+                self._response_log_keys = {
+                    (candidate._request_id, candidate.url, candidate.status)
+                    for candidate in self._response_log
+                }
             return response
-        self._response_log.append(response)
-        self._response_log_keys.add(key)
-        overflow = len(self._response_log) - 100
-        if overflow > 0:
-            for old_response in self._response_log[:overflow]:
-                self._response_log_keys.discard((old_response._request_id, old_response.url, old_response.status))
-            self._response_log = self._response_log[overflow:]
-        return response
 
     def _retain_navigation_response_bodies(self) -> None:
-        retained: list[Response] = []
-        for response in self._navigation_responses:
-            if response._body_cache is not None:
-                retained.append(response)
-                continue
+        with self._network_history_lock_for():
+            responses = list(self._navigation_responses)
+        for response in responses:
+            with self._network_history_lock_for():
+                if response._body_cache is not None:
+                    continue
             try:
                 response._cache_body(timeout_ms=250.0)
             except Exception:
                 pass
-            retained.append(response)
-        self._navigation_responses = retained[-20:]
+        self._prune_navigation_responses()
+
+    def _release_memory_buffers(self) -> None:
+        release = getattr(self._core, "release_memory_buffers", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                pass
+        with self._network_history_lock_for():
+            self._request_log.clear()
+            self._request_log_sequences.clear()
+            self._request_log_keys.clear()
+            self._requests_by_key.clear()
+            self._response_log.clear()
+            self._response_log_sequences.clear()
+            self._response_log_keys.clear()
+            self._navigation_responses.clear()
+            self._fulfilled_route_bodies.clear()
+            self._request_history_pending_keys.clear()
+            self._request_history_wait_until = 0.0
+            self._request_log_generation += 1
+            with self._request_log_condition:
+                self._request_log_condition.notify_all()
+        self._console_messages.clear()
+        self._page_errors.clear()
+        self._frame_object_cache.clear()
+        self._frame_event_cache.clear()
+        self._workers.clear()
+        self._worker_console_forwards.clear()
+        self._owned_cdp_sessions.clear()
+        self._routes.clear()
+        self._websocket_routes.clear()
+        self._bindings.clear()
+        self._har_recordings.clear()
+        self._locator_handlers.clear()
+        self._clock_script_names.clear()
+        self._clock_initialized.clear()
+        self._video = None
 
     def _navigation_response_request_ids(self) -> list[str]:
         request_ids: list[str] = []
-        for response in self._navigation_responses:
-            if response._body_cache is not None:
-                continue
-            if response._request_id:
-                request_ids.append(str(response._request_id))
-            else:
-                response._body_cache = b""
+        with self._network_history_lock_for():
+            for response in self._navigation_responses:
+                if response._body_cache is not None:
+                    continue
+                if response._request_id:
+                    request_ids.append(str(response._request_id))
+                else:
+                    response._body_cache = b""
         return request_ids
 
     def _apply_retained_navigation_response_bodies(self, payload: Any) -> None:
@@ -16382,11 +16714,12 @@ class Page:
         retained = payload.get("response_bodies")
         if not isinstance(retained, dict):
             return
-        responses = {
-            str(response._request_id): response
-            for response in self._navigation_responses
-            if response._request_id and response._body_cache is None
-        }
+        with self._network_history_lock_for():
+            responses = {
+                str(response._request_id): response
+                for response in self._navigation_responses
+                if response._request_id and response._body_cache is None
+            }
         for request_id, body_payload in retained.items():
             response = responses.get(str(request_id))
             if response is None:
@@ -16533,7 +16866,9 @@ class Page:
                 if message.startswith("Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE"):
                     deadline = time.monotonic() + 1.0
                     while time.monotonic() < deadline:
-                        for response in reversed(self._response_log):
+                        with self._network_history_lock_for():
+                            response_log = list(self._response_log)
+                        for response in reversed(response_log):
                             if response.url == target_url and int(response.status or 0) >= 400:
                                 self._trace_end_action(call_id, result={"response": {"url": response.url, "status": response.status}})
                                 return self._remember_navigation_response(response)
@@ -16829,7 +17164,7 @@ class Page:
         waiter: Any = None,
         method: str = "Page.wait_for_event",
         reject_on_close: bool = True,
-        log_offset: Optional[int] = None,
+        log_sequence: Optional[int] = None,
     ) -> Request | Response:
         if kind not in {"request", "response", "requestfinished", "requestfailed"}:
             raise Error(f"unsupported network event kind: {kind}")
@@ -16841,7 +17176,7 @@ class Page:
             waiter=waiter,
             reject_on_close=reject_on_close,
             method=method,
-            state={} if log_offset is None else {"log_offset": log_offset},
+            state={} if log_sequence is None else {"log_sequence": log_sequence},
         )
 
     def _wait_for_navigation_response(
@@ -19976,16 +20311,22 @@ class Page:
 
 
     def requests(self) -> list[Request]:
-        if not self._closed and time.monotonic() < self._request_history_wait_until:
-            deadline = self._request_history_wait_until
-            generation = self._request_log_generation
+        while True:
+            with self._network_history_lock_for():
+                if self._closed:
+                    break
+                deadline = self._request_history_wait_until
+                generation = self._request_log_generation
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
             with self._request_log_condition:
-                while self._request_log_generation == generation:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    self._request_log_condition.wait(timeout=remaining)
-        return list(self._request_log)
+                self._request_log_condition.wait(timeout=remaining)
+            with self._network_history_lock_for():
+                if self._request_log_generation != generation:
+                    break
+        with self._network_history_lock_for():
+            return list(self._request_log)
 
     def _console_messages_snapshot(self, filter: Optional[str]) -> list[ConsoleMessage]:
         if filter == "all":
@@ -20396,6 +20737,7 @@ class Page:
         if self._context is not None and self in self._context._pages:
             self._context._pages.remove(self)
         _emit_event(self._event_handlers, "close", self)
+        self._release_memory_buffers()
         if self._owns_context and self._context is not None:
             self._context.close()
 
@@ -21052,33 +21394,39 @@ class Page:
     def _dispatch_frame_lifecycle_event(self, event: str, frame: Frame) -> None:
         self._dispatch_event_handlers(event, frame)
 
-    def _record_request(self, request: Request) -> Request:
-        request = self._adopt_request(request)
-        key = self._request_key(request)
-        if key is not None and request.method and key in self._request_history_pending_keys:
-            self._request_history_pending_keys.discard(key)
-            if not self._request_history_pending_keys:
-                self._request_history_wait_until = 0.0
-        if key is not None and key in self._request_log_keys:
-            with self._request_log_condition:
-                self._request_log_generation += 1
-                self._request_log_condition.notify_all()
-            return request
-        self._request_log.append(request)
-        if key is not None:
-            self._request_log_keys.add(key)
-        overflow = len(self._request_log) - 100
-        if overflow > 0:
-            for old_request in self._request_log[:overflow]:
-                old_key = self._request_key(old_request)
-                if old_key is not None:
-                    self._request_log_keys.discard(old_key)
-                    self._request_history_pending_keys.discard(old_key)
-            self._request_log = self._request_log[overflow:]
+    def _notify_request_log_change_locked(self) -> None:
+        self._request_log_generation += 1
         with self._request_log_condition:
-            self._request_log_generation += 1
             self._request_log_condition.notify_all()
-        return request
+
+    def _record_request(self, request: Request) -> Request:
+        with self._network_history_lock_for():
+            request = self._adopt_request(request)
+            key = self._request_key(request)
+            if key is not None and request.method and key in self._request_history_pending_keys:
+                self._request_history_pending_keys.discard(key)
+                if not self._request_history_pending_keys:
+                    self._request_history_wait_until = 0.0
+            if key is not None and key in self._request_log_keys:
+                self._notify_request_log_change_locked()
+                return request
+            self._ensure_request_log_sequences()
+            self._request_log.append(request)
+            self._request_log_sequences.append(self._next_request_log_sequence)
+            self._next_request_log_sequence += 1
+            if key is not None:
+                self._request_log_keys.add(key)
+            overflow = len(self._request_log) - 100
+            if overflow > 0:
+                for old_request in self._request_log[:overflow]:
+                    old_key = self._request_key(old_request)
+                    if old_key is not None:
+                        self._request_log_keys.discard(old_key)
+                        self._request_history_pending_keys.discard(old_key)
+                self._request_log = self._request_log[overflow:]
+                self._request_log_sequences = self._request_log_sequences[overflow:]
+            self._notify_request_log_change_locked()
+            return request
 
     def _request_key(self, request: Request) -> Optional[tuple[str, str]]:
         if not request._request_id or not request.url:
@@ -21122,36 +21470,55 @@ class Page:
         return target
 
     def _adopt_request(self, request: Request) -> Request:
-        key = self._request_key(request)
-        if key is None:
-            return request
-        existing = self._requests_by_key.get(key)
-        if existing is None:
-            self._requests_by_key[key] = request
-            if len(self._requests_by_key) > 300:
-                for old_key in list(self._requests_by_key)[:-300]:
-                    self._requests_by_key.pop(old_key, None)
-            return request
-        return self._merge_request_state(existing, request)
+        with self._network_history_lock_for():
+            key = self._request_key(request)
+            if key is None:
+                return request
+            existing = self._requests_by_key.get(key)
+            if existing is None:
+                self._requests_by_key[key] = request
+                if len(self._requests_by_key) > 300:
+                    for old_key in list(self._requests_by_key)[:-300]:
+                        self._requests_by_key.pop(old_key, None)
+                return request
+            return self._merge_request_state(existing, request)
 
     def _link_response_request(self, response: Response) -> None:
-        if response.request is None:
-            return
-        request = self._adopt_request(response.request)
-        response.request = request
-        request._response = response
-        self._record_request(request)
-        if not request.method and request._request_id:
-            key = self._request_key(request)
-            if key is not None:
-                self._request_history_pending_keys.add(key)
-            self._request_history_wait_until = time.monotonic() + _HISTORY_EVENT_DRAIN_TIMEOUT_SECONDS
+        with self._network_history_lock_for():
+            if response.request is None:
+                return
+            request = self._adopt_request(response.request)
+            response.request = request
+            request._response = response
+            self._record_request(request)
+            if not request.method and request._request_id:
+                key = self._request_key(request)
+                if key is not None:
+                    self._request_history_pending_keys.add(key)
+                self._request_history_wait_until = time.monotonic() + _HISTORY_EVENT_DRAIN_TIMEOUT_SECONDS
 
     def _remember_fulfilled_route_body(self, request_id: str, body: bytes) -> None:
-        self._fulfilled_route_bodies[str(request_id)] = bytes(body)
-        if len(self._fulfilled_route_bodies) > 200:
-            for old_request_id in list(self._fulfilled_route_bodies)[:-200]:
-                self._fulfilled_route_bodies.pop(old_request_id, None)
+        request_id = str(request_id)
+        stored_body = bytes(body)
+        with self._network_history_lock_for():
+            if not hasattr(self, "_fulfilled_route_bodies"):
+                self._fulfilled_route_bodies = {}
+            matching_response = next(
+                (
+                    response
+                    for response in [*self._navigation_responses, *self._response_log]
+                    if response._request_id is not None
+                    and str(response._request_id) == request_id
+                ),
+                None,
+            )
+            if matching_response is None:
+                self._fulfilled_route_bodies[request_id] = stored_body
+                while len(self._fulfilled_route_bodies) > 200:
+                    self._fulfilled_route_bodies.pop(next(iter(self._fulfilled_route_bodies)))
+            elif matching_response._body_cache is None:
+                matching_response._body_cache = stored_body
+            self._prune_navigation_responses_locked()
 
     def _ensure_console_thread(self) -> None:
         if self._runtime_observation_enabled:
