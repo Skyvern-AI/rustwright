@@ -4597,6 +4597,814 @@ def test_context_close_closes_pages_before_context_close_event(playwright):
     browser.close()
 
 
+def test_new_context_download_behavior_failure_rolls_back_sync_context():
+    from rustwright.sync_api import Browser
+
+    class ContextCore:
+        context_id = "download-behavior-sync"
+
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            raise RuntimeError("context disposal failed")
+
+    class BrowserCore:
+        def __init__(self, context_core):
+            self.context_core = context_core
+
+        def single_process_fallback(self):
+            return False
+
+        def new_context(self, _options):
+            return self.context_core
+
+    context_core = ContextCore()
+    browser = Browser(BrowserCore(context_core))
+    browser._browser_download_behavior = {"behavior": "allow"}
+    original = RuntimeError("download behavior failed")
+
+    def fail_download_behavior(_context):
+        raise original
+
+    browser._apply_browser_download_behavior_to_context = fail_download_behavior
+
+    with pytest.raises(RuntimeError) as exc_info:
+        browser.new_context()
+
+    assert exc_info.value is original
+    assert browser.contexts == []
+    assert context_core.close_calls == 1
+
+
+def test_new_context_download_behavior_failure_rolls_back_async_slow_path():
+    from playwright.async_api import Browser
+
+    class ContextCore:
+        context_id = "download-behavior-async"
+
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            raise RuntimeError("context disposal failed")
+
+    class BrowserCore:
+        def __init__(self, context_core):
+            self.context_core = context_core
+
+        def single_process_fallback(self):
+            return False
+
+        def new_context(self, _options):
+            return self.context_core
+
+    async def run():
+        context_core = ContextCore()
+        sync_browser = rustwright.sync_api.Browser(BrowserCore(context_core))
+        sync_browser._browser_download_behavior = {"behavior": "allow"}
+        original = RuntimeError("download behavior failed")
+
+        def fail_download_behavior(_context):
+            raise original
+
+        sync_browser._apply_browser_download_behavior_to_context = fail_download_behavior
+        browser = Browser(sync_browser)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await browser.new_context()
+
+        assert exc_info.value is original
+        assert sync_browser.contexts == []
+        assert context_core.close_calls == 1
+
+    asyncio.run(run())
+
+
+def test_context_close_retries_native_disposal_without_repeating_cleanup():
+    from rustwright.sync_api import BrowserContext
+
+    class ContextCore:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("transient context disposal failure")
+
+    class Page:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self, **_kwargs):
+            self.close_calls += 1
+
+    core = ContextCore()
+    page = Page()
+    context = BrowserContext(core)
+    context._pages.append(page)
+    request_dispose_calls = []
+    context.request.dispose = lambda: request_dispose_calls.append("dispose")
+
+    with pytest.raises(Error, match="transient context disposal failure"):
+        context.close()
+
+    assert not context.is_closed()
+    assert core.close_calls == 1
+    assert page.close_calls == 1
+    assert request_dispose_calls == ["dispose"]
+
+    context.close()
+    context.close()
+
+    assert context.is_closed()
+    assert core.close_calls == 2
+    assert page.close_calls == 1
+    assert request_dispose_calls == ["dispose"]
+
+
+def test_context_close_concurrent_calls_dispose_native_context_once():
+    from rustwright.sync_api import BrowserContext
+
+    class ContextCore:
+        def __init__(self):
+            self.close_calls = 0
+            self.close_started = threading.Event()
+            self.release_close = threading.Event()
+
+        def close(self):
+            self.close_calls += 1
+            self.close_started.set()
+            assert self.release_close.wait()
+
+    class Page:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self, **_kwargs):
+            self.close_calls += 1
+
+    core = ContextCore()
+    page = Page()
+    context = BrowserContext(core)
+    context._pages.append(page)
+    request_dispose_calls = []
+    context.request.dispose = lambda: request_dispose_calls.append("dispose")
+    errors = []
+    second_waiting = threading.Event()
+    original_condition_wait = context._rustwright_sync_close_condition.wait
+
+    def condition_wait(timeout=None):
+        second_waiting.set()
+        return original_condition_wait(timeout)
+
+    context._rustwright_sync_close_condition.wait = condition_wait
+
+    def close_context():
+        try:
+            context.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=close_context)
+    second = threading.Thread(target=close_context)
+    first.start()
+    assert core.close_started.wait(5)
+    second.start()
+    assert second_waiting.wait(5)
+    core.release_close.set()
+    first.join()
+    second.join()
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert context.is_closed()
+    assert core.close_calls == 1
+    assert page.close_calls == 1
+    assert request_dispose_calls == ["dispose"]
+
+
+def test_owned_page_close_does_not_reenter_closing_context():
+    from rustwright.sync_api import BrowserContext, Page
+
+    class EventStream:
+        def close(self):
+            pass
+
+    class PageCore:
+        def __init__(self):
+            self.close_calls = 0
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def combined_event_stream(self):
+            return EventStream()
+
+        def close(self, *_args):
+            self.close_calls += 1
+
+    context = BrowserContext(object())
+    page_core = PageCore()
+    page = Page(page_core, context=context, _start_event_pump=False)
+    page._owns_context = True
+    context._pages.append(page)
+    context._rustwright_sync_close_state = "closing"
+
+    page.close()
+
+    assert page_core.close_calls == 1
+    assert page.is_closed()
+    assert context.is_closed() is False
+    assert context._rustwright_sync_close_state == "closing"
+
+
+def test_context_close_wait_for_concurrent_close_is_bounded():
+    from rustwright.sync_api import BrowserContext
+
+    context = BrowserContext(object())
+    context._default_timeout = 10.0
+    context._rustwright_sync_close_state = "closing"
+    context._rustwright_sync_close_owner = -1
+    errors = []
+
+    def close_context():
+        try:
+            context.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    closer = threading.Thread(target=close_context, daemon=True)
+    closer.start()
+    closer.join(1)
+
+    assert not closer.is_alive()
+    assert len(errors) == 1
+    assert type(errors[0]) is TimeoutError
+    assert str(errors[0]) == "BrowserContext.close: timed out waiting for concurrent close to finish"
+
+
+
+def test_context_new_page_rejects_sync_closing_window():
+    from rustwright.sync_api import BrowserContext
+
+    class ContextCore:
+        def __init__(self):
+            self.close_started = threading.Event()
+            self.release_close = threading.Event()
+            self.new_page_calls = 0
+
+        def new_page(self):
+            self.new_page_calls += 1
+            raise AssertionError("new_page should be rejected before native creation")
+
+        def close(self):
+            self.close_started.set()
+            assert self.release_close.wait(5)
+
+    core = ContextCore()
+    context = BrowserContext(core)
+    context.request.dispose = lambda: None
+    errors = []
+
+    def close_context():
+        try:
+            context.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    closer = threading.Thread(target=close_context)
+    closer.start()
+    assert core.close_started.wait(5)
+    with pytest.raises(Error, match="BrowserContext is closed"):
+        context.new_page()
+    assert core.new_page_calls == 0
+    core.release_close.set()
+    closer.join()
+
+    assert errors == []
+    assert context.is_closed()
+
+
+def test_context_new_page_rejects_browser_closing_window():
+    from rustwright.sync_api import Browser
+
+    class ContextCore:
+        def __init__(self):
+            self.close_started = threading.Event()
+            self.release_close = threading.Event()
+            self.new_page_calls = 0
+
+        def new_page(self):
+            self.new_page_calls += 1
+            raise AssertionError("new_page should be rejected before native creation")
+
+        def close(self):
+            self.close_started.set()
+            assert self.release_close.wait(5)
+
+    class BrowserCore:
+        def __init__(self, context_core):
+            self.context_core = context_core
+
+        def single_process_fallback(self):
+            return False
+
+        def new_context(self, _options):
+            return self.context_core
+
+        def close(self):
+            pass
+
+    context_core = ContextCore()
+    browser = Browser(BrowserCore(context_core))
+    context = browser.new_context()
+    context.request.dispose = lambda: None
+    errors = []
+
+    def close_browser():
+        try:
+            browser.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    closer = threading.Thread(target=close_browser)
+    closer.start()
+    assert context_core.close_started.wait(5)
+    with pytest.raises(Error, match="BrowserContext is closed"):
+        context.new_page()
+    assert context_core.new_page_calls == 0
+    context_core.release_close.set()
+    closer.join()
+
+    assert errors == []
+    assert browser._closed
+
+
+def test_context_new_page_rejects_async_closing_window():
+    from rustwright.async_api import AsyncBrowserContext
+    from rustwright.sync_api import BrowserContext
+
+    class ContextCore:
+        def __init__(self):
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+            self.new_page_calls = 0
+
+        async def new_page_async(self):
+            self.new_page_calls += 1
+            raise AssertionError("new_page should be rejected before native creation")
+
+        async def close_async(self):
+            self.close_started.set()
+            await self.release_close.wait()
+
+    async def run():
+        core = ContextCore()
+        sync_context = BrowserContext(core)
+        sync_context.request.dispose = lambda: None
+        context = AsyncBrowserContext(sync_context)
+
+        close_task = asyncio.create_task(context.close())
+        await asyncio.wait_for(core.close_started.wait(), 5)
+        with pytest.raises(Error, match="BrowserContext is closed"):
+            await context.new_page()
+        assert core.new_page_calls == 0
+        core.release_close.set()
+        await close_task
+        assert context.is_closed()
+
+    asyncio.run(run())
+
+
+def test_browser_close_retries_transient_context_failure():
+    from rustwright.sync_api import Browser
+
+    class ContextCore:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("transient context disposal failure")
+
+    class BrowserCore:
+        def __init__(self, context_core):
+            self.context_core = context_core
+            self.close_calls = 0
+
+        def single_process_fallback(self):
+            return False
+
+        def new_context(self, _options):
+            return self.context_core
+
+        def close(self):
+            self.close_calls += 1
+
+    context_core = ContextCore()
+    browser = Browser(BrowserCore(context_core))
+    context = browser.new_context()
+    context.request.dispose = lambda: None
+
+    with pytest.raises(Error, match="transient context disposal failure"):
+        browser.close()
+
+    assert not browser._closed
+    assert not context.is_closed()
+    assert context in browser.contexts
+    assert context_core.close_calls == 1
+    assert browser._core.close_calls == 0
+
+    browser.close()
+
+    assert browser._closed
+    assert context.is_closed()
+    assert context_core.close_calls == 2
+    assert browser._core.close_calls == 1
+
+
+def test_context_close_waiter_gets_pre_native_failure_and_fresh_retry():
+    from rustwright.sync_api import BrowserContext
+
+    class ContextCore:
+        def __init__(self):
+            self.close_calls = 0
+            self.close_started = threading.Event()
+            self.release_close = threading.Event()
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                self.close_started.set()
+                assert self.release_close.wait(5)
+                raise RuntimeError("transient context disposal failure")
+
+    core = ContextCore()
+    context = BrowserContext(core)
+    context.request.dispose = lambda: None
+    waiter_entered = threading.Event()
+    original_condition_wait = context._rustwright_sync_close_condition.wait
+
+    def condition_wait(timeout=None):
+        waiter_entered.set()
+        return original_condition_wait(timeout)
+
+    context._rustwright_sync_close_condition.wait = condition_wait
+    errors = []
+
+    def close_context(label):
+        try:
+            context.close()
+        except BaseException as exc:
+            errors.append((label, exc))
+
+    first = threading.Thread(target=close_context, args=("owner",))
+    second = threading.Thread(target=close_context, args=("waiter",))
+    first.start()
+    assert core.close_started.wait(5)
+    second.start()
+    assert waiter_entered.wait(5)
+    core.release_close.set()
+    first.join()
+    second.join()
+
+    assert {label for label, _ in errors} == {"owner", "waiter"}
+    owner_error = next(error for label, error in errors if label == "owner")
+    waiter_error = next(error for label, error in errors if label == "waiter")
+    assert type(owner_error) is type(waiter_error) is Error
+    assert str(owner_error) == str(waiter_error) == "transient context disposal failure"
+    assert waiter_error is not owner_error
+    assert waiter_error.__cause__ is not None
+    assert waiter_error.__cause__ is not owner_error
+
+    context.close()
+
+    assert context.is_closed()
+    assert core.close_calls == 2
+
+
+def test_context_close_fresh_retry_does_not_steal_waiter_outcome():
+    from rustwright.sync_api import BrowserContext
+
+    class ContextCore:
+        def __init__(self):
+            self.close_calls = 0
+            self.close_started = threading.Event()
+            self.release_close = threading.Event()
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                self.close_started.set()
+                assert self.release_close.wait(5)
+                raise RuntimeError("transient context disposal failure")
+
+    core = ContextCore()
+    context = BrowserContext(core)
+    context.request.dispose = lambda: None
+    waiter_ident_ready = threading.Event()
+    waiter_entered = threading.Event()
+    waiter_woken = threading.Event()
+    allow_waiter_return = threading.Event()
+    waiter_ident = []
+    original_condition_wait = context._rustwright_sync_close_condition.wait
+
+    def condition_wait(timeout=None):
+        if threading.get_ident() == waiter_ident[0]:
+            waiter_entered.set()
+            original_condition_wait(timeout)
+            waiter_woken.set()
+            context._rustwright_sync_close_condition.release()
+            try:
+                assert allow_waiter_return.wait(5)
+            finally:
+                context._rustwright_sync_close_condition.acquire()
+            return
+        return original_condition_wait(timeout)
+
+    context._rustwright_sync_close_condition.wait = condition_wait
+    errors = []
+
+    def owner_close():
+        try:
+            context.close()
+        except BaseException as exc:
+            errors.append(("owner", exc))
+
+    def waiter_close():
+        waiter_ident.append(threading.get_ident())
+        waiter_ident_ready.set()
+        try:
+            context.close()
+        except BaseException as exc:
+            errors.append(("waiter", exc))
+
+    owner = threading.Thread(target=owner_close)
+    waiter = threading.Thread(target=waiter_close)
+    owner.start()
+    assert core.close_started.wait(5)
+    waiter.start()
+    assert waiter_ident_ready.wait(5)
+    assert waiter_entered.wait(5)
+    core.release_close.set()
+    assert waiter_woken.wait(5)
+
+    fresh_errors = []
+
+    def fresh_close():
+        try:
+            context.close()
+        except BaseException as exc:
+            fresh_errors.append(exc)
+
+    fresh = threading.Thread(target=fresh_close)
+    fresh.start()
+    fresh.join()
+    allow_waiter_return.set()
+    owner.join()
+    waiter.join()
+
+    assert fresh_errors == []
+    assert {label for label, _ in errors} == {"owner", "waiter"}
+    waiter_error = next(error for label, error in errors if label == "waiter")
+    assert type(waiter_error) is Error
+    assert str(waiter_error) == "transient context disposal failure"
+    assert context.is_closed()
+    assert core.close_calls == 2
+
+
+
+def test_context_close_waiter_gets_post_native_failure_and_reentrant_close_is_safe():
+    from rustwright.sync_api import BrowserContext
+
+    class ContextCore:
+        def __init__(self):
+            self.close_calls = 0
+            self.close_started = threading.Event()
+            self.release_close = threading.Event()
+
+        def close(self):
+            self.close_calls += 1
+            self.close_started.set()
+            assert self.release_close.wait(5)
+
+    core = ContextCore()
+    context = BrowserContext(core)
+    context.request.dispose = lambda: None
+
+    def fail_close_handler(closed_context):
+        closed_context.close()
+        raise Error("post-native close handler failure")
+
+    context.on("close", fail_close_handler)
+    waiter_entered = threading.Event()
+    original_condition_wait = context._rustwright_sync_close_condition.wait
+
+    def condition_wait(timeout=None):
+        waiter_entered.set()
+        return original_condition_wait(timeout)
+
+    context._rustwright_sync_close_condition.wait = condition_wait
+    errors = []
+
+    def close_context(label):
+        try:
+            context.close()
+        except BaseException as exc:
+            errors.append((label, exc))
+
+    first = threading.Thread(target=close_context, args=("owner",))
+    second = threading.Thread(target=close_context, args=("waiter",))
+    first.start()
+    assert core.close_started.wait(5)
+    second.start()
+    assert waiter_entered.wait(5)
+    core.release_close.set()
+    first.join()
+    second.join()
+
+    assert {label for label, _ in errors} == {"owner", "waiter"}
+    owner_error = next(error for label, error in errors if label == "owner")
+    waiter_error = next(error for label, error in errors if label == "waiter")
+    assert type(owner_error) is type(waiter_error) is Error
+    assert str(owner_error) == str(waiter_error) == "post-native close handler failure"
+    assert waiter_error is not owner_error
+    assert waiter_error.__cause__ is not None
+    assert context.is_closed()
+    assert core.close_calls == 1
+
+
+def test_async_context_close_ignores_target_closed_native_disposal():
+    from rustwright.async_api import AsyncBrowserContext
+    from rustwright.sync_api import BrowserContext
+
+    class ContextCore:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def close_async(self):
+            self.close_calls += 1
+            raise RuntimeError("Target closed")
+
+    async def run():
+        core = ContextCore()
+        sync_context = BrowserContext(core)
+        request_dispose_calls = []
+        sync_context.request.dispose = lambda: request_dispose_calls.append("dispose")
+        context = AsyncBrowserContext(sync_context)
+
+        await context.close()
+        await context.close()
+
+        assert context.is_closed()
+        assert core.close_calls == 1
+        assert request_dispose_calls == ["dispose"]
+
+    asyncio.run(run())
+
+
+def test_context_close_retries_only_incomplete_cleanup_stages(monkeypatch, tmp_path: Path):
+    import rustwright.sync_api as sync_api
+    from rustwright.sync_api import BrowserContext
+
+    har_writes = []
+    monkeypatch.setattr(sync_api, "_write_har", lambda *args, **kwargs: har_writes.append((args, kwargs)))
+
+    class ContextCore:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    class Page:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self, **_kwargs):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise Error("transient page cleanup failure")
+
+    core = ContextCore()
+    page = Page()
+    context = BrowserContext(core, options={"record_har_path": str(tmp_path / "trace.har")})
+    context._pages.append(page)
+    request_dispose_calls = []
+    context.request.dispose = lambda: request_dispose_calls.append("dispose")
+
+    with pytest.raises(Error, match="transient page cleanup failure"):
+        context.close()
+    assert not context.is_closed()
+    assert len(har_writes) == 1
+
+    context.close()
+
+    assert context.is_closed()
+    assert len(har_writes) == 1
+    assert page.close_calls == 2
+    assert request_dispose_calls == ["dispose"]
+
+def test_async_context_close_retries_native_disposal_without_repeating_cleanup():
+    from rustwright.async_api import AsyncBrowserContext
+    from rustwright.sync_api import BrowserContext
+
+    class ContextCore:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def close_async(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("transient async context disposal failure")
+
+    class Page:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def close(self, **_kwargs):
+            self.close_calls += 1
+
+    async def run():
+        core = ContextCore()
+        page = Page()
+        sync_context = BrowserContext(core)
+        sync_context._pages.append(page)
+        request_dispose_calls = []
+        sync_context.request.dispose = lambda: request_dispose_calls.append("dispose")
+        context = AsyncBrowserContext(sync_context)
+
+        with pytest.raises(Error, match="transient async context disposal failure"):
+            await context.close()
+
+        assert not context.is_closed()
+        assert core.close_calls == 1
+        assert page.close_calls == 1
+        assert request_dispose_calls == []
+
+        await context.close()
+        await context.close()
+
+        assert context.is_closed()
+        assert core.close_calls == 2
+        assert page.close_calls == 1
+        assert request_dispose_calls == ["dispose"]
+
+    asyncio.run(run())
+
+
+def test_async_context_close_concurrent_calls_dispose_native_context_once():
+    from rustwright.async_api import AsyncBrowserContext
+    from rustwright.sync_api import BrowserContext
+
+    class ContextCore:
+        def __init__(self):
+            self.close_calls = 0
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        async def close_async(self):
+            self.close_calls += 1
+            self.close_started.set()
+            await self.release_close.wait()
+
+    class Page:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def close(self, **_kwargs):
+            self.close_calls += 1
+
+    async def run():
+        core = ContextCore()
+        page = Page()
+        sync_context = BrowserContext(core)
+        sync_context._pages.append(page)
+        request_dispose_calls = []
+        sync_context.request.dispose = lambda: request_dispose_calls.append("dispose")
+        context = AsyncBrowserContext(sync_context)
+
+        first = asyncio.create_task(context.close())
+        await core.close_started.wait()
+        second = asyncio.create_task(context.close())
+        await asyncio.sleep(0)
+        core.release_close.set()
+        await asyncio.gather(first, second)
+
+        assert context.is_closed()
+        assert core.close_calls == 1
+        assert page.close_calls == 1
+        assert request_dispose_calls == ["dispose"]
+
+    asyncio.run(run())
+
+
 @pytest.fixture()
 def http_proxy_server():
     seen: list[tuple[str, str | None]] = []
