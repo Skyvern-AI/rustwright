@@ -107,7 +107,7 @@ HAND_METHODS = {
     "AsyncExpectation": ("_run_sync_assertion", "to_have_text", "to_contain_text", "to_be_visible", "to_be_hidden", "to_be_enabled", "to_be_disabled", "to_be_editable", "to_be_checked", "to_be_attached", "to_be_empty", "to_be_focused", "to_have_count", "to_have_value", "to_have_values", "to_have_attribute", "to_have_id", "to_have_class", "to_contain_class", "to_have_role", "to_have_accessible_name", "to_have_accessible_description", "to_have_accessible_error_message", "to_match_aria_snapshot", "to_have_css", "to_have_js_property", "to_be_in_viewport", "to_be_ok", "to_have_title", "to_have_url"),
     "AsyncBrowser": ("__aenter__", "__aexit__", "new_page", "new_context", "close", "_close_native"),
     "AsyncBrowserContext": ("__aenter__", "__aexit__", "new_page", "close", "_close_for_browser_close", "_close_native", "_close_native_impl", "expose_function", "expose_binding", "route", "unroute", "unroute_all", "wait_for_event", "route_web_socket"),
-    "AsyncPage": ("_event_pump", "_consume_event_batch", "goto", "wait_for_load_state", "evaluate", "add_script_tag", "add_style_tag", "expose_function", "expose_binding", "wait_for_selector", "click", "fill", "inner_text", "wait_for_event", "route", "unroute", "unroute_all", "route_web_socket", "screenshot", "add_locator_handler", "remove_locator_handler", "close", "_close_native"),
+    "AsyncPage": ("__aenter__", "__aexit__", "_event_pump", "_consume_event_batch", "goto", "wait_for_load_state", "evaluate", "add_script_tag", "add_style_tag", "expose_function", "expose_binding", "wait_for_selector", "click", "fill", "inner_text", "wait_for_event", "route", "unroute", "unroute_all", "route_web_socket", "screenshot", "add_locator_handler", "remove_locator_handler", "close", "_close_native"),
     "AsyncFrame": ("wait_for_load_state",),
     "AsyncLocator": ("drag_to",),
     "AsyncAPIRequestContext": ("_run_request", "fetch", "get", "post", "put", "patch", "delete", "head"),
@@ -133,6 +133,7 @@ HAND_ASYNC_HELPERS = (
     "_install_async_expectation_negated_aliases.make_alias.alias",
     "_call_async_assertion_impl_method",
     "_make_async_assertion_impl_method.method",
+    "_wrap_async_event_handler.wrapper.run_awaitable_with_state.await_result",
     "_make_async_assertion_public_method.method",
 )
 

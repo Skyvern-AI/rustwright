@@ -16,6 +16,16 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_IMPLS = ["rustwright", "playwright", "typescript-playwright"]
 STRICT_IMPLS = ["rustwright", "playwright"]
+REQUIRED_PSS_ROLES = {
+    "browser",
+    "renderer",
+    "gpu",
+    "utility",
+    "network",
+    "python-host",
+    "node-driver",
+    "other",
+}
 
 
 def output_to_text(value: Any) -> str:
@@ -28,6 +38,16 @@ def output_to_text(value: Any) -> str:
 
 def default_iterations() -> int:
     return int(os.environ.get("BENCHMARK_FULL_ITERATIONS") or os.environ.get("BENCHMARK_ITERATIONS") or "10")
+
+
+def positive_repetitions(value: str) -> int:
+    try:
+        repetitions = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("repetitions must be an integer") from None
+    if repetitions < 1:
+        raise argparse.ArgumentTypeError("repetitions must be at least 1")
+    return repetitions
 
 
 def extract_json(output: str) -> dict[str, Any]:
@@ -86,7 +106,7 @@ def run_impl(args: argparse.Namespace, implementation: str) -> dict[str, Any]:
         return result
     result = extract_json(combined)
     memory = result.get("memory")
-    memory_available = (
+    rss_available = (
         isinstance(memory, dict)
         and memory.get("available") is True
         and all(
@@ -95,14 +115,38 @@ def run_impl(args: argparse.Namespace, implementation: str) -> dict[str, Any]:
         )
         and memory["rss_tree_kb"] >= memory["rss_self_kb"]
     )
+    pss_by_role = memory.get("pss_by_role_kb") if isinstance(memory, dict) else None
+    pss_required = isinstance(memory, dict) and memory.get("pss_required") is True
+    pss_values_supplied = isinstance(memory, dict) and (
+        memory.get("pss_tree_kb") is not None
+        or pss_by_role is not None
+        or memory.get("pss_available") is True
+    )
+    pss_values_valid = (
+        isinstance(memory, dict)
+        and type(memory.get("pss_tree_kb")) is int
+        and memory["pss_tree_kb"] > 0
+        and isinstance(pss_by_role, dict)
+        and set(pss_by_role) == REQUIRED_PSS_ROLES
+        and all(type(value) is int and value >= 0 for value in pss_by_role.values())
+        and sum(pss_by_role.values()) == memory["pss_tree_kb"]
+        and memory.get("pss_available") is True
+    )
+    pss_valid = pss_values_valid if pss_values_supplied else not pss_required
+    memory_available = rss_available and (
+        pss_valid if pss_required or pss_values_supplied else True
+    )
     if memory_available:
         result["status"] = "passed"
     else:
         result["status"] = "failed"
         result["failure_kind"] = "memory_unavailable"
+        missing = "process-tree RSS"
+        if pss_required or pss_values_supplied:
+            missing += " or PSS"
         result["output_tail"] = (
-            "benchmark completed, but process-tree RSS was unavailable; "
-            "canonical matrix runs require paired latency and memory results"
+            f"benchmark completed, but {missing} was unavailable or invalid; "
+            "canonical matrix runs require paired latency and complete memory results"
         )
     result["container_isolation"] = "separate_container"
     result["command"] = " ".join(command)
@@ -113,6 +157,31 @@ def run_impl(args: argparse.Namespace, implementation: str) -> dict[str, Any]:
     result["matrix_lifecycle"] = args.lifecycle
     return result
 
+def complete_repetition_group(items: list[dict[str, Any]], planned_repetitions: int) -> bool:
+    if len(items) != planned_repetitions or any(item.get("status") != "passed" for item in items):
+        return False
+    repetitions = [item.get("repetition") for item in items]
+    if any(repetition is not None for repetition in repetitions):
+        return set(repetitions) == set(range(1, planned_repetitions + 1))
+    return True
+
+
+def implementation_repetition_status(
+    results: list[dict[str, Any]],
+    implementations: list[str],
+    planned_repetitions: int,
+) -> dict[str, str]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in results:
+        grouped.setdefault(item.get("implementation", ""), []).append(item)
+    return {
+        implementation: (
+            "passed"
+            if complete_repetition_group(grouped.get(implementation, []), planned_repetitions)
+            else "failed"
+        )
+        for implementation in implementations
+    }
 
 def passed_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [item for item in results if item.get("status") == "passed"]
@@ -292,15 +361,29 @@ def case_winners_from_aggregate(aggregate: dict[str, Any]) -> dict[str, Any]:
     return {"win_counts": win_counts, "cases": rows}
 
 
-def aggregate_repetitions(results: list[dict[str, Any]]) -> dict[str, Any]:
+def aggregate_repetitions(
+    results: list[dict[str, Any]], planned_repetitions: int | None = None
+) -> dict[str, Any]:
     grouped: dict[str, list[dict[str, Any]]] = {}
-    for item in passed_results(results):
+    for item in results:
         grouped.setdefault(item["implementation"], []).append(item)
+    if planned_repetitions is not None:
+        grouped = {
+            implementation: items
+            for implementation, items in grouped.items()
+            if complete_repetition_group(items, planned_repetitions)
+        }
+    else:
+        grouped = {
+            implementation: passed_results(items)
+            for implementation, items in grouped.items()
+            if passed_results(items)
+        }
     aggregate = {}
     for implementation, items in grouped.items():
         totals = [float(item["total_mean_ms"]) for item in items]
         case_names = sorted({name for item in items for name in item.get("cases", {})})
-        memory_fields = ("rss_self_kb", "rss_tree_kb")
+        memory_fields = ("rss_self_kb", "rss_tree_kb", "pss_tree_kb")
         memory = {
             field: aggregate_optional_values(
                 [
@@ -311,12 +394,40 @@ def aggregate_repetitions(results: list[dict[str, Any]]) -> dict[str, Any]:
             )
             for field in memory_fields
         }
+        roles = sorted(
+            {
+                role
+                for item in items
+                for role in (item.get("memory", {}).get("pss_by_role_kb") or {})
+            }
+        )
+        memory["pss_by_role_kb"] = {
+            role: aggregate_optional_values(
+                [
+                    float(item["memory"]["pss_by_role_kb"][role])
+                    for item in items
+                    if role in (item.get("memory", {}).get("pss_by_role_kb") or {})
+                ]
+            )
+            for role in roles
+        }
+        memory["pss_by_role_statistic"] = "independent_marginal_medians"
+        memory["pss_required"] = any(
+            item.get("memory", {}).get("pss_required") is True for item in items
+        )
+        memory["pss_statistic"] = "at_tree_rss_peak"
         aggregate[implementation] = {
             "runs": len(items),
             "total_mean_ms": aggregate_values(totals),
             "memory": memory,
             "cases": {
-                name: aggregate_values([float(item["cases"][name]["mean_ms"]) for item in items if name in item.get("cases", {})])
+                name: aggregate_values(
+                    [
+                        float(item["cases"][name]["mean_ms"])
+                        for item in items
+                        if name in item.get("cases", {})
+                    ]
+                )
                 for name in case_names
             },
         }
@@ -427,34 +538,44 @@ def markdown_table(result: dict[str, Any]) -> str:
         "| Implementation | Status | Total median ms | Comparison |",
         "| --- | --- | ---: | --- |",
     ]
-    speedup = result["speedups"]
-    rows_source = result.get("aggregate", {}).items() if result.get("aggregate") else []
-    if rows_source:
-        for name, item in rows_source:
-            total = item["total_mean_ms"]["median"]
-            p25 = item["total_mean_ms"]["p25"]
-            p75 = item["total_mean_ms"]["p75"]
-            comparison = "baseline"
-            rustwright = result["aggregate"].get("rustwright")
-            if name != "rustwright" and rustwright:
-                baseline = float(total)
-                rust = float(rustwright["total_mean_ms"]["median"])
-                if baseline > 0:
-                    reduction = (baseline - rust) / baseline * 100
-                    comparison = f"Rustwright lower by {reduction:.1f}%" if reduction >= 0 else f"Rustwright higher by {abs(reduction):.1f}%"
-            rows.append(f"| {name} | passed | {float(total):.2f} (p25 {float(p25):.2f}, p75 {float(p75):.2f}) | {comparison} |")
-        return "\n".join(rows)
-    for item in result["results"]:
-        name = item["implementation"]
-        if item.get("status") != "passed":
+    aggregate = result.get("aggregate") or {}
+    statuses = result.get("implementation_status") or {}
+    implementations = result.get("implementations") or list(
+        dict.fromkeys(item["implementation"] for item in result.get("results", []))
+    )
+    rustwright = aggregate.get("rustwright")
+    for name in implementations:
+        item = aggregate.get(name)
+        status = statuses.get(name, "passed" if item is not None else "failed")
+        if status != "passed" or item is None:
             rows.append(f"| {name} | failed |  | see JSON output |")
             continue
+        total = item["total_mean_ms"]["median"]
+        p25 = item["total_mean_ms"]["p25"]
+        p75 = item["total_mean_ms"]["p75"]
         comparison = "baseline"
-        if name != "rustwright":
-            value = speedup.get(f"vs_{name}_reduction_pct")
-            if value is not None:
-                comparison = f"Rustwright lower by {value:.1f}%" if value >= 0 else f"Rustwright higher by {abs(value):.1f}%"
-        rows.append(f"| {name} | passed | {float(item['total_mean_ms']):.2f} | {comparison} |")
+        if name != "rustwright" and rustwright:
+            baseline = float(total)
+            rust = float(rustwright["total_mean_ms"]["median"])
+            if baseline > 0:
+                reduction = (baseline - rust) / baseline * 100
+                comparison = (
+                    f"Rustwright lower by {reduction:.1f}%"
+                    if reduction >= 0
+                    else f"Rustwright higher by {abs(reduction):.1f}%"
+                )
+        rows.append(
+            f"| {name} | passed | {float(total):.2f} "
+            f"(p25 {float(p25):.2f}, p75 {float(p75):.2f}) | {comparison} |"
+        )
+    if result.get("diagnostic_aggregate"):
+        rows.extend(
+            [
+                "",
+                "Noncanonical diagnostic aggregates are available under "
+                "`diagnostic_aggregate`; they are excluded from canonical metrics.",
+            ]
+        )
     return "\n".join(rows)
 
 
@@ -480,7 +601,12 @@ def main() -> int:
         description="Run benchmark implementations in separate Docker containers through tools/docker_test.sh."
     )
     parser.add_argument("--iterations", type=int, default=default_iterations())
-    parser.add_argument("--repetitions", type=int, default=1, help="Repeat the full implementation matrix this many times.")
+    parser.add_argument(
+        "--repetitions",
+        type=positive_repetitions,
+        default=1,
+        help="Repeat the full implementation matrix this many times.",
+    )
     parser.add_argument("--impl", action="append", help="Implementation to run. Defaults to the standard matrix.")
     parser.add_argument("--include-puppeteer", action="store_true", help="Add typescript-puppeteer to the default matrix.")
     parser.add_argument("--suite", choices=["equivalent", "strict"], default="equivalent")
@@ -528,7 +654,11 @@ def main() -> int:
         unsupported = [implementation for implementation in implementations if implementation not in STRICT_IMPLS]
         if unsupported:
             raise SystemExit(f"--suite strict only supports: {', '.join(STRICT_IMPLS)}; got {', '.join(unsupported)}")
-    planned_runs = [(repetition, implementation) for repetition in range(args.repetitions) for implementation in implementations]
+    planned_runs = [
+        (repetition, implementation)
+        for repetition in range(args.repetitions)
+        for implementation in implementations
+    ]
     docker_preflight = docker_health_check(args.docker_preflight_timeout)
     if docker_preflight.get("status") != "healthy":
         results = skipped_results_after_docker_preflight(planned_runs)
@@ -552,21 +682,36 @@ def main() -> int:
             results.append(result)
             if result.get("failure_kind") == "docker_daemon_error":
                 stop_remaining_reason = "skipped_after_docker_daemon_error"
-    aggregate = aggregate_repetitions(results)
+    implementation_status = implementation_repetition_status(
+        results,
+        implementations,
+        args.repetitions,
+    )
+    canonical_complete = all(status == "passed" for status in implementation_status.values())
+    diagnostic_aggregate = aggregate_repetitions(results)
+    aggregate = (
+        aggregate_repetitions(results, planned_repetitions=args.repetitions)
+        if canonical_complete
+        else {}
+    )
     result = {
         "iterations": args.iterations,
         "repetitions": args.repetitions,
         "suite": args.suite,
         "lifecycle": args.lifecycle,
         "case_filters": args.case_filters or [],
+        "implementations": implementations,
+        "implementation_status": implementation_status,
+        "canonical_aggregate_complete": canonical_complete,
         "container_isolation": "one_container_per_implementation_per_repetition",
         "metadata": matrix_metadata(args, implementations, docker_preflight),
         "results": results,
         "rustwright_rebuild_target_cache": os.environ.get("RUSTWRIGHT_DOCKER_REBUILD_TARGET_CACHE") == "1",
         "aggregate": aggregate,
+        "diagnostic_aggregate": diagnostic_aggregate if not canonical_complete else {},
         "common_case_comparison": common_case_comparison(aggregate),
-        "case_winners": case_winners_from_aggregate(aggregate) if aggregate else case_winners_from_results(results),
-        "speedups": speedups_from_aggregate(aggregate) if aggregate else speedups_from_results(results),
+        "case_winners": case_winners_from_aggregate(aggregate) if aggregate else {},
+        "speedups": speedups_from_aggregate(aggregate) if aggregate else {},
     }
     output_path = Path(args.output) if args.output else default_result_path(args)
     if not output_path.is_absolute():
