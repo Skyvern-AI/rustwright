@@ -125,6 +125,7 @@ HAND_ASYNC_HELPERS = (
     "_await_native_action",
     "_await_cleanup_completion",
     "_single_flight_close",
+    "_wait_for_page_creations",
     "_native_context_page",
     "_finish_native_page",
     "_run_sync_wait_sliced",

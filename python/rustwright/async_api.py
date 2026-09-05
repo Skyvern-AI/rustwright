@@ -80,6 +80,9 @@ from .sync_api import (
     _EVENT_DISPATCH_SEQUENCE,
     _json,
     _is_ignorable_close_error,
+    _sync_close_wait_deadline,
+    _raise_close_wait_timeout,
+    _update_sync_cleanup_complete,
     _navigation_timeout_for_method,
     _normalize_action_boolean,
     _normalize_lifecycle_state,
@@ -92,7 +95,7 @@ from .sync_api import (
     _options_from_explicit_kwargs,
     _response_from_payload,
     _translate_error,
-    _validate_timeout_value,
+    _write_har,
     _CONSOLE_HISTORY_BUFFER,
     _PAGE_ERROR_HISTORY_BUFFER,
 )
@@ -266,8 +269,33 @@ _CLOSE_CLOSED = "closed"
 
 async def _single_flight_close(sync_obj: Any, cleanup: Callable[[], Any]) -> None:
     """Run one cancellation-safe close task and share its result with every caller."""
-    state = getattr(sync_obj, "_rustwright_async_close_state", _CLOSE_OPEN)
-    task = getattr(sync_obj, "_rustwright_async_close_task", None)
+    condition = getattr(sync_obj, "_rustwright_sync_close_condition", None)
+    if condition is not None and not hasattr(condition, "__enter__"):
+        condition = None
+
+    def read_state() -> tuple[str, Any]:
+        if condition is None:
+            return (
+                getattr(sync_obj, "_rustwright_async_close_state", _CLOSE_OPEN),
+                getattr(sync_obj, "_rustwright_async_close_task", None),
+            )
+        with condition:
+            return (
+                getattr(sync_obj, "_rustwright_async_close_state", _CLOSE_OPEN),
+                getattr(sync_obj, "_rustwright_async_close_task", None),
+            )
+
+    def write_state(state: str, task: Any) -> None:
+        if condition is None:
+            sync_obj._rustwright_async_close_state = state
+            sync_obj._rustwright_async_close_task = task
+            return
+        with condition:
+            sync_obj._rustwright_async_close_state = state
+            sync_obj._rustwright_async_close_task = task
+            condition.notify_all()
+
+    state, task = read_state()
     if state == _CLOSE_CLOSED:
         return
     if state == _CLOSE_CLOSING and task is not None:
@@ -277,21 +305,14 @@ async def _single_flight_close(sync_obj: Any, cleanup: Callable[[], Any]) -> Non
         return
 
     task = asyncio.create_task(cleanup())
-    sync_obj._rustwright_async_close_state = _CLOSE_CLOSING
-    sync_obj._rustwright_async_close_task = task
+    write_state(_CLOSE_CLOSING, task)
     try:
         await _await_cleanup_completion(task)
     except BaseException:
-        if task.done() and not task.cancelled() and task.exception() is None:
-            sync_obj._rustwright_async_close_state = _CLOSE_CLOSED
-            sync_obj._rustwright_async_close_task = None
-        else:
-            sync_obj._rustwright_async_close_state = _CLOSE_OPEN
-            sync_obj._rustwright_async_close_task = None
+        write_state(_CLOSE_CLOSED if task.done() and not task.cancelled() and task.exception() is None else _CLOSE_OPEN, None)
         raise
     else:
-        sync_obj._rustwright_async_close_state = _CLOSE_CLOSED
-        sync_obj._rustwright_async_close_task = None
+        write_state(_CLOSE_CLOSED, None)
 
 
 def _native_normalize_selector(selector: str, *, method: str) -> str:
@@ -359,8 +380,35 @@ def _native_page_hot_path_supported(page: Any) -> bool:
 
 
 async def _native_context_page(context: SyncBrowserContext) -> SyncPage:
-    core = await _await_native(context._core.new_page_async())
-    return await _finish_native_page(context, core)
+    context._begin_page_creation(method="BrowserContext.new_page")
+    try:
+        core = await _await_native(context._core.new_page_async())
+        return await _finish_native_page(context, core)
+    finally:
+        context._finish_page_creation()
+
+async def _wait_for_page_creations(context: SyncBrowserContext) -> None:
+    deadline = _sync_close_wait_deadline(context)
+    while True:
+        with context._rustwright_sync_close_condition:
+            pending = context._rustwright_sync_close_page_creation_pending
+        if not pending:
+            return
+        if deadline - time.monotonic() <= 0:
+            _raise_close_wait_timeout("BrowserContext.close")
+        await asyncio.sleep(0)
+
+
+def _update_async_cleanup_complete(context: SyncBrowserContext) -> None:
+    context._rustwright_async_close_cleanup_complete = all(
+        bool(getattr(context, name, False))
+        for name in (
+            "_rustwright_async_close_har_written",
+            "_rustwright_async_close_default_context_cleaned",
+            "_rustwright_async_close_pages_closed",
+            "_rustwright_async_close_request_disposed",
+        )
+    )
 
 
 async def _finish_native_page(context: SyncBrowserContext, core: Any) -> SyncPage:
@@ -372,7 +420,7 @@ async def _finish_native_page(context: SyncBrowserContext, core: Any) -> SyncPag
         page.set_default_timeout(context._default_timeout)
         if context._default_navigation_timeout is not None:
             page.set_default_navigation_timeout(context._default_navigation_timeout)
-        context._pages.append(page)
+        context._register_page(page, method="BrowserContext.new_page")
         registered = True
         if context._event_handlers.get("page"):
             await _await_cleanup_completion(_run_sync_call(context._ensure_page_popup_bridge, page))
@@ -381,7 +429,9 @@ async def _finish_native_page(context: SyncBrowserContext, core: Any) -> SyncPag
         return page
     except BaseException:
         if registered and page in context._pages:
-            context._pages.remove(page)
+            with context._rustwright_sync_close_condition:
+                if page in context._pages:
+                    context._pages.remove(page)
         popup_handler = context._popup_bridge_handlers.pop(page, None)
         if popup_handler is not None:
             page.remove_listener("popup", popup_handler)
@@ -2134,17 +2184,39 @@ class AsyncBrowser(_AsyncBrowserGeneratedMixin, _AsyncWrapper):
             and not self._sync._browser_download_behavior
             and not bool(self._sync._core.single_process_fallback())
         ):
-            core = await _await_native(self._sync._core.new_context_async(None))
-            context = SyncBrowserContext(core, browser=self._sync, options={})
-            self._sync._contexts.append(context)
+            self._sync._begin_context_creation(method="Browser.new_page")
+            context: Optional[SyncBrowserContext] = None
+            context_core: Any = None
             try:
-                page_core = await _await_native(core.new_page_async())
-                page = await _finish_native_page(context, page_core)
+                context_core = await _await_native(self._sync._core.new_context_async(None))
+                context = SyncBrowserContext(context_core, browser=self._sync, options={})
+                self._sync._append_context(context, method="Browser.new_page")
+            except BaseException:
+                try:
+                    if context_core is not None:
+                        await _await_cleanup_completion(context_core.close_async())
+                except BaseException:
+                    pass
+                raise
+            finally:
+                self._sync._finish_context_creation()
+            try:
+                context._begin_page_creation(method="Browser.new_page")
             except BaseException:
                 await _run_sync_call(context.close)
                 raise
+            try:
+                page_core = await _await_native(context_core.new_page_async())
+                page = await _finish_native_page(context, page_core)
+            except BaseException:
+                context._finish_page_creation()
+                await _run_sync_call(context.close)
+                raise
+            else:
+                context._finish_page_creation()
             page._owns_context = True
             return _wrap_async_page(page)
+
         return _wrap_async_page(await _run_sync_call(self._sync.new_page, **options))
 
     async def new_context(
@@ -2191,16 +2263,27 @@ class AsyncBrowser(_AsyncBrowserGeneratedMixin, _AsyncWrapper):
         if (
             isinstance(self._sync, SyncBrowser)
             and not options
-            and not self._sync._closed
             and not self._sync._browser_download_behavior
             and not self._sync._launch_proxy
             and not self._sync._launch_downloads_path
             and not bool(self._sync._core.single_process_fallback())
         ):
-            core = await _await_native(self._sync._core.new_context_async(None))
-            context = SyncBrowserContext(core, browser=self._sync, options={})
-            self._sync._contexts.append(context)
-            return _wrap_async_browser_context(context)
+            self._sync._begin_context_creation(method="Browser.new_context")
+            context_core: Any = None
+            try:
+                context_core = await _await_native(self._sync._core.new_context_async(None))
+                context = SyncBrowserContext(context_core, browser=self._sync, options={})
+                self._sync._append_context(context, method="Browser.new_context")
+                return _wrap_async_browser_context(context)
+            except BaseException:
+                try:
+                    if context_core is not None:
+                        await _await_cleanup_completion(context_core.close_async())
+                except BaseException:
+                    pass
+                raise
+            finally:
+                self._sync._finish_context_creation()
         return _wrap_async_browser_context(await _run_sync_call(self._sync.new_context, **options))
 
     async def close(self, *, reason: Optional[str] = None) -> None:
@@ -2326,8 +2409,6 @@ class AsyncBrowserContext(_AsyncBrowserContextGeneratedMixin, _AsyncWrapper):
             close = self._sync._close_for_browser_close if for_browser_close else self._sync.close
             await _run_sync_call(close, reason=reason)
             return
-        if self._sync._closed:
-            return
         normalized_reason = None
         if reason is not None:
             normalized_reason = _normalize_string_option(
@@ -2335,20 +2416,78 @@ class AsyncBrowserContext(_AsyncBrowserContextGeneratedMixin, _AsyncWrapper):
                 method="BrowserContext.close",
                 name="reason",
             )
+        close_started = self._sync._try_begin_async_close()
+        while close_started is None:
+            await asyncio.sleep(0)
+            close_started = self._sync._try_begin_async_close()
+        if not close_started:
+            return
         self._sync._closed_reason = normalized_reason
-        if not for_browser_close or self._sync._owns_browser:
-            await _run_sync_call(self._sync._cleanup_default_context_state)
-        for page in list(self._sync._pages):
-            await _wrap_async_page(page).close(reason=normalized_reason)
-        if self._sync._core is not None:
-            await _await_native(self._sync._core.close_async())
-        await _run_sync_call(self._sync.request.dispose)
-        self._sync._closed = True
-        self._sync._pages.clear()
-        if self._sync._browser is not None and self._sync in self._sync._browser._contexts:
-            self._sync._browser._contexts.remove(self._sync)
-        _emit_event(self._sync._event_handlers, "close", self._sync)
-        self._sync._release_memory_buffers()
+        try:
+            await _wait_for_page_creations(self._sync)
+            if not self._sync._rustwright_async_close_har_written:
+                if self._sync._record_har_path:
+                    await _run_sync_call(
+                        _write_har,
+                        self._sync._record_har_path,
+                        list(self._sync._pages),
+                        self._sync._record_har_url_filter,
+                        content_mode=self._sync._record_har_content,
+                        har_mode=self._sync._record_har_mode,
+                    )
+                self._sync._rustwright_async_close_har_written = True
+                self._sync._rustwright_sync_close_har_written = True
+                _update_async_cleanup_complete(self._sync)
+                _update_sync_cleanup_complete(self._sync)
+            if not self._sync._rustwright_async_close_default_context_cleaned:
+                if not for_browser_close or self._sync._owns_browser:
+                    await _run_sync_call(self._sync._cleanup_default_context_state)
+                self._sync._rustwright_async_close_default_context_cleaned = True
+                self._sync._rustwright_sync_close_default_context_cleaned = True
+                _update_async_cleanup_complete(self._sync)
+                _update_sync_cleanup_complete(self._sync)
+            if not self._sync._rustwright_async_close_pages_closed:
+                for page in list(self._sync._pages):
+                    try:
+                        await _wrap_async_page(page).close(reason=normalized_reason)
+                    except Error as exc:
+                        if not _is_ignorable_close_error(exc):
+                            raise
+                self._sync._pages.clear()
+                self._sync._rustwright_async_close_pages_closed = True
+                self._sync._rustwright_sync_close_pages_closed = True
+                _update_async_cleanup_complete(self._sync)
+                _update_sync_cleanup_complete(self._sync)
+            if (
+                self._sync._core is not None
+                and not self._sync._rustwright_async_close_native_disposed
+            ):
+                try:
+                    await _await_native(self._sync._core.close_async())
+                except Error as exc:
+                    if not _is_ignorable_close_error(exc):
+                        raise
+                self._sync._rustwright_async_close_native_disposed = True
+                self._sync._rustwright_sync_close_native_disposed = True
+            elif self._sync._core is None:
+                self._sync._rustwright_async_close_native_disposed = True
+                self._sync._rustwright_sync_close_native_disposed = True
+            if not self._sync._rustwright_async_close_request_disposed:
+                await _run_sync_call(self._sync.request.dispose)
+                self._sync._rustwright_async_close_request_disposed = True
+                self._sync._rustwright_sync_close_request_disposed = True
+                _update_async_cleanup_complete(self._sync)
+                _update_sync_cleanup_complete(self._sync)
+            self._sync._closed = True
+            if self._sync._browser is not None and self._sync in self._sync._browser._contexts:
+                self._sync._browser._contexts.remove(self._sync)
+            _emit_event(self._sync._event_handlers, "close", self._sync)
+            self._sync._release_memory_buffers()
+        except BaseException as exc:
+            self._sync._finish_close_failure(exc)
+            raise
+        else:
+            self._sync._finish_close_success()
 
     def is_closed(self) -> bool:
         return self._sync.is_closed()
@@ -2658,6 +2797,7 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
             else _normalize_string_option(referer, method="Page.goto", name="referer")
         )
         target = self._sync._resolve_url(target)
+        self._sync._mark_context_pageload_pending()
         self._sync._mark_request_cookie_sync_required()
         before, _ = await _run_sync_call(self._sync._prepare_navigation)
         await _run_sync_call(self._sync._mark_navigation_history_boundary, before)
@@ -2680,6 +2820,7 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
                 )
             )
         except Error as exc:
+            await _run_sync_call(self._sync._clear_context_pageload_pending)
             message = str(exc).splitlines()[0]
             if (
                 download_waiter is not None
@@ -2703,6 +2844,8 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
         if self._sync._context is not None:
             await _run_sync_call(self._sync._context._apply_storage_state_to_page, self._sync)
         self._sync._slow_mo()
+        if normalized_state not in {"commit", "domcontentloaded"}:
+            await _run_sync_call(self._sync._dispatch_context_pageload_if_pending)
         return _wrap_async_response(response)
 
     async def wait_for_load_state(self, state: Optional[str] = None, *, timeout: Optional[float] = None) -> None:
@@ -3264,6 +3407,12 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
         if (
             self._sync._owns_context
             and self._sync._context is not None
+            and getattr(
+                self._sync._context,
+                "_rustwright_sync_close_state",
+                _CLOSE_OPEN,
+            )
+            == _CLOSE_OPEN
             and getattr(
                 self._sync._context,
                 "_rustwright_async_close_state",

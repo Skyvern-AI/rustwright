@@ -47,6 +47,9 @@ _CUSTOM_SELECTOR_ENGINES: dict[str, str] = {}
 _DOWNLOADS_NOT_ACCEPTED = "Pass 'accept_downloads=True' when you are creating your browser context."
 _MISSING = object()
 _UNSET = object()
+_SYNC_CLOSE_OPEN = "open"
+_SYNC_CLOSE_CLOSING = "closing"
+_SYNC_CLOSE_CLOSED = "closed"
 _HISTORY_EVENT_DRAIN_TIMEOUT_SECONDS = 0.02
 _CONSOLE_HISTORY_SETTLE_TIMEOUT_SECONDS = 0.001
 _CONSOLE_HISTORY_BUFFER = "__console_history__"
@@ -1830,6 +1833,121 @@ def _is_ignorable_close_error(error: Error) -> bool:
             "No target with given id found",
         )
     )
+
+@dataclass(frozen=True)
+class _CloseErrorSnapshot:
+    """Immutable close failure data used to construct caller-local errors."""
+
+    error_type: Type[BaseException]
+    message: str
+    wire_kind: Optional[str] = None
+    wire_payload_json: Optional[str] = None
+    failure_kind: Optional[str] = None
+    failure_phase: Optional[str] = None
+    failure_target_kind: Optional[str] = None
+    failure_command_written: Optional[str] = None
+    failure_retryable: Optional[bool] = None
+    cause: Optional["_CloseErrorSnapshot"] = None
+
+    @classmethod
+    def from_exception(
+        cls,
+        error: BaseException,
+        *,
+        _depth: int = 0,
+    ) -> "_CloseErrorSnapshot":
+        wire_kind = getattr(error, _WIRE_ERROR_KIND_ATTRIBUTE, None)
+        wire_payload = getattr(error, _WIRE_ERROR_PAYLOAD_ATTRIBUTE, None)
+        try:
+            wire_payload_json = (
+                json.dumps(wire_payload, sort_keys=True, separators=(",", ":"))
+                if isinstance(wire_kind, str) and isinstance(wire_payload, dict)
+                else None
+            )
+        except (TypeError, ValueError):
+            wire_payload_json = None
+        cause = None
+        if _depth < 4 and isinstance(error.__cause__, BaseException) and error.__cause__ is not error:
+            cause = cls.from_exception(error.__cause__, _depth=_depth + 1)
+        return cls(
+            error_type=type(error),
+            message=str(error),
+            wire_kind=wire_kind if isinstance(wire_kind, str) else None,
+            wire_payload_json=wire_payload_json,
+            failure_kind=getattr(error, "_rustwright_failure_kind", None),
+            failure_phase=getattr(error, "_rustwright_failure_phase", None),
+            failure_target_kind=getattr(error, "_rustwright_failure_target_kind", None),
+            failure_command_written=getattr(error, "_rustwright_failure_command_written", None),
+            failure_retryable=getattr(error, "_rustwright_failure_retryable", None),
+            cause=cause,
+        )
+
+    def instantiate(self) -> BaseException:
+        try:
+            error = self.error_type(self.message)
+        except Exception:
+            error = Error(self.message)
+        if isinstance(error, Error):
+            if self.wire_kind is not None and self.wire_payload_json is not None:
+                try:
+                    _annotate_wire_error(error, self.wire_kind, json.loads(self.wire_payload_json))
+                except (TypeError, ValueError):
+                    pass
+            for name, value in (
+                ("_rustwright_failure_kind", self.failure_kind),
+                ("_rustwright_failure_phase", self.failure_phase),
+                ("_rustwright_failure_target_kind", self.failure_target_kind),
+                ("_rustwright_failure_command_written", self.failure_command_written),
+                ("_rustwright_failure_retryable", self.failure_retryable),
+            ):
+                if value is not None:
+                    setattr(error, name, value)
+        return error
+
+
+@dataclass(frozen=True)
+class _CloseAttemptOutcome:
+    generation: int
+    error: Optional[_CloseErrorSnapshot] = None
+
+
+def _raise_close_error(snapshot: _CloseErrorSnapshot) -> None:
+    error = snapshot.instantiate()
+    cause = snapshot.cause.instantiate() if snapshot.cause is not None else snapshot.instantiate()
+    raise error from cause
+
+
+def _is_context_cleanup_complete(context: Any) -> bool:
+    return all(
+        bool(getattr(context, name, False))
+        for name in (
+            "_rustwright_sync_close_har_written",
+            "_rustwright_sync_close_default_context_cleaned",
+            "_rustwright_sync_close_pages_closed",
+            "_rustwright_sync_close_request_disposed",
+        )
+    )
+
+
+def _update_sync_cleanup_complete(context: Any) -> None:
+    context._rustwright_sync_close_cleanup_complete = _is_context_cleanup_complete(context)
+
+
+_CLOSE_WAIT_FALLBACK_MS = 30_000.0
+
+
+def _sync_close_wait_deadline(owner: Any) -> float:
+    try:
+        timeout_ms = float(getattr(owner, "_default_timeout", _CLOSE_WAIT_FALLBACK_MS))
+    except (TypeError, ValueError):
+        timeout_ms = _CLOSE_WAIT_FALLBACK_MS
+    if not math.isfinite(timeout_ms) or timeout_ms <= 0:
+        timeout_ms = _CLOSE_WAIT_FALLBACK_MS
+    return time.monotonic() + max(timeout_ms, 1.0) / 1000
+
+
+def _raise_close_wait_timeout(method: str) -> None:
+    raise TimeoutError(f"{method}: timed out waiting for concurrent close to finish")
 
 
 def _clean_options(options: Dict[str, Any]) -> Dict[str, Any]:
@@ -11673,6 +11791,15 @@ class Browser:
         self._connected_over_cdp = bool(launch_options.get("_connected_over_cdp"))
         self._owned_cdp_sessions: list[CDPSession] = []
         self._closed = False
+        self._rustwright_sync_close_state = _SYNC_CLOSE_OPEN
+        self._rustwright_sync_close_condition = threading.Condition()
+        self._rustwright_sync_close_owner: Optional[int] = None
+        self._rustwright_sync_close_error: Optional[_CloseErrorSnapshot] = None
+        self._rustwright_sync_close_generation = 0
+        self._rustwright_sync_close_outcomes: dict[int, _CloseAttemptOutcome] = {}
+        self._rustwright_sync_close_waiters: dict[int, int] = {}
+        self._rustwright_sync_close_context_creation_pending = 0
+        self._rustwright_sync_close_context_creation_threads: dict[int, int] = {}
         self._rustwright_async_close_state = "open"
         self._rustwright_async_close_task: Any = None
         self._closed_reason: Optional[str] = None
@@ -11812,7 +11939,124 @@ class Browser:
         options = _options_from_explicit_kwargs(locals())
         return self._new_context_from_options(options)
 
+    def _assert_open_for_context_creation(self, *, method: str) -> None:
+        with self._rustwright_sync_close_condition:
+            if (
+                self._closed
+                or self._rustwright_sync_close_state != _SYNC_CLOSE_OPEN
+                or self._rustwright_async_close_state == "closing"
+            ):
+                raise Error(f"{method}: Browser is closed")
+
+    def _begin_context_creation(self, *, method: str) -> None:
+        current_thread = threading.get_ident()
+        with self._rustwright_sync_close_condition:
+            if (
+                self._closed
+                or self._rustwright_sync_close_state != _SYNC_CLOSE_OPEN
+                or self._rustwright_async_close_state == "closing"
+            ):
+                raise Error(f"{method}: Browser is closed")
+            self._rustwright_sync_close_context_creation_pending += 1
+            self._rustwright_sync_close_context_creation_threads[current_thread] = (
+                self._rustwright_sync_close_context_creation_threads.get(current_thread, 0) + 1
+            )
+
+    def _finish_context_creation(self) -> None:
+        current_thread = threading.get_ident()
+        with self._rustwright_sync_close_condition:
+            self._rustwright_sync_close_context_creation_pending = max(
+                0,
+                self._rustwright_sync_close_context_creation_pending - 1,
+            )
+            count = self._rustwright_sync_close_context_creation_threads.get(current_thread, 0)
+            if count <= 1:
+                self._rustwright_sync_close_context_creation_threads.pop(current_thread, None)
+            else:
+                self._rustwright_sync_close_context_creation_threads[current_thread] = count - 1
+            self._rustwright_sync_close_condition.notify_all()
+
+    def _append_context(self, context: "BrowserContext", *, method: str) -> None:
+        with self._rustwright_sync_close_condition:
+            if (
+                self._closed
+                or self._rustwright_sync_close_state != _SYNC_CLOSE_OPEN
+                or self._rustwright_async_close_state == "closing"
+            ):
+                raise Error(f"{method}: Browser is closed")
+            self._contexts.append(context)
+
+    def _wait_for_context_creations(self) -> None:
+        deadline = _sync_close_wait_deadline(self)
+        with self._rustwright_sync_close_condition:
+            while self._rustwright_sync_close_context_creation_pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _raise_close_wait_timeout("Browser.close")
+                self._rustwright_sync_close_condition.wait(timeout=remaining)
+
+    def _begin_browser_close(self) -> bool:
+        current_thread = threading.get_ident()
+        deadline = _sync_close_wait_deadline(self)
+        with self._rustwright_sync_close_condition:
+            while self._rustwright_sync_close_state == _SYNC_CLOSE_CLOSING:
+                if self._rustwright_sync_close_owner == current_thread:
+                    return False
+                waited_generation = self._rustwright_sync_close_generation
+                self._rustwright_sync_close_waiters[waited_generation] = (
+                    self._rustwright_sync_close_waiters.get(waited_generation, 0) + 1
+                )
+                try:
+                    while waited_generation not in self._rustwright_sync_close_outcomes:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            _raise_close_wait_timeout("Browser.close")
+                        self._rustwright_sync_close_condition.wait(timeout=remaining)
+                    outcome = self._rustwright_sync_close_outcomes[waited_generation]
+                finally:
+                    waiter_count = self._rustwright_sync_close_waiters.get(waited_generation, 0)
+                    if waiter_count <= 1:
+                        self._rustwright_sync_close_waiters.pop(waited_generation, None)
+                    else:
+                        self._rustwright_sync_close_waiters[waited_generation] = waiter_count - 1
+                if outcome.error is not None:
+                    _raise_close_error(outcome.error)
+                return False
+            if self._closed or self._rustwright_sync_close_state == _SYNC_CLOSE_CLOSED:
+                return False
+            if self._rustwright_sync_close_context_creation_threads.get(current_thread, 0):
+                return False
+            for generation in tuple(self._rustwright_sync_close_outcomes):
+                if not self._rustwright_sync_close_waiters.get(generation, 0):
+                    self._rustwright_sync_close_outcomes.pop(generation, None)
+            self._rustwright_sync_close_state = _SYNC_CLOSE_CLOSING
+            self._rustwright_sync_close_owner = current_thread
+            self._rustwright_sync_close_generation += 1
+            self._rustwright_sync_close_error = None
+            return True
+
+    def _finish_browser_close_success(self) -> None:
+        with self._rustwright_sync_close_condition:
+            generation = self._rustwright_sync_close_generation
+            self._rustwright_sync_close_outcomes[generation] = _CloseAttemptOutcome(generation)
+            self._rustwright_sync_close_state = _SYNC_CLOSE_CLOSED
+            self._rustwright_sync_close_owner = None
+            self._rustwright_sync_close_error = None
+            self._rustwright_sync_close_condition.notify_all()
+
+    def _finish_browser_close_failure(self, error: BaseException) -> None:
+        with self._rustwright_sync_close_condition:
+            snapshot = _CloseErrorSnapshot.from_exception(error)
+            generation = self._rustwright_sync_close_generation
+            self._rustwright_sync_close_outcomes[generation] = _CloseAttemptOutcome(generation, snapshot)
+            self._closed = False
+            self._rustwright_sync_close_state = _SYNC_CLOSE_OPEN
+            self._rustwright_sync_close_owner = None
+            self._rustwright_sync_close_error = snapshot
+            self._rustwright_sync_close_condition.notify_all()
+
     def _new_context_from_options(self, options: Dict[str, Any], *, method: str = "Browser.new_context") -> "BrowserContext":
+        self._assert_open_for_context_creation(method=method)
         effective_options = dict(options)
         _normalize_page_emulation_options(effective_options, method="Browser.new_context")
         _normalize_context_environment_options(effective_options, method="Browser.new_context")
@@ -11839,28 +12083,60 @@ class Browser:
             effective_options["_proxy_from_launch"] = True
         if "downloads_path" not in effective_options and "downloadsPath" not in effective_options and self._launch_downloads_path is not None:
             effective_options["downloads_path"] = self._launch_downloads_path
-        if bool(getattr(self._core, "single_process_fallback", lambda: False)()):
-            context = BrowserContext(None, browser=self, options=effective_options)
-            self._contexts.append(context)
+        self._begin_context_creation(method=method)
+        context: Optional[BrowserContext] = None
+        context_core: Any = None
+        registered = False
+        try:
+            if bool(getattr(self._core, "single_process_fallback", lambda: False)()):
+                context = BrowserContext(None, browser=self, options=effective_options)
+                self._append_context(context, method=method)
+                registered = True
+                return context
+            core_options = _browser_context_core_options(effective_options, method=method)
+            context_core = _call(
+                self._core.new_context,
+                json_module_dumps(core_options) if core_options else None,
+            )
+            context = BrowserContext(context_core, browser=self, options=effective_options)
+            self._append_context(context, method=method)
+            registered = True
+            self._apply_browser_download_behavior_to_context(context)
             return context
-        core_options = _browser_context_core_options(effective_options, method=method)
-        context_core = _call(
-            self._core.new_context,
-            json_module_dumps(core_options) if core_options else None,
-        )
-        context = BrowserContext(context_core, browser=self, options=effective_options)
-        self._contexts.append(context)
-        self._apply_browser_download_behavior_to_context(context)
-        return context
+        except BaseException:
+            if registered and context is not None:
+                with self._rustwright_sync_close_condition:
+                    if context in self._contexts:
+                        self._contexts.remove(context)
+            try:
+                if context_core is not None:
+                    _call(context_core.close)
+            except BaseException:
+                pass
+            raise
+        finally:
+            self._finish_context_creation()
 
     def close(self, *, reason: Optional[str] = None) -> None:
-        if self._closed:
-            return
+        with self._rustwright_sync_close_condition:
+            if self._closed or self._rustwright_sync_close_state == _SYNC_CLOSE_CLOSED:
+                return
         normalized_reason = None
         if reason is not None:
             normalized_reason = _normalize_string_option(reason, method="Browser.close", name="reason")
         self._closed_reason = normalized_reason
-        self._closed = True
+        if not self._begin_browser_close():
+            return
+        try:
+            self._close_impl(normalized_reason=normalized_reason)
+        except BaseException as exc:
+            self._finish_browser_close_failure(exc)
+            raise
+        else:
+            self._finish_browser_close_success()
+
+    def _close_impl(self, *, normalized_reason: Optional[str]) -> None:
+        self._wait_for_context_creations()
         self._mark_owned_cdp_sessions_closed()
         if self._connected_over_cdp:
             self._stop_page_event_pumps()
@@ -11869,6 +12145,7 @@ class Browser:
             except Error as exc:
                 if not _is_ignorable_close_error(exc):
                     raise
+            self._closed = True
             self._contexts.clear()
             self._emit_disconnected()
             return
@@ -11883,6 +12160,7 @@ class Browser:
         except Error as exc:
             if not _is_ignorable_close_error(exc):
                 raise
+        self._closed = True
         self._contexts.clear()
         self._emit_disconnected()
 
@@ -13041,8 +13319,29 @@ class BrowserContext:
         self._default_timeout = 30_000.0
         self._default_navigation_timeout: Optional[float] = None
         self._closed = False
+        self._rustwright_sync_close_state = _SYNC_CLOSE_OPEN
+        self._rustwright_sync_close_condition = threading.Condition()
+        self._rustwright_sync_close_error: Optional[_CloseErrorSnapshot] = None
+        self._rustwright_sync_close_owner: Optional[int] = None
+        self._rustwright_sync_close_generation = 0
+        self._rustwright_sync_close_outcomes: dict[int, _CloseAttemptOutcome] = {}
+        self._rustwright_sync_close_waiters: dict[int, int] = {}
+        self._rustwright_sync_close_page_creation_pending = 0
+        self._rustwright_sync_close_page_creation_threads: dict[int, int] = {}
+        self._rustwright_sync_close_har_written = not bool(self._record_har_path)
+        self._rustwright_sync_close_default_context_cleaned = False
+        self._rustwright_sync_close_pages_closed = False
+        self._rustwright_sync_close_request_disposed = False
+        self._rustwright_sync_close_cleanup_complete = False
+        self._rustwright_sync_close_native_disposed = False
         self._rustwright_async_close_state = "open"
         self._rustwright_async_close_task: Any = None
+        self._rustwright_async_close_har_written = not bool(self._record_har_path)
+        self._rustwright_async_close_default_context_cleaned = False
+        self._rustwright_async_close_pages_closed = False
+        self._rustwright_async_close_cleanup_complete = False
+        self._rustwright_async_close_native_disposed = False
+        self._rustwright_async_close_request_disposed = False
         self._closed_reason: Optional[str] = None
         self._clock = Clock(context=self)
         self._debugger = Debugger(self)
@@ -13168,6 +13467,7 @@ class BrowserContext:
                 self._persistent_browser_context_id,
                 self._default_timeout,
             )
+
         elif self._browser is not None:
             cores = _call(self._browser._core.list_service_workers, self._default_timeout)
         else:
@@ -13175,6 +13475,17 @@ class BrowserContext:
         for core in cores:
             self._service_worker_from_core(core)
         return list(self._service_workers.values())
+
+    def _browser_is_closing(self) -> bool:
+        browser = self._browser
+        return bool(
+            browser is not None
+            and (
+                bool(getattr(browser, "_closed", False))
+                or getattr(browser, "_rustwright_sync_close_state", _SYNC_CLOSE_OPEN) != _SYNC_CLOSE_OPEN
+                or getattr(browser, "_rustwright_async_close_state", "open") == "closing"
+            )
+        )
 
     @property
     def tracing(self) -> Tracing:
@@ -13191,63 +13502,161 @@ class BrowserContext:
     def new_page(self) -> "Page":
         return self._new_page(method="BrowserContext.new_page")
 
-    def _new_page(self, *, method: str) -> "Page":
-        if self._closed:
-            raise Error("BrowserContext is closed")
-        if self._core is None:
-            if self._browser is None:
-                raise Error("persistent context is not attached to a browser")
-            core = _call(self._browser._core.new_page)
-            self._remember_persistent_context_id_from_core(core)
-            page = Page(core, context=self)
-            page._apply_options(self._options, method=method)
-        else:
-            page = Page(_call(self._core.new_page), context=self)
-            page._apply_options(self._options, method=method)
-        if self._core is None and self._browser is not None:
-            self._install_default_context_proxy_route(page)
-        self._install_client_certificate_route(page)
-        page.set_default_timeout(self._default_timeout)
-        if self._default_navigation_timeout is not None:
-            page.set_default_navigation_timeout(self._default_navigation_timeout)
-        for source in self._init_scripts:
-            page._add_init_script_source(source, run_immediately=True)
-        for registration in self._routes:
-            page._add_route_registration(registration)
-        for registration in self._har_routes:
-            page._add_route_registration(registration)
-        for matcher, handler in self._websocket_routes:
-            page.route_web_socket(matcher, handler)
-        for name, callback, needs_source, wants_handle in self._bindings:
-            page._install_context_binding(
-                name,
-                callback,
-                needs_source=needs_source,
-                wants_handle=wants_handle,
+
+    def _begin_page_creation(self, *, method: str) -> None:
+        current_thread = threading.get_ident()
+        browser_condition = getattr(self._browser, "_rustwright_sync_close_condition", None)
+        if browser_condition is not None:
+            browser_condition.acquire()
+        try:
+            with self._rustwright_sync_close_condition:
+                if (
+                    self._closed
+                    or self._rustwright_sync_close_state != _SYNC_CLOSE_OPEN
+                    or self._rustwright_async_close_state == "closing"
+                    or self._browser_is_closing()
+                ):
+                    raise Error("BrowserContext is closed")
+                self._rustwright_sync_close_page_creation_pending += 1
+                self._rustwright_sync_close_page_creation_threads[current_thread] = (
+                    self._rustwright_sync_close_page_creation_threads.get(current_thread, 0) + 1
+                )
+        finally:
+            if browser_condition is not None:
+                browser_condition.release()
+
+    def _finish_page_creation(self) -> None:
+        current_thread = threading.get_ident()
+        with self._rustwright_sync_close_condition:
+            self._rustwright_sync_close_page_creation_pending = max(
+                0,
+                self._rustwright_sync_close_page_creation_pending - 1,
             )
-        for event in ("request", "response", "requestfinished", "requestfailed", "console", "dialog"):
-            for handler in self._event_handlers.get(event, []):
-                page.on(event, handler)
-        if self._event_handlers.get("weberror"):
-            self._ensure_page_web_error_bridge(page)
-        if self._event_handlers.get("pageload"):
-            self._ensure_page_load_bridge(page)
-        if self._event_handlers.get("pageclose"):
-            self._ensure_page_close_bridge(page)
-        if self._record_har_path:
-            self._enable_har_recording_for_page(page)
-        if self._record_video_dir:
-            page._start_video_recording(self._record_video_dir, size=self._record_video_size)
-        if self._tracing._started:
-            self._tracing._attach_page(page)
-        self._pages.append(page)
-        if self._clock._installed:
-            self._clock._ensure_page(page)
-        if self._event_handlers.get("page"):
-            self._ensure_page_popup_bridge(page)
-        _emit_event(self._event_handlers, "page", page)
-        page._core.mark_delivered()
-        return page
+            count = self._rustwright_sync_close_page_creation_threads.get(current_thread, 0)
+            if count <= 1:
+                self._rustwright_sync_close_page_creation_threads.pop(current_thread, None)
+            else:
+                self._rustwright_sync_close_page_creation_threads[current_thread] = count - 1
+            self._rustwright_sync_close_condition.notify_all()
+
+    def _register_page(self, page: "Page", *, method: str) -> None:
+        browser_condition = getattr(self._browser, "_rustwright_sync_close_condition", None)
+        if browser_condition is not None:
+            browser_condition.acquire()
+        try:
+            with self._rustwright_sync_close_condition:
+                if (
+                    self._closed
+                    or self._rustwright_sync_close_state != _SYNC_CLOSE_OPEN
+                    or self._rustwright_async_close_state == "closing"
+                    or self._browser_is_closing()
+                ):
+                    raise Error("BrowserContext is closed")
+                self._pages.append(page)
+        finally:
+            if browser_condition is not None:
+                browser_condition.release()
+
+    def _wait_for_page_creations(self) -> None:
+        deadline = _sync_close_wait_deadline(self)
+        with self._rustwright_sync_close_condition:
+            while self._rustwright_sync_close_page_creation_pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _raise_close_wait_timeout("BrowserContext.close")
+                self._rustwright_sync_close_condition.wait(timeout=remaining)
+
+    def _try_begin_async_close(self) -> Optional[bool]:
+        current_thread = threading.get_ident()
+        with self._rustwright_sync_close_condition:
+            if self._rustwright_sync_close_state == _SYNC_CLOSE_CLOSING:
+                if self._rustwright_sync_close_owner == current_thread:
+                    return False
+                return None
+            if self._closed or self._rustwright_sync_close_state == _SYNC_CLOSE_CLOSED:
+                return False
+            for generation in tuple(self._rustwright_sync_close_outcomes):
+                if not self._rustwright_sync_close_waiters.get(generation, 0):
+                    self._rustwright_sync_close_outcomes.pop(generation, None)
+            self._rustwright_sync_close_state = _SYNC_CLOSE_CLOSING
+            self._rustwright_sync_close_owner = current_thread
+            self._rustwright_sync_close_generation += 1
+            self._rustwright_sync_close_error = None
+            return True
+
+    def _new_page(self, *, method: str) -> "Page":
+        self._begin_page_creation(method=method)
+        page: Optional[Page] = None
+        registered = False
+        try:
+            if self._core is None:
+                if self._browser is None:
+                    raise Error("persistent context is not attached to a browser")
+                core = _call(self._browser._core.new_page)
+                self._remember_persistent_context_id_from_core(core)
+                page = Page(core, context=self)
+                page._apply_options(self._options, method=method)
+            else:
+                page = Page(_call(self._core.new_page), context=self)
+                page._apply_options(self._options, method=method)
+            if self._core is None and self._browser is not None:
+                self._install_default_context_proxy_route(page)
+            self._install_client_certificate_route(page)
+            page.set_default_timeout(self._default_timeout)
+            if self._default_navigation_timeout is not None:
+                page.set_default_navigation_timeout(self._default_navigation_timeout)
+            for source in self._init_scripts:
+                page._add_init_script_source(source, run_immediately=True)
+            for registration in self._routes:
+                page._add_route_registration(registration)
+            for registration in self._har_routes:
+                page._add_route_registration(registration)
+            for matcher, handler in self._websocket_routes:
+                page.route_web_socket(matcher, handler)
+            for name, callback, needs_source, wants_handle in self._bindings:
+                page._install_context_binding(
+                    name,
+                    callback,
+                    needs_source=needs_source,
+                    wants_handle=wants_handle,
+                )
+            for event in ("request", "response", "requestfinished", "requestfailed", "console", "dialog"):
+                for handler in self._event_handlers.get(event, []):
+                    page.on(event, handler)
+            if self._event_handlers.get("weberror"):
+                self._ensure_page_web_error_bridge(page)
+            if self._event_handlers.get("pageload"):
+                self._ensure_page_load_bridge(page)
+            if self._event_handlers.get("pageclose"):
+                self._ensure_page_close_bridge(page)
+            if self._record_har_path:
+                self._enable_har_recording_for_page(page)
+            if self._record_video_dir:
+                page._start_video_recording(self._record_video_dir, size=self._record_video_size)
+            if self._tracing._started:
+                self._tracing._attach_page(page)
+            self._register_page(page, method=method)
+            registered = True
+            if self._clock._installed:
+                self._clock._ensure_page(page)
+            if self._event_handlers.get("page"):
+                self._ensure_page_popup_bridge(page)
+            _emit_event(self._event_handlers, "page", page)
+            page._core.mark_delivered()
+            return page
+        except BaseException:
+            if page is not None:
+                if registered:
+                    with self._rustwright_sync_close_condition:
+                        if page in self._pages:
+                            self._pages.remove(page)
+                try:
+                    page.close()
+                except BaseException:
+                    pass
+            raise
+        finally:
+            self._finish_page_creation()
 
     def _install_default_context_proxy_route(self, page: "Page") -> None:
         proxy = self._options.get("proxy")
@@ -13341,7 +13750,14 @@ class BrowserContext:
             page._start_video_recording(self._record_video_dir, size=self._record_video_size)
         if self._tracing._started:
             self._tracing._attach_page(page)
-        self._pages.append(page)
+        try:
+            self._register_page(page, method="BrowserContext._adopt_popup")
+        except Error:
+            try:
+                page.close()
+            except BaseException:
+                pass
+            return page
         if self._clock._installed:
             self._clock._ensure_page(page)
         self._ensure_page_popup_bridge(page)
@@ -13373,7 +13789,7 @@ class BrowserContext:
             return
 
         def page_load_handler(loaded_page: "Page") -> None:
-            _emit_event(self._event_handlers, "pageload", loaded_page)
+            loaded_page._dispatch_context_pageload_if_pending()
 
         self._page_load_bridge_handlers[page] = page_load_handler
         page.on("load", page_load_handler)
@@ -13419,43 +13835,144 @@ class BrowserContext:
         self._bindings.clear()
         self._storage_state_origins.clear()
 
-    def close(self, *, reason: Optional[str] = None) -> None:
-        if self._closed:
-            return
-        normalized_reason = None
-        if reason is not None:
-            normalized_reason = _normalize_string_option(reason, method="BrowserContext.close", name="reason")
-        self._closed_reason = normalized_reason
-        if self._record_har_path:
-            _write_har(
-                self._record_har_path,
-                list(self._pages),
-                self._record_har_url_filter,
-                content_mode=self._record_har_content,
-                har_mode=self._record_har_mode,
+    def _begin_close(self) -> bool:
+        current_thread = threading.get_ident()
+        deadline = _sync_close_wait_deadline(self)
+        with self._rustwright_sync_close_condition:
+            while self._rustwright_sync_close_state == _SYNC_CLOSE_CLOSING:
+                if self._rustwright_sync_close_owner == current_thread:
+                    return False
+                waited_generation = self._rustwright_sync_close_generation
+                self._rustwright_sync_close_waiters[waited_generation] = (
+                    self._rustwright_sync_close_waiters.get(waited_generation, 0) + 1
+                )
+                try:
+                    while waited_generation not in self._rustwright_sync_close_outcomes:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            _raise_close_wait_timeout("BrowserContext.close")
+                        self._rustwright_sync_close_condition.wait(timeout=remaining)
+                    outcome = self._rustwright_sync_close_outcomes[waited_generation]
+                finally:
+                    waiter_count = self._rustwright_sync_close_waiters.get(waited_generation, 0)
+                    if waiter_count <= 1:
+                        self._rustwright_sync_close_waiters.pop(waited_generation, None)
+                    else:
+                        self._rustwright_sync_close_waiters[waited_generation] = waiter_count - 1
+                if outcome.error is not None:
+                    _raise_close_error(outcome.error)
+                return False
+            if self._closed or self._rustwright_sync_close_state == _SYNC_CLOSE_CLOSED:
+                return False
+            if self._rustwright_sync_close_page_creation_threads.get(current_thread, 0):
+                return False
+            for generation in tuple(self._rustwright_sync_close_outcomes):
+                if not self._rustwright_sync_close_waiters.get(generation, 0):
+                    self._rustwright_sync_close_outcomes.pop(generation, None)
+            self._rustwright_sync_close_state = _SYNC_CLOSE_CLOSING
+            self._rustwright_sync_close_owner = current_thread
+            self._rustwright_sync_close_generation += 1
+            self._rustwright_sync_close_error = None
+            return True
+
+    def _finish_close_success(self) -> None:
+        with self._rustwright_sync_close_condition:
+            generation = self._rustwright_sync_close_generation
+            self._rustwright_sync_close_outcomes[generation] = _CloseAttemptOutcome(generation)
+            self._rustwright_sync_close_state = _SYNC_CLOSE_CLOSED
+            self._rustwright_sync_close_owner = None
+            self._rustwright_sync_close_error = None
+            self._rustwright_sync_close_condition.notify_all()
+
+    def _finish_close_failure(self, error: BaseException) -> None:
+        with self._rustwright_sync_close_condition:
+            snapshot = _CloseErrorSnapshot.from_exception(error)
+            generation = self._rustwright_sync_close_generation
+            self._rustwright_sync_close_outcomes[generation] = _CloseAttemptOutcome(generation, snapshot)
+            terminal = (
+                self._closed
+                and self._rustwright_sync_close_native_disposed
+                and _is_context_cleanup_complete(self)
             )
-        self._cleanup_default_context_state()
-        self._closed = True
-        for page in list(self._pages):
-            try:
-                page.close(reason=normalized_reason)
-            except Error as exc:
-                if not _is_ignorable_close_error(exc):
-                    raise
-        self._pages.clear()
-        self.request.dispose()
-        if self._core is not None:
+            if terminal:
+                self._rustwright_sync_close_state = _SYNC_CLOSE_CLOSED
+            else:
+                self._closed = False
+                self._rustwright_sync_close_state = _SYNC_CLOSE_OPEN
+            self._rustwright_sync_close_error = snapshot
+            self._rustwright_sync_close_owner = None
+            self._rustwright_sync_close_condition.notify_all()
+
+    def _close_impl(self, *, normalized_reason: Optional[str], for_browser_close: bool) -> None:
+        self._wait_for_page_creations()
+        if not self._rustwright_sync_close_har_written:
+            if self._record_har_path:
+                _write_har(
+                    self._record_har_path,
+                    list(self._pages),
+                    self._record_har_url_filter,
+                    content_mode=self._record_har_content,
+                    har_mode=self._record_har_mode,
+                )
+            self._rustwright_sync_close_har_written = True
+            _update_sync_cleanup_complete(self)
+        if not self._rustwright_sync_close_default_context_cleaned:
+            if not for_browser_close or self._owns_browser:
+                self._cleanup_default_context_state()
+            self._rustwright_sync_close_default_context_cleaned = True
+            _update_sync_cleanup_complete(self)
+        if not for_browser_close:
+            self._closed = True
+        if not self._rustwright_sync_close_pages_closed:
+            for page in list(self._pages):
+                try:
+                    page.close(reason=normalized_reason)
+                except Error as exc:
+                    if not _is_ignorable_close_error(exc):
+                        raise
+            self._pages.clear()
+            self._rustwright_sync_close_pages_closed = True
+            _update_sync_cleanup_complete(self)
+        if not self._rustwright_sync_close_request_disposed:
+            self.request.dispose()
+            self._rustwright_sync_close_request_disposed = True
+            _update_sync_cleanup_complete(self)
+
+        if self._core is None:
+            self._rustwright_sync_close_native_disposed = True
+        elif not self._rustwright_sync_close_native_disposed:
             try:
                 _call(self._core.close)
             except Error as exc:
                 if not _is_ignorable_close_error(exc):
                     raise
-        if self._owns_browser and self._browser is not None:
+            self._rustwright_sync_close_native_disposed = True
+
+        self._closed = True
+        if self._owns_browser and not for_browser_close and self._browser is not None:
             self._browser.close()
         if self._browser is not None and self in self._browser._contexts:
             self._browser._contexts.remove(self)
         _emit_event(self._event_handlers, "close", self)
         self._release_memory_buffers()
+
+    def close(self, *, reason: Optional[str] = None) -> None:
+        with self._rustwright_sync_close_condition:
+            if self._rustwright_sync_close_state == _SYNC_CLOSE_CLOSED:
+                return
+        normalized_reason = None
+        if reason is not None:
+            normalized_reason = _normalize_string_option(reason, method="BrowserContext.close", name="reason")
+        self._closed_reason = normalized_reason
+        if not self._begin_close():
+            return
+        try:
+            self._close_impl(normalized_reason=normalized_reason, for_browser_close=False)
+        except BaseException as exc:
+            self._finish_close_failure(exc)
+            raise
+        else:
+            self._finish_close_success()
 
     def _cleanup_default_context_state(self) -> None:
         if self._core is not None or self._browser is None:
@@ -13496,38 +14013,18 @@ class BrowserContext:
                 pass
 
     def _close_for_browser_close(self, *, reason: Optional[str] = None) -> None:
-        if self._closed:
+        with self._rustwright_sync_close_condition:
+            if self._rustwright_sync_close_state == _SYNC_CLOSE_CLOSED:
+                return
+        if not self._begin_close():
             return
-        if self._record_har_path:
-            _write_har(
-                self._record_har_path,
-                list(self._pages),
-                self._record_har_url_filter,
-                content_mode=self._record_har_content,
-                har_mode=self._record_har_mode,
-            )
-        if self._owns_browser:
-            self._cleanup_default_context_state()
-        for page in list(self._pages):
-            try:
-                page.close(reason=reason)
-            except Error as exc:
-                if not _is_ignorable_close_error(exc):
-                    raise
-        if self._closed:
-            return
-        self._closed = True
-        self._pages.clear()
-        self.request.dispose()
-        if self._core is not None:
-            try:
-                _call(self._core.close)
-            except Error as exc:
-                if not _is_ignorable_close_error(exc):
-                    raise
-        if self._browser is not None and self in self._browser._contexts:
-            self._browser._contexts.remove(self)
-        _emit_event(self._event_handlers, "close", self)
+        try:
+            self._close_impl(normalized_reason=reason, for_browser_close=True)
+        except BaseException as exc:
+            self._finish_close_failure(exc)
+            raise
+        else:
+            self._finish_close_success()
 
     def _enable_har_recording_for_page(self, page: "Page") -> None:
         page.on("request", lambda _: None)
@@ -15758,6 +16255,8 @@ class Page:
         self._request = context.request if context is not None else APIRequestContext()
         self._event_handlers: dict[str, list[Callable[..., Any]]] = {}
         self._event_handler_cursors: dict[tuple[str, int], Optional[int]] = {}
+        self._context_pageload_lock = threading.Lock()
+        self._context_pageload_pending = False
         self._main_frame = Frame(self, name="", url="", is_main=True)
         self._set_content_html_document_known: Optional[bool] = True
         self._frame_object_cache: dict[str, Frame] = {}
@@ -16802,6 +17301,7 @@ class Page:
         if referer is not None:
             normalized_referer = _normalize_string_option(referer, method="Page.goto", name="referer")
         target_url = self._resolve_url(url)
+        self._mark_context_pageload_pending()
         self._mark_request_cookie_sync_required()
         self._set_content_html_document_known = None
         call_id = self._trace_begin_action(
@@ -16870,6 +17370,7 @@ class Page:
                             response_log = list(self._response_log)
                         for response in reversed(response_log):
                             if response.url == target_url and int(response.status or 0) >= 400:
+                                self._clear_context_pageload_pending()
                                 self._trace_end_action(call_id, result={"response": {"url": response.url, "status": response.status}})
                                 return self._remember_navigation_response(response)
                         time.sleep(0.02)
@@ -16882,7 +17383,7 @@ class Page:
                         request=request,
                     )
                     request._response = response
-                    response._page = self
+                    self._clear_context_pageload_pending()
                     self._trace_end_action(call_id, result={"response": {"url": response.url, "status": response.status}})
                     return self._remember_navigation_response(response)
                 raise
@@ -16896,6 +17397,8 @@ class Page:
                 if self._context is not None:
                     self._context._apply_storage_state_to_page(self)
                 self._slow_mo()
+                if normalized_state not in {"commit", "domcontentloaded"}:
+                    self._dispatch_context_pageload_if_pending()
                 self._trace_end_action(call_id, result={"response": None})
                 return None
             response = _response_from_payload(self, payload, fallback_url=target_url)
@@ -16903,6 +17406,7 @@ class Page:
                 self._context._apply_storage_state_to_page(self)
             self._slow_mo()
         except Exception as exc:
+            self._clear_context_pageload_pending()
             if single_process_crash_navigation:
                 crash_error = Error("Page crashed")
                 self._mark_crashed()
@@ -16918,6 +17422,8 @@ class Page:
                 else {"url": response.url, "status": response.status},
             },
         )
+        if normalized_state not in {"commit", "domcontentloaded"}:
+            self._dispatch_context_pageload_if_pending()
         return self._remember_navigation_response(response)
 
     def reload(
@@ -16933,11 +17439,22 @@ class Page:
             prior_time_origin = self.evaluate("() => performance.timeOrigin")
         except Error:
             prior_time_origin = None
-        before, _ = self._prepare_navigation()
-        self._mark_navigation_history_boundary(before)
-        self._set_content_html_document_known = None
-        waiter = self._core.network_event_waiter("response")
-        payload = json.loads(_call_wait_with_playwright_timeout("Page.reload", self._core.reload, "commit", reload_timeout))
+        self._mark_context_pageload_pending()
+        try:
+            before, _ = self._prepare_navigation()
+            self._mark_navigation_history_boundary(before)
+            self._set_content_html_document_known = None
+            waiter = self._core.network_event_waiter("response")
+        except BaseException:
+            self._clear_context_pageload_pending()
+            raise
+        try:
+            payload = json.loads(
+                _call_wait_with_playwright_timeout("Page.reload", self._core.reload, "commit", reload_timeout)
+            )
+        except BaseException:
+            self._clear_context_pageload_pending()
+            raise
         event = None
         if payload is not None:
             event = _response_from_payload(self, payload, fallback_url=current_url)
@@ -16955,8 +17472,11 @@ class Page:
             try:
                 self._wait_for_reload_document_state(normalized_state, prior_time_origin, reload_timeout)
             except TimeoutError:
+                self._clear_context_pageload_pending()
                 raise _method_timeout_error("Page.reload", reload_timeout) from None
         self._slow_mo()
+        if normalized_state not in {"commit", "domcontentloaded"}:
+            self._dispatch_context_pageload_if_pending()
         if isinstance(event, Response):
             return self._remember_navigation_response(event)
         if payload is None:
@@ -17064,29 +17584,41 @@ class Page:
     ) -> Optional[Response]:
         navigation_timeout = _navigation_timeout_for_method(self, timeout, method="Page.go_back")
         normalized_state = _normalize_lifecycle_state(wait_until, label="wait_until", method="Page.go_back")
-        self._set_content_html_document_known = None
-        boundary = self._navigation_history_boundary()
-        before, _ = self._prepare_navigation()
-        self._mark_navigation_history_boundary(before)
-        before_url = self.url
+        self._mark_context_pageload_pending()
         try:
-            payload = json.loads(_call_wait_with_playwright_timeout(
-                "Page.go_back",
-                self._core.go_back,
-                normalized_state,
-                navigation_timeout,
-            ))
+            self._set_content_html_document_known = None
+            boundary = self._navigation_history_boundary()
+            before, _ = self._prepare_navigation()
+            self._mark_navigation_history_boundary(before)
+            before_url = self.url
+        except BaseException:
+            self._clear_context_pageload_pending()
+            raise
+        try:
+            payload = json.loads(
+                _call_wait_with_playwright_timeout(
+                    "Page.go_back",
+                    self._core.go_back,
+                    normalized_state,
+                    navigation_timeout,
+                )
+            )
         except Exception:
+            self._clear_context_pageload_pending()
             self._restore_navigation_history_boundary(boundary)
             raise
         if payload is None:
             cached_response = None if self.url == before_url else self._cached_navigation_response_for_current_url()
             if cached_response is None:
+                self._clear_context_pageload_pending()
                 self._restore_navigation_history_boundary(boundary)
                 return None
-            return cached_response
-        response = _response_from_payload(self, payload, fallback_url=self.url)
+            response = cached_response
+        else:
+            response = _response_from_payload(self, payload, fallback_url=self.url)
         self._slow_mo()
+        if normalized_state not in {"commit", "domcontentloaded"}:
+            self._dispatch_context_pageload_if_pending()
         return self._remember_navigation_response(response)
 
     def go_forward(
@@ -17097,29 +17629,41 @@ class Page:
     ) -> Optional[Response]:
         navigation_timeout = _navigation_timeout_for_method(self, timeout, method="Page.go_forward")
         normalized_state = _normalize_lifecycle_state(wait_until, label="wait_until", method="Page.go_forward")
-        boundary = self._navigation_history_boundary()
-        before, _ = self._prepare_navigation()
-        self._mark_navigation_history_boundary(before)
-        self._set_content_html_document_known = None
-        before_url = self.url
+        self._mark_context_pageload_pending()
         try:
-            payload = json.loads(_call_wait_with_playwright_timeout(
-                "Page.go_forward",
-                self._core.go_forward,
-                normalized_state,
-                navigation_timeout,
-            ))
+            boundary = self._navigation_history_boundary()
+            before, _ = self._prepare_navigation()
+            self._mark_navigation_history_boundary(before)
+            self._set_content_html_document_known = None
+            before_url = self.url
+        except BaseException:
+            self._clear_context_pageload_pending()
+            raise
+        try:
+            payload = json.loads(
+                _call_wait_with_playwright_timeout(
+                    "Page.go_forward",
+                    self._core.go_forward,
+                    normalized_state,
+                    navigation_timeout,
+                )
+            )
         except Exception:
+            self._clear_context_pageload_pending()
             self._restore_navigation_history_boundary(boundary)
             raise
         if payload is None:
             cached_response = None if self.url == before_url else self._cached_navigation_response_for_current_url()
             if cached_response is None:
+                self._clear_context_pageload_pending()
                 self._restore_navigation_history_boundary(boundary)
                 return None
-            return cached_response
-        response = _response_from_payload(self, payload, fallback_url=self.url)
+            response = cached_response
+        else:
+            response = _response_from_payload(self, payload, fallback_url=self.url)
         self._slow_mo()
+        if normalized_state not in {"commit", "domcontentloaded"}:
+            self._dispatch_context_pageload_if_pending()
         return self._remember_navigation_response(response)
 
     def wait_for_url(
@@ -20738,7 +21282,12 @@ class Page:
             self._context._pages.remove(self)
         _emit_event(self._event_handlers, "close", self)
         self._release_memory_buffers()
-        if self._owns_context and self._context is not None:
+        if (
+            self._owns_context
+            and self._context is not None
+            and getattr(self._context, "_rustwright_sync_close_state", _SYNC_CLOSE_OPEN) == _SYNC_CLOSE_OPEN
+            and getattr(self._context, "_rustwright_async_close_state", "open") != "closing"
+        ):
             self._context.close()
 
     def get_by_text(self, text: str, *, exact: bool = False) -> "Locator":
@@ -21367,6 +21916,25 @@ class Page:
                 if remaining <= 0:
                     return
                 self._page_cdp_event_condition.wait(timeout=remaining)
+
+    def _mark_context_pageload_pending(self) -> None:
+        with self._context_pageload_lock:
+            self._context_pageload_pending = True
+
+    def _clear_context_pageload_pending(self) -> None:
+        with self._context_pageload_lock:
+            self._context_pageload_pending = False
+
+    def _dispatch_context_pageload_if_pending(self) -> None:
+        with self._context_pageload_lock:
+            if not self._context_pageload_pending:
+                return
+            self._context_pageload_pending = False
+        if self._context is not None:
+            try:
+                _emit_event(self._context._event_handlers, "pageload", self)
+            except Exception:
+                pass
 
     def _handle_page_cdp_event(self, event: str) -> None:
         self._dispatch_event_handlers(event, self)
