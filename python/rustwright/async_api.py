@@ -75,11 +75,16 @@ from .sync_api import (
     _default_timeout_for_method,
     _emit_event,
     _event_handler_positional_args,
+    _EVENT_DIALOG_CLAIM,
+    _SYNC_CLOSE_CLOSED,
+    _SYNC_CLOSE_CLOSING,
+    _raise_close_error,
     _EVENT_DISPATCH_OWNER,
     _EVENT_DISPATCH_REGISTRATION,
     _EVENT_DISPATCH_SEQUENCE,
     _json,
     _is_ignorable_close_error,
+    _validate_timeout_value,
     _sync_close_wait_deadline,
     _raise_close_wait_timeout,
     _update_sync_cleanup_complete,
@@ -137,6 +142,9 @@ from ._async_generated import (
 
 
 _DEFAULT_ASYNCIO_TO_THREAD = asyncio.to_thread
+_ASYNC_CLOSE_OWNER: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "_rustwright_async_close_owner", default=None
+)
 
 _ASYNC_EXECUTOR_LOCK = threading.Lock()
 _ASYNC_EXECUTOR: Optional[concurrent.futures.Executor] = None
@@ -191,18 +199,36 @@ def async_executor_info() -> dict[str, Any]:
         "owned": owns_executor,
         "max_workers": getattr(executor, "_max_workers", None),
     }
-
-
 async def _run_sync_call(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
     with _ASYNC_EXECUTOR_LOCK:
         executor = _ASYNC_EXECUTOR
+    owner = _ASYNC_CLOSE_OWNER.get()
+
+    def call() -> Any:
+        if owner is None:
+            return func(*args, **kwargs)
+        condition = getattr(owner, "_rustwright_sync_close_condition", None)
+        if condition is None or not hasattr(condition, "__enter__"):
+            return func(*args, **kwargs)
+        current_thread = threading.get_ident()
+        with condition:
+            owner._rustwright_async_close_sync_owner = current_thread
+            condition.notify_all()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            with condition:
+                if owner._rustwright_async_close_sync_owner == current_thread:
+                    owner._rustwright_async_close_sync_owner = None
+                    condition.notify_all()
+
     if executor is None:
-        return await _DEFAULT_ASYNCIO_TO_THREAD(func, *args, **kwargs)
+        return await _DEFAULT_ASYNCIO_TO_THREAD(call)
 
     loop = asyncio.get_running_loop()
     ctx = contextvars.copy_context()
-    call = functools.partial(ctx.run, func, *args, **kwargs)
-    return await loop.run_in_executor(executor, call)
+    wrapped_call = functools.partial(ctx.run, call)
+    return await loop.run_in_executor(executor, wrapped_call)
 
 
 async def _await_native(awaitable: Any) -> Any:
@@ -246,7 +272,6 @@ async def _await_native_action(method: str, awaitable: Any) -> Any:
         error = error_type(f"{method}: {message}")
         raise _copy_wire_error_metadata(exc, error) from None
 
-
 async def _await_cleanup_completion(awaitable: Any) -> Any:
     """Finish lifecycle cleanup before propagating cancellation to the caller."""
     cleanup_task = asyncio.ensure_future(awaitable)
@@ -266,6 +291,16 @@ _CLOSE_OPEN = "open"
 _CLOSE_CLOSING = "closing"
 _CLOSE_CLOSED = "closed"
 
+def _async_close_is_terminal(sync_obj: Any) -> bool:
+    condition = getattr(sync_obj, "_rustwright_sync_close_condition", None)
+    if condition is None or not hasattr(condition, "__enter__"):
+        return getattr(sync_obj, "_rustwright_async_close_state", _CLOSE_OPEN) == _CLOSE_CLOSED
+    with condition:
+        return (
+            getattr(sync_obj, "_rustwright_sync_close_state", _CLOSE_OPEN) == _SYNC_CLOSE_CLOSED
+            or getattr(sync_obj, "_rustwright_async_close_state", _CLOSE_OPEN) == _CLOSE_CLOSED
+        )
+
 
 async def _single_flight_close(sync_obj: Any, cleanup: Callable[[], Any]) -> None:
     """Run one cancellation-safe close task and share its result with every caller."""
@@ -273,48 +308,115 @@ async def _single_flight_close(sync_obj: Any, cleanup: Callable[[], Any]) -> Non
     if condition is not None and not hasattr(condition, "__enter__"):
         condition = None
 
-    def read_state() -> tuple[str, Any]:
-        if condition is None:
-            return (
-                getattr(sync_obj, "_rustwright_async_close_state", _CLOSE_OPEN),
-                getattr(sync_obj, "_rustwright_async_close_task", None),
-            )
-        with condition:
-            return (
-                getattr(sync_obj, "_rustwright_async_close_state", _CLOSE_OPEN),
-                getattr(sync_obj, "_rustwright_async_close_task", None),
-            )
+    async def owned_cleanup() -> Any:
+        token = _ASYNC_CLOSE_OWNER.set(sync_obj)
+        try:
+            return await cleanup()
+        finally:
+            _ASYNC_CLOSE_OWNER.reset(token)
 
-    def write_state(state: str, task: Any) -> None:
-        if condition is None:
-            sync_obj._rustwright_async_close_state = state
-            sync_obj._rustwright_async_close_task = task
+    candidate = asyncio.create_task(owned_cleanup())
+    current_thread = threading.get_ident()
+    if condition is None:
+        state = getattr(sync_obj, "_rustwright_async_close_state", _CLOSE_OPEN)
+        task = getattr(sync_obj, "_rustwright_async_close_task", None)
+        if state == _CLOSE_CLOSED:
+            candidate.cancel()
             return
-        with condition:
-            sync_obj._rustwright_async_close_state = state
-            sync_obj._rustwright_async_close_task = task
-            condition.notify_all()
-
-    state, task = read_state()
-    if state == _CLOSE_CLOSED:
-        return
-    if state == _CLOSE_CLOSING and task is not None:
-        if task is asyncio.current_task():
+        if state == _CLOSE_CLOSING and task is not None:
+            candidate.cancel()
+            await _await_cleanup_completion(task)
             return
-        await _await_cleanup_completion(task)
-        return
+        sync_obj._rustwright_async_close_state = _CLOSE_CLOSING
+        sync_obj._rustwright_async_close_sync_owner = current_thread
+        sync_obj._rustwright_async_close_task = candidate
+        owner = True
+    else:
+        role: str
+        task: Any = None
+        generation: Optional[int] = None
+        closed_error: Any = None
+        with condition:
+            sync_state = getattr(sync_obj, "_rustwright_sync_close_state", _CLOSE_OPEN)
+            if sync_state == _SYNC_CLOSE_CLOSED:
+                role = "closed"
+                outcomes = getattr(sync_obj, "_rustwright_sync_close_outcomes", {})
+                outcome = outcomes.get(getattr(sync_obj, "_rustwright_sync_close_generation", 0))
+                closed_error = getattr(outcome, "error", None)
+            elif sync_state == _SYNC_CLOSE_CLOSING:
+                owner = getattr(sync_obj, "_rustwright_sync_close_owner", None)
+                if owner == current_thread:
+                    role = "reentrant"
+                else:
+                    role = "sync"
+                    generation = getattr(sync_obj, "_rustwright_sync_close_generation", 0)
+                    waiters = getattr(sync_obj, "_rustwright_sync_close_waiters", None)
+                    if isinstance(waiters, dict):
+                        waiters[generation] = waiters.get(generation, 0) + 1
+            else:
+                async_state = getattr(sync_obj, "_rustwright_async_close_state", _CLOSE_OPEN)
+                if async_state == _CLOSE_CLOSED:
+                    role = "closed"
+                elif async_state == _CLOSE_CLOSING:
+                    role = "async"
+                    task = getattr(sync_obj, "_rustwright_async_close_task", None)
+                else:
+                    sync_obj._rustwright_async_close_state = _CLOSE_CLOSING
+                    sync_obj._rustwright_async_close_sync_owner = current_thread
+                    sync_obj._rustwright_async_close_task = candidate
+                    role = "owner"
+                    owner = True
+        if role != "owner":
+            candidate.cancel()
+            if role == "closed" and closed_error is not None:
+                _raise_close_error(closed_error)
+            if role == "sync" and generation is not None:
+                wait_sync_generation = getattr(sync_obj, "_wait_for_sync_close_generation", None)
+                if callable(wait_sync_generation):
+                    await _run_sync_call(wait_sync_generation, generation)
+                return
+            if role == "async" and task is not None:
+                if task is not asyncio.current_task():
+                    await _await_cleanup_completion(task)
+                return
+            return
 
-    task = asyncio.create_task(cleanup())
-    write_state(_CLOSE_CLOSING, task)
     try:
-        await _await_cleanup_completion(task)
+        await _await_cleanup_completion(candidate)
     except BaseException:
-        write_state(_CLOSE_CLOSED if task.done() and not task.cancelled() and task.exception() is None else _CLOSE_OPEN, None)
+        native_disposed = getattr(sync_obj, "_rustwright_sync_close_native_disposed", None)
+        if native_disposed is None:
+            native_disposed = getattr(sync_obj, "_rustwright_async_close_native_disposed", None)
+        if native_disposed is None:
+            native_disposed = True
+        if condition is None:
+            complete = bool(
+                native_disposed
+                and getattr(sync_obj, "_rustwright_sync_close_cleanup_complete", False)
+            )
+            sync_obj._rustwright_async_close_state = _CLOSE_CLOSED if complete else _CLOSE_OPEN
+            sync_obj._rustwright_async_close_task = None
+        else:
+            with condition:
+                complete = bool(
+                    native_disposed
+                    and getattr(sync_obj, "_rustwright_sync_close_cleanup_complete", False)
+                )
+                sync_obj._rustwright_async_close_state = _CLOSE_CLOSED if complete else _CLOSE_OPEN
+                sync_obj._rustwright_async_close_task = None
+                sync_obj._rustwright_async_close_sync_owner = None
+                condition.notify_all()
         raise
     else:
-        write_state(_CLOSE_CLOSED, None)
-
-
+        if condition is None:
+            sync_obj._rustwright_async_close_state = _CLOSE_CLOSED
+            sync_obj._rustwright_async_close_task = None
+        else:
+            with condition:
+                sync_obj._rustwright_async_close_state = _CLOSE_CLOSED
+                sync_obj._rustwright_async_close_task = None
+                sync_obj._rustwright_async_close_sync_owner = None
+                condition.notify_all()
 def _native_normalize_selector(selector: str, *, method: str) -> str:
     missing_method = "_click" if method == "Page.click" else method.rsplit(".", 1)[-1]
     return _normalize_selector_option(
@@ -1320,6 +1422,17 @@ def _wrap_async_event_handler(owner: Any, event: str, handler: Any) -> Any:
 
     def wrapper(*args: Any) -> None:
         sync_owner = getattr(owner, "_sync", None)
+        dialog_claim = _EVENT_DIALOG_CLAIM.get() if event == "dialog" else None
+        claim_released = False
+
+        def release_dialog_claim() -> None:
+            nonlocal claim_released
+            if claim_released or dialog_claim is None or not args:
+                return
+            claim_released = True
+            release = getattr(args[0], "_release_handler_claim", None)
+            if callable(release):
+                release(dialog_claim)
 
         def call_handler() -> Any:
             mapped_args = tuple(_wrap_async_event_value(event, arg) for arg in args)
@@ -1333,10 +1446,15 @@ def _wrap_async_event_handler(owner: Any, event: str, handler: Any) -> Any:
                     if not callable(activate) or not activate(state, task):
                         if inspect.iscoroutine(result):
                             result.close()
+                        release_dialog_claim()
                         return None
                 owner_token = _EVENT_DISPATCH_OWNER.set(task)
                 try:
-                    return await result
+                    try:
+                        return await result
+                    except BaseException:
+                        release_dialog_claim()
+                        return None
                 finally:
                     _EVENT_DISPATCH_OWNER.reset(owner_token)
                     if state is not None:
@@ -1350,19 +1468,26 @@ def _wrap_async_event_handler(owner: Any, event: str, handler: Any) -> Any:
             owner_token = _EVENT_DISPATCH_OWNER.set(callback_owner)
             active = False
             deferred = False
+            handler_raised = False
             try:
                 if state is not None:
                     activate = getattr(sync_owner, "_activate_deferred_event_handler", None)
                     if not callable(activate) or not activate(state, callback_owner):
+                        release_dialog_claim()
                         return
                     active = True
-                result = call_handler()
+                try:
+                    result = call_handler()
+                except BaseException:
+                    handler_raised = True
+                    raise
                 if _should_await_callback_result(result):
                     if state is not None:
                         deferred_state = getattr(sync_owner, "_defer_current_event_handler", lambda: None)()
                         if deferred_state is None:
                             if inspect.iscoroutine(result):
                                 result.close()
+                            release_dialog_claim()
                             return
                         deferred = True
                         try:
@@ -1371,37 +1496,54 @@ def _wrap_async_event_handler(owner: Any, event: str, handler: Any) -> Any:
                             release = getattr(sync_owner, "_release_deferred_event_handler", None)
                             if callable(release):
                                 release(deferred_state)
+                            release_dialog_claim()
                             raise
                     else:
                         _run_awaitable_on_loop(loop, result)
             finally:
-                if active and not deferred:
-                    finish = getattr(sync_owner, "_finish_event_handler", None)
-                    if callable(finish):
-                        finish(state, callback_owner)
+                if not deferred:
+                    if handler_raised:
+                        release_dialog_claim()
+                    if active:
+                        finish = getattr(sync_owner, "_finish_event_handler", None)
+                        if callable(finish):
+                            finish(state, callback_owner)
                 _EVENT_DISPATCH_OWNER.reset(owner_token)
 
         def invoke_in_current_loop() -> None:
-            result = call_handler()
-            if not _should_await_callback_result(result):
-                return
-            state = _EVENT_DISPATCH_REGISTRATION.get()
-            defer = getattr(sync_owner, "_defer_current_event_handler", None)
-            deferred_state = defer() if callable(defer) else None
-            if state is not None and deferred_state is None:
-                if inspect.iscoroutine(result):
-                    result.close()
-                return
-            if deferred_state is not None:
+            deferred = False
+            handler_raised = False
+            try:
                 try:
-                    run_awaitable_with_state(result, deferred_state, loop)
+                    result = call_handler()
                 except BaseException:
-                    release = getattr(sync_owner, "_release_deferred_event_handler", None)
-                    if callable(release):
-                        release(deferred_state)
+                    handler_raised = True
                     raise
-            else:
-                _run_awaitable_on_loop(loop, result)
+                if not _should_await_callback_result(result):
+                    return
+                state = _EVENT_DISPATCH_REGISTRATION.get()
+                defer = getattr(sync_owner, "_defer_current_event_handler", None)
+                deferred_state = defer() if callable(defer) else None
+                if state is not None and deferred_state is None:
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    release_dialog_claim()
+                    return
+                if deferred_state is not None:
+                    deferred = True
+                    try:
+                        run_awaitable_with_state(result, deferred_state, loop)
+                    except BaseException:
+                        release = getattr(sync_owner, "_release_deferred_event_handler", None)
+                        if callable(release):
+                            release(deferred_state)
+                        release_dialog_claim()
+                        raise
+                else:
+                    _run_awaitable_on_loop(loop, result)
+            finally:
+                if not deferred and handler_raised:
+                    release_dialog_claim()
 
         loop = getattr(owner, "_loop", None)
         if loop is not None and loop.is_running():
@@ -1427,11 +1569,16 @@ def _wrap_async_event_handler(owner: Any, event: str, handler: Any) -> Any:
                     release = getattr(sync_owner, "_release_deferred_event_handler", None)
                     if callable(release):
                         release(state)
+                release_dialog_claim()
                 raise
             return
 
-        result = call_handler()
-        _run_awaitable(result)
+        try:
+            result = call_handler()
+            _run_awaitable(result)
+        except BaseException:
+            release_dialog_claim()
+            raise
 
     wrappers.append((event, handler, wrapper))
     return wrapper
@@ -2215,6 +2362,7 @@ class AsyncBrowser(_AsyncBrowserGeneratedMixin, _AsyncWrapper):
             else:
                 context._finish_page_creation()
             page._owns_context = True
+            page._rustwright_sync_close_default_context_cleaned = False
             return _wrap_async_page(page)
 
         return _wrap_async_page(await _run_sync_call(self._sync.new_page, **options))
@@ -2287,6 +2435,8 @@ class AsyncBrowser(_AsyncBrowserGeneratedMixin, _AsyncWrapper):
         return _wrap_async_browser_context(await _run_sync_call(self._sync.new_context, **options))
 
     async def close(self, *, reason: Optional[str] = None) -> None:
+        if _async_close_is_terminal(self._sync):
+            return
         if not isinstance(self._sync, SyncBrowser):
             await _single_flight_close(
                 self._sync,
@@ -2382,6 +2532,8 @@ class AsyncBrowserContext(_AsyncBrowserContextGeneratedMixin, _AsyncWrapper):
         return _wrap_async_page(await _run_sync_call(self._sync.new_page))
 
     async def close(self, *, reason: Optional[str] = None) -> None:
+        if _async_close_is_terminal(self._sync):
+            return
         browser = getattr(self._sync, "_browser", None)
         if getattr(self._sync, "_owns_browser", False) and browser is not None:
             normalized_reason = None
@@ -2582,7 +2734,7 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
                     await _await_native(self._sync._event_stream.wait_batch_async(500.0, 64))
                 )
             except asyncio.CancelledError:
-                self._sync._event_stream.rollback_batch()
+                await _await_cleanup_completion(self._sync._event_stream.cancel_wait_async())
                 return
             except RuntimeError as exc:
                 if "page event stream is already waiting" not in str(exc):
@@ -2597,7 +2749,9 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
             try:
                 stream_closed = await _await_cleanup_completion(self._consume_event_batch(batch))
             except asyncio.CancelledError:
+                await _await_cleanup_completion(self._sync._event_stream.cancel_wait_async())
                 return
+            self._sync._note_event_batch_consumed(stream_closed)
             if stream_closed:
                 self._sync._stop_event_pump()
                 return
@@ -2833,6 +2987,11 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
                 )
             ):
                 raise Error("Page.goto: Download is starting") from None
+            if self._sync._crashed or (
+                target.lower().startswith("chrome://crash")
+                and message.startswith("Page.goto: net::ERR_ABORTED")
+            ):
+                raise Error("Page crashed") from None
             raise
         response = (
             None
@@ -3332,6 +3491,8 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
         await _run_sync_call(self._sync.remove_locator_handler, sync_locator)
 
     async def close(self, *, run_before_unload: Optional[bool] = None, reason: Optional[str] = None) -> None:
+        if _async_close_is_terminal(self._sync):
+            return
         if not isinstance(self._sync, SyncPage):
             await _single_flight_close(
                 self._sync,
@@ -3341,10 +3502,6 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
                     reason=reason,
                 ),
             )
-            return
-        if self._sync._closed or getattr(
-            self._sync, "_rustwright_async_close_state", _CLOSE_OPEN
-        ) == _CLOSE_CLOSED:
             return
         if (
             self._sync._video is not None
@@ -3373,56 +3530,53 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
 
     async def _close_native(self, normalized_reason: Optional[str], unload: bool) -> None:
         self._sync._closed_reason = normalized_reason
-        if self._sync._owns_context and self._sync._context is not None:
-            await _run_sync_call(self._sync._context._cleanup_default_context_state)
-        dialog_dispatch_count = self._sync._dialog_dispatch_count
+        first_error: Optional[BaseException] = None
+        native_attempted = self._sync._rustwright_sync_close_native_disposed
         try:
-            try:
-                await _await_native_method(
-                    "Page.close",
-                    self._sync._core.close_async(self._sync._default_timeout, unload)
-                )
-            except Error as exc:
-                if not _is_ignorable_close_error(exc):
-                    raise
-            if unload and self._sync._event_handlers.get("dialog"):
-                deadline = time.monotonic() + min(self._sync._default_timeout / 1000, 0.5)
-                while (
-                    self._sync._dialog_dispatch_count == dialog_dispatch_count
-                    and time.monotonic() < deadline
+            await _run_sync_call(self._sync._purge_owned_default_context)
+            if not self._sync._rustwright_sync_close_native_disposed:
+                with self._sync._event_dispatch_condition:
+                    beforeunload_dispatch_count = self._sync._beforeunload_dispatch_count
+                if not unload:
+                    self._sync._closing = True
+                native_attempted = True
+                try:
+                    await _await_native_method(
+                        "Page.close",
+                        self._sync._core.close_async(self._sync._default_timeout, unload),
+                    )
+                except Error as exc:
+                    if not _is_ignorable_close_error(exc):
+                        raise
+                self._sync._rustwright_sync_close_native_disposed = True
+                if unload:
+                    self._sync._rustwright_sync_close_beforeunload_count = beforeunload_dispatch_count
+            if self._sync._rustwright_sync_close_beforeunload_count is not None:
+                if not await _run_sync_call(
+                    self._sync._wait_for_close_event_dispatch_or_fallback,
+                    self._sync._rustwright_sync_close_beforeunload_count,
                 ):
-                    await asyncio.sleep(0.01)
+                    raise TimeoutError("Page.close: timed out waiting for beforeunload event dispatch; retry close")
+                self._sync._rustwright_sync_close_beforeunload_count = None
+        except BaseException as exc:
+            first_error = exc
         finally:
-            self._sync._stop_event_pump()
-            pump_task = self._event_pump_task
-            if pump_task is not None and pump_task is not asyncio.current_task():
-                await asyncio.gather(pump_task, return_exceptions=True)
-        self._sync._closed = True
-        self._sync._closing = True
-        self._sync._mark_owned_cdp_sessions_closed()
-        if self._sync._context is not None and self._sync in self._sync._context._pages:
-            self._sync._context._pages.remove(self._sync)
-        _emit_event(self._sync._event_handlers, "close", self._sync)
-        self._sync._release_memory_buffers()
-        if (
-            self._sync._owns_context
-            and self._sync._context is not None
-            and getattr(
-                self._sync._context,
-                "_rustwright_sync_close_state",
-                _CLOSE_OPEN,
-            )
-            == _CLOSE_OPEN
-            and getattr(
-                self._sync._context,
-                "_rustwright_async_close_state",
-                _CLOSE_OPEN,
-            )
-            != _CLOSE_CLOSING
-        ):
-            await _wrap_async_browser_context(self._sync._context).close()
-
-
+            if native_attempted and self._sync._rustwright_sync_close_beforeunload_count is None:
+                try:
+                    self._sync._stop_event_pump()
+                    pump_task = self._event_pump_task
+                    if pump_task is not None and pump_task is not asyncio.current_task():
+                        await asyncio.gather(pump_task, return_exceptions=True)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                try:
+                    await _run_sync_call(self._sync._run_close_cleanup)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+        if first_error is not None:
+            raise first_error
 class AsyncJSHandle(_AsyncJSHandleGeneratedMixin, _AsyncWrapper):
     def __str__(self) -> str:
         return str(self._sync)
