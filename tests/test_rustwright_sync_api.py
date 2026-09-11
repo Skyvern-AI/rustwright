@@ -4595,6 +4595,26 @@ def test_context_close_closes_pages_before_context_close_event(playwright):
         ("context", True, True, True, True, False, False),
     ]
     browser.close()
+def test_page_close_owned_context_only_for_browser_new_page(playwright):
+    browser = playwright.chromium.launch(headless=True)
+    try:
+        owned_page = browser.new_page()
+        owned_context = owned_page.context
+        owned_context_close_events = []
+        owned_context.on("close", owned_context_close_events.append)
+        owned_page.close()
+        assert owned_page.is_closed()
+        assert owned_context.is_closed()
+        assert owned_context_close_events == [owned_context]
+
+        shared_context = browser.new_context()
+        shared_page = shared_context.new_page()
+        shared_page.close()
+        assert shared_page.is_closed()
+        assert shared_context.is_closed() is False
+        shared_context.close()
+    finally:
+        browser.close()
 
 
 def test_new_context_download_behavior_failure_rolls_back_sync_context():
@@ -9258,29 +9278,80 @@ def test_event_wait_on_owning_event_pump_thread_raises_instead_of_deadlocking():
     assert "'console'" in outcome["context_error"]
 
 
-def test_event_pump_overflow_warns_and_reconciles_bookkeeping_without_browser():
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("owned", [False, True])
+@pytest.mark.parametrize("split_batch", [False, True])
+def test_event_pump_overflow_warns_and_reconciles_bookkeeping_without_browser(async_mode, owned, split_batch):
     from rustwright.sync_api import Page
+    from rustwright.async_api import AsyncPage
 
-    class Core:
-        def __init__(self):
-            self.dialog_calls = []
+    async def run():
+        core = _LifecycleCore()
+        page = Page(core, _start_event_pump=not async_mode)
+        wrapper = AsyncPage(page) if async_mode else None
+        page._network_idle_active_requests.add("request-1")
+        page._network_idle_last_activity = 0.0
+        actions_at_listener = []
 
-        def handle_dialog(self, *args):
-            self.dialog_calls.append(args)
+        def listener(dialog):
+            actions_at_listener.append(list(core.dialog_actions))
+            dialog.accept()
 
-    owner = Page.__new__(Page)
-    owner._network_idle_condition = threading.Condition()
-    owner._network_idle_active_requests = {"request-1"}
-    owner._network_idle_last_activity = 0.0
-    owner._core = Core()
-    owner._default_timeout = 30_000.0
+        async def async_listener(dialog):
+            actions_at_listener.append(list(core.dialog_actions))
+            await dialog.accept()
 
-    with pytest.warns(RuntimeWarning, match=r"dropped 7 event\(s\)"):
-        owner._reconcile_event_stream_overflow({"dropped": 7})
+        if owned:
+            if wrapper is None:
+                page.on("dialog", listener)
+            else:
+                wrapper.on("dialog", async_listener)
+        batch = [
+            {"seq": 7, "kind": "_overflow", "payload": {"dropped": 7}},
+            {"seq": 8, "kind": "dialog", "payload": {"type": "beforeunload", "message": "retained"}},
+            {"seq": 9, "kind": "_closed", "payload": None},
+        ]
+        try:
+            with pytest.warns(RuntimeWarning, match=r"dropped 7 event\(s\)"):
+                for part in ([batch[:1], batch[1:]] if split_batch else [batch]):
+                    core.stream.batches.put((9, part))
+                assert await asyncio.to_thread(core.dialog_handled.wait, 2)
+                if wrapper is not None:
+                    await asyncio.wait_for(wrapper._event_pump_task, 2)
+                else:
+                    await asyncio.to_thread(page._event_pump_thread.join, 2)
+                    assert not page._event_pump_thread.is_alive()
+            assert page._network_idle_active_requests == set()
+            assert page._network_idle_last_activity > 0
+            assert actions_at_listener == ([[]] if owned else [])
+            assert core.dialog_actions == [owned]
+        finally:
+            page._stop_event_pump()
+            if wrapper is not None:
+                await asyncio.wait_for(wrapper._event_pump_task, 2)
+            else:
+                await asyncio.to_thread(page._event_pump_thread.join, 2)
 
-    assert owner._network_idle_active_requests == set()
-    assert owner._network_idle_last_activity > 0
-    assert owner._core.dialog_calls == [(False, None, 500.0)]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("ownership", ["unowned", "listener", "waiter"])
+def test_recovered_dialog_uses_ownership_dispatch_without_browser(async_mode, ownership):
+    from dialog_overflow_pump import exercise_dialog_overflow_pump
+
+    stream = _LifecycleEventStream()
+
+    def publish(phase):
+        if phase == 0:
+            stream.emit("console", {"type": "log", "text": "blocked"})
+            return
+        stream.emit("_overflow", {"dropped": 7})
+        if phase == 1:
+            stream.emit("dialog", {"type": "beforeunload", "message": "evicted"})
+        stream.emit("console", {"type": "log", "text": "drained"})
+
+    exercise_dialog_overflow_pump(stream, publish, async_mode, ownership)
 
 
 def test_page_network_lifecycle_order_and_close_stops_event_pump(browser, http_server):
@@ -24887,6 +24958,42 @@ def test_dialog_without_handler_is_auto_dismissed_by_page_event_pump(page):
     assert page.evaluate("document.body.dataset.after") == "done"
 
 
+def test_dialog_predicate_exception_is_propagated(page):
+    page.set_content("<main>dialog predicate error</main>")
+
+    def predicate(_dialog):
+        raise ZeroDivisionError("dialog predicate failed")
+
+    with pytest.raises(ZeroDivisionError, match="dialog predicate failed"):
+        with page.expect_event("dialog", predicate, timeout=1_000):
+            page.evaluate("() => alert('predicate error')")
+
+
+def test_dialog_predicate_rejection_keeps_unmatched_dialog_auto_dismissal(page):
+    page.set_content("<main>dialog predicate</main>")
+
+    with page.expect_event("dialog", lambda dialog: dialog.message == "wanted", timeout=3_000) as info:
+        page.evaluate(
+            """() => {
+                setTimeout(() => alert("unwanted"), 0);
+                setTimeout(() => alert("wanted"), 100);
+            }"""
+        )
+
+    info.value.dismiss()
+
+
+def test_wait_for_event_console_repeated_text_only_matches_new_event(page):
+    repeated_text = "same console payload"
+    page.evaluate("(text) => console.log(text)", repeated_text)
+    wait_until(lambda: repeated_text in [message.text for message in page.console_messages(filter="all")])
+
+    with page.expect_event("console", lambda message: message.text == repeated_text, timeout=3_000) as info:
+        page.evaluate("(text) => console.log(text)", repeated_text)
+
+    assert info.value.text == repeated_text
+
+
 def test_page_close_run_before_unload_emits_beforeunload_dialog(browser):
     context = browser.new_context()
     page = context.new_page()
@@ -24908,6 +25015,337 @@ def test_page_close_run_before_unload_emits_beforeunload_dialog(browser):
     assert page not in context.pages
     assert seen == [("beforeunload", "", "")]
     context.close()
+
+
+def test_page_close_tail_failure_is_reported_to_waiters_and_retry_skips_native_close():
+    from rustwright.sync_api import Page
+
+    class EventStream:
+        def close(self):
+            return None
+
+    class Core:
+        def __init__(self):
+            self.close_calls = 0
+
+        def combined_event_stream(self):
+            return EventStream()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def close(self, *_args):
+            self.close_calls += 1
+
+    core = Core()
+    page = Page(core, _start_event_pump=False)
+    fail_once = [True]
+
+    def on_close(_page):
+        if fail_once[0]:
+            fail_once[0] = False
+            raise RuntimeError("close tail failed")
+
+    page.on("close", on_close)
+    with pytest.raises(RuntimeError, match="close tail failed"):
+        page.close()
+    generation = page._rustwright_sync_close_generation
+    assert page._rustwright_sync_close_state == "open"
+    assert page._rustwright_sync_close_outcomes[generation].error is not None
+    assert core.close_calls == 1
+
+    page.close()
+    assert page.is_closed()
+    assert core.close_calls == 1
+class _LifecycleEventStream:
+    """In-memory transport for the production sync and async page pumps."""
+
+    def __init__(self):
+        import queue
+
+        self.batches = queue.Queue()
+        self.producer_cursor = 0
+        self.cursor = 0
+        self.terminal = False
+        self.pending_terminal = False
+
+    def emit(self, kind, payload=None):
+        self.producer_cursor += 1
+        self.batches.put((self.producer_cursor, [{"seq": self.producer_cursor, "kind": kind, "payload": payload}]))
+
+    def _read_batch(self):
+        import queue
+
+        try:
+            self.cursor, batch = self.batches.get(timeout=1)
+        except queue.Empty:
+            return "[]"
+        self.pending_terminal = batch[-1]["kind"] == "_closed"
+        return json.dumps(batch)
+
+    def wait_batch(self, _timeout, _limit):
+        batch = self._read_batch()
+        # The sync binding publishes closure on read; async waits for ack_batch.
+        self.terminal = self.pending_terminal
+        return batch
+
+    async def wait_batch_async(self, timeout, limit):
+        return await asyncio.to_thread(self._read_batch)
+
+    def ack_batch(self):
+        self.terminal = self.pending_terminal
+
+    def rollback_batch(self):
+        pass
+
+    def event_cursor(self):
+        return self.cursor
+
+    def is_closed(self):
+        return self.terminal
+
+    def close(self):
+        self.emit("_closed")
+
+
+class _LifecycleCore:
+    def __init__(self):
+        self.stream = _LifecycleEventStream()
+        self.close_calls = 0
+        self.dialog_actions = []
+        self.dialog_handled = threading.Event()
+
+    def combined_event_stream(self):
+        return self.stream
+
+    def keyboard_primary_modifier(self):
+        return "Control"
+
+    def event_cursor(self):
+        return self.stream.producer_cursor
+
+    def is_closed(self):
+        # Deliberately models the former lifecycle predicate: command completion
+        # must not let the production barrier bypass terminal stream receipt.
+        return self.close_calls > 0
+
+    def close(self, *_args):
+        self.close_calls += 1
+
+    async def close_async(self, *args):
+        self.close(*args)
+
+    def handle_dialog(self, accept, _prompt, _timeout):
+        self.dialog_actions.append(accept)
+        self.dialog_handled.set()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_page_close_har_export_failure_preserves_retryable_cleanup(monkeypatch, async_mode):
+    import rustwright.sync_api as sync_api
+    from rustwright.async_api import AsyncPage
+
+    async def run():
+        core = _LifecycleCore()
+        page = sync_api.Page(core, _start_event_pump=not async_mode)
+        wrapper = AsyncPage(page) if async_mode else None
+        page._har_recordings.append(("retry.har", None, "embed", "minimal"))
+        received = threading.Event()
+        messages = []
+
+        def on_console(message):
+            messages.append(message.text)
+            received.set()
+
+        page._event_handlers["console"] = [on_console]
+        page._event_handler_cursors[("console", id(on_console))] = 0
+        fail = [True]
+        writes = []
+
+        def receive_console(text):
+            received.clear()
+            core.stream.emit("console", {"type": "log", "text": text, "args": []})
+            assert received.wait(2), "live event pump stopped during pre-native export"
+
+        def write_har(path, _pages, _url_filter, *, content_mode, har_mode):
+            if fail[0]:
+                # Force two separate pump iterations while export is in progress.
+                receive_console("during export 1")
+                receive_console("during export 2")
+                raise OSError("output directory is unwritable")
+            writes.append((path, content_mode, har_mode))
+
+        monkeypatch.setattr(sync_api, "_write_har", write_har)
+
+        async def close():
+            if wrapper is not None:
+                await wrapper.close()
+            else:
+                await asyncio.to_thread(page.close)
+
+        try:
+            with pytest.raises(OSError, match="unwritable"):
+                await close()
+            assert core.close_calls == 0
+            assert page._rustwright_sync_close_state == "open"
+            assert page._har_recordings
+            assert page._rustwright_sync_close_native_disposed is False
+            await asyncio.to_thread(receive_console, "after failure")
+            core.stream.emit("dialog", {"type": "alert", "message": "unowned after failure"})
+            assert await asyncio.to_thread(core.dialog_handled.wait, 2)
+            assert core.dialog_actions == [False]
+            fail[0] = False
+            await close()
+            assert core.close_calls == 1
+            assert writes == [("retry.har", "embed", "minimal")]
+            assert messages == ["during export 1", "during export 2", "after failure"]
+        finally:
+            page._stop_event_pump()
+            if wrapper is not None:
+                await asyncio.wait_for(wrapper._event_pump_task, 2)
+            elif page._event_pump_thread is not None:
+                await asyncio.to_thread(page._event_pump_thread.join, 2)
+                assert not page._event_pump_thread.is_alive()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("fail_first", [False, True])
+def test_owned_page_purges_storage_and_service_workers_before_native_close(monkeypatch, async_mode, fail_first):
+    from rustwright.sync_api import BrowserContext, Page
+    from rustwright.async_api import AsyncPage
+
+    async def run():
+        storage = {"local": "private", "session": "private"}
+        registrations = ["/sw.js"]
+        cleared_origins = []
+        core = _LifecycleCore()
+        page = Page(core, _start_event_pump=not async_mode)
+        wrapper = AsyncPage(page) if async_mode else None
+
+        class Context:
+            _core = None
+            _browser = object()
+            _storage_state_origins = set()
+            _rustwright_sync_close_state = "open"
+
+            def __init__(self):
+                self._pages = [page]
+                self.closed = False
+                self.fail_purge = fail_first
+
+            def _cleanup_default_context_state(self):
+                if self.fail_purge:
+                    self.fail_purge = False
+                    raise OSError("purge preparation failed")
+                BrowserContext._cleanup_default_context_state(self)
+
+            def _send_default_context_browser_command(self, method, params=None):
+                if method == "Storage.clearDataForOrigin":
+                    cleared_origins.append(params["origin"])
+
+            def close(self):
+                self.closed = True
+
+        context = Context()
+        page._context = context
+        page._owns_context = True
+        page._rustwright_sync_close_default_context_cleaned = False
+
+        def evaluate(expression):
+            if core.close_calls:
+                raise Error("Target closed")
+            if expression == "location.origin":
+                return "https://example.test"
+            assert "registration.unregister()" in expression
+            assert "localStorage.clear()" in expression
+            assert "sessionStorage.clear()" in expression
+            storage.clear()
+            registrations.clear()
+
+        monkeypatch.setattr(page, "evaluate", evaluate)
+        original_close = core.close
+
+        def native_close(*args):
+            assert not storage and not registrations
+            assert cleared_origins == ["https://example.test"]
+            original_close(*args)
+
+        monkeypatch.setattr(core, "close", native_close)
+        async def close():
+            if wrapper is not None:
+                await wrapper.close()
+            else:
+                await asyncio.to_thread(page.close)
+
+        try:
+            if fail_first:
+                with pytest.raises(OSError, match="purge preparation failed"):
+                    await close()
+                assert core.close_calls == 0
+                assert not page._rustwright_sync_close_default_context_cleaned
+                assert not page._event_pump_stopped
+                assert storage and registrations
+            await close()
+            assert context.closed
+            assert core.close_calls == 1
+            assert not storage and not registrations
+            assert page._rustwright_sync_close_default_context_cleaned
+        finally:
+            page._stop_event_pump()
+            if wrapper is not None:
+                await asyncio.wait_for(wrapper._event_pump_task, 2)
+            else:
+                await asyncio.to_thread(page._event_pump_thread.join, 2)
+                assert not page._event_pump_thread.is_alive()
+
+    asyncio.run(run())
+
+
+def test_owned_default_context_page_close_isolates_origin_state(browser, http_server, monkeypatch):
+    # Exercise the logical default-context fallback on a real browser. No native
+    # incognito context can hide a missed pre-disposal purge in this test.
+    native = browser._core
+
+    class DefaultContextCore:
+        def single_process_fallback(self):
+            return True
+
+        def __getattr__(self, name):
+            return getattr(native, name)
+
+    monkeypatch.setattr(browser, "_core", DefaultContextCore())
+    first = browser.new_page()
+    assert first.context._core is None
+    first.goto(http_server)
+    first.evaluate("""async () => {
+        await navigator.serviceWorker.register('/sw.js');
+        await navigator.serviceWorker.ready;
+        localStorage.setItem('owned-page-secret', 'private');
+        sessionStorage.setItem('owned-page-secret', 'private');
+    }""")
+    assert first.evaluate("async () => (await navigator.serviceWorker.getRegistrations()).length") > 0
+    first.close()
+    second = browser.new_page()
+    try:
+        second.goto(http_server)
+        assert second.evaluate("localStorage.getItem('owned-page-secret')") is None
+        assert second.evaluate("sessionStorage.getItem('owned-page-secret')") is None
+        assert second.evaluate("async () => (await navigator.serviceWorker.getRegistrations()).length") == 0
+    finally:
+        second.close()
+
+
+@pytest.mark.parametrize("clock_mode", ["installed", "throwing"])
+def test_console_capture_ignores_application_clock_override(page, clock_mode):
+    if clock_mode == "installed":
+        page.clock.install(time="2100-01-01T00:00:00Z")
+    else:
+        page.evaluate("() => { Date.now = () => { throw 9000000000000000; }; }")
+    with page.expect_console_message(lambda message: message.text == "trusted clock live") as message:
+        page.evaluate("console.log('trusted clock live')")
+    assert message.value.text == "trusted clock live"
 
 
 def test_close_reason_option_validation_matches_playwright(browser):
@@ -25195,6 +25633,46 @@ def test_page_crash_event_for_chromium_target_crash(browser):
     assert seen == [True]
     with pytest.raises(TimeoutError, match='Timeout 10ms exceeded while waiting for event "crash"'):
         page.wait_for_event("crash", timeout=10)
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_page_goto_crash_url_maps_aborted_without_crash_listener(monkeypatch, async_mode):
+    from rustwright.sync_api import Page
+
+    class FakeCore(_LifecycleCore):
+        def goto(self, *_args):
+            raise Error("Page.goto: net::ERR_ABORTED at chrome://crash")
+
+        async def goto_async(self, *args):
+            self.goto(*args)
+
+    page = Page(FakeCore(), _start_event_pump=False)
+    assert not page._crashed
+    page._context = None
+    page._default_timeout = 1_000.0
+    page._closed = False
+    page._closing = False
+    monkeypatch.setattr(Page, "_resolve_url", lambda _self, value: value)
+    monkeypatch.setattr(Page, "_mark_context_pageload_pending", lambda _self: None)
+    monkeypatch.setattr(Page, "_mark_request_cookie_sync_required", lambda _self: None)
+    monkeypatch.setattr(Page, "_trace_begin_action", lambda _self, *_args, **_kwargs: None)
+    monkeypatch.setattr(Page, "_trace_end_action", lambda _self, *_args, **_kwargs: None)
+    monkeypatch.setattr(Page, "_page_cdp_event_generation", lambda _self, *_args: None)
+    monkeypatch.setattr(Page, "_prepare_navigation", lambda _self: (0, None))
+    monkeypatch.setattr(Page, "_mark_navigation_history_boundary", lambda _self, *_args: None)
+    monkeypatch.setattr(Page, "_clear_context_pageload_pending", lambda _self: None)
+    monkeypatch.setattr(Page, "_download_event_waiter", lambda _self: None)
+    monkeypatch.setattr(Page, "_slow_mo", lambda _self: None)
+
+    with pytest.raises(Error, match="Page crashed"):
+        if async_mode:
+            from rustwright.async_api import AsyncPage
+
+            wrapper = object.__new__(AsyncPage)
+            wrapper._sync = page
+            asyncio.run(wrapper.goto("chrome://crash"))
+        else:
+            page.goto("chrome://crash")
+
+
 
 
 def test_page_event_waiters_reject_on_page_crash(browser):
@@ -33039,13 +33517,54 @@ def test_async_native_future_cancellation_aborts_and_releases_event_stream():
             assert pump is not None
             pump.cancel()
             await asyncio.gather(pump, return_exceptions=True)
-            await asyncio.sleep(0)
 
             retry = page._sync._event_stream.wait_batch_async(1.0, 64)
             assert isinstance(retry, asyncio.Future)
             await retry
             page._sync._event_stream.ack_batch()
             await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_event_pump_cancellation_waits_for_lease_restoration():
+    async def run():
+        from rustwright.async_api import AsyncPage
+
+        started = asyncio.Event()
+        restoring = asyncio.Event()
+        restored = asyncio.Event()
+
+        class FakeEventStream:
+            async def wait_batch_async(self, _timeout, _limit):
+                if started.is_set():
+                    assert restored.is_set(), "retry acquired an unrestored lease"
+                    return "[]"
+                started.set()
+                await asyncio.Future()
+
+            async def cancel_wait_async(self):
+                restoring.set()
+                await restored.wait()
+
+        class FakePage:
+            _event_stream = FakeEventStream()
+
+            def _event_listeners_active(self):
+                return True
+
+        page = object.__new__(AsyncPage)
+        page._sync = FakePage()
+        pump = asyncio.create_task(page._event_pump())
+        await asyncio.wait_for(started.wait(), 2)
+        pump.cancel()
+        await asyncio.wait_for(restoring.wait(), 2)
+        assert not pump.done()
+        # Repeated cancellation must still leave the event loop free to restore.
+        pump.cancel()
+        restored.set()
+        await asyncio.wait_for(asyncio.gather(pump, return_exceptions=True), 2)
+        assert await page._sync._event_stream.wait_batch_async(1.0, 64) == "[]"
 
     asyncio.run(run())
 
@@ -33075,9 +33594,14 @@ def test_async_event_pump_closed_batch_is_terminal_and_acknowledged():
             def __init__(self):
                 self._event_stream = FakeEventStream()
                 self.stop_calls = 0
+                self.cursor_notes = 0
 
             def _event_listeners_active(self):
                 return True
+
+            def _note_event_batch_consumed(self, terminal):
+                assert terminal
+                self.cursor_notes += 1
 
             def _stop_event_pump(self):
                 self.stop_calls += 1
@@ -33093,6 +33617,7 @@ def test_async_event_pump_closed_batch_is_terminal_and_acknowledged():
                 pump.cancel()
                 await asyncio.gather(pump, return_exceptions=True)
 
+        assert sync_page.cursor_notes == 1
         assert sync_page._event_stream.wait_calls == 1
         assert sync_page._event_stream.ack_calls == 1
         assert sync_page._event_stream.rollback_calls == 0
@@ -33101,73 +33626,317 @@ def test_async_event_pump_closed_batch_is_terminal_and_acknowledged():
     asyncio.run(run())
 
 
-def test_async_native_close_waits_for_beforeunload_dialog_dispatch():
-    async def run() -> None:
-        import rustwright.async_api as async_api
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("outcome", ["listener", "unowned", "terminal"])
+@pytest.mark.parametrize("preparation_dialog", ["alert", "beforeunload"])
+def test_page_close_production_barrier_waits_for_post_response_receipt(async_mode, outcome, preparation_dialog):
+    from rustwright.sync_api import Page
+    from rustwright.async_api import AsyncPage
 
-        order = []
+    async def run():
+        core = _LifecycleCore()
+        page = Page(core, _start_event_pump=not async_mode)
+        page._default_timeout = 30_000
+        wrapper = AsyncPage(page) if async_mode else None
+        waiting = threading.Event()
+        dispatched = threading.Event()
         seen = []
 
-        class FakeCore:
-            def __init__(self, owner):
-                self.owner = owner
+        class BarrierCondition(threading.Condition):
+            def wait(self, timeout=None):
+                waiting.set()
+                return super().wait(timeout)
 
-            def close_async(self, _timeout, _run_before_unload):
-                async def close():
-                    order.append("close-command")
+        page._event_dispatch_condition = BarrierCondition(page._event_dispatch_lock)
+        handle_dialog = page._handle_dialog_event
 
-                    async def dispatch_dialog():
-                        await asyncio.sleep(0.02)
-                        if self.owner._event_pump_stopped:
-                            return
-                        for handler in self.owner._event_handlers["dialog"]:
-                            handler("beforeunload")
-                        self.owner._dialog_dispatch_count += 1
-                        order.append("dialog")
+        def note_dispatch(payload):
+            handle_dialog(payload)
+            dispatched.set()
 
-                    self.owner.dispatch_task = asyncio.create_task(dispatch_dialog())
+        page._handle_dialog_event = note_dispatch
+        purge = page._purge_owned_default_context
 
-                return close()
+        def prepare():
+            core.stream.emit("dialog", {"type": preparation_dialog, "message": "preparation"})
+            assert dispatched.wait(2), "preparation dialog was not dispatched"
+            purge()
 
-        class FakePage:
-            def __init__(self):
-                self._closed_reason = None
-                self._owns_context = False
-                self._context = None
-                self._default_timeout = 1_000.0
-                self._event_handlers = {"dialog": [seen.append]}
-                self._dialog_dispatch_count = 0
-                self._event_pump_stopped = False
-                self._closed = False
-                self._closing = False
-                self.dispatch_task = None
-                self.release_calls = 0
-                self._core = FakeCore(self)
+        page._purge_owned_default_context = prepare
 
-            def _stop_event_pump(self):
-                self._event_pump_stopped = True
-                order.append("stop-pump")
+        def unexpected_timeout_fallback():
+            raise AssertionError("close barrier reached its fallback deadline")
 
-            def _mark_owned_cdp_sessions_closed(self):
-                pass
+        page._fallback_close_dialog = unexpected_timeout_fallback
+        if outcome in {"listener", "terminal"}:
+            def on_dialog(dialog):
+                seen.append(dialog.type)
+                dialog.dismiss()
+            page.on("dialog", on_dialog)
 
-            def _release_memory_buffers(self):
-                self.release_calls += 1
-                order.append("release")
+        close = asyncio.create_task(
+            wrapper.close(run_before_unload=True) if wrapper is not None
+            else asyncio.to_thread(page.close, run_before_unload=True)
+        )
+        try:
+            assert await asyncio.to_thread(waiting.wait, 2), "barrier returned on command response"
+            assert core.close_calls == 1
+            assert not close.done()
+            assert not page._event_pump_stopped
+            # An unrelated dialog after the boundary must not satisfy it either.
+            waiting.clear()
+            dispatched.clear()
+            core.stream.emit("dialog", {"type": "alert", "message": "after response"})
+            assert await asyncio.to_thread(dispatched.wait, 2)
+            assert await asyncio.to_thread(waiting.wait, 2), "alert satisfied the beforeunload barrier"
+            assert not close.done()
+            if outcome == "terminal":
+                core.stream.emit("_closed")
+            else:
+                core.stream.emit("dialog", {"type": "beforeunload", "message": "", "defaultValue": ""})
+            await asyncio.wait_for(close, 10)
+            assert seen == (
+                [preparation_dialog, "alert"] + (["beforeunload"] if outcome == "listener" else [])
+                if outcome in {"listener", "terminal"} else []
+            )
+            assert core.dialog_actions == ([False, False] if outcome == "terminal" else [False, False, False])
+            assert page.is_closed()
+        finally:
+            page._stop_event_pump()
+            await asyncio.gather(close, return_exceptions=True)
+            if wrapper is not None:
+                await asyncio.wait_for(wrapper._event_pump_task, 2)
+            else:
+                await asyncio.to_thread(page._event_pump_thread.join, 2)
+                assert not page._event_pump_thread.is_alive()
 
-        sync_page = FakePage()
-        page = object.__new__(async_api.AsyncPage)
-        page._sync = sync_page
-        page._event_pump_task = None
+    asyncio.run(run())
 
-        await page._close_native(None, True)
-        order.append("close-complete")
-        assert sync_page.dispatch_task is not None
-        await sync_page.dispatch_task
-        assert seen == ["beforeunload"]
 
-        assert sync_page.release_calls == 1
-        assert order == ["close-command", "dialog", "stop-pump", "release", "close-complete"]
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_page_close_terminal_batch_requires_python_consumption(async_mode):
+    from rustwright.sync_api import Page
+    from rustwright.async_api import AsyncPage
+
+    async def run():
+        core = _LifecycleCore()
+        page = Page(core, _start_event_pump=not async_mode)
+        wrapper = AsyncPage(page) if async_mode else None
+        waiting = threading.Event()
+        first_consumed = threading.Event()
+        final_console_entered = threading.Event()
+        release_console = threading.Event()
+        seen = []
+
+        class BarrierCondition(threading.Condition):
+            def wait(self, timeout=None):
+                waiting.set()
+                return super().wait(timeout)
+
+        page._event_dispatch_condition = BarrierCondition(page._event_dispatch_lock)
+        note_consumed = page._note_event_batch_consumed
+
+        def note(terminal):
+            note_consumed(terminal)
+            if not terminal:
+                first_consumed.set()
+
+        page._note_event_batch_consumed = note
+
+        def on_console(message):
+            seen.append(message.text)
+            if message.text == "terminal batch":
+                final_console_entered.set()
+                assert release_console.wait(5)
+
+        page._event_handlers["console"] = [on_console]
+        page._event_handler_cursors[("console", id(on_console))] = 0
+        page.on("dialog", lambda dialog: seen.append(dialog.type))
+        close = asyncio.create_task(
+            wrapper.close(run_before_unload=True) if wrapper is not None
+            else asyncio.to_thread(page.close, run_before_unload=True)
+        )
+        try:
+            assert await asyncio.to_thread(waiting.wait, 2)
+            core.stream.producer_cursor = 100
+            core.stream.batches.put((100, [
+                {"seq": index, "kind": "console", "payload": {"type": "log", "text": str(index)}}
+                for index in range(64)
+            ]))
+            assert await asyncio.to_thread(first_consumed.wait, 2)
+            core.stream.batches.put((100, [
+                {"seq": 64, "kind": "console", "payload": {"type": "log", "text": "terminal batch"}},
+                {"seq": 65, "kind": "dialog", "payload": {"type": "beforeunload", "message": "retained"}},
+                {"seq": 100, "kind": "_closed", "payload": None},
+            ]))
+            assert await asyncio.to_thread(final_console_entered.wait, 2)
+            assert core.stream.event_cursor() == 100
+            assert core.stream.is_closed() is (not async_mode)
+            # Recheck while the preceding consumption and final read share a
+            # cursor, and Python has not yet reached the retained dialog.
+            with page._event_dispatch_condition:
+                waiting.clear()
+                page._event_dispatch_condition.notify_all()
+            assert await asyncio.to_thread(waiting.wait, 2), "native read was mistaken for consumption"
+            assert not close.done()
+            assert not page._event_pump_stopped
+            release_console.set()
+            await asyncio.wait_for(close, 5)
+            assert seen == [str(index) for index in range(64)] + ["terminal batch", "beforeunload"]
+            assert core.dialog_actions == []
+        finally:
+            release_console.set()
+            page._stop_event_pump()
+            await asyncio.wait_for(asyncio.gather(close, return_exceptions=True), 5)
+            if wrapper is not None:
+                await asyncio.wait_for(wrapper._event_pump_task, 2)
+            else:
+                await asyncio.to_thread(page._event_pump_thread.join, 2)
+                assert not page._event_pump_thread.is_alive()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("terminal", [False, True])
+def test_page_close_timeout_keeps_queued_unowned_dialog_retryable(async_mode, terminal):
+    from rustwright.sync_api import Page
+    from rustwright.async_api import AsyncPage
+
+    async def run():
+        core = _LifecycleCore()
+        page = Page(core, _start_event_pump=not async_mode)
+        page._default_timeout = 100
+        wrapper = AsyncPage(page) if async_mode else None
+        entered = threading.Event()
+        release = threading.Event()
+        waiting = threading.Event()
+        close_actions = []
+
+        class BarrierCondition(threading.Condition):
+            def wait(self, timeout=None):
+                waiting.set()
+                return super().wait(timeout)
+
+        page._event_dispatch_condition = BarrierCondition(page._event_dispatch_lock)
+
+        def on_console(_message):
+            entered.set()
+            assert release.wait(5)
+
+        page._event_handlers["console"] = [on_console]
+        page._event_handler_cursors[("console", id(on_console))] = 0
+        page.on("close", lambda _page: close_actions.append(list(core.dialog_actions)))
+
+        async def close(**kwargs):
+            if wrapper is not None:
+                await wrapper.close(**kwargs)
+            else:
+                await asyncio.to_thread(page.close, **kwargs)
+
+        attempt = None
+        try:
+            core.stream.emit("console", {"type": "log", "text": "blocking callback"})
+            assert await asyncio.to_thread(entered.wait, 2)
+            attempt = asyncio.create_task(close(run_before_unload=True))
+            assert await asyncio.to_thread(waiting.wait, 2)
+            assert core.close_calls == 1
+            core.stream.emit("dialog", {"type": "beforeunload", "message": "after response"})
+            if terminal:
+                core.stream.emit("_closed")
+            with pytest.raises(TimeoutError, match="beforeunload event dispatch; retry close"):
+                await asyncio.wait_for(attempt, 2)
+            assert not page.is_closed()
+            assert not page._event_pump_stopped
+            assert not page._rustwright_sync_close_cleanup_complete
+            assert core.dialog_actions == []
+            assert close_actions == []
+            # Retrying with default arguments must resume the same dispatch phase.
+            with pytest.raises(TimeoutError, match="beforeunload event dispatch; retry close"):
+                await asyncio.wait_for(close(), 2)
+            assert core.close_calls == 1
+            assert not page._event_pump_stopped
+            release.set()
+            assert await asyncio.to_thread(core.dialog_handled.wait, 2)
+            await asyncio.wait_for(close(), 3)
+            assert core.dialog_actions == [False]
+            assert close_actions == [[False]]
+            assert page.is_closed()
+            assert core.close_calls == 1
+        finally:
+            release.set()
+            page._stop_event_pump()
+            if attempt is not None:
+                await asyncio.wait_for(asyncio.gather(attempt, return_exceptions=True), 3)
+            if wrapper is not None:
+                await asyncio.wait_for(wrapper._event_pump_task, 2)
+            else:
+                await asyncio.to_thread(page._event_pump_thread.join, 2)
+                assert not page._event_pump_thread.is_alive()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_close_barrier_timeout_preserves_dialog_listener_claim(async_mode):
+    from rustwright.sync_api import Page
+    from rustwright.async_api import AsyncPage
+
+    async def run():
+        core = _LifecycleCore()
+        page = Page(core, _start_event_pump=not async_mode)
+        page._default_timeout = 100
+        wrapper = AsyncPage(page) if async_mode else None
+        entered = threading.Event()
+        released = threading.Event()
+        finished = threading.Event()
+        dialogs = []
+
+        def listener(dialog):
+            dialogs.append(dialog)
+            entered.set()
+            try:
+                assert released.wait(5)
+            finally:
+                finished.set()
+
+        async def async_listener(dialog):
+            dialogs.append(dialog._sync)
+            entered.set()
+            try:
+                assert await asyncio.to_thread(released.wait, 5)
+            finally:
+                finished.set()
+
+        if wrapper is None:
+            page.on("dialog", listener)
+        else:
+            wrapper.on("dialog", async_listener)
+        try:
+            core.stream.emit("dialog", {"type": "beforeunload", "message": "owned"})
+            assert await asyncio.to_thread(entered.wait, 2)
+            assert dialogs[0]._dispatch.handler_claims
+            # Exercise the production timeout branch even when async handler
+            # scheduling has already advanced the beforeunload dispatch count.
+            result = await asyncio.wait_for(
+                asyncio.to_thread(page._wait_for_close_event_dispatch_or_fallback), 2
+            )
+            assert result is False
+            assert not finished.is_set()
+            assert core.dialog_actions == []
+            assert dialogs[0]._dispatch.handler_claims
+            released.set()
+            assert await asyncio.to_thread(finished.wait, 2)
+            page._maybe_fallback_pending_dialogs()
+            assert core.dialog_actions == []
+        finally:
+            released.set()
+            page._stop_event_pump()
+            if wrapper is not None:
+                await asyncio.wait_for(wrapper._event_pump_task, 2)
+            else:
+                await asyncio.to_thread(page._event_pump_thread.join, 2)
+                assert not page._event_pump_thread.is_alive()
 
     asyncio.run(run())
 
@@ -33217,6 +33986,30 @@ def test_async_close_is_single_flight_for_page_context_browser_and_recursive_own
             browser.on("disconnected", lambda: disconnected.append(True))
             await asyncio.gather(browser.close(), browser.close())
             assert disconnected == [True]
+
+    asyncio.run(run())
+def test_async_page_close_owned_context_only_for_browser_new_page():
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            owned_page = await browser.new_page()
+            owned_context = owned_page.context
+            owned_context_close_events = []
+            owned_context.on("close", owned_context_close_events.append)
+            await owned_page.close()
+            assert owned_page.is_closed()
+            assert owned_context.is_closed()
+            assert owned_context_close_events == [owned_context]
+
+            shared_context = await browser.new_context()
+            shared_page = await shared_context.new_page()
+            await shared_page.close()
+            assert shared_page.is_closed()
+            assert shared_context.is_closed() is False
+            await shared_context.close()
+            await browser.close()
 
     asyncio.run(run())
 
@@ -48572,6 +49365,42 @@ def test_page_listener_concurrent_self_removal_does_not_deadlock():
     assert len(completed) == 2
 
 
+def test_event_waiter_publish_wins_timeout_interleaving(monkeypatch):
+    import rustwright.sync_api as sync_api
+    from rustwright.sync_api import Page, _ListenerEventContextManager
+
+    class Core:
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+    page = Page(Core(), _start_event_pump=False)
+    page._ensure_console_thread = lambda: None
+    page._attach_existing_worker_console_propagation = lambda: None
+    page._ensure_worker_thread = lambda: None
+    event_info = _ListenerEventContextManager(page, "console", lambda _event: True, 1_000)
+    event_info.__enter__()
+    wait_entered = threading.Event()
+    published = threading.Event()
+
+    def wait_then_race(*_args, **_kwargs):
+        wait_entered.set()
+        dispatch = threading.Thread(
+            target=lambda: (event_info._handler(object()), published.set()),
+            daemon=True,
+        )
+        dispatch.start()
+        assert published.wait(2)
+        dispatch.join(timeout=2)
+        raise TimeoutError("synthetic timeout after publish")
+
+    monkeypatch.setattr(sync_api, "_wait_for_ready_event_or_owner_close", wait_then_race)
+    event_info.__exit__(None, None, None)
+    assert wait_entered.is_set()
+    assert event_info.value is not None
+
 def test_page_console_listener_ignores_event_log_history_before_registration():
     from rustwright.sync_api import Page
 
@@ -49491,7 +50320,80 @@ def test_dialog_handler_exception_is_auto_dismissed_once():
     assert core.dismissals == [(False, None, page._default_timeout)]
 
 
-def test_dialog_handler_that_returns_without_handling_is_auto_dismissed_once():
+def test_dialog_handler_exception_during_action_operation_is_auto_dismissed_once():
+    from rustwright.sync_api import Page
+
+    class Core:
+        def __init__(self):
+            self.dismissals = []
+
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def handle_dialog(self, accepted, prompt_text, timeout_ms):
+            self.dismissals.append((accepted, prompt_text, timeout_ms))
+
+    core = Core()
+    page = Page(core, _start_event_pump=False)
+
+    def handler(_dialog):
+        raise RuntimeError("action dialog handler failed")
+
+    page.on("dialog", handler)
+    release_operation = page._begin_dialog_operation()
+    try:
+        page._handle_dialog_event({"type": "alert", "message": "raises during action"})
+    finally:
+        release_operation()
+    assert core.dismissals == [(False, None, page._default_timeout)]
+
+
+def test_async_dialog_handler_exception_during_action_operation_is_auto_dismissed_once():
+    from rustwright.async_api import _wrap_async_event_handler
+    from rustwright.sync_api import Page
+
+    class Core:
+        def __init__(self):
+            self.dismissals = []
+
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def handle_dialog(self, accepted, prompt_text, timeout_ms):
+            self.dismissals.append((accepted, prompt_text, timeout_ms))
+
+    async def run():
+        core = Core()
+        page = Page(core, _start_event_pump=False)
+        owner = type("AsyncOwner", (), {})()
+        owner._sync = page
+        owner._loop = asyncio.get_running_loop()
+        owner._event_handler_wrappers = []
+
+        async def handler(_dialog):
+            raise RuntimeError("async action dialog handler failed")
+
+        wrapped = _wrap_async_event_handler(owner, "dialog", handler)
+        page.on("dialog", wrapped)
+        release_operation = page._begin_dialog_operation()
+        try:
+            page._handle_dialog_event({"type": "alert", "message": "async raises during action"})
+        finally:
+            release_operation()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert core.dismissals == [(False, None, page._default_timeout)]
+
+    asyncio.run(run())
+
+
+def test_dialog_handler_that_returns_without_handling_remains_open():
     from rustwright.sync_api import Page
 
     class Core:
@@ -49511,7 +50413,42 @@ def test_dialog_handler_that_returns_without_handling_is_auto_dismissed_once():
     page = Page(core, _start_event_pump=False)
     page.on("dialog", lambda _dialog: None)
     page._handle_dialog_event({"type": "alert", "message": "unhandled"})
-    assert core.dismissals == [(False, None, page._default_timeout)]
+    assert core.dismissals == []
+
+
+def test_dialog_handler_claims_are_retained_per_sync_handler():
+    from rustwright.sync_api import Page
+
+    class Core:
+        def __init__(self):
+            self.dismissals = []
+
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def handle_dialog(self, accepted, prompt_text, timeout_ms):
+            self.dismissals.append((accepted, prompt_text, timeout_ms))
+
+    core = Core()
+    page = Page(core, _start_event_pump=False)
+
+    def returns(_dialog):
+        return None
+
+    def raises(_dialog):
+        raise RuntimeError("second handler failed")
+
+    page.on("dialog", returns)
+    page.on("dialog", raises)
+    release_operation = page._begin_dialog_operation()
+    try:
+        page._handle_dialog_event({"type": "alert", "message": "two handlers"})
+    finally:
+        release_operation()
+    assert core.dismissals == []
 
 
 def test_async_dialog_handler_cancellation_after_activation_is_auto_dismissed_once():
@@ -49553,6 +50490,51 @@ def test_async_dialog_handler_cancellation_after_activation_is_auto_dismissed_on
         for _ in range(3):
             await asyncio.sleep(0)
         assert core.dismissals == [(False, None, page._default_timeout)]
+
+    asyncio.run(run())
+
+
+def test_dialog_handler_claims_are_retained_per_async_handler():
+    from rustwright.async_api import _wrap_async_event_handler
+    from rustwright.sync_api import Page
+
+    class Core:
+        def __init__(self):
+            self.dismissals = []
+
+        def combined_event_stream(self):
+            return object()
+
+        def keyboard_primary_modifier(self):
+            return "Control"
+
+        def handle_dialog(self, accepted, prompt_text, timeout_ms):
+            self.dismissals.append((accepted, prompt_text, timeout_ms))
+
+    async def run():
+        core = Core()
+        page = Page(core, _start_event_pump=False)
+        owner = type("AsyncOwner", (), {})()
+        owner._sync = page
+        owner._loop = asyncio.get_running_loop()
+        owner._event_handler_wrappers = []
+
+        async def returns(_dialog):
+            return None
+
+        async def raises(_dialog):
+            raise RuntimeError("second async handler failed")
+
+        page.on("dialog", _wrap_async_event_handler(owner, "dialog", returns))
+        page.on("dialog", _wrap_async_event_handler(owner, "dialog", raises))
+        release_operation = page._begin_dialog_operation()
+        try:
+            page._handle_dialog_event({"type": "alert", "message": "two async handlers"})
+        finally:
+            release_operation()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert core.dismissals == []
 
     asyncio.run(run())
 
