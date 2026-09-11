@@ -266,16 +266,27 @@ impl CloseOutcome {
 
 enum ClosePhase {
     Open,
-    Closing(watch::Sender<Option<CloseOutcome>>),
-    Closed(CloseOutcome),
+    Closing {
+        sender: watch::Sender<Option<CloseOutcome>>,
+        generation: u64,
+        before_unload_generation: Option<u64>,
+    },
+    Closed {
+        outcome: CloseOutcome,
+        before_unload_generation: Option<u64>,
+    },
 }
 
 struct CloseLifecycle {
     phase: Mutex<ClosePhase>,
+    next_generation: AtomicU64,
 }
 
 enum CloseStart {
-    Lead(watch::Sender<Option<CloseOutcome>>),
+    Lead {
+        sender: watch::Sender<Option<CloseOutcome>>,
+        generation: u64,
+    },
     Wait(watch::Receiver<Option<CloseOutcome>>),
     Done(CloseOutcome),
 }
@@ -284,34 +295,65 @@ impl CloseLifecycle {
     fn new() -> Self {
         Self {
             phase: Mutex::new(ClosePhase::Open),
+            next_generation: AtomicU64::new(0),
         }
     }
 
     fn start(&self) -> CloseStart {
+        self.start_with_before_unload(false)
+    }
+
+    fn start_with_before_unload(&self, before_unload: bool) -> CloseStart {
         let mut phase = self.phase.lock().unwrap();
         match &*phase {
             ClosePhase::Open => {
+                let generation = self
+                    .next_generation
+                    .fetch_add(1, Ordering::SeqCst)
+                    .wrapping_add(1);
                 let (sender, _) = watch::channel(None);
-                *phase = ClosePhase::Closing(sender.clone());
-                CloseStart::Lead(sender)
+                *phase = ClosePhase::Closing {
+                    sender: sender.clone(),
+                    generation,
+                    before_unload_generation: before_unload.then_some(generation),
+                };
+                CloseStart::Lead { sender, generation }
             }
-            ClosePhase::Closing(sender) => CloseStart::Wait(sender.subscribe()),
-            ClosePhase::Closed(outcome) => CloseStart::Done(outcome.clone()),
+            ClosePhase::Closing { sender, .. } => CloseStart::Wait(sender.subscribe()),
+            ClosePhase::Closed { outcome, .. } => CloseStart::Done(outcome.clone()),
         }
     }
 
     fn finish(
         &self,
         sender: watch::Sender<Option<CloseOutcome>>,
+        generation: u64,
         result: &RwResult<()>,
         close_on_error: bool,
     ) {
         let outcome = CloseOutcome::from_result(result);
         {
             let mut phase = self.phase.lock().unwrap();
+            let Some(before_unload_generation) = (match &*phase {
+                ClosePhase::Closing {
+                    generation: active_generation,
+                    before_unload_generation,
+                    ..
+                } if *active_generation == generation => Some(*before_unload_generation),
+                _ => None,
+            }) else {
+                sender.send_replace(Some(outcome));
+                return;
+            };
             if result.is_ok() || close_on_error {
-                *phase = ClosePhase::Closed(outcome.clone());
+                *phase = ClosePhase::Closed {
+                    outcome: outcome.clone(),
+                    before_unload_generation,
+                };
             } else {
+                // Clear the marker before reopening the phase. This keeps a
+                // failed close from changing the event policy of a later
+                // close generation.
                 *phase = ClosePhase::Open;
             }
         }
@@ -319,11 +361,40 @@ impl CloseLifecycle {
     }
 
     fn is_closed(&self) -> bool {
-        matches!(*self.phase.lock().unwrap(), ClosePhase::Closed(_))
+        matches!(*self.phase.lock().unwrap(), ClosePhase::Closed { .. })
     }
 
     fn is_closing_or_closed(&self) -> bool {
         !matches!(*self.phase.lock().unwrap(), ClosePhase::Open)
+    }
+
+    fn clear_before_unload(&self) {
+        let mut phase = self.phase.lock().unwrap();
+        match &mut *phase {
+            ClosePhase::Closing {
+                before_unload_generation,
+                ..
+            }
+            | ClosePhase::Closed {
+                before_unload_generation,
+                ..
+            } => *before_unload_generation = None,
+            ClosePhase::Open => {}
+        }
+    }
+
+    fn allows_events_during_close(&self) -> bool {
+        let phase = self.phase.lock().unwrap();
+        matches!(
+            &*phase,
+            ClosePhase::Closing {
+                before_unload_generation: Some(_),
+                ..
+            } | ClosePhase::Closed {
+                before_unload_generation: Some(_),
+                ..
+            }
+        )
     }
 }
 
@@ -350,12 +421,25 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = RwResult<()>>,
 {
-    match lifecycle.start() {
+    single_flight_close_mode(lifecycle, close_on_error, false, cleanup).await
+}
+
+async fn single_flight_close_mode<F, Fut>(
+    lifecycle: Arc<CloseLifecycle>,
+    close_on_error: bool,
+    before_unload: bool,
+    cleanup: F,
+) -> RwResult<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = RwResult<()>>,
+{
+    match lifecycle.start_with_before_unload(before_unload) {
         CloseStart::Done(outcome) => outcome.into_result(),
         CloseStart::Wait(receiver) => wait_for_close_outcome(receiver).await,
-        CloseStart::Lead(sender) => {
+        CloseStart::Lead { sender, generation } => {
             let result = cleanup().await;
-            lifecycle.finish(sender, &result, close_on_error);
+            lifecycle.finish(sender, generation, &result, close_on_error);
             result
         }
     }
@@ -2626,6 +2710,7 @@ fn py_err(error: RwError) -> PyErr {
 #[pyclass(name = "_RustFutureAbort")]
 struct PyRustFutureAbort {
     cancellation: RustFutureCancellation,
+    cancel_hook: Option<PageEventStreamCancelHook>,
 }
 
 #[cfg(feature = "python")]
@@ -2747,6 +2832,9 @@ impl PyRustFutureAbort {
     fn __call__(&self, future: &Bound<'_, PyAny>) -> PyResult<()> {
         if future.call_method0("cancelled")?.extract::<bool>()? {
             self.cancellation.cancel();
+            if let Some(hook) = self.cancel_hook.as_ref() {
+                hook();
+            }
         }
         Ok(())
     }
@@ -2918,6 +3006,7 @@ where
         py,
         PyRustFutureAbort {
             cancellation: RustFutureCancellation::Tokio(task.abort_handle()),
+            cancel_hook: None,
         },
     )?;
     if let Err(error) = returned
@@ -2936,7 +3025,8 @@ fn python_future_on_with_delivery<F, T, C>(
     handle: tokio::runtime::Handle,
     rust_future: F,
     convert: C,
-) -> PyResult<Py<PyAny>>
+    cancel_hook: Option<PageEventStreamCancelHook>,
+) -> PyResult<(Py<PyAny>, tokio::task::AbortHandle)>
 where
     F: Future<Output = RwResult<T>> + Send + 'static,
     T: Send + 'static,
@@ -2950,10 +3040,12 @@ where
         let result = rust_future.await;
         settle_python_future_output(event_loop, future, result, convert);
     });
+    let abort_handle = task.abort_handle();
     let aborter = Py::new(
         py,
         PyRustFutureAbort {
-            cancellation: RustFutureCancellation::Tokio(task.abort_handle()),
+            cancellation: RustFutureCancellation::Tokio(abort_handle.clone()),
+            cancel_hook,
         },
     )?;
     if let Err(error) = returned
@@ -2963,7 +3055,7 @@ where
         task.abort();
         return Err(error);
     }
-    Ok(returned)
+    Ok((returned, abort_handle))
 }
 
 #[cfg(feature = "python")]
@@ -2987,6 +3079,7 @@ where
         py,
         PyRustFutureAbort {
             cancellation: RustFutureCancellation::Thread(cancelled),
+            cancel_hook: None,
         },
     )?;
     returned
@@ -4149,6 +4242,244 @@ multiline-compatible = """4.5.6"""
         cancellation.await.unwrap();
         assert!(matches!(result, Err(RwError::Cancelled)));
         assert!(started.elapsed() < Duration::from_millis(250));
+    }
+    #[cfg(feature = "python")]
+    fn initialize_test_python() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let version = unsafe { std::ffi::CStr::from_ptr(pyo3::ffi::Py_GetVersion()) }
+                .to_str().unwrap();
+            let version = version.split('.').take(2).collect::<Vec<_>>().join(".");
+            let mut home = None;
+            #[cfg(unix)]
+            unsafe {
+                // Equal Python versions can come from incompatible distributions. Resolve
+                // the loaded library, not a PATH interpreter with different native modules.
+                let mut library: libc::Dl_info = std::mem::zeroed();
+                if libc::dladdr(pyo3::ffi::Py_GetVersion as *const libc::c_void, &mut library) != 0
+                    && !library.dli_fname.is_null() {
+                    let path = std::ffi::CStr::from_ptr(library.dli_fname).to_str().unwrap();
+                    home = Path::new(path).ancestors().find(|prefix|
+                        prefix.join(format!("lib/python{version}/encodings")).is_dir()
+                    ).map(Path::to_path_buf);
+                }
+            }
+            let home = home.unwrap_or_else(|| {
+                let executable = Path::new(env!("CARGO_MANIFEST_DIR")).join(".venv")
+                    .join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
+                let python = if executable.is_file() { executable } else {
+                    env::var_os("PYO3_PYTHON").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("python3"))
+                };
+                let output = Command::new(python).args(["-c",
+                    "import json, sys; print(json.dumps([sys.base_prefix, '%d.%d' % sys.version_info[:2]]))"])
+                    .env_remove("PYTHONHOME").env_remove("PYTHONPATH")
+                    .output().expect("resolve the test interpreter home");
+                assert!(output.status.success(), "test interpreter discovery failed");
+                let config: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(version, config[1], "test interpreter version differs from linked Python");
+                PathBuf::from(&config[0])
+            });
+            let home = std::ffi::CString::new(home.to_str().unwrap()).unwrap();
+            // Configure the linked interpreter without changing process-wide environment.
+            // The stable ABI requires this wide string to live until interpreter shutdown.
+            unsafe {
+                let home = pyo3::ffi::Py_DecodeLocale(home.as_ptr(), std::ptr::null_mut());
+                assert!(!home.is_null(), "decode the test interpreter home");
+                pyo3::ffi::Py_SetPythonHome(home);
+            }
+            Python::initialize();
+        });
+    }
+
+    #[cfg(feature = "python")]
+    pub(super) struct PageEventStreamHandoffBarrier {
+        pub entered: std::sync::mpsc::Sender<()>,
+        pub release: std::sync::mpsc::Receiver<()>,
+        pub restored: std::sync::mpsc::Sender<()>,
+    }
+
+    #[cfg(feature = "python")]
+    pub(super) fn page_event_stream_handoff_barriers(
+    ) -> &'static Mutex<HashMap<usize, PageEventStreamHandoffBarrier>> {
+        static BARRIERS: OnceLock<Mutex<HashMap<usize, PageEventStreamHandoffBarrier>>> =
+            OnceLock::new();
+        BARRIERS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn page_event_stream_cancel_retry_during_lease_handoff_preserves_receiver() {
+        initialize_test_python();
+        let harness = navigation_test_harness(8);
+        let stream = PyPage {
+            inner: Arc::clone(&harness.page),
+        }
+        .combined_event_stream()
+        .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (restored_tx, restored_rx) = std::sync::mpsc::channel();
+        page_event_stream_handoff_barriers().lock().unwrap().insert(
+            Arc::as_ptr(&stream.state) as usize,
+            PageEventStreamHandoffBarrier {
+                entered: entered_tx,
+                release: release_rx,
+                restored: restored_tx,
+            },
+        );
+        Python::attach(|py| {
+            let asyncio = PyModule::import(py, "asyncio").unwrap();
+            let event_loop = asyncio.call_method0("new_event_loop").unwrap();
+            let events = asyncio.getattr("events").unwrap();
+            events
+                .call_method1("_set_running_loop", (&event_loop,))
+                .unwrap();
+            let future = stream.wait_batch_async(py, Some(30_000.0), 64).unwrap();
+            events
+                .call_method1("_set_running_loop", (py.None(),))
+                .unwrap();
+            future.call_method0(py, "cancel").unwrap();
+            stream.cancel_wait();
+            py.detach(move || entered_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            // Park Drop at the former publication-before-restoration boundary.
+            // Both public acquisition paths must fail without stealing the receiver.
+            assert!(stream.receiver.lock().unwrap().is_none());
+            assert!(stream.wait_batch_async(py, Some(1.0), 64).is_err());
+            assert!(stream.wait_batch(py, Some(1.0), 64).is_err());
+            events
+                .call_method1("_set_running_loop", (&event_loop,))
+                .unwrap();
+            let restored = stream.cancel_wait_async(py).unwrap();
+            events
+                .call_method1("_set_running_loop", (py.None(),))
+                .unwrap();
+            assert!(!restored
+                .call_method0(py, "done")
+                .unwrap()
+                .extract::<bool>(py)
+                .unwrap());
+            release_tx.send(()).unwrap();
+            let bounded = asyncio.call_method1("wait_for", (restored, 5.0)).unwrap();
+            event_loop
+                .call_method1("run_until_complete", (bounded,))
+                .unwrap();
+            py.detach(move || restored_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            assert!(stream.receiver.lock().unwrap().is_some());
+            assert!(stream.state.lock().unwrap().is_some());
+            assert_eq!(stream.event_cursor(), 0);
+            // A failed second take must put back the receiver it already took.
+            let state = stream.state.lock().unwrap().take();
+            assert!(stream.wait_batch_async(py, Some(1.0), 64).is_err());
+            assert!(stream.receiver.lock().unwrap().is_some());
+            assert!(stream.wait_batch(py, Some(1.0), 64).is_err());
+            assert!(stream.receiver.lock().unwrap().is_some());
+            *stream.state.lock().unwrap() = state;
+            harness.emit(
+                json!({"sessionId": "page-session", "method": "Page.javascriptDialogOpening",
+                "params": {"type": "alert", "message": "after cancellation"}}),
+            );
+            events
+                .call_method1("_set_running_loop", (&event_loop,))
+                .unwrap();
+            let retry = stream.wait_batch_async(py, Some(100.0), 64).unwrap();
+            events
+                .call_method1("_set_running_loop", (py.None(),))
+                .unwrap();
+            let batch: Value = serde_json::from_str(
+                &event_loop
+                    .call_method1("run_until_complete", (retry,))
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+            )
+            .unwrap();
+            stream.ack_batch();
+            assert_eq!(batch[0]["kind"], "dialog");
+            assert_eq!(batch[0]["payload"]["message"], "after cancellation");
+            assert_eq!(stream.event_cursor(), 1);
+            event_loop
+                .call_method1("call_soon", (event_loop.getattr("stop").unwrap(),))
+                .unwrap();
+            event_loop.call_method0("run_forever").unwrap();
+            event_loop.call_method0("close").unwrap();
+        });
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn page_event_stream_cancel_with_queued_python_settler_replays_batch() {
+        initialize_test_python();
+        let harness = navigation_test_harness(8);
+        let stream = PyPage {
+            inner: Arc::clone(&harness.page),
+        }
+        .combined_event_stream()
+        .unwrap();
+        harness.emit(
+            json!({"sessionId": "page-session", "method": "Page.javascriptDialogOpening",
+            "params": {"type": "alert", "message": "queued settlement"}}),
+        );
+        Python::attach(|py| {
+            let asyncio = PyModule::import(py, "asyncio").unwrap();
+            let event_loop = asyncio.call_method0("new_event_loop").unwrap();
+            let events = asyncio.getattr("events").unwrap();
+            events
+                .call_method1("_set_running_loop", (&event_loop,))
+                .unwrap();
+            let future = stream.wait_batch_async(py, Some(1_000.0), 64).unwrap();
+            events
+                .call_method1("_set_running_loop", (py.None(),))
+                .unwrap();
+            let abort = stream
+                .active_wait
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .abort_handle
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .clone();
+            py.detach(|| {
+                harness.page.browser.block_on_raw(async {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while !abort.is_finished() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                })
+            });
+            // Native completion has queued the real settler, but Python has not
+            // executed it. Cancellation must return without waiting for that loop.
+            assert!(!future
+                .call_method0(py, "done")
+                .unwrap()
+                .extract::<bool>(py)
+                .unwrap());
+            future.call_method0(py, "cancel").unwrap();
+            stream.cancel_wait();
+            events
+                .call_method1("_set_running_loop", (&event_loop,))
+                .unwrap();
+            let restored = stream.cancel_wait_async(py).unwrap();
+            events
+                .call_method1("_set_running_loop", (py.None(),))
+                .unwrap();
+            let bounded = asyncio.call_method1("wait_for", (restored, 5.0)).unwrap();
+            event_loop
+                .call_method1("run_until_complete", (bounded,))
+                .unwrap();
+            assert_eq!(stream.event_cursor(), 0);
+            let batch: Value =
+                serde_json::from_str(&stream.wait_batch(py, Some(100.0), 64).unwrap()).unwrap();
+            assert_eq!(batch[0]["payload"]["message"], "queued settlement");
+            assert_eq!(stream.event_cursor(), 1);
+            event_loop.call_method0("close").unwrap();
+        });
     }
 
     #[test]
@@ -9018,6 +9349,24 @@ multiline-compatible = """4.5.6"""
 
     #[test]
     fn blocking_wrapper_falls_back_when_python_is_unavailable() {
+        const CHILD: &str = "RUSTWRIGHT_TEST_WITHOUT_PYTHON";
+        if env::var_os(CHILD).is_none() {
+            let output = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::blocking_wrapper_falls_back_when_python_is_unavailable",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         assert!(
             Python::try_attach(|_| ()).is_none(),
             "cargo test should not initialize the Python interpreter"
@@ -9061,6 +9410,32 @@ multiline-compatible = """4.5.6"""
         first.await.unwrap().unwrap();
         second.await.unwrap().unwrap();
         assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
+        assert!(lifecycle.is_closed());
+    }
+
+    #[test]
+    fn failed_before_unload_close_clears_marker_for_next_generation() {
+        let lifecycle = CloseLifecycle::new();
+        let CloseStart::Lead { sender, generation } = lifecycle.start_with_before_unload(true)
+        else {
+            panic!("first close must own the lifecycle");
+        };
+        assert!(lifecycle.allows_events_during_close());
+        lifecycle.finish(
+            sender,
+            generation,
+            &Err(RwError::Message("close failed".to_string())),
+            false,
+        );
+        assert!(!lifecycle.is_closing_or_closed());
+        assert!(!lifecycle.allows_events_during_close());
+
+        let CloseStart::Lead { sender, generation } = lifecycle.start_with_before_unload(false)
+        else {
+            panic!("failed close must allow a retry");
+        };
+        assert!(!lifecycle.allows_events_during_close());
+        lifecycle.finish(sender, generation, &Ok(()), false);
         assert!(lifecycle.is_closed());
     }
 
@@ -9109,11 +9484,14 @@ multiline-compatible = """4.5.6"""
         };
 
         let (closed_browser, mut closed_writes) = make_browser();
-        let sender = match closed_browser.inner.lifecycle.start() {
-            CloseStart::Lead(sender) => sender,
+        let (sender, generation) = match closed_browser.inner.lifecycle.start() {
+            CloseStart::Lead { sender, generation } => (sender, generation),
             _ => panic!("new lifecycle must lead close"),
         };
-        closed_browser.inner.lifecycle.finish(sender, &Ok(()), true);
+        closed_browser
+            .inner
+            .lifecycle
+            .finish(sender, generation, &Ok(()), true);
         assert!(matches!(closed_browser.new_page(), Err(RwError::Closed)));
         assert!(matches!(
             closed_browser.pages(Duration::from_secs(1)),
@@ -9960,6 +10338,7 @@ multiline-compatible = """4.5.6"""
             requests: Arc::clone(&shared_requests),
             working_requests: Arc::clone(&working_requests),
             page: None,
+            restored: None,
         };
 
         drop(lease);
@@ -9987,6 +10366,7 @@ multiline-compatible = """4.5.6"""
             requests: Arc::clone(&shared_requests),
             working_requests,
             page: None,
+            restored: None,
         };
         {
             let mut live = shared_requests.lock().unwrap();
@@ -10086,6 +10466,7 @@ multiline-compatible = """4.5.6"""
             requests: Arc::clone(&shared_requests),
             working_requests,
             page: Some(page.clone()),
+            restored: None,
         };
 
         page.release_memory_buffers();
@@ -10201,6 +10582,7 @@ multiline-compatible = """4.5.6"""
             requests: Arc::clone(&shared_requests),
             working_requests,
             page: None,
+            restored: None,
         };
 
         shared_requests.lock().unwrap().reset_after_overflow(20);
@@ -10368,6 +10750,7 @@ multiline-compatible = """4.5.6"""
             requests: Arc::clone(&shared_requests),
             working_requests,
             page: None,
+            restored: None,
         };
 
         shared_requests.lock().unwrap().reset_after_overflow(8_000);
@@ -10465,6 +10848,7 @@ multiline-compatible = """4.5.6"""
             requests: Arc::clone(&shared_requests),
             working_requests,
             page: None,
+            restored: None,
         };
 
         shared_requests.lock().unwrap().reset_after_overflow(8_000);
@@ -10583,6 +10967,729 @@ multiline-compatible = """4.5.6"""
         assert_eq!(batch[2]["kind"], "requestfinished");
     }
 
+    pub(super) fn page_event_stream_snapshot_barriers(
+    ) -> &'static Mutex<HashMap<usize, (oneshot::Sender<()>, oneshot::Receiver<()>)>> {
+        static BARRIERS: OnceLock<
+            Mutex<HashMap<usize, (oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+        > = OnceLock::new();
+        BARRIERS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn beforeunload_stream_drains_dialog_before_terminal_receipt() {
+        for terminal in [
+            json!({"method": "Target.targetDestroyed", "params": {"targetId": "test-target"}}),
+            json!({"method": "Inspector.detached", "sessionId": "page-session", "params": {}}),
+            json!({"method": "Target.detachedFromTarget", "params": {"sessionId": "page-session"}}),
+        ] {
+            for (with_dialog, pending_response, after_snapshot, max_events) in
+                [false, true].into_iter().flat_map(|dialog| {
+                    [false, true].into_iter().flat_map(move |response| {
+                        [false, true].into_iter().flat_map(move |after| {
+                            [1, 2, 64]
+                                .into_iter()
+                                .map(move |limit| (dialog, response, after, limit))
+                        })
+                    })
+                })
+            {
+                let mut harness = navigation_test_harness(8);
+                let page = Arc::clone(&harness.page);
+                let (mut events, mut cursor, mut state) =
+                    PageEventStreamState::subscribe_page_event_stream(&page);
+                let closing_page = Arc::clone(&page);
+                let closing =
+                    tokio::spawn(page_close_async(closing_page, Duration::from_secs(2), true));
+                let command = harness.next_command("Page.close").await;
+                harness.reply(&command, json!({}));
+                closing.await.unwrap().unwrap();
+                assert!(page.lifecycle.is_closing_or_closed());
+                assert!(!page.target_closed.load(Ordering::SeqCst));
+                #[cfg(feature = "python")]
+                assert!(!PyPage {
+                    inner: Arc::clone(&page)
+                }
+                .is_closed());
+                let publish = async {
+                    if pending_response {
+                        harness.emit(json!({"sessionId": "page-session", "method": "Network.requestWillBeSent",
+                            "params": {"requestId": "pending", "type": "Document",
+                                "request": {"url": "https://example.test/", "method": "GET", "headers": {}}}}));
+                        harness.emit(json!({"sessionId": "page-session", "method": "Network.responseReceived",
+                            "params": {"requestId": "pending", "type": "Document", "hasExtraInfo": true,
+                                "response": {"url": "https://example.test/", "status": 200, "headers": {}}}}));
+                    }
+                    if with_dialog {
+                        harness.emit(json!({"sessionId": "page-session", "method": "Page.javascriptDialogOpening",
+                            "params": {"type": "beforeunload", "message": ""}}));
+                    }
+                    harness.emit(terminal.clone());
+                    handle_page_oopif_event(Arc::clone(&page), terminal.clone()).await;
+                    assert!(page.target_closed.load(Ordering::SeqCst));
+                };
+                let (_close_tx, close_rx) = watch::channel(false);
+                let (_alive_tx, alive_rx) = watch::channel(true);
+                let first = wait_for_page_event_batch(
+                    &mut events,
+                    Arc::clone(&harness.event_log),
+                    &mut cursor,
+                    "page-session",
+                    Arc::clone(&page.network_requests),
+                    &mut state,
+                    &page,
+                    close_rx.clone(),
+                    alive_rx.clone(),
+                    Duration::ZERO,
+                    max_events,
+                );
+                let (mut batch, mut closed) = if after_snapshot {
+                    let (entered_tx, entered_rx) = oneshot::channel();
+                    let (release_tx, release_rx) = oneshot::channel();
+                    page_event_stream_snapshot_barriers()
+                        .lock()
+                        .unwrap()
+                        .insert(Arc::as_ptr(&page) as usize, (entered_tx, release_rx));
+                    // Publish only after the reader captured an empty tail. The
+                    // terminal flag must force another ordered scan of that tail.
+                    let (_, result) = tokio::join!(
+                        async {
+                            entered_rx.await.unwrap();
+                            publish.await;
+                            release_tx.send(()).unwrap();
+                        },
+                        first
+                    );
+                    result
+                } else {
+                    publish.await;
+                    first.await
+                };
+                assert!(batch.len() <= max_events);
+                for _ in 0..4 {
+                    if closed {
+                        break;
+                    }
+                    let (next, terminal) = wait_for_page_event_batch(
+                        &mut events,
+                        Arc::clone(&harness.event_log),
+                        &mut cursor,
+                        "page-session",
+                        Arc::clone(&page.network_requests),
+                        &mut state,
+                        &page,
+                        close_rx.clone(),
+                        alive_rx.clone(),
+                        Duration::ZERO,
+                        max_events,
+                    )
+                    .await;
+                    assert!(!next.is_empty());
+                    assert!(next.len() <= max_events);
+                    batch.extend(next);
+                    closed = terminal;
+                }
+                assert!(closed);
+                let kinds: Vec<_> = batch
+                    .iter()
+                    .map(|event| event["kind"].as_str().unwrap())
+                    .collect();
+                let mut expected = Vec::new();
+                if pending_response {
+                    expected.extend(["request", "response"]);
+                }
+                if with_dialog {
+                    expected.push("dialog");
+                }
+                expected.push("_closed");
+                assert_eq!(kinds, expected);
+                assert!(batch
+                    .windows(2)
+                    .all(|pair| pair[0]["seq"].as_u64() < pair[1]["seq"].as_u64()));
+                assert!(state.network.pending_responses.is_empty());
+                assert!(state.ready.is_empty());
+                assert_eq!(cursor, harness.event_log.lock().unwrap().cursor());
+            }
+        }
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn page_event_stream_sync_beforeunload_batches_share_terminal_read_cursor() {
+        initialize_test_python();
+        let harness = navigation_test_harness(8);
+        let page = &harness.page;
+        let stream = PyPage {
+            inner: Arc::clone(page),
+        }
+        .combined_event_stream()
+        .unwrap();
+        let _closing = page.lifecycle.start_with_before_unload(true);
+        harness.emit(
+            json!({"sessionId": "page-session", "method": "Network.requestWillBeSent",
+            "params": {"requestId": "pending", "type": "Document",
+                "request": {"url": "https://example.test/", "method": "GET", "headers": {}}}}),
+        );
+        harness.emit(
+            json!({"sessionId": "page-session", "method": "Network.responseReceived",
+            "params": {"requestId": "pending", "type": "Document", "hasExtraInfo": true,
+                "response": {"url": "https://example.test/", "status": 200, "headers": {}}}}),
+        );
+        {
+            let entries = harness.event_log.lock().unwrap().entries_since(0);
+            let mut slot = stream.state.lock().unwrap();
+            let state = slot.as_mut().unwrap();
+            for (seq, event) in entries {
+                process_page_observation_event_with_page(
+                    seq,
+                    &event,
+                    &harness.event_log,
+                    "page-session",
+                    &page.network_requests,
+                    state,
+                    Some(page),
+                );
+            }
+            // This pin tests terminal draining, independent of time spent waiting for the GIL.
+            state
+                .network
+                .pending_responses
+                .get_mut("pending")
+                .unwrap()
+                .deadline = tokio::time::Instant::now() + DISABLED_ACTION_TIMEOUT;
+            *stream.cursor.lock().unwrap() = harness.event_log.lock().unwrap().cursor();
+        }
+        for index in 0..64 {
+            harness.emit(json!({"sessionId": "page-session", "method": "Runtime.consoleAPICalled",
+                "params": {"type": "log", "args": [{"type": "string", "value": index.to_string()}]}}));
+        }
+        harness.emit(
+            json!({"sessionId": "page-session", "method": "Page.javascriptDialogOpening",
+            "params": {"type": "beforeunload", "message": "retained"}}),
+        );
+        harness.emit(
+            json!({"method": "Target.targetDestroyed", "params": {"targetId": "test-target"}}),
+        );
+        page.target_closed.store(true, Ordering::SeqCst);
+        Python::attach(|py| {
+            let first: Vec<Value> =
+                serde_json::from_str(&stream.wait_batch(py, Some(100.0), 64).unwrap()).unwrap();
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0]["kind"], "request");
+            stream.ack_batch();
+            let full: Vec<Value> =
+                serde_json::from_str(&stream.wait_batch(py, Some(100.0), 64).unwrap()).unwrap();
+            assert_eq!(full.len(), 64);
+            assert_eq!(full[0]["kind"], "response");
+            assert!(full[1..].iter().all(|event| event["kind"] == "console"));
+            let terminal_cursor = stream.event_cursor();
+            let log_cursor = harness.event_log.lock().unwrap().cursor();
+            assert_eq!(terminal_cursor, log_cursor);
+            assert!(!stream.is_closed());
+            stream.ack_batch();
+            let last: Vec<Value> =
+                serde_json::from_str(&stream.wait_batch(py, Some(100.0), 64).unwrap()).unwrap();
+            assert_eq!(
+                last.iter()
+                    .map(|event| event["kind"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["console", "dialog", "_closed"]
+            );
+            assert_eq!(stream.event_cursor(), terminal_cursor);
+            // Native closure acknowledges reading, not Python dispatch. The
+            // close barrier must wait for consumption even at this same cursor.
+            assert!(stream.is_closed());
+        });
+    }
+
+    #[tokio::test]
+    async fn beforeunload_stream_overflow_drains_retained_dialog_and_terminal() {
+        for max_events in [1, 64] {
+            let harness = navigation_test_harness(8);
+            let page = &harness.page;
+            let (mut events, mut cursor, mut state) =
+                PageEventStreamState::subscribe_page_event_stream(page);
+            for index in 0..CDP_EVENT_LOG_LIMIT {
+                harness.emit(json!({"method": "Test.unrelated", "params": {"index": index}}));
+            }
+            let _closing = page.lifecycle.start_with_before_unload(true);
+            let dialog_seq = harness.event_log.lock().unwrap().cursor();
+            harness.emit(
+                json!({"sessionId": "page-session", "method": "Page.javascriptDialogOpening",
+                "params": {"type": "beforeunload", "message": "retained"}}),
+            );
+            let terminal =
+                json!({"method": "Target.targetDestroyed", "params": {"targetId": "test-target"}});
+            harness.emit(terminal.clone());
+            handle_page_oopif_event(Arc::clone(page), terminal).await;
+            let oldest_seq = harness.event_log.lock().unwrap().oldest_seq();
+            assert!(oldest_seq > cursor && oldest_seq < dialog_seq);
+            let (_close_tx, close_rx) = watch::channel(false);
+            let (_alive_tx, alive_rx) = watch::channel(true);
+            let mut received = Vec::new();
+            let mut closed = false;
+            for _ in 0..3 {
+                let (batch, terminal) = wait_for_page_event_batch(
+                    &mut events,
+                    Arc::clone(&harness.event_log),
+                    &mut cursor,
+                    "page-session",
+                    Arc::clone(&page.network_requests),
+                    &mut state,
+                    page,
+                    close_rx.clone(),
+                    alive_rx.clone(),
+                    Duration::from_millis(100),
+                    max_events,
+                )
+                .await;
+                assert!(batch.len() <= max_events);
+                received.extend(batch);
+                closed = terminal;
+                if closed {
+                    break;
+                }
+            }
+            assert!(closed);
+            assert_eq!(
+                received
+                    .iter()
+                    .map(|event| event["kind"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["_overflow", "dialog", "_closed"]
+            );
+            assert_eq!(received[0]["payload"]["dropped"], oldest_seq);
+            assert_eq!(received[1]["seq"], dialog_seq);
+            assert_eq!(received[1]["payload"]["message"], "retained");
+            assert_eq!(cursor, harness.event_log.lock().unwrap().cursor());
+        }
+    }
+
+    #[tokio::test]
+    async fn evicted_active_dialog_recovery_respects_delivery_and_close() {
+        for max_events in [1, 64] {
+            for disposition in ["open", "delivered", "closed", "detached", "released"] {
+                let harness = navigation_test_harness(8);
+                let page = &harness.page;
+                let (mut events, mut cursor, mut state) =
+                    PageEventStreamState::subscribe_page_event_stream(page);
+                harness.emit(
+                    json!({"sessionId": "page-session", "method": "Page.javascriptDialogOpening",
+                    "params": {"type": "beforeunload", "message": "evicted"}}),
+                );
+                let (_close_tx, close_rx) = watch::channel(false);
+                let (_alive_tx, alive_rx) = watch::channel(true);
+                if disposition == "delivered" {
+                    let (batch, _) = wait_for_page_event_batch(
+                        &mut events,
+                        Arc::clone(&harness.event_log),
+                        &mut cursor,
+                        "page-session",
+                        Arc::clone(&page.network_requests),
+                        &mut state,
+                        page,
+                        close_rx.clone(),
+                        alive_rx.clone(),
+                        Duration::ZERO,
+                        max_events,
+                    )
+                    .await;
+                    assert_eq!(batch[0]["kind"], "dialog");
+                } else if disposition == "closed" {
+                    harness.emit(json!({"sessionId": "page-session", "method": "Page.javascriptDialogClosed", "params": {}}));
+                } else if disposition == "detached" {
+                    harness.emit(json!({"method": "Target.detachedFromTarget", "params": {"sessionId": "page-session"}}));
+                } else if disposition == "released" {
+                    page.release_memory_buffers();
+                }
+                for _ in 0..=CDP_EVENT_LOG_LIMIT {
+                    harness.emit(json!({"sessionId": "other-session", "method": "Test.unrelated"}));
+                }
+                assert!(harness.event_log.lock().unwrap().oldest_seq() > cursor);
+                assert_eq!(
+                    harness.event_log.lock().unwrap().active_dialogs.len(),
+                    usize::from(matches!(disposition, "open" | "delivered"))
+                );
+                let mut received = Vec::new();
+                for _ in 0..3 {
+                    let (batch, _) = wait_for_page_event_batch(
+                        &mut events,
+                        Arc::clone(&harness.event_log),
+                        &mut cursor,
+                        "page-session",
+                        Arc::clone(&page.network_requests),
+                        &mut state,
+                        page,
+                        close_rx.clone(),
+                        alive_rx.clone(),
+                        Duration::ZERO,
+                        max_events,
+                    )
+                    .await;
+                    assert!(batch.len() <= max_events);
+                    received.extend(batch);
+                }
+                assert_eq!(
+                    received
+                        .iter()
+                        .filter(|event| event["kind"] == "dialog")
+                        .count(),
+                    usize::from(disposition == "open")
+                );
+                harness.event_log.lock().unwrap().clear_retained();
+                assert!(harness.event_log.lock().unwrap().active_dialogs.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn page_drop_tolerates_event_log_poison_during_unwind() {
+        let harness = navigation_test_harness(8);
+        harness.emit(
+            json!({"sessionId": "page-session", "method": "Page.javascriptDialogOpening",
+            "params": {"type": "alert", "message": "cleanup"}}),
+        );
+        let log = Arc::clone(&harness.event_log);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let harness = harness;
+            let _guard = harness.event_log.lock().unwrap();
+            panic!("simulate an assertion while holding the event log");
+        }));
+        assert!(result.is_err());
+        assert!(log.is_poisoned());
+        assert!(log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_dialogs
+            .is_empty());
+    }
+
+    #[test]
+    fn reset_active_dialog_recovery_respects_delivery_and_close() {
+        for backfill in [false, true] {
+            for disposition in ["queued", "delivered", "closed"] {
+                let harness = navigation_test_harness(8);
+                let page = &harness.page;
+                let mut state = PageEventStreamState::for_page(page);
+                harness.emit(json!({"sessionId": "page-session", "method": "Network.responseReceived",
+                    "params": {"requestId": "pending", "hasExtraInfo": true, "response": {"status": 200}}}));
+                harness.emit(
+                    json!({"sessionId": "page-session", "method": "Page.javascriptDialogOpening",
+                    "params": {"type": "beforeunload", "message": "queued"}}),
+                );
+                let entries = harness.event_log.lock().unwrap().entries_since(0);
+                for (seq, event) in entries {
+                    process_page_observation_event_with_page(
+                        seq,
+                        &event,
+                        &harness.event_log,
+                        "page-session",
+                        &page.network_requests,
+                        &mut state,
+                        Some(page),
+                    );
+                }
+                let mut batch = Vec::new();
+                append_ready_page_events(&mut batch, &mut state, 64);
+                assert!(batch.is_empty());
+                assert_eq!(state.ready[&1]["kind"], "dialog");
+                assert_eq!(state.network.earliest_pending_seq(), Some(0));
+                if disposition == "delivered" {
+                    state.network.pending_responses.clear();
+                    append_ready_page_events(&mut batch, &mut state, 64);
+                    assert_eq!(batch[0]["kind"], "dialog");
+                } else if disposition == "closed" {
+                    harness.emit(json!({"sessionId": "page-session", "method": "Page.javascriptDialogClosed", "params": {}}));
+                }
+                for _ in 0..2 {
+                    let tombstone_seq = harness.event_log.lock().unwrap().cursor();
+                    harness.emit(json!({"sessionId": "other-session", "method": "Runtime.consoleAPICalled",
+                        "params": {"type": "log", "args": (0..9).map(|index|
+                            json!({"type": "string", "value": format!("{index}:{}", "x".repeat(8_193))})
+                        ).collect::<Vec<_>>()}}));
+                    if backfill {
+                        // The request store must backfill the real tombstone.
+                        page.network_requests.lock().unwrap().next_applied_seq = tombstone_seq;
+                        harness.emit(
+                            json!({"sessionId": "other-session", "method": "Test.unrelated"}),
+                        );
+                    }
+                    let (seq, event) = {
+                        let log = harness.event_log.lock().unwrap();
+                        assert_eq!(log.oldest_seq(), 0);
+                        let entries = log.entries_since(tombstone_seq);
+                        assert!(is_unreplayable_cdp_event(&entries[0].1));
+                        entries.last().unwrap().clone()
+                    };
+                    process_page_observation_event_with_page(
+                        seq,
+                        &event,
+                        &harness.event_log,
+                        "page-session",
+                        &page.network_requests,
+                        &mut state,
+                        Some(page),
+                    );
+                    assert!(state.network.pending_responses.is_empty());
+                }
+                batch.clear();
+                append_ready_page_events(&mut batch, &mut state, 64);
+                assert_eq!(
+                    batch
+                        .iter()
+                        .filter(|event| event["kind"] == "dialog")
+                        .count(),
+                    usize::from(disposition == "queued")
+                );
+                assert!(batch.iter().any(|event| event["kind"] == "_overflow"));
+            }
+        }
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn evicted_active_dialog_reaches_both_python_pumps_once() {
+        initialize_test_python();
+        Python::attach(|py| {
+            let sys = PyModule::import(py, "sys").unwrap();
+            sys.getattr("path")
+                .unwrap()
+                .call_method1(
+                    "insert",
+                    (0, concat!(env!("CARGO_MANIFEST_DIR"), "/python")),
+                )
+                .unwrap();
+            let native = PyModule::new(py, "rustwright._rustwright").unwrap();
+            _rustwright(py, &native).unwrap();
+            sys.getattr("modules")
+                .unwrap()
+                .set_item("rustwright._rustwright", native)
+                .unwrap();
+            let source =
+                std::ffi::CString::new(include_str!("../tests/dialog_overflow_pump.py")).unwrap();
+            let helper = PyModule::from_code(
+                py,
+                &source,
+                c"dialog_overflow_pump.py",
+                c"dialog_overflow_pump",
+            )
+            .unwrap();
+            for async_mode in [false, true] {
+                for ownership in ["unowned", "listener", "waiter"] {
+                    for (kind, tombstone) in [
+                        ("alert", false),
+                        ("beforeunload", false),
+                        ("alert", true),
+                        ("beforeunload", true),
+                    ] {
+                        let mut harness = navigation_test_harness(8);
+                        let stream = PyPage {
+                            inner: Arc::clone(&harness.page),
+                        }
+                        .combined_event_stream()
+                        .unwrap();
+                        let event_log = Arc::clone(&harness.event_log);
+                        let events = harness.events.clone();
+                        let pending = Arc::clone(&harness.pending);
+                        let publish = pyo3::types::PyCFunction::new_closure(py, None, None,
+                            move |args: &Bound<'_, pyo3::types::PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| -> PyResult<()> {
+                                let phase: u8 = args.get_item(0)?.extract()?;
+                                let emit = |event| dispatch_cdp_payload(event, Arc::clone(&pending), events.clone(), Arc::clone(&event_log));
+                                let overflow = || {
+                                    if tombstone {
+                                        emit(json!({"sessionId": "other-session", "method": "Runtime.consoleAPICalled",
+                                            "params": {"type": "log", "args": (0..9).map(|index|
+                                                json!({"type": "string", "value": format!("{index}:{}", "x".repeat(8_193))})
+                                            ).collect::<Vec<_>>()}}));
+                                        let log = event_log.lock().unwrap();
+                                        assert_eq!(log.oldest_seq(), 0);
+                                        assert!(is_unreplayable_cdp_event(&log.events.back().unwrap().event));
+                                        drop(log);
+                                        // Async request snapshots backfill the tombstone on the
+                                        // next event. Keep that reset ahead of the pump's marker.
+                                        emit(json!({"sessionId": "other-session", "method": "Test.unrelated"}));
+                                    } else {
+                                        for _ in 0..=CDP_EVENT_LOG_LIMIT {
+                                            emit(json!({"sessionId": "other-session", "method": "Test.unrelated"}));
+                                        }
+                                    }
+                                };
+                                if phase == 1 {
+                                    if tombstone {
+                                        emit(json!({"sessionId": "page-session", "method": "Network.responseReceived",
+                                            "params": {"requestId": "pending", "hasExtraInfo": true,
+                                                "response": {"status": 200}}}));
+                                    }
+                                    let opening = event_log.lock().unwrap().cursor();
+                                    emit(json!({"sessionId": "page-session", "method": "Page.javascriptDialogOpening",
+                                        "params": {"type": kind, "message": "evicted"}}));
+                                    overflow();
+                                    let log = event_log.lock().unwrap();
+                                    assert_eq!(log.oldest_seq() > opening, !tombstone);
+                                    assert_eq!(log.entries_since(0).iter().any(|(_, event)| event["method"] == "Page.javascriptDialogOpening"), tombstone);
+                                } else if phase == 2 {
+                                    overflow();
+                                }
+                                emit(json!({"sessionId": "page-session", "method": "Runtime.consoleAPICalled",
+                                    "params": {"type": "log", "args": [{"type": "string", "value": if phase == 0 { "blocked" } else { "drained" }}]}}));
+                                Ok(())
+                            }).unwrap();
+                        helper
+                            .getattr("exercise_dialog_overflow_pump")
+                            .unwrap()
+                            .call1((Py::new(py, stream).unwrap(), publish, async_mode, ownership,
+                                if async_mode && tombstone { 4 } else { 2 }))
+                            .unwrap_or_else(|error| {
+                                error.print(py);
+                                panic!("dialog overflow pump failed: async={async_mode}, ownership={ownership}, kind={kind}, tombstone={tombstone}");
+                            });
+                        assert!(
+                            harness.write_rx.try_recv().is_err(),
+                            "native recovery must issue no CDP command"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn console_capture_lock_waits_respect_operation_budget() {
+        for lock_site in [
+            "setup",
+            "prepare",
+            "enable",
+            "iframe_detach",
+            "worker_detach",
+        ] {
+            let mut harness = navigation_test_harness(8);
+            if matches!(lock_site, "iframe_detach" | "worker_detach") {
+                harness.emit(json!({
+                    "sessionId": "page-session",
+                    "method": "Target.attachedToTarget",
+                    "params": {
+                        "sessionId": "detached-session",
+                        "targetInfo": {
+                            "type": if lock_site == "iframe_detach" { "iframe" } else { "worker" },
+                            "targetId": "detached-target"
+                        }
+                    }
+                }));
+                harness.emit(json!({
+                    "method": "Target.detachedFromTarget",
+                    "params": {"sessionId": "detached-session"}
+                }));
+            }
+            let page = &harness.page;
+            let setup_guard = page.console_capture.setup_lock.lock().await;
+            let enabled_guard = page.console_capture.enabled_sessions.lock().await;
+            let budget = Duration::from_millis(100);
+            let started = Instant::now();
+            let result = tokio::time::timeout(Duration::from_millis(250), async {
+                match lock_site {
+                    "setup" => enable_console_capture(page, budget).await.map(|_| ()),
+                    "prepare" | "iframe_detach" | "worker_detach" => {
+                        prepare_console_capture(page, OperationDeadline::new(budget))
+                            .await
+                            .map(|_| ())
+                    }
+                    _ => enable_console_capture_for_session_at_sample(
+                        page,
+                        "page-session",
+                        budget,
+                        None,
+                    )
+                    .await
+                    .map(|_| ()),
+                }
+            })
+            .await
+            .expect("console setup lock exceeded the operation budget");
+            assert!(
+                matches!(result, Err(RwError::Timeout(100))),
+                "{lock_site}: {result:?}"
+            );
+            // Allow scheduler overhead, but never wait for the lock holder.
+            assert!(started.elapsed() < Duration::from_millis(200));
+            drop(enabled_guard);
+            drop(setup_guard);
+            assert!(harness.try_next_command_any().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn console_replay_sampler_uses_isolated_clock_and_rejects_thrown_values() {
+        for throws in [false, true] {
+            let mut harness = navigation_test_harness(8);
+            warm_main_frame_cache(&harness.page);
+            let page = Arc::clone(&harness.page);
+            let sample = tokio::spawn(async move {
+                sample_console_replay_clock_for_page(
+                    &page,
+                    "page-session",
+                    OperationDeadline::new(Duration::from_secs(2)),
+                )
+                .await
+            });
+            let world = harness.next_command("Page.createIsolatedWorld").await;
+            harness.reply(&world, json!({"executionContextId": 7}));
+            let evaluate = harness.next_command("Runtime.evaluate").await;
+            // An application-world evaluation would return a poisoned clock.
+            let isolated = evaluate["params"]["contextId"] == 7;
+            let value = if isolated && !throws {
+                100.0
+            } else {
+                9_000_000_000_000_000.0
+            };
+            let response = if throws {
+                json!({"result": {"type": "number", "value": value}, "exceptionDetails": {"text": "thrown clock"}})
+            } else {
+                json!({"result": {"type": "number", "value": value}})
+            };
+            harness.reply(&evaluate, response);
+            assert_eq!(
+                sample.await.unwrap(),
+                if throws { None } else { Some(100.0) }
+            );
+            assert!(
+                isolated,
+                "application Date overrides must never supply the sample"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn console_replay_untrusted_sessions_do_not_sample_application_clock() {
+        let mut harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        harness
+            .page
+            .console_capture
+            .enabled_sessions
+            .lock()
+            .await
+            .insert("page-session".to_string());
+        harness
+            .page
+            .frame_state
+            .lock()
+            .unwrap()
+            .record_worker_session_at_sequence("worker-session", Some(0));
+        let deadline = OperationDeadline::new(Duration::from_secs(2));
+        let samples = prepare_console_capture(&harness.page, deadline)
+            .await
+            .unwrap();
+        assert_eq!(samples.get("worker-session"), Some(&None));
+        assert_eq!(
+            sample_console_replay_clock_for_page(&harness.page, "unresolved-session", deadline)
+                .await,
+            None
+        );
+        assert!(
+            harness.try_next_command_any().is_none(),
+            "untrusted sessions must not evaluate default-world Date"
+        );
+    }
+
     #[tokio::test]
     async fn console_capture_provisional_cutoff_blocks_ordered_pump_during_setup() {
         let mut harness = navigation_test_harness(16);
@@ -10594,6 +11701,11 @@ multiline-compatible = """4.5.6"""
         let mut state = PageEventStreamState::for_page(&page);
         let mut cursor = 0;
 
+        page.frame_state
+            .lock()
+            .unwrap()
+            .session_frames
+            .insert("child-session".to_string(), "child-frame".to_string());
         let capture_page = Arc::clone(&page);
         let capture = tokio::spawn(async move {
             enable_console_capture_for_session(
@@ -10603,6 +11715,15 @@ multiline-compatible = """4.5.6"""
             )
             .await
         });
+        let world = harness.next_command("Page.createIsolatedWorld").await;
+        harness.reply(&world, json!({"executionContextId": 7}));
+        let sample = harness.next_command("Runtime.evaluate").await;
+        assert_eq!(sample["params"]["contextId"], 7);
+        assert_eq!(sample["params"]["expression"], "Date.now()");
+        harness.reply(
+            &sample,
+            json!({"result": {"type": "number", "value": 100.0}}),
+        );
         let enable = harness.next_command("Runtime.enable").await;
         assert_eq!(
             event_log
@@ -10636,6 +11757,7 @@ multiline-compatible = """4.5.6"""
             "sessionId": "child-session",
             "method": "Runtime.consoleAPICalled",
             "params": {
+                "timestamp": 99.0,
                 "type": "log",
                 "args": [{"type": "string", "value": "before capture response"}]
             }
@@ -10695,6 +11817,11 @@ multiline-compatible = """4.5.6"""
         let mut state = PageEventStreamState::for_page(&page);
         let mut cursor = 0;
 
+        page.frame_state
+            .lock()
+            .unwrap()
+            .session_frames
+            .insert("child-session".to_string(), "child-frame".to_string());
         let capture_page = Arc::clone(&page);
         let capture = tokio::spawn(async move {
             enable_console_capture_for_session(
@@ -10704,6 +11831,15 @@ multiline-compatible = """4.5.6"""
             )
             .await
         });
+        let world = harness.next_command("Page.createIsolatedWorld").await;
+        harness.reply(&world, json!({"executionContextId": 7}));
+        let sample = harness.next_command("Runtime.evaluate").await;
+        assert_eq!(sample["params"]["contextId"], 7);
+        assert_eq!(sample["params"]["expression"], "Date.now()");
+        harness.reply(
+            &sample,
+            json!({"result": {"type": "number", "value": 100.0}}),
+        );
         let enable = harness.next_command("Runtime.enable").await;
         assert_eq!(
             event_log
@@ -10775,6 +11911,19 @@ multiline-compatible = """4.5.6"""
             )
             .await
         });
+        let frame_tree = harness.next_command("Page.getFrameTree").await;
+        harness.reply(
+            &frame_tree,
+            json!({"frameTree": {"frame": {"id": "main-frame"}}}),
+        );
+        let create_world = harness.next_command("Page.createIsolatedWorld").await;
+        harness.reply(&create_world, json!({"executionContextId": 1}));
+        let sample = harness.next_command("Runtime.evaluate").await;
+        assert_eq!(sample["params"]["expression"], "Date.now()");
+        harness.reply(
+            &sample,
+            json!({"result": {"type": "number", "value": 100.0}}),
+        );
         let enable = harness.next_command("Runtime.enable").await;
         page.release_memory_buffers();
         harness.reply(&enable, json!({}));
@@ -12077,6 +13226,15 @@ return this.dataset.mainWorldOverride === "observed";
         };
         let responder = async move {
             let mut methods = Vec::new();
+            let create_world = harness.next_command("Page.createIsolatedWorld").await;
+            methods.push("Page.createIsolatedWorld");
+            harness.reply(&create_world, json!({"executionContextId": 1}));
+            let sample = harness.next_command("Runtime.evaluate").await;
+            assert_eq!(sample["params"]["expression"], "Date.now()");
+            harness.reply(
+                &sample,
+                json!({"result": {"type": "number", "value": 100.0}}),
+            );
             let runtime_enable = harness.next_command("Runtime.enable").await;
             methods.push("Runtime.enable");
             assert_eq!(runtime_enable["sessionId"], "page-session");
@@ -12118,6 +13276,7 @@ return this.dataset.mainWorldOverride === "observed";
         assert_eq!(
             methods,
             [
+                "Page.createIsolatedWorld",
                 "Runtime.enable",
                 "Runtime.evaluate",
                 "Runtime.callFunctionOn",
@@ -13724,7 +14883,7 @@ return this.dataset.mainWorldOverride === "observed";
     }
 
     #[tokio::test]
-    async fn console_capture_multi_session_setup_uses_remaining_deadline() {
+    async fn console_capture_multi_session_setup_samples_before_enable() {
         let mut harness = navigation_test_harness(8);
         {
             let mut state = harness.page.frame_state.lock().unwrap();
@@ -13734,35 +14893,55 @@ return this.dataset.mainWorldOverride === "observed";
                 .insert("iframe-session".to_string());
         }
         let page = Arc::clone(&harness.page);
-        let operation =
-            async move { enable_console_capture(&page, Duration::from_millis(100)).await };
-        let responder = async {
+        let operation_page = Arc::clone(&page);
+        let operation = enable_console_capture(&operation_page, Duration::from_secs(1));
+        let responder_page = Arc::clone(&page);
+        let responder = async move {
+            let mut sampled = 0;
+            while sampled < 2 {
+                let command = harness.next_command_any().await;
+                match command["method"].as_str() {
+                    Some("Page.getFrameTree") => harness.reply(
+                        &command,
+                        json!({"frameTree": {"frame": {"id": "main-frame"}}}),
+                    ),
+                    Some("Page.createIsolatedWorld") => {
+                        harness.reply(&command, json!({"executionContextId": sampled + 1}));
+                        let sample = harness.next_command("Runtime.evaluate").await;
+                        assert_eq!(sample["params"]["expression"], "Date.now()");
+                        harness.reply(
+                            &sample,
+                            json!({"result": {"type": "number", "value": 100.0 + sampled as f64 * 100.0}}),
+                        );
+                        sampled += 1;
+                    }
+                    Some("Runtime.evaluate") => {
+                        assert_eq!(command["params"]["expression"], "Date.now()");
+                        harness.reply(
+                            &command,
+                            json!({"result": {"type": "number", "value": 100.0 + sampled as f64 * 100.0}}),
+                        );
+                        sampled += 1;
+                    }
+                    method => panic!("unexpected console sample command: {method:?}"),
+                }
+            }
             let first = harness.next_command("Runtime.enable").await;
-            tokio::time::sleep(Duration::from_millis(60)).await;
             harness.reply(&first, json!({}));
+            responder_page
+                .observation_event_cursor
+                .store(u64::MAX, Ordering::SeqCst);
             let second = harness.next_command("Runtime.enable").await;
+            harness.reply(&second, json!({}));
+            responder_page
+                .observation_event_cursor
+                .store(u64::MAX, Ordering::SeqCst);
             (first["sessionId"].clone(), second["sessionId"].clone())
         };
-        let started = Instant::now();
-        let (result, (first_session, second_session)) =
-            tokio::time::timeout(Duration::from_millis(135), async {
-                tokio::join!(operation, responder)
-            })
-            .await
-            .expect("second session setup must consume the remaining budget");
-
-        assert!(
-            matches!(result, Err(RwError::Timeout(ms)) if ms > 0 && ms < 100),
-            "second setup must report only its remaining timeout: {result:?}"
-        );
+        let (result, (first_session, second_session)) = tokio::join!(operation, responder);
+        result.expect("multi-session capture should complete");
         assert_ne!(first_session, second_session);
-        assert!(
-            started.elapsed() < Duration::from_millis(135),
-            "second setup exceeded the original deadline: {:?}",
-            started.elapsed()
-        );
     }
-
     #[tokio::test]
     async fn sequence_gate_live_iframe_attachments_without_parent_mapping_are_noops() {
         let mut harness = navigation_test_harness(16);
@@ -22951,6 +24130,234 @@ return this.dataset.mainWorldOverride === "observed";
         assert!(log.retained_bytes <= CDP_EVENT_LOG_MAX_BYTES);
         assert_eq!(log.cursor_after_event(0, &live), 1);
     }
+
+    #[test]
+    fn console_replay_sample_filters_by_browser_timestamp() {
+        let mut log = CdpEventLog::new();
+        let generation = log.begin_console_replay_cutoff("page-session", Some(100.0));
+        let replay = log.push(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "timestamp": 99.0,
+                "type": "log",
+                "args": [{"type": "string", "value": "replayed"}]
+            }
+        }));
+        let equal = log.push(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "timestamp": 100.0,
+                "type": "log",
+                "args": [{"type": "string", "value": "live-equal"}]
+            }
+        }));
+        let cutoff = log.cursor();
+        log.finalize_console_replay_cutoff("page-session", generation, cutoff);
+        let event_log = Arc::new(Mutex::new(log));
+        let cutoffs = HashMap::from([("page-session".to_string(), cutoff)]);
+        let samples = HashMap::from([("page-session".to_string(), Some(100.0))]);
+        assert!(console_event_is_replay_history(
+            &replay, &event_log, &cutoffs, &samples
+        ));
+        assert!(!console_event_is_replay_history(
+            &equal, &event_log, &cutoffs, &samples
+        ));
+    }
+    #[tokio::test]
+    async fn console_replay_overlapping_windows_preserve_page_stream_and_waiter_events() {
+        let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let mut state = PageEventStreamState::for_session("page-session".to_string());
+        let requests = Arc::new(Mutex::new(NetworkRequestStore::new(0)));
+        for method in ["Runtime.consoleAPICalled", "Runtime.exceptionThrown"] {
+            let (first_event, second_event, first_cutoff) = {
+                let mut log = event_log.lock().unwrap();
+                let first = log.begin_console_replay_cutoff("page-session", Some(100.0));
+                let first_event = log.push(json!({"sessionId": "page-session", "method": method,
+                    "params": {"timestamp": 150.0, "type": "log", "args": [{"type": "string", "value": "live"}],
+                        "exceptionDetails": {"text": "live"}}}));
+                let cutoff = log.cursor();
+                // Leave generation one provisional until generation two has begun.
+                let second = log.begin_console_replay_cutoff("page-session", Some(200.0));
+                let second_event = log.push(json!({"sessionId": "page-session", "method": method,
+                    "params": {"timestamp": 150.0, "type": "log", "args": [{"type": "string", "value": "history"}],
+                        "exceptionDetails": {"text": "history"}}}));
+                let end = log.cursor();
+                log.finalize_console_replay_cutoff("page-session", second, end);
+                log.finalize_console_replay_cutoff("page-session", first, end);
+                (first_event, second_event, cutoff)
+            };
+            for event in [&first_event, &second_event] {
+                process_page_observation_event(
+                    cdp_event_sequence(event).unwrap(),
+                    event,
+                    &event_log,
+                    "page-session",
+                    &requests,
+                    &mut state,
+                );
+            }
+            let mut batch = Vec::new();
+            append_ready_page_events(&mut batch, &mut state, 64);
+            assert_eq!(
+                batch.len(),
+                1,
+                "queued live event must survive the newer sample"
+            );
+            assert_eq!(batch[0]["seq"], cdp_event_sequence(&first_event).unwrap());
+            let mut cursor = cdp_event_sequence(&first_event).unwrap();
+            let cutoffs = HashMap::from([("page-session".to_string(), first_cutoff)]);
+            let samples = HashMap::from([("page-session".to_string(), Some(100.0))]);
+            let kind = if method == "Runtime.consoleAPICalled" {
+                "console"
+            } else {
+                "pageerror"
+            };
+            let mut newer_cursor = cdp_event_sequence(&first_event).unwrap();
+            let newer_samples = HashMap::from([("page-session".to_string(), Some(200.0))]);
+            assert!(
+                process_console_wait_event(
+                    first_event.clone(),
+                    &mut newer_cursor,
+                    0,
+                    &event_log,
+                    "page-session",
+                    &cutoffs,
+                    &newer_samples,
+                    kind,
+                    None,
+                    Some(&mut state),
+                    None,
+                    None,
+                    false
+                )
+                .await
+                .unwrap()
+                .is_none(),
+                "a newer waiter must retain its own no-replay baseline"
+            );
+            let result = process_console_wait_event(
+                first_event,
+                &mut cursor,
+                0,
+                &event_log,
+                "page-session",
+                &cutoffs,
+                &samples,
+                kind,
+                None,
+                Some(&mut state),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(
+                result.is_some(),
+                "the original waiter's queued event must remain live"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn page_console_waiter_learns_late_session_replay_windows() {
+        for method in ["Runtime.consoleAPICalled", "Runtime.exceptionThrown"] {
+            let harness = navigation_test_harness(8);
+            let event_log = Arc::clone(&harness.event_log);
+            let mut state = PageEventStreamState::for_session("page-session".to_string());
+            let mut cursor = 0;
+            let cutoffs = HashMap::new();
+            let samples = HashMap::new();
+            let kind = if method == "Runtime.consoleAPICalled" {
+                "console"
+            } else {
+                "pageerror"
+            };
+            let (attach, old, live) = {
+                let mut log = event_log.lock().unwrap();
+                let attach = log.push(
+                    json!({"sessionId": "page-session", "method": "Target.attachedToTarget",
+                    "params": {"sessionId": "late-session", "targetInfo": {"type": "iframe"}}}),
+                );
+                let generation = log.begin_console_replay_cutoff("late-session", Some(100.0));
+                let make = |timestamp| {
+                    json!({"sessionId": "late-session", "method": method,
+                    "params": {"timestamp": timestamp, "type": "log", "args": [{"type": "string", "value": "message"}],
+                        "exceptionDetails": {"text": "message"}}})
+                };
+                let old = log.push(make(99.0));
+                let live = log.push(make(100.0));
+                let end = log.cursor();
+                log.finalize_console_replay_cutoff("late-session", generation, end);
+                (attach, old, live)
+            };
+            for event in [attach, old] {
+                assert!(process_console_wait_event(
+                    event,
+                    &mut cursor,
+                    0,
+                    &event_log,
+                    "page-session",
+                    &cutoffs,
+                    &samples,
+                    kind,
+                    Some(Arc::clone(&harness.page)),
+                    Some(&mut state),
+                    None,
+                    None,
+                    false
+                )
+                .await
+                .unwrap()
+                .is_none());
+            }
+            assert!(process_console_wait_event(
+                live,
+                &mut cursor,
+                0,
+                &event_log,
+                "page-session",
+                &cutoffs,
+                &samples,
+                kind,
+                Some(Arc::clone(&harness.page)),
+                Some(&mut state),
+                None,
+                None,
+                false
+            )
+            .await
+            .unwrap()
+            .is_some());
+        }
+    }
+    #[test]
+    fn console_replay_invalid_clock_sample_keeps_event_live() {
+        let mut log = CdpEventLog::new();
+        let generation = log.begin_console_replay_cutoff("page-session", None);
+        let event = log.push(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "timestamp": 1.0,
+                "type": "log",
+                "args": [{"type": "string", "value": "live"}]
+            }
+        }));
+        let cutoff = log.cursor();
+        log.finalize_console_replay_cutoff("page-session", generation, cutoff);
+        let event_log = Arc::new(Mutex::new(log));
+        let cutoffs = HashMap::from([("page-session".to_string(), cutoff)]);
+        assert!(!console_event_is_replay_history_for_sample(
+            &event,
+            &event_log,
+            &cutoffs,
+            "page-session",
+            Some(None),
+        ));
+    }
     #[test]
     fn cdp_event_log_tombstones_payloads_that_remain_oversized_after_compaction() {
         let mut log = CdpEventLog::new();
@@ -23167,6 +24574,7 @@ return this.dataset.mainWorldOverride === "observed";
         let waiter = tokio::spawn(async move {
             let mut cursor = 0;
             let replay_until = HashMap::new();
+            let replay_clock_samples = HashMap::new();
             process_console_wait_event(
                 event,
                 &mut cursor,
@@ -23174,6 +24582,7 @@ return this.dataset.mainWorldOverride === "observed";
                 &waiter_log,
                 "page-session",
                 &replay_until,
+                &replay_clock_samples,
                 "console",
                 Some(waiter_page),
                 None,
@@ -23942,9 +25351,8 @@ return this.dataset.mainWorldOverride === "observed";
             retained_bytes: 0,
             retention_gate: Arc::new(CdpRetentionGate::new()),
             action_dispatch_receipts: HashMap::new(),
-            console_replay_cutoffs: HashMap::new(),
-            console_replay_cutoff_generations: HashMap::new(),
-            console_replay_cutoff_cancellations: HashMap::new(),
+            console_replay_windows: HashMap::new(),
+            active_dialogs: HashMap::new(),
             next_console_replay_cutoff_generation: 0,
         };
         let initial = json!({
@@ -24194,7 +25602,7 @@ return this.dataset.mainWorldOverride === "observed";
     #[cfg(feature = "python")]
     #[test]
     fn python_launch_option_parse_errors_remain_value_errors() {
-        Python::initialize();
+        initialize_test_python();
         Python::attach(|py| {
             let error = parse_python_launch_options("{").unwrap_err();
             assert!(error.is_instance_of::<PyValueError>(py));
@@ -25480,20 +26888,6 @@ fn wrap_cdp_command_error(method: &str, error: RwError) -> RwError {
     }
 }
 
-fn merge_console_replay_cutoff(stored: &mut u64, cutoff: u64) {
-    if *stored == u64::MAX && cutoff != u64::MAX {
-        // A finite response cursor finalizes an in-flight provisional sentinel. Do not let
-        // overflow-recreated state retain the sentinel forever.
-        *stored = cutoff;
-    } else if cutoff == u64::MAX {
-        // A new capture generation must suppress replay immediately, even if an older finite
-        // cutoff is still retained for a slow ordered consumer.
-        *stored = u64::MAX;
-    } else {
-        *stored = (*stored).max(cutoff);
-    }
-}
-
 fn compact_retained_cdp_value(value: &mut Value) {
     match value {
         Value::String(text) => {
@@ -25750,6 +27144,83 @@ impl CdpRetentionGate {
     }
 }
 
+fn console_event_timestamp(event: &Value) -> Option<f64> {
+    let timestamp = event.pointer("/params/timestamp").and_then(Value::as_f64)?;
+    timestamp.is_finite().then_some(timestamp)
+}
+
+fn console_event_is_replay_history(
+    event: &Value,
+    event_log: &Arc<Mutex<CdpEventLog>>,
+    replay_until: &HashMap<String, u64>,
+    replay_clock_samples: &HashMap<String, Option<f64>>,
+) -> bool {
+    let Some(session_id) = event.get("sessionId").and_then(Value::as_str) else {
+        return false;
+    };
+    console_event_is_replay_history_for_sample(
+        event,
+        event_log,
+        replay_until,
+        session_id,
+        replay_clock_samples.get(session_id).copied(),
+    )
+}
+
+fn console_event_is_replay_history_for_sample(
+    event: &Value,
+    event_log: &Arc<Mutex<CdpEventLog>>,
+    replay_until: &HashMap<String, u64>,
+    session_id: &str,
+    replay_clock_sample: Option<Option<f64>>,
+) -> bool {
+    if !matches!(
+        event.get("method").and_then(Value::as_str),
+        Some("Runtime.consoleAPICalled") | Some("Runtime.exceptionThrown")
+    ) {
+        return false;
+    }
+    let Some(sequence) = cdp_event_sequence(event) else {
+        return false;
+    };
+    let log = event_log.lock().unwrap();
+    let Some(window) = log.console_replay_window(session_id, sequence) else {
+        return false;
+    };
+    // A waiter retains its own setup baseline. Events from later-attached
+    // sessions use the window in which they arrived instead.
+    let sample = if replay_until
+        .get(session_id)
+        .is_some_and(|cutoff| sequence < *cutoff)
+    {
+        replay_clock_sample.unwrap_or(window.sample)
+    } else {
+        window.sample
+    };
+    window.is_history(event, sample)
+}
+
+#[derive(Clone)]
+struct ConsoleReplayWindow {
+    generation: u64,
+    start: u64,
+    end: u64,
+    sample: Option<f64>,
+}
+
+impl ConsoleReplayWindow {
+    fn contains(&self, sequence: u64) -> bool {
+        self.start <= sequence && sequence < self.end
+    }
+
+    fn is_history(&self, event: &Value, sample: Option<f64>) -> bool {
+        cdp_event_sequence(event).is_some_and(|sequence| self.contains(sequence))
+            && sample.is_some_and(|sample| {
+                console_event_timestamp(event).is_some_and(|timestamp| timestamp < sample)
+            })
+    }
+}
+
 struct CdpEventLogEntry {
     sequence: u64,
     event: Value,
@@ -25762,9 +27233,9 @@ struct CdpEventLog {
     retained_bytes: usize,
     retention_gate: Arc<CdpRetentionGate>,
     action_dispatch_receipts: HashMap<String, ActionDispatchReceiptMap>,
-    console_replay_cutoffs: HashMap<String, u64>,
-    console_replay_cutoff_generations: HashMap<String, u64>,
-    console_replay_cutoff_cancellations: HashMap<String, u64>,
+    console_replay_windows: HashMap<String, VecDeque<ConsoleReplayWindow>>,
+    // Live dialogs must survive eviction until Chromium closes them.
+    active_dialogs: HashMap<String, (u64, Value)>,
     next_console_replay_cutoff_generation: u64,
 }
 
@@ -25776,85 +27247,118 @@ impl CdpEventLog {
             retained_bytes: 0,
             retention_gate: Arc::new(CdpRetentionGate::new()),
             action_dispatch_receipts: HashMap::new(),
-            console_replay_cutoff_cancellations: HashMap::new(),
-            console_replay_cutoffs: HashMap::new(),
-            console_replay_cutoff_generations: HashMap::new(),
+            console_replay_windows: HashMap::new(),
+            active_dialogs: HashMap::new(),
             next_console_replay_cutoff_generation: 0,
         }
     }
 
-    fn begin_console_replay_cutoff(&mut self, session_id: &str) -> u64 {
+    fn begin_console_replay_cutoff(&mut self, session_id: &str, sample: Option<f64>) -> u64 {
         advance_lifetime_counter(&mut self.next_console_replay_cutoff_generation);
         let generation = self.next_console_replay_cutoff_generation;
-        self.console_replay_cutoff_generations
-            .insert(session_id.to_string(), generation);
-        self.console_replay_cutoff_cancellations.remove(session_id);
-        // The provisional sentinel is deliberately published in the event-log metadata.
-        // Every ordered consumer reads this map, so no replay event can pass while Runtime.enable
-        // is still in flight.
-        self.console_replay_cutoffs
-            .insert(session_id.to_string(), u64::MAX);
+        let start = self.cursor();
+        let windows = self
+            .console_replay_windows
+            .entry(session_id.to_string())
+            .or_default();
+        if let Some(previous) = windows.back_mut() {
+            previous.end = previous.end.min(start);
+        }
+        windows.push_back(ConsoleReplayWindow {
+            generation,
+            start,
+            end: u64::MAX,
+            sample,
+        });
+        self.prune_console_replay_cutoffs();
         generation
     }
 
     fn finalize_console_replay_cutoff(&mut self, session_id: &str, generation: u64, cutoff: u64) {
-        if self.console_replay_cutoff_generations.get(session_id) == Some(&generation) {
-            self.console_replay_cutoffs
-                .insert(session_id.to_string(), cutoff);
-            self.console_replay_cutoff_cancellations.remove(session_id);
-            self.prune_console_replay_cutoffs();
-        }
-    }
-    fn cancel_console_replay_cutoff(&mut self, session_id: &str, generation: u64) {
-        if self.console_replay_cutoff_generations.get(session_id) == Some(&generation) {
-            let cutoff = self.cursor();
-            self.console_replay_cutoffs
-                .insert(session_id.to_string(), cutoff);
-            self.console_replay_cutoff_generations.remove(session_id);
-            self.console_replay_cutoff_cancellations
-                .insert(session_id.to_string(), generation);
-            self.prune_console_replay_cutoffs();
-        }
-    }
-    fn finalize_console_replay_cutoff_on_detach(&mut self, session_id: &str, cutoff: Option<u64>) {
-        let generation = self.console_replay_cutoff_generations.remove(session_id);
-        if self.console_replay_cutoffs.get(session_id) == Some(&u64::MAX) {
-            self.console_replay_cutoffs.insert(
-                session_id.to_string(),
-                cutoff.unwrap_or_else(|| self.cursor()),
-            );
-            if let Some(generation) = generation {
-                self.console_replay_cutoff_cancellations
-                    .insert(session_id.to_string(), generation);
-            }
+        if let Some(window) = self
+            .console_replay_windows
+            .get_mut(session_id)
+            .and_then(|windows| {
+                windows
+                    .iter_mut()
+                    .find(|window| window.generation == generation)
+            })
+        {
+            window.end = window.end.min(cutoff);
         }
         self.prune_console_replay_cutoffs();
     }
 
-    fn console_replay_cutoff_with_generation(&self, session_id: &str) -> Option<(u64, u64)> {
-        let generation = self
-            .console_replay_cutoff_generations
-            .get(session_id)
-            .copied()
-            .or_else(|| {
-                self.console_replay_cutoff_cancellations
-                    .get(session_id)
-                    .copied()
-            })?;
-        Some((generation, self.console_replay_cutoff(session_id)?))
+    fn cancel_console_replay_cutoff(&mut self, session_id: &str, generation: u64) {
+        let cutoff = self.cursor();
+        if let Some(window) = self
+            .console_replay_windows
+            .get_mut(session_id)
+            .and_then(|windows| {
+                windows
+                    .iter_mut()
+                    .find(|window| window.generation == generation)
+            })
+        {
+            window.end = window.end.min(cutoff);
+            window.sample = None;
+        }
+        self.prune_console_replay_cutoffs();
     }
+
+    fn finalize_console_replay_cutoff_on_detach(&mut self, session_id: &str, cutoff: Option<u64>) {
+        let cutoff = cutoff.unwrap_or_else(|| self.cursor());
+        if let Some(window) = self
+            .console_replay_windows
+            .get_mut(session_id)
+            .and_then(|windows| windows.back_mut())
+        {
+            window.end = window.end.min(cutoff);
+        }
+        self.prune_console_replay_cutoffs();
+    }
+
+    #[cfg(test)]
     fn console_replay_cutoff(&self, session_id: &str) -> Option<u64> {
-        self.console_replay_cutoffs.get(session_id).copied()
+        self.console_replay_windows
+            .get(session_id)?
+            .back()
+            .map(|window| window.end)
+    }
+
+    #[cfg(test)]
+    fn console_replay_sample(&self, session_id: &str) -> Option<Option<f64>> {
+        self.console_replay_windows
+            .get(session_id)?
+            .back()
+            .map(|window| window.sample)
+    }
+
+    fn console_replay_window(
+        &self,
+        session_id: &str,
+        sequence: u64,
+    ) -> Option<&ConsoleReplayWindow> {
+        self.console_replay_windows
+            .get(session_id)?
+            .iter()
+            .find(|window| window.contains(sequence))
     }
 
     fn prune_console_replay_cutoffs(&mut self) {
         let oldest_seq = self.oldest_seq();
-        self.console_replay_cutoffs
-            .retain(|_, stored| *stored == u64::MAX || *stored >= oldest_seq);
-        self.console_replay_cutoff_cancellations
-            .retain(|session_id, _| self.console_replay_cutoffs.contains_key(session_id));
-        self.console_replay_cutoff_generations
-            .retain(|session_id, _| self.console_replay_cutoffs.contains_key(session_id));
+        self.console_replay_windows.retain(|_, windows| {
+            // Keep the current window even when empty, but do not accumulate
+            // superseded empty generations or windows older than the event log.
+            let current = windows.back().map(|window| window.generation);
+            windows.retain(|window| {
+                Some(window.generation) == current
+                    || (window.start < window.end && window.end > oldest_seq)
+            });
+            windows
+                .back()
+                .is_some_and(|window| window.end >= oldest_seq)
+        });
     }
 
     fn cursor(&self) -> u64 {
@@ -25869,6 +27373,31 @@ impl CdpEventLog {
                 "__rustwright_cdp_event_seq".to_string(),
                 Value::Number(seq.into()),
             );
+        }
+        match event.get("method").and_then(Value::as_str) {
+            Some("Page.javascriptDialogOpening") => {
+                if let (Some(session), Some(mut dialog)) = (
+                    event.get("sessionId").and_then(Value::as_str),
+                    dialog_from_event(&event),
+                ) {
+                    compact_retained_cdp_value(&mut dialog);
+                    self.active_dialogs
+                        .insert(session.to_string(), (seq, dialog));
+                }
+            }
+            Some(
+                "Page.javascriptDialogClosed" | "Inspector.detached" | "Inspector.targetCrashed",
+            ) => {
+                if let Some(session) = event.get("sessionId").and_then(Value::as_str) {
+                    self.active_dialogs.remove(session);
+                }
+            }
+            Some("Target.detachedFromTarget") => {
+                if let Some(session) = event.pointer("/params/sessionId").and_then(Value::as_str) {
+                    self.active_dialogs.remove(session);
+                }
+            }
+            _ => {}
         }
         let (retained_event, retained_bytes) = compact_retained_cdp_event(event.clone());
         self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
@@ -25885,8 +27414,6 @@ impl CdpEventLog {
             };
             self.retained_bytes = self.retained_bytes.saturating_sub(evicted.retained_bytes);
         }
-        // Cutoff pruning is low-water driven, not part of the hot event path. A bounded batch
-        // keeps the map inexpensive under high-volume Runtime/Network traffic.
         let oldest_seq = self.oldest_seq();
         if oldest_seq != 0 && oldest_seq % 256 == 0 {
             self.prune_console_replay_cutoffs();
@@ -25941,9 +27468,8 @@ impl CdpEventLog {
         self.events = VecDeque::new();
         self.retained_bytes = 0;
         self.action_dispatch_receipts = HashMap::new();
-        self.console_replay_cutoffs = HashMap::new();
-        self.console_replay_cutoff_generations = HashMap::new();
-        self.console_replay_cutoff_cancellations = HashMap::new();
+        self.console_replay_windows = HashMap::new();
+        self.active_dialogs = HashMap::new();
     }
 
     fn entries_since(&self, cursor: u64) -> Vec<(u64, Value)> {
@@ -26767,7 +28293,11 @@ impl CdpClient {
     }
 
     fn retention_gate(&self) -> Arc<CdpRetentionGate> {
-        self.event_log.lock().unwrap().retention_gate.clone()
+        self.event_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retention_gate
+            .clone()
     }
 
     fn retention_enabled(&self) -> bool {
@@ -27724,10 +29254,10 @@ impl BrowserInner {
     }
 
     fn close_last_owner_without_gil(&self) -> RwResult<()> {
-        let sender = match self.lifecycle.start() {
+        let (sender, generation) = match self.lifecycle.start() {
             CloseStart::Done(outcome) => return outcome.into_result(),
             CloseStart::Wait(_) => return Ok(()),
-            CloseStart::Lead(sender) => sender,
+            CloseStart::Lead { sender, generation } => (sender, generation),
         };
         let owns_browser_process = self.process.lock().unwrap().is_some();
         if owns_browser_process && tokio::runtime::Handle::try_current().is_err() {
@@ -27766,7 +29296,7 @@ impl BrowserInner {
 
         self.profile_dir.lock().unwrap().take();
         let result = cleanup_error.map_or(Ok(()), |error| Err(RwError::Io(error)));
-        self.lifecycle.finish(sender, &result, true);
+        self.lifecycle.finish(sender, generation, &result, true);
         result
     }
 }
@@ -28383,6 +29913,7 @@ struct PageInner {
 struct ConsoleCaptureState {
     requested: AtomicBool,
     enabled_sessions: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    setup_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct CreatedTargetGuard {
@@ -28570,9 +30101,17 @@ impl PageInner {
     }
 
     fn release_memory_buffers(&self) {
+        self.lifecycle.clear_before_unload();
         self.target_closed.store(true, Ordering::SeqCst);
         let retention_gate = self.browser.client.retention_gate();
         let _retention_guard = retention_gate.lock_for_release();
+        self.browser
+            .client
+            .event_log
+            .lock()
+            .unwrap()
+            .active_dialogs
+            .remove(&self.session_id);
         self.network_requests.lock().unwrap().clear_for_close();
         self.native_network_records
             .lock()
@@ -28645,6 +30184,13 @@ impl Drop for PageInner {
             self as *const PageInner,
         );
         self.close_in_background();
+        self.browser
+            .client
+            .event_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_dialogs
+            .remove(&self.session_id);
     }
 }
 
@@ -31187,18 +32733,55 @@ struct PyPageEventStream {
     pending_batch: Arc<Mutex<Option<PendingPageEventBatch>>>,
     close_tx: watch::Sender<bool>,
     closed: Arc<AtomicBool>,
+    active_wait: Arc<Mutex<Option<Arc<PageEventStreamWaitState>>>>,
 }
 
 #[derive(Clone)]
 struct PageEventStreamState {
     network: NetworkObservationState,
     ready: BTreeMap<u64, Value>,
+    terminal_cursor: Option<u64>,
     main_session_id: String,
     owned_sessions: HashSet<String>,
     session_parents: HashMap<String, String>,
-    replay_until: HashMap<String, u64>,
-    replay_cutoff_generations: HashMap<String, u64>,
+    replay_windows: HashMap<String, VecDeque<ConsoleReplayWindow>>,
 }
+
+#[cfg(feature = "python")]
+struct PageEventStreamWaitState {
+    abort_handle: Mutex<Option<tokio::task::AbortHandle>>,
+    cancelled: AtomicBool,
+    restored: watch::Sender<bool>,
+}
+#[cfg(feature = "python")]
+impl PageEventStreamWaitState {
+    fn new() -> Self {
+        Self {
+            abort_handle: Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+            restored: watch::channel(false).0,
+        }
+    }
+
+    fn set_abort_handle(&self, abort_handle: tokio::task::AbortHandle) {
+        let mut slot = self.abort_handle.lock().unwrap();
+        if self.cancelled.load(Ordering::SeqCst) {
+            abort_handle.abort();
+        } else {
+            *slot = Some(abort_handle);
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Some(abort_handle) = self.abort_handle.lock().unwrap().take() {
+            abort_handle.abort();
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+type PageEventStreamCancelHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(feature = "python")]
 struct PageEventStreamLease {
@@ -31214,6 +32797,7 @@ struct PageEventStreamLease {
     requests: Arc<Mutex<NetworkRequestStore>>,
     working_requests: Arc<Mutex<NetworkRequestStore>>,
     page: Option<Arc<PageInner>>,
+    restored: Option<watch::Sender<bool>>,
 }
 
 #[cfg(feature = "python")]
@@ -31237,7 +32821,6 @@ impl PendingPageEventBatch {
         }
     }
 }
-
 #[cfg(feature = "python")]
 impl PageEventStreamLease {
     fn deliver(mut self) {
@@ -31255,12 +32838,7 @@ impl PageEventStreamLease {
         *self.state_slot.lock().unwrap() = self.rollback_state.take();
         *self.cursor_slot.lock().unwrap() = self.rollback_cursor;
     }
-}
-
-#[cfg(feature = "python")]
-impl Drop for PageEventStreamLease {
-    fn drop(&mut self) {
-        *self.receiver_slot.lock().unwrap() = self.receiver.take();
+    fn restore(&mut self) {
         if self.delivered {
             if let Some(page) = self.page.as_ref().map(Arc::clone) {
                 let retention_gate = page.browser.client.retention_gate();
@@ -31268,8 +32846,9 @@ impl Drop for PageEventStreamLease {
                     self.restore_rollback();
                     return;
                 };
-                if page.lifecycle.is_closing_or_closed()
-                    || page.target_closed.load(Ordering::SeqCst)
+                if (page.lifecycle.is_closing_or_closed()
+                    || page.target_closed.load(Ordering::SeqCst))
+                    && !page.lifecycle.allows_events_during_close()
                 {
                     self.restore_rollback();
                     return;
@@ -31278,6 +32857,36 @@ impl Drop for PageEventStreamLease {
             self.commit_delivered();
         } else {
             self.restore_rollback();
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+impl Drop for PageEventStreamLease {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        let handoff = tests::page_event_stream_handoff_barriers()
+            .lock()
+            .unwrap()
+            .remove(&(Arc::as_ptr(&self.state_slot) as usize));
+        #[cfg(test)]
+        if let Some(barrier) = &handoff {
+            barrier.entered.send(()).unwrap();
+            barrier
+                .release
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }
+        self.restore();
+        // The receiver is the availability token. Publish it only after state, cursor,
+        // and request history have all been restored or committed.
+        *self.receiver_slot.lock().unwrap() = self.receiver.take();
+        if let Some(restored) = &self.restored {
+            restored.send_replace(true);
+        }
+        #[cfg(test)]
+        if let Some(barrier) = handoff {
+            barrier.restored.send(()).unwrap();
         }
     }
 }
@@ -31296,11 +32905,11 @@ impl PageEventStreamState {
         Self {
             network: NetworkObservationState::new(),
             ready: BTreeMap::new(),
+            terminal_cursor: None,
             main_session_id,
             owned_sessions,
             session_parents: HashMap::new(),
-            replay_until: HashMap::new(),
-            replay_cutoff_generations: HashMap::new(),
+            replay_windows: HashMap::new(),
         }
     }
 
@@ -31329,11 +32938,6 @@ impl PageEventStreamState {
             }
         }
         drop(frame_state);
-        state.replay_until = page
-            .console_replay_until_event_cursor
-            .lock()
-            .unwrap()
-            .clone();
         state
     }
 
@@ -31346,9 +32950,7 @@ impl PageEventStreamState {
         let receiver = client.events.subscribe();
         let event_cursor = event_log.cursor();
         let entries = event_log.entries_since(0);
-        let replay_cutoffs = event_log.console_replay_cutoffs.clone();
-        let replay_generations = event_log.console_replay_cutoff_generations.clone();
-        let replay_cancellations = event_log.console_replay_cutoff_cancellations.clone();
+        let replay_windows = event_log.console_replay_windows.clone();
         drop(event_log);
         let retention_gate = client.retention_gate();
         let Some(_retention_guard) = retention_gate.lock_for_write() else {
@@ -31383,31 +32985,11 @@ impl PageEventStreamState {
             }
             page_state.apply_target_transition(&event, &page.session_id);
         }
-        page_state.seed_replay_cutoffs(&replay_cutoffs);
-        for session_id in replay_cutoffs.keys() {
-            if let Some(generation) = replay_generations
-                .get(session_id)
-                .copied()
-                .or_else(|| replay_cancellations.get(session_id).copied())
-            {
-                page_state
-                    .replay_cutoff_generations
-                    .insert(session_id.clone(), generation);
-            }
-        }
+        page_state.replay_windows = replay_windows;
         (receiver, event_cursor, page_state)
     }
 
-    fn seed_replay_cutoffs(&mut self, replay_until: &HashMap<String, u64>) {
-        for (session_id, cutoff) in replay_until {
-            self.replay_until
-                .entry(session_id.clone())
-                .and_modify(|stored| merge_console_replay_cutoff(stored, *cutoff))
-                .or_insert(*cutoff);
-        }
-    }
-
-    fn sync_replay_cutoffs_for_event(
+    fn sync_replay_windows_for_event(
         &mut self,
         event: &Value,
         event_log: &Arc<Mutex<CdpEventLog>>,
@@ -31435,25 +33017,22 @@ impl PageEventStreamState {
         }
         let log = event_log.lock().unwrap();
         for session_id in session_ids {
-            let Some(cutoff) = log.console_replay_cutoff(session_id) else {
-                continue;
-            };
-            if let Some((generation, _)) = log.console_replay_cutoff_with_generation(session_id) {
-                if self
-                    .replay_cutoff_generations
-                    .get(session_id)
-                    .is_some_and(|stored| *stored > generation)
-                {
-                    continue;
-                }
-                self.replay_cutoff_generations
-                    .insert(session_id.to_string(), generation);
+            if let Some(windows) = log.console_replay_windows.get(session_id) {
+                self.replay_windows
+                    .insert(session_id.to_string(), windows.clone());
             }
-            self.replay_until
-                .entry(session_id.to_string())
-                .and_modify(|stored| merge_console_replay_cutoff(stored, cutoff))
-                .or_insert(cutoff);
         }
+    }
+
+    fn console_event_is_replay_history(&self, event: &Value) -> bool {
+        let Some(session_id) = event.get("sessionId").and_then(Value::as_str) else {
+            return false;
+        };
+        self.replay_windows.get(session_id).is_some_and(|windows| {
+            windows
+                .iter()
+                .any(|window| window.is_history(event, window.sample))
+        })
     }
 
     fn ensure_main_session(&mut self, session_id: &str) {
@@ -31500,7 +33079,7 @@ impl PageEventStreamState {
                 }
                 let mut pending = vec![detached_session_id.to_string()];
                 while let Some(session_id) = pending.pop() {
-                    self.replay_until.remove(&session_id);
+                    self.replay_windows.remove(&session_id);
                     if !self.owned_sessions.remove(&session_id) {
                         continue;
                     }
@@ -31522,11 +33101,27 @@ impl PageEventStreamState {
         }
     }
 
+    fn undispatched_active_dialogs(
+        &self,
+        log: &CdpEventLog,
+        unread: std::ops::Range<u64>,
+    ) -> BTreeMap<u64, Value> {
+        log.active_dialogs
+            .iter()
+            .filter_map(|(session, (seq, dialog))| {
+                // Never replay a dialog already handed to Python, including
+                // one still owned by a listener or accepted waiter.
+                (self.owns_session(session)
+                    && (unread.contains(seq) || self.ready.contains_key(seq)))
+                .then(|| (*seq, page_event_envelope(*seq, "dialog", dialog.clone())))
+            })
+            .collect()
+    }
+
     fn reset_after_overflow(&mut self) {
         self.network = NetworkObservationState::new();
         self.ready.clear();
-        self.replay_until.clear();
-        self.replay_cutoff_generations.clear();
+        self.replay_windows.clear();
     }
 }
 
@@ -31563,6 +33158,7 @@ struct PyConsoleEventWaiter {
     session_id: String,
     event_cursor: Mutex<u64>,
     replay_until: HashMap<String, u64>,
+    replay_clock_samples: HashMap<String, Option<f64>>,
     event_kind: String,
     page: Option<Arc<PageInner>>,
     page_state: Mutex<Option<PageEventStreamState>>,
@@ -38526,7 +40122,9 @@ async fn page_close_cleanup(
         Arc::as_ptr(&page),
     );
     page.close_target_on_drop.store(false, Ordering::SeqCst);
-    page.release_memory_buffers();
+    if !run_before_unload {
+        page.release_memory_buffers();
+    }
     Ok(())
 }
 
@@ -38536,12 +40134,14 @@ async fn page_close_async(
     run_before_unload: bool,
 ) -> RwResult<()> {
     let lifecycle = Arc::clone(&page.lifecycle);
-    single_flight_close(lifecycle, false, move || async move {
-        page.clear_worker_resume_handoffs();
-        page.abort_iframe_setup_tasks();
-        page_close_cleanup(page, timeout, run_before_unload).await
-    })
-    .await
+    let result =
+        single_flight_close_mode(lifecycle, false, run_before_unload, move || async move {
+            page.clear_worker_resume_handoffs();
+            page.abort_iframe_setup_tasks();
+            page_close_cleanup(page, timeout, run_before_unload).await
+        })
+        .await;
+    result
 }
 
 async fn dispatch_mouse_click_sequence_locked_async(
@@ -38720,6 +40320,9 @@ async fn dispatch_mouse_click_async(
 impl PyPage {
     fn event_cursor(&self) -> u64 {
         self.inner.browser.client.event_cursor()
+    }
+    fn is_closed(&self) -> bool {
+        self.inner.target_closed.load(Ordering::SeqCst)
     }
 
     fn background_override_active(&self) -> bool {
@@ -41416,6 +43019,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
             pending_batch: Arc::new(Mutex::new(None)),
             close_tx,
             closed: Arc::new(AtomicBool::new(false)),
+            active_wait: Arc::new(Mutex::new(None)),
         };
         Ok(stream)
     }
@@ -41449,46 +43053,61 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         let page = Arc::clone(&self.inner);
         let browser = Arc::clone(&page.browser);
         let client = Arc::clone(&browser.client);
-        let (receiver, event_cursor, mut page_wait_state) =
-            PageEventStreamState::subscribe_page_event_stream(&page);
         let timeout = BrowserInner::command_timeout(timeout_ms);
+        let deadline = OperationDeadline::new(timeout);
+        let page_for_setup = Arc::clone(&page);
+        let samples = browser
+            .block_on(async move { prepare_console_capture(&page_for_setup, deadline).await })
+            .map_err(py_err)?;
+        let (receiver, event_cursor, page_wait_state) =
+            PageEventStreamState::subscribe_page_event_stream(&page);
+        let replay_clock_samples = samples.clone();
         let page_for_setup = Arc::clone(&page);
         let replay_until = browser
-            .block_on(async move { enable_console_capture(&page_for_setup, timeout).await })
+            .block_on(async move {
+                enable_console_capture_with_samples(&page_for_setup, deadline, samples).await
+            })
             .map_err(py_err)?;
-        page_wait_state.seed_replay_cutoffs(&replay_until);
         Ok(PyConsoleEventWaiter {
             browser: Arc::clone(&self.inner.browser),
             receiver: Mutex::new(Some(receiver)),
             event_log: Arc::clone(&client.event_log),
             session_id: self.inner.session_id.clone(),
             event_cursor: Mutex::new(event_cursor),
+            replay_clock_samples,
             replay_until,
             event_kind: "console".to_string(),
             page: Some(Arc::clone(&self.inner)),
             page_state: Mutex::new(Some(page_wait_state)),
         })
     }
-
     #[pyo3(signature = (timeout_ms=None))]
     fn page_error_event_waiter(&self, timeout_ms: Option<f64>) -> PyResult<PyConsoleEventWaiter> {
         let page = Arc::clone(&self.inner);
         let browser = Arc::clone(&page.browser);
         let client = Arc::clone(&browser.client);
-        let (receiver, event_cursor, mut page_wait_state) =
-            PageEventStreamState::subscribe_page_event_stream(&page);
         let timeout = BrowserInner::command_timeout(timeout_ms);
+        let deadline = OperationDeadline::new(timeout);
+        let page_for_setup = Arc::clone(&page);
+        let samples = browser
+            .block_on(async move { prepare_console_capture(&page_for_setup, deadline).await })
+            .map_err(py_err)?;
+        let (receiver, event_cursor, page_wait_state) =
+            PageEventStreamState::subscribe_page_event_stream(&page);
+        let replay_clock_samples = samples.clone();
         let page_for_setup = Arc::clone(&page);
         let replay_until = browser
-            .block_on(async move { enable_console_capture(&page_for_setup, timeout).await })
+            .block_on(async move {
+                enable_console_capture_with_samples(&page_for_setup, deadline, samples).await
+            })
             .map_err(py_err)?;
-        page_wait_state.seed_replay_cutoffs(&replay_until);
         Ok(PyConsoleEventWaiter {
             browser: Arc::clone(&self.inner.browser),
             receiver: Mutex::new(Some(receiver)),
             event_log: Arc::clone(&client.event_log),
             session_id: self.inner.session_id.clone(),
             event_cursor: Mutex::new(event_cursor),
+            replay_clock_samples,
             replay_until,
             event_kind: "pageerror".to_string(),
             page: Some(Arc::clone(&self.inner)),
@@ -42171,6 +43790,10 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
             .map_err(py_err)
     }
 
+    fn release_memory_buffers(&self) {
+        self.inner.release_memory_buffers();
+    }
+
     fn mark_delivered(&self) {
         self.inner.mark_delivered();
     }
@@ -42522,15 +44145,26 @@ impl PyWorker {
         let client = Arc::clone(&browser.client);
         let session_id = self.session_id.clone();
         let timeout = BrowserInner::command_timeout(timeout_ms);
+        let deadline = OperationDeadline::new(timeout);
+        // Workers have no isolated world. An application clock cannot establish
+        // a trusted replay boundary, so preserve events when the sample is uncertain.
+        let sample = None;
         let (receiver, event_cursor) = client.subscribe_with_cursor();
         let setup_client = Arc::clone(&client);
         let setup_session_id = session_id.clone();
+        let enable_timeout = deadline.remaining().map_err(py_err)?;
         let replay_until = browser
             .block_on(async move {
-                enable_runtime_with_local_console_cutoff(&setup_client, &setup_session_id, timeout)
-                    .await
+                enable_runtime_with_local_console_cutoff_at_sample(
+                    &setup_client,
+                    &setup_session_id,
+                    enable_timeout,
+                    sample,
+                )
+                .await
             })
             .map_err(py_err)?;
+        let replay_clock_samples = std::iter::once((session_id.clone(), sample)).collect();
         let replay_until = std::iter::once((session_id.clone(), replay_until)).collect();
         Ok(PyConsoleEventWaiter {
             browser: Arc::clone(&self.browser),
@@ -42538,6 +44172,7 @@ impl PyWorker {
             event_log: Arc::clone(&client.event_log),
             session_id: self.session_id.clone(),
             event_cursor: Mutex::new(event_cursor),
+            replay_clock_samples,
             replay_until,
             event_kind: "console".to_string(),
             page: None,
@@ -42670,12 +44305,36 @@ impl PyNetworkEventWaiter {
 
 #[cfg(feature = "python")]
 impl PyPageEventStream {
+    fn take_receiver_and_state(
+        &self,
+    ) -> PyResult<(broadcast::Receiver<Value>, PageEventStreamState)> {
+        let mut receiver_slot = self.receiver.lock().unwrap();
+        let receiver = receiver_slot
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("page event stream is already waiting"))?;
+        let Some(state) = self.state.lock().unwrap().take() else {
+            *receiver_slot = Some(receiver);
+            return Err(PyRuntimeError::new_err(
+                "page event stream is already waiting",
+            ));
+        };
+        Ok((receiver, state))
+    }
+
     fn take_pending_batch(&self) -> Option<PendingPageEventBatch> {
         self.pending_batch.lock().unwrap().take()
     }
 
     fn rollback_pending_batch(&self) {
         drop(self.take_pending_batch());
+    }
+    fn cancel_active_wait(&self) -> Option<Arc<PageEventStreamWaitState>> {
+        self.rollback_pending_batch();
+        let wait_state = self.active_wait.lock().unwrap().clone();
+        if let Some(wait_state) = &wait_state {
+            wait_state.cancel();
+        }
+        wait_state
     }
 }
 
@@ -42687,9 +44346,39 @@ impl PyPageEventStream {
             batch.acknowledge();
         }
     }
+    fn cancel_wait(&self) {
+        self.cancel_active_wait();
+    }
+
+    fn cancel_wait_async(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let wait_state = self.cancel_active_wait();
+        python_future_on(
+            py,
+            self.browser.runtime.handle().clone(),
+            async move {
+                if let Some(wait_state) = wait_state {
+                    let mut restored = wait_state.restored.subscribe();
+                    while !*restored.borrow_and_update() {
+                        if restored.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            },
+            |py, ()| Ok(py.None()),
+        )
+    }
 
     fn rollback_batch(&self) {
         self.rollback_pending_batch();
+    }
+
+    fn event_cursor(&self) -> u64 {
+        *self.cursor.lock().unwrap()
+    }
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     fn enable_runtime(&self) -> PyResult<()> {
@@ -42739,18 +44428,7 @@ impl PyPageEventStream {
                 Value::Array(vec![page_event_envelope(cursor, "_closed", Value::Null)]).to_string(),
             );
         }
-        let mut receiver = self
-            .receiver
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("page event stream is already waiting"))?;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("page event stream is already waiting"))?;
+        let (mut receiver, mut state) = self.take_receiver_and_state()?;
         let browser = Arc::clone(&self.browser);
         let event_log = Arc::clone(&self.event_log);
         let mut cursor = *self.cursor.lock().unwrap();
@@ -42776,12 +44454,12 @@ impl PyPageEventStream {
             ));
             (batch, cursor, state, terminal, receiver)
         });
-        *self.receiver.lock().unwrap() = Some(receiver);
         *self.cursor.lock().unwrap() = cursor;
         *self.state.lock().unwrap() = Some(state);
         if terminal {
             self.closed.store(true, Ordering::SeqCst);
         }
+        *self.receiver.lock().unwrap() = Some(receiver);
         Ok(Value::Array(batch).to_string())
     }
 
@@ -42808,18 +44486,7 @@ impl PyPageEventStream {
             future.call_method1("set_result", (payload,))?;
             return Ok(future.unbind());
         }
-        let receiver = self
-            .receiver
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("page event stream is already waiting"))?;
-        let state = self
-            .state
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("page event stream is already waiting"))?;
+        let (receiver, state) = self.take_receiver_and_state()?;
         let browser = Arc::clone(&self.browser);
         let page = Arc::clone(&self.page);
         let runtime = browser.runtime.handle().clone();
@@ -42830,6 +44497,10 @@ impl PyPageEventStream {
         let alive_rx = browser.client.alive_tx.subscribe();
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let working_requests = Arc::new(Mutex::new(self.requests.lock().unwrap().clone()));
+        let wait_state = Arc::new(PageEventStreamWaitState::new());
+        *self.active_wait.lock().unwrap() = Some(Arc::clone(&wait_state));
+        let cancel_wait_state = Arc::clone(&wait_state);
+        let cancel_hook: PageEventStreamCancelHook = Arc::new(move || cancel_wait_state.cancel());
         let mut lease = PageEventStreamLease {
             receiver: Some(receiver),
             rollback_state: Some(state.clone()),
@@ -42843,10 +44514,11 @@ impl PyPageEventStream {
             requests: Arc::clone(&self.requests),
             working_requests: Arc::clone(&working_requests),
             page: Some(Arc::clone(&self.page)),
+            restored: Some(wait_state.restored.clone()),
         };
         let closed = Arc::clone(&self.closed);
         let pending_batch = Arc::clone(&self.pending_batch);
-        python_future_on_with_delivery(
+        let (future, abort_handle) = python_future_on_with_delivery(
             py,
             runtime,
             async move {
@@ -42879,7 +44551,10 @@ impl PyPageEventStream {
                     })),
                 })
             },
-        )
+            Some(cancel_hook),
+        )?;
+        wait_state.set_abort_handle(abort_handle);
+        Ok(future)
     }
 
     fn close(&self) {
@@ -42983,6 +44658,7 @@ impl PyConsoleEventWaiter {
         let session_id = self.session_id.clone();
         let event_cursor = *self.event_cursor.lock().unwrap();
         let replay_until = self.replay_until.clone();
+        let replay_clock_samples = self.replay_clock_samples.clone();
         let event_kind = self.event_kind.clone();
         let page = self.page.clone();
         let timeout = BrowserInner::command_timeout(timeout_ms);
@@ -42994,6 +44670,7 @@ impl PyConsoleEventWaiter {
                 &session_id,
                 event_cursor,
                 &replay_until,
+                &replay_clock_samples,
                 &event_kind,
                 page,
                 &mut page_state,
@@ -46174,7 +47851,15 @@ return waitForScrollSettle();
         let page = Arc::clone(&self.inner);
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
-        browser.block_on_raw(page_close_async(page, timeout, run_before_unload))
+        let result = browser.block_on_raw(page_close_async(
+            Arc::clone(&page),
+            timeout,
+            run_before_unload,
+        ));
+        if result.is_ok() && run_before_unload {
+            page.release_memory_buffers();
+        }
+        result
     }
 
     fn evaluate_expression(&self, expression: &str, timeout_ms: Option<f64>) -> RwResult<String> {
@@ -48730,11 +50415,10 @@ async fn register_page_owned_workers_from_event_log(page: &PageInner) -> bool {
     false
 }
 
-async fn enable_console_capture(
+async fn prepare_console_capture(
     page: &PageInner,
-    timeout: Duration,
-) -> RwResult<HashMap<String, u64>> {
-    let deadline = Instant::now() + timeout;
+    deadline: OperationDeadline,
+) -> RwResult<HashMap<String, Option<f64>>> {
     if with_live_page_retention(page, || {
         page.console_capture.requested.store(true, Ordering::SeqCst);
     })
@@ -48742,26 +50426,78 @@ async fn enable_console_capture(
     {
         return Err(RwError::TargetClosed(TargetClosedKind::Page));
     }
-    if register_page_owned_iframes_from_event_log(page).await
-        || register_page_owned_workers_from_event_log(page).await
-    {
+    // Registration can wait for enabled_sessions while clearing detached sessions.
+    let unreplayable = tokio::time::timeout(deadline.remaining()?, async {
+        register_page_owned_iframes_from_event_log(page).await
+            || register_page_owned_workers_from_event_log(page).await
+    })
+    .await
+    .map_err(|_| RwError::Timeout(deadline.timeout.as_millis() as u64))?;
+    if unreplayable {
         return Err(RwError::Message(
             "CDP event log contains unreplayable console history".to_string(),
         ));
     }
-    let sessions = {
+    let (mut sessions, worker_sessions) = {
         let frame_state = page.frame_state.lock().unwrap();
         let mut sessions = frame_state.all_owned_session_ids();
-        sessions.extend(frame_state.worker_sessions.iter().cloned());
-        sessions.into_iter().collect::<HashSet<_>>()
+        let worker_sessions = frame_state.worker_sessions.clone();
+        sessions.extend(worker_sessions.iter().cloned());
+        (
+            sessions.into_iter().collect::<HashSet<_>>(),
+            worker_sessions,
+        )
     };
-    let mut replay_until = HashMap::with_capacity(sessions.len());
+    let enabled_sessions = tokio::time::timeout(
+        deadline.remaining()?,
+        page.console_capture.enabled_sessions.lock(),
+    )
+    .await
+    .map_err(|_| RwError::Timeout(deadline.timeout.as_millis() as u64))?;
+    deadline.remaining()?;
+    sessions.retain(|session_id| !enabled_sessions.contains(session_id));
+    drop(enabled_sessions);
+    let mut samples = HashMap::with_capacity(sessions.len());
     for session_id in sessions {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(RwError::Timeout(timeout.as_millis() as u64));
-        }
-        let cutoff = enable_console_capture_for_session(page, &session_id, remaining).await?;
+        let sample = if worker_sessions.contains(&session_id) {
+            None
+        } else {
+            sample_console_replay_clock_for_page(page, &session_id, deadline).await
+        };
+        samples.insert(session_id, sample);
+    }
+    Ok(samples)
+}
+
+async fn enable_console_capture(
+    page: &PageInner,
+    timeout: Duration,
+) -> RwResult<HashMap<String, u64>> {
+    let deadline = OperationDeadline::new(timeout);
+    let _setup_guard = tokio::time::timeout(
+        deadline.remaining()?,
+        page.console_capture.setup_lock.lock(),
+    )
+    .await
+    .map_err(|_| RwError::Timeout(timeout.as_millis() as u64))?;
+    let samples = prepare_console_capture(page, deadline).await?;
+    enable_console_capture_with_samples(page, deadline, samples).await
+}
+
+async fn enable_console_capture_with_samples(
+    page: &PageInner,
+    deadline: OperationDeadline,
+    samples: HashMap<String, Option<f64>>,
+) -> RwResult<HashMap<String, u64>> {
+    let mut replay_until = HashMap::with_capacity(samples.len());
+    for (session_id, sample) in samples {
+        let cutoff = enable_console_capture_for_session_at_sample(
+            page,
+            &session_id,
+            deadline.remaining()?,
+            sample,
+        )
+        .await?;
         replay_until.insert(session_id, cutoff);
     }
     Ok(replay_until)
@@ -48779,52 +50515,155 @@ async fn enable_console_capture_for_session_if_requested(
         .await
         .map(Some)
 }
+async fn sample_console_replay_clock_for_page(
+    page: &PageInner,
+    session_id: &str,
+    deadline: OperationDeadline,
+) -> Option<f64> {
+    let frame_id = if session_id == page.session_id {
+        page.main_frame_id(&page.browser.client, session_id, deadline.remaining().ok()?)
+            .await
+            .ok()
+    } else {
+        page.frame_state
+            .lock()
+            .unwrap()
+            .session_frames
+            .get(session_id)
+            .cloned()
+    };
+    // Never fall back to the application's default-world Date implementation.
+    let frame_id = frame_id?;
+    let context_id = create_isolated_world_for_frame(
+        &page.browser.client,
+        session_id,
+        &frame_id,
+        deadline.remaining().ok()?,
+    )
+    .await
+    .ok()?;
+    let response = page
+        .browser
+        .client
+        .send(
+            "Runtime.evaluate",
+            json!({
+                "expression": "Date.now()",
+                "contextId": context_id,
+                "returnByValue": true,
+                "awaitPromise": false,
+            }),
+            Some(session_id),
+            deadline.remaining().ok()?,
+        )
+        .await
+        .ok()?;
+    if response.get("exceptionDetails").is_some()
+        || response.pointer("/result/exceptionDetails").is_some()
+    {
+        return None;
+    }
+    response
+        .pointer("/result/result/value")
+        .or_else(|| response.pointer("/result/value"))
+        .and_then(Value::as_f64)
+        .filter(|sample| sample.is_finite())
+}
 
-async fn enable_runtime_with_local_console_cutoff(
+fn begin_console_replay_cutoff(client: &CdpClient, session_id: &str, sample: Option<f64>) -> u64 {
+    client
+        .event_log
+        .lock()
+        .unwrap()
+        .begin_console_replay_cutoff(session_id, sample)
+}
+
+fn cancel_console_replay_cutoff(client: &CdpClient, session_id: &str, generation: u64) {
+    client
+        .event_log
+        .lock()
+        .unwrap()
+        .cancel_console_replay_cutoff(session_id, generation);
+}
+
+async fn enable_runtime_with_local_console_cutoff_at_sample(
     client: &CdpClient,
     session_id: &str,
     timeout: Duration,
+    sample: Option<f64>,
 ) -> RwResult<u64> {
-    client
+    let generation = begin_console_replay_cutoff(client, session_id, sample);
+    match client
         .send("Runtime.enable", json!({}), Some(session_id), timeout)
-        .await?;
-    Ok(client.event_cursor())
+        .await
+    {
+        Ok(_) => {
+            let cutoff = client.event_cursor();
+            client
+                .event_log
+                .lock()
+                .unwrap()
+                .finalize_console_replay_cutoff(session_id, generation, cutoff);
+            Ok(cutoff)
+        }
+        Err(error) => {
+            cancel_console_replay_cutoff(client, session_id, generation);
+            Err(error)
+        }
+    }
 }
-
 async fn enable_console_capture_for_session(
     page: &PageInner,
     session_id: &str,
     timeout: Duration,
 ) -> RwResult<u64> {
-    // Hold the enabled-session set across Runtime.enable. This makes first use
-    // single-flight and records the session before any later console_records()
-    // call can send the detectable command a second time.
-    let mut enabled_sessions = page.console_capture.enabled_sessions.lock().await;
-    let retention_gate = page.browser.client.retention_gate();
-    let Some(retention_guard) = retention_gate.lock_for_write() else {
-        return Err(RwError::TargetClosed(TargetClosedKind::Page));
-    };
-    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
-        return Err(RwError::TargetClosed(TargetClosedKind::Page));
-    }
-    if enabled_sessions.contains(session_id) {
-        return Ok(page.browser.client.event_cursor());
+    let deadline = OperationDeadline::new(timeout);
+    let sample = sample_console_replay_clock_for_page(page, session_id, deadline).await;
+    enable_console_capture_for_session_at_sample(page, session_id, deadline.remaining()?, sample)
+        .await
+}
+
+async fn enable_console_capture_for_session_at_sample(
+    page: &PageInner,
+    session_id: &str,
+    timeout: Duration,
+    sample: Option<f64>,
+) -> RwResult<u64> {
+    // Hold the enabled-session set across Runtime.enable. This makes first use single-flight and
+    // records the session before any later console_records() call can send it a second time.
+    let deadline = OperationDeadline::new(timeout);
+    let mut enabled_sessions = tokio::time::timeout(
+        deadline.remaining()?,
+        page.console_capture.enabled_sessions.lock(),
+    )
+    .await
+    .map_err(|_| RwError::Timeout(timeout.as_millis() as u64))?;
+    let timeout = deadline.remaining()?;
+    {
+        let retention_gate = page.browser.client.retention_gate();
+        let Some(_retention_guard) = retention_gate.lock_for_write() else {
+            return Err(RwError::TargetClosed(TargetClosedKind::Page));
+        };
+        if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+            return Err(RwError::TargetClosed(TargetClosedKind::Page));
+        }
+        if enabled_sessions.contains(session_id) {
+            return Ok(page.browser.client.event_cursor());
+        }
     }
     let started = Instant::now();
-    // Publish the provisional cutoff in CdpEventLog before Runtime.enable. Ordered consumers
-    // all read this sequenced metadata source, so replay cannot pass during setup.
-    let cutoff_generation = page
-        .browser
-        .client
-        .event_log
-        .lock()
-        .unwrap()
-        .begin_console_replay_cutoff(session_id);
-    page.console_replay_until_event_cursor
-        .lock()
-        .unwrap()
-        .insert(session_id.to_owned(), u64::MAX);
-    drop(retention_guard);
+    let cutoff_generation = begin_console_replay_cutoff(&page.browser.client, session_id, sample);
+    {
+        let retention_gate = page.browser.client.retention_gate();
+        let Some(_retention_guard) = retention_gate.lock_for_write() else {
+            cancel_console_replay_cutoff(&page.browser.client, session_id, cutoff_generation);
+            return Err(RwError::TargetClosed(TargetClosedKind::Page));
+        };
+        page.console_replay_until_event_cursor
+            .lock()
+            .unwrap()
+            .insert(session_id.to_owned(), u64::MAX);
+    }
     let replay_until = match page
         .browser
         .client
@@ -48852,12 +50691,7 @@ async fn enable_console_capture_for_session(
                     .lock()
                     .unwrap()
                     .remove(session_id);
-                page.browser
-                    .client
-                    .event_log
-                    .lock()
-                    .unwrap()
-                    .cancel_console_replay_cutoff(session_id, cutoff_generation);
+                cancel_console_replay_cutoff(&page.browser.client, session_id, cutoff_generation);
             });
             return Err(error);
         }
@@ -48899,7 +50733,6 @@ async fn enable_console_capture_for_session(
     }
     Ok(replay_until)
 }
-
 const ATTACHED_IFRAME_SETUP_RETRY_LIMIT: usize = 1;
 #[cfg(test)]
 const ATTACHED_IFRAME_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -49477,7 +51310,8 @@ fn spawn_page_sequence_gated_event_listener(
             let Some(page) = page.upgrade() else {
                 break;
             };
-            if page.lifecycle.is_closing_or_closed() {
+            if page.lifecycle.is_closing_or_closed() && !page.lifecycle.allows_events_during_close()
+            {
                 break;
             }
             let event_sequence = cdp_event_sequence(&event);
@@ -50070,7 +51904,39 @@ fn reset_page_history_after_unreplayable_locked(page: &PageInner, sequence: u64)
         .unwrap()
         .mark_all_frame_caches_dirty();
 }
+fn is_page_target_close_event(page: &PageInner, event: &Value) -> bool {
+    match event.get("method").and_then(Value::as_str) {
+        Some("Target.targetDestroyed") => {
+            event.pointer("/params/targetId").and_then(Value::as_str)
+                == Some(page.target_id.as_str())
+        }
+        Some("Inspector.detached") => {
+            event.get("sessionId").and_then(Value::as_str) == Some(page.session_id.as_str())
+        }
+        Some("Target.detachedFromTarget") => {
+            event.pointer("/params/sessionId").and_then(Value::as_str)
+                == Some(page.session_id.as_str())
+        }
+        _ => false,
+    }
+}
+
 async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
+    // A Page.close response is not terminal receipt. The listener must still
+    // record target disposal while the beforeunload close lifecycle is active.
+    if is_page_target_close_event(&page, &event) {
+        page.target_closed.store(true, Ordering::SeqCst);
+        page.browser
+            .client
+            .event_log
+            .lock()
+            .unwrap()
+            .active_dialogs
+            .remove(&page.session_id);
+        page.clear_worker_resume_handoffs();
+        page.abort_iframe_setup_tasks();
+        return;
+    }
     if page.lifecycle.is_closing_or_closed()
         || page.target_closed.load(Ordering::SeqCst)
         || !page.browser.client.retention_enabled()
@@ -50112,26 +51978,6 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
         && event.get("sessionId").and_then(Value::as_str) == Some(page.session_id.as_str())
     {
         page.crashed.store(true, Ordering::SeqCst);
-        return;
-    }
-    if method == "Target.targetDestroyed"
-        && event.pointer("/params/targetId").and_then(Value::as_str)
-            == Some(page.target_id.as_str())
-    {
-        page.target_closed.store(true, Ordering::SeqCst);
-        page.clear_worker_resume_handoffs();
-        page.abort_iframe_setup_tasks();
-        return;
-    }
-    if (method == "Inspector.detached"
-        && event.get("sessionId").and_then(Value::as_str) == Some(page.session_id.as_str()))
-        || (method == "Target.detachedFromTarget"
-            && event.pointer("/params/sessionId").and_then(Value::as_str)
-                == Some(page.session_id.as_str()))
-    {
-        page.target_closed.store(true, Ordering::SeqCst);
-        page.clear_worker_resume_handoffs();
-        page.abort_iframe_setup_tasks();
         return;
     }
     if method == "Target.attachedToTarget" {
@@ -50432,20 +52278,19 @@ fn record_page_observation_event_with_ownership(
         return;
     }
     let event_sequence = cdp_event_sequence(event);
-    let event_cursor = event_sequence.map(|sequence| sequence.saturating_add(1));
     let event_session_id = event.get("sessionId").and_then(Value::as_str);
-    let capture_baseline_replay = event_session_id
-        .and_then(|session_id| {
-            page.console_replay_until_event_cursor
-                .lock()
-                .unwrap()
-                .get(session_id)
-                .copied()
-        })
-        .is_some_and(|replay_until| {
-            replay_until == u64::MAX
-                || event_cursor.is_some_and(|event_cursor| event_cursor <= replay_until)
-        });
+    let capture_baseline_replay =
+        event_sequence
+            .zip(event_session_id)
+            .is_some_and(|(sequence, session)| {
+                page.browser
+                    .client
+                    .event_log
+                    .lock()
+                    .unwrap()
+                    .console_replay_window(session, sequence)
+                    .is_some_and(|window| window.is_history(event, window.sample))
+            });
     let method = event.get("method").and_then(Value::as_str).unwrap_or("");
     let is_main_session = event_session_id == Some(page.session_id.as_str());
     let owned_session = replay_owned_session.unwrap_or_else(|| {
@@ -50903,33 +52748,59 @@ mod native_console_record_tests {
         assert!(write_rx.try_recv().is_err());
 
         let respond = async {
-            let outgoing = tokio::time::timeout(Duration::from_secs(1), write_rx.recv())
-                .await
-                .expect("console capture must send Runtime.enable")
-                .expect("CDP writer must remain open");
-            let command = match outgoing {
-                CdpOutgoing::Text { payload, .. } => {
-                    serde_json::from_str::<Value>(&payload).unwrap()
+            let mut methods = Vec::new();
+            loop {
+                let outgoing = tokio::time::timeout(Duration::from_secs(1), write_rx.recv())
+                    .await
+                    .expect("console capture must send setup command")
+                    .expect("CDP writer must remain open");
+                let command = match outgoing {
+                    CdpOutgoing::Text { payload, .. } => {
+                        serde_json::from_str::<Value>(&payload).unwrap()
+                    }
+                    CdpOutgoing::Close => panic!("unexpected transport close"),
+                };
+                let method = command["method"].as_str().unwrap();
+                methods.push(method.to_string());
+                let result = match method {
+                    "Page.getFrameTree" => {
+                        json!({"frameTree": {"frame": {"id": "main-frame"}}})
+                    }
+                    "Page.createIsolatedWorld" => json!({"executionContextId": 1}),
+                    "Runtime.evaluate" => {
+                        json!({"result": {"type": "number", "value": 100.0}})
+                    }
+                    "Runtime.enable" => json!({}),
+                    other => panic!("unexpected console setup command: {other}"),
+                };
+                dispatch_cdp_payload(
+                    json!({ "id": command["id"], "result": result }),
+                    Arc::clone(&pending),
+                    events.clone(),
+                    Arc::clone(&event_log),
+                );
+                if method == "Runtime.enable" {
+                    break;
                 }
-                CdpOutgoing::Close => panic!("unexpected transport close"),
-            };
-            dispatch_cdp_payload(
-                json!({ "id": command["id"], "result": {} }),
-                Arc::clone(&pending),
-                events.clone(),
-                Arc::clone(&event_log),
-            );
-            command
+            }
+            methods
         };
-        let (first, second, command) = tokio::join!(
+        let (first, second, methods) = tokio::join!(
             enable_console_capture(&page, Duration::from_secs(1)),
             enable_console_capture(&page, Duration::from_secs(1)),
             respond,
         );
         first.unwrap();
         second.unwrap();
-        assert_eq!(command["method"], "Runtime.enable");
-        assert_eq!(command["sessionId"], "root-session");
+        assert!(
+            methods
+                == [
+                    "Page.createIsolatedWorld",
+                    "Runtime.evaluate",
+                    "Runtime.enable"
+                ]
+                || methods == ["Runtime.evaluate", "Runtime.enable"]
+        );
         assert!(
             write_rx.try_recv().is_err(),
             "concurrent first-use must not send Runtime.enable twice"
@@ -50939,8 +52810,48 @@ mod native_console_record_tests {
             .lock()
             .unwrap()
             .record_session_for_frame("late-iframe-frame", "late-iframe-session");
-
         let respond_late_iframe = async {
+            let create_outgoing = tokio::time::timeout(Duration::from_secs(1), write_rx.recv())
+                .await
+                .expect("late iframe capture must create utility world")
+                .expect("CDP writer must remain open");
+            let create_command = match create_outgoing {
+                CdpOutgoing::Text { payload, .. } => {
+                    serde_json::from_str::<Value>(&payload).unwrap()
+                }
+                CdpOutgoing::Close => panic!("unexpected transport close"),
+            };
+            assert_eq!(create_command["method"], "Page.createIsolatedWorld");
+            dispatch_cdp_payload(
+                json!({
+                    "id": create_command["id"],
+                    "result": {"executionContextId": 2}
+                }),
+                Arc::clone(&pending),
+                events.clone(),
+                Arc::clone(&event_log),
+            );
+            let sample_outgoing = tokio::time::timeout(Duration::from_secs(1), write_rx.recv())
+                .await
+                .expect("late iframe capture must sample Runtime clock")
+                .expect("CDP writer must remain open");
+            let sample_command = match sample_outgoing {
+                CdpOutgoing::Text { payload, .. } => {
+                    serde_json::from_str::<Value>(&payload).unwrap()
+                }
+                CdpOutgoing::Close => panic!("unexpected transport close"),
+            };
+            assert_eq!(sample_command["method"], "Runtime.evaluate");
+            assert_eq!(sample_command["params"]["expression"], "Date.now()");
+            dispatch_cdp_payload(
+                json!({
+                    "id": sample_command["id"],
+                    "result": {"result": {"type": "number", "value": 100.0}}
+                }),
+                Arc::clone(&pending),
+                events.clone(),
+                Arc::clone(&event_log),
+            );
             let outgoing = tokio::time::timeout(Duration::from_secs(1), write_rx.recv())
                 .await
                 .expect("late iframe capture must send Runtime.enable")
@@ -50951,11 +52862,16 @@ mod native_console_record_tests {
                 }
                 CdpOutgoing::Close => panic!("unexpected transport close"),
             };
+            assert_eq!(command["method"], "Runtime.enable");
             for event in [
                 json!({
                     "method": "Runtime.consoleAPICalled",
                     "sessionId": "late-iframe-session",
-                    "params": {"type": "log", "args": [{"type": "string", "value": "iframe replay before navigation"}]}
+                    "params": {
+                        "timestamp": 99.0,
+                        "type": "log",
+                        "args": [{"type": "string", "value": "iframe replay before navigation"}]
+                    }
                 }),
                 json!({
                     "method": "Page.frameNavigated",
@@ -50971,12 +52887,29 @@ mod native_console_record_tests {
                 json!({
                     "method": "Runtime.consoleAPICalled",
                     "sessionId": "late-iframe-session",
-                    "params": {"type": "log", "args": [{"type": "string", "value": "iframe replay after navigation"}]}
+                    "params": {
+                        "timestamp": 99.0,
+                        "type": "log",
+                        "args": [{"type": "string", "value": "iframe replay after navigation"}]
+                    }
+                }),
+                json!({
+                    "method": "Runtime.consoleAPICalled",
+                    "sessionId": "late-iframe-session",
+                    "params": {
+                        "timestamp": 100.0,
+                        "type": "log",
+                        "args": [{"type": "string", "value": "iframe live at sample boundary"}]
+                    }
                 }),
                 json!({
                     "method": "Runtime.consoleAPICalled",
                     "sessionId": "root-session",
-                    "params": {"type": "log", "args": [{"type": "string", "value": "live main during iframe replay"}]}
+                    "params": {
+                        "timestamp": 100.0,
+                        "type": "log",
+                        "args": [{"type": "string", "value": "live main during iframe replay"}]
+                    }
                 }),
             ] {
                 dispatch_cdp_payload(
@@ -51014,11 +52947,11 @@ mod native_console_record_tests {
                 "params": {"type": "log", "args": [{"type": "string", "value": "iframe after replay window"}]}
             }),
             Arc::clone(&pending),
-            events,
-            event_log,
+            events.clone(),
+            Arc::clone(&event_log),
         );
         tokio::time::timeout(Duration::from_secs(1), async {
-            while page.observation_event_cursor.load(Ordering::SeqCst) < 6 {
+            while page.observation_event_cursor.load(Ordering::SeqCst) < 7 {
                 tokio::task::yield_now().await;
             }
         })
@@ -51034,6 +52967,7 @@ mod native_console_record_tests {
             vec![
                 ("iframe replay before navigation", 0),
                 ("iframe replay after navigation", 0),
+                ("iframe live at sample boundary", 2),
                 ("live main during iframe replay", 2),
                 ("iframe after replay window", 2),
             ]
@@ -51046,10 +52980,143 @@ mod native_console_record_tests {
                 .map(|record| record.text.as_str())
                 .collect::<Vec<_>>(),
             vec![
+                "iframe live at sample boundary",
                 "live main during iframe replay",
-                "iframe after replay window"
+                "iframe after replay window",
             ]
         );
+        clear_console_capture_for_session(&page, "late-iframe-session").await;
+        let cursor_before_second_generation = page.observation_event_cursor.load(Ordering::SeqCst);
+        let respond_second_generation = async {
+            let create_outgoing = tokio::time::timeout(Duration::from_secs(1), write_rx.recv())
+                .await
+                .expect("second-generation capture must create utility world")
+                .expect("CDP writer must remain open");
+            let create_command = match create_outgoing {
+                CdpOutgoing::Text { payload, .. } => {
+                    serde_json::from_str::<Value>(&payload).unwrap()
+                }
+                CdpOutgoing::Close => panic!("unexpected transport close"),
+            };
+            assert_eq!(create_command["method"], "Page.createIsolatedWorld");
+            dispatch_cdp_payload(
+                json!({
+                    "id": create_command["id"],
+                    "result": {"executionContextId": 3}
+                }),
+                Arc::clone(&pending),
+                events.clone(),
+                Arc::clone(&event_log),
+            );
+            let sample_outgoing = tokio::time::timeout(Duration::from_secs(1), write_rx.recv())
+                .await
+                .expect("second-generation capture must sample Runtime clock")
+                .expect("CDP writer must remain open");
+            let sample_command = match sample_outgoing {
+                CdpOutgoing::Text { payload, .. } => {
+                    serde_json::from_str::<Value>(&payload).unwrap()
+                }
+                CdpOutgoing::Close => panic!("unexpected transport close"),
+            };
+            assert_eq!(sample_command["method"], "Runtime.evaluate");
+            assert_eq!(sample_command["params"]["expression"], "Date.now()");
+            dispatch_cdp_payload(
+                json!({
+                    "id": sample_command["id"],
+                    "result": {"result": {"type": "number", "value": 200.0}}
+                }),
+                Arc::clone(&pending),
+                events.clone(),
+                Arc::clone(&event_log),
+            );
+            let outgoing = tokio::time::timeout(Duration::from_secs(1), write_rx.recv())
+                .await
+                .expect("second-generation capture must send Runtime.enable")
+                .expect("CDP writer must remain open");
+            let command = match outgoing {
+                CdpOutgoing::Text { payload, .. } => {
+                    serde_json::from_str::<Value>(&payload).unwrap()
+                }
+                CdpOutgoing::Close => panic!("unexpected transport close"),
+            };
+            assert_eq!(command["method"], "Runtime.enable");
+            for event in [
+                json!({
+                    "method": "Runtime.consoleAPICalled",
+                    "sessionId": "late-iframe-session",
+                    "params": {
+                        "timestamp": 199.0,
+                        "type": "log",
+                        "args": [{"type": "string", "value": "second generation replay"}]
+                    }
+                }),
+                json!({
+                    "method": "Runtime.consoleAPICalled",
+                    "sessionId": "late-iframe-session",
+                    "params": {
+                        "timestamp": 200.0,
+                        "type": "log",
+                        "args": [{"type": "string", "value": "second generation live at boundary"}]
+                    }
+                }),
+            ] {
+                dispatch_cdp_payload(
+                    event,
+                    Arc::clone(&pending),
+                    events.clone(),
+                    Arc::clone(&event_log),
+                );
+            }
+            dispatch_cdp_payload(
+                json!({ "id": command["id"], "result": {} }),
+                Arc::clone(&pending),
+                events.clone(),
+                Arc::clone(&event_log),
+            );
+            command
+        };
+        let (second_generation, command) = tokio::join!(
+            enable_console_capture_for_session_if_requested(
+                &page,
+                "late-iframe-session",
+                Duration::from_secs(1),
+            ),
+            respond_second_generation,
+        );
+        second_generation.unwrap();
+        assert_eq!(command["method"], "Runtime.enable");
+        assert_eq!(command["sessionId"], "late-iframe-session");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while page.observation_event_cursor.load(Ordering::SeqCst)
+                < cursor_before_second_generation + 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener must consume second-generation console records");
+        let second_generation_current = page.console_records.lock().unwrap().read(false, false);
+        let second_generation_texts = second_generation_current
+            .records
+            .iter()
+            .map(|record| record.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_log
+                .lock()
+                .unwrap()
+                .console_replay_sample("late-iframe-session"),
+            Some(Some(200.0))
+        );
+        let log = event_log.lock().unwrap();
+        let window = log
+            .console_replay_window("late-iframe-session", cursor_before_second_generation)
+            .unwrap();
+        assert_eq!(window.start, cursor_before_second_generation);
+        assert_eq!(window.end, cursor_before_second_generation + 2);
+        drop(log);
+        assert!(!second_generation_texts.contains(&"second generation replay"));
+        assert!(second_generation_texts.contains(&"second generation live at boundary"));
     }
 }
 
@@ -54177,13 +56244,14 @@ fn process_page_observation_event_with_page(
     page: Option<&PageInner>,
 ) {
     if page.is_some_and(|page| {
-        page.lifecycle.is_closing_or_closed()
-            || page.target_closed.load(Ordering::SeqCst)
+        ((page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst))
+            && !page.lifecycle.allows_events_during_close())
             || !page.browser.client.retention_enabled()
     }) {
         return;
     }
     if is_unreplayable_cdp_event(event) {
+        let recovered_dialogs = state.undispatched_active_dialogs(&event_log.lock().unwrap(), 0..0);
         if let Some(page) = page {
             reset_page_history_after_unreplayable_locked(page, seq);
             *state = PageEventStreamState::for_page(page);
@@ -54194,6 +56262,7 @@ fn process_page_observation_event_with_page(
                 .reset_after_overflow(seq.saturating_add(1));
             state.reset_after_overflow();
         }
+        state.ready = recovered_dialogs;
         state.ready.insert(
             seq,
             page_event_envelope(
@@ -54208,7 +56277,7 @@ fn process_page_observation_event_with_page(
         return;
     }
     state.ensure_main_session(session_id);
-    state.sync_replay_cutoffs_for_event(event, event_log);
+    state.sync_replay_windows_for_event(event, event_log);
     state.apply_target_transition(event, session_id);
     let method = event.get("method").and_then(Value::as_str).unwrap_or("");
     let matched = match process_network_observation_event(
@@ -54222,7 +56291,10 @@ fn process_page_observation_event_with_page(
     ) {
         Ok(matched) => matched,
         Err(dropped) => {
+            let recovered_dialogs =
+                state.undispatched_active_dialogs(&event_log.lock().unwrap(), 0..0);
             state.reset_after_overflow();
+            state.ready = recovered_dialogs;
             state.ready.insert(
                 seq,
                 page_event_envelope(seq, "_overflow", json!({ "dropped": dropped })),
@@ -54245,14 +56317,7 @@ fn process_page_observation_event_with_page(
     if !state.owns_session(event_session_id) {
         return;
     }
-    if matches!(
-        method,
-        "Runtime.consoleAPICalled" | "Runtime.exceptionThrown"
-    ) && state
-        .replay_until
-        .get(event_session_id)
-        .is_some_and(|cutoff| *cutoff == u64::MAX || seq < *cutoff)
-    {
+    if state.console_event_is_replay_history(event) {
         return;
     }
     let matched = match method {
@@ -54341,8 +56406,8 @@ async fn wait_for_page_event_batch(
     let deadline = tokio::time::Instant::now() + timeout;
     let mut batch = Vec::with_capacity(max_events);
     loop {
-        if page.lifecycle.is_closing_or_closed()
-            || page.target_closed.load(Ordering::SeqCst)
+        if ((page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst))
+            && !page.lifecycle.allows_events_during_close())
             || !page.browser.client.retention_enabled()
         {
             batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
@@ -54356,47 +56421,102 @@ async fn wait_for_page_event_batch(
             batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
             return (batch, true);
         }
+        let terminal_drained = state.terminal_cursor.is_some_and(|end| *cursor >= end);
+        if terminal_drained {
+            for (_, pending) in state.network.pending_responses.drain() {
+                state.ready.insert(
+                    pending.seq,
+                    page_event_envelope(pending.seq, "response", pending.response),
+                );
+            }
+        }
         expire_page_responses(state);
         append_ready_page_events(&mut batch, state, max_events);
         if batch.len() >= max_events {
             return (batch, false);
         }
+        if terminal_drained {
+            batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
+            return (batch, true);
+        }
 
         let raw_limit = (max_events - batch.len())
             .min(PAGE_EVENT_LOG_SCAN_CHUNK)
             .max(1);
-        let (oldest_seq, entries) = {
+        let (oldest_seq, entries, recovered_dialogs) = {
             let log = event_log.lock().unwrap();
+            // A terminal flag certifies only a snapshot taken after its publication.
+            // Keep that boundary across batches, including when the terminal event
+            // itself has already fallen out of the retained log.
+            if state.terminal_cursor.is_none() && page.target_closed.load(Ordering::SeqCst) {
+                state.terminal_cursor = Some(log.cursor());
+            }
             (
                 log.oldest_seq(),
                 log.entries_since_limited(*cursor, raw_limit),
+                if *cursor < log.oldest_seq() {
+                    state.undispatched_active_dialogs(&log, *cursor..log.oldest_seq())
+                } else {
+                    BTreeMap::new()
+                },
             )
         };
+        #[cfg(test)]
+        if entries.is_empty() {
+            let barrier = tests::page_event_stream_snapshot_barriers()
+                .lock()
+                .unwrap()
+                .remove(&(page as *const PageInner as usize));
+            if let Some((entered, released)) = barrier {
+                entered.send(()).unwrap();
+                released.await.unwrap();
+            }
+        }
         let scanned_full_chunk = entries.len() >= raw_limit;
         if *cursor < oldest_seq {
             let dropped = oldest_seq - *cursor;
-            let Some(()) = with_live_page_retention(page, || {
+            {
+                let retention_gate = page.browser.client.retention_gate();
+                let Some(_retention_guard) = retention_gate.lock_for_write() else {
+                    batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
+                    return (batch, true);
+                };
+                if (page.lifecycle.is_closing_or_closed()
+                    || page.target_closed.load(Ordering::SeqCst))
+                    && !page.lifecycle.allows_events_during_close()
+                {
+                    batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
+                    return (batch, true);
+                }
                 *cursor = oldest_seq;
+                let terminal_cursor = state.terminal_cursor;
                 *state = PageEventStreamState::for_page(page);
+                state.terminal_cursor = terminal_cursor;
+                state.ready = recovered_dialogs;
                 requests.lock().unwrap().reset_after_overflow(oldest_seq);
-            }) else {
-                batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
-                return (batch, true);
-            };
+            }
             batch.push(page_event_envelope(
                 *cursor,
                 "_overflow",
                 json!({ "dropped": dropped }),
             ));
+            append_ready_page_events(&mut batch, state, max_events);
             if batch.len() >= max_events {
                 return (batch, false);
             }
         }
         for (seq, event) in entries {
+            if state.terminal_cursor.is_some_and(|end| seq >= end) {
+                break;
+            }
             if seq < *cursor {
                 continue;
             }
             *cursor = seq.saturating_add(1);
+            if is_page_target_close_event(page, &event) {
+                state.terminal_cursor = Some(*cursor);
+                break;
+            }
             let retention_gate = page.browser.client.retention_gate();
             let Some(_retention_guard) = retention_gate.lock_for_write() else {
                 batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
@@ -54417,10 +56537,17 @@ async fn wait_for_page_event_batch(
                 return (batch, false);
             }
         }
+        if state.terminal_cursor.is_some_and(|end| *cursor >= end) {
+            continue;
+        }
         if !batch.is_empty() {
             return (batch, false);
         }
         if scanned_full_chunk {
+            continue;
+        }
+
+        if page.target_closed.load(Ordering::SeqCst) {
             continue;
         }
 
@@ -54882,7 +57009,7 @@ fn page_worker_session_from_attachment(page: &PageInner, event: &Value) -> Optio
         state.arm_worker_resume_handoff(child_session_id, event_sequence);
         state
             .claim_worker_resume_handoff(child_session_id)
-            .then(|| child_session_id.to_string())
+            .then_some(child_session_id.to_string())
     })
     .flatten()
 }
@@ -54904,10 +57031,11 @@ fn remove_page_worker_session_from_detachment(page: &PageInner, event: &Value) -
 async fn process_console_wait_event(
     event: Value,
     event_cursor: &mut u64,
-    replay_start_cursor: u64,
+    _replay_start_cursor: u64,
     event_log: &Arc<Mutex<CdpEventLog>>,
     session_id: &str,
     replay_until: &HashMap<String, u64>,
+    replay_clock_samples: &HashMap<String, Option<f64>>,
     event_kind: &str,
     page: Option<Arc<PageInner>>,
     mut page_state: Option<&mut PageEventStreamState>,
@@ -54937,21 +57065,12 @@ async fn process_console_wait_event(
         *event_cursor = sequence.saturating_add(1);
     }
     if let Some(state) = page_state.as_mut() {
-        state.sync_replay_cutoffs_for_event(&event, event_log);
+        state.sync_replay_windows_for_event(&event, event_log);
         state.apply_target_transition(&event, session_id);
     }
-    let replay_cutoff = event_session_id.and_then(|event_session_id| {
-        page_state
-            .as_ref()
-            .and_then(|state| state.replay_until.get(event_session_id).copied())
-            .or_else(|| replay_until.get(event_session_id).copied())
-    });
-    if matches!(
-        method,
-        Some("Runtime.consoleAPICalled") | Some("Runtime.exceptionThrown")
-    ) && replay_cutoff.is_some_and(|cutoff| {
-        event_sequence.is_some_and(|sequence| sequence < cutoff && sequence < replay_start_cursor)
-    }) {
+    let is_replay_history =
+        console_event_is_replay_history(&event, event_log, replay_until, replay_clock_samples);
+    if is_replay_history {
         return Ok(None);
     }
 
@@ -55057,6 +57176,7 @@ async fn wait_for_console_event(
     session_id: &str,
     mut event_cursor: u64,
     replay_until: &HashMap<String, u64>,
+    replay_clock_samples: &HashMap<String, Option<f64>>,
     event_kind: &str,
     page: Option<Arc<PageInner>>,
     page_state: &mut Option<PageEventStreamState>,
@@ -55109,6 +57229,7 @@ async fn wait_for_console_event(
                     &event_log,
                     session_id,
                     replay_until,
+                    replay_clock_samples,
                     event_kind,
                     page.clone(),
                     page_state.as_mut(),
@@ -55149,6 +57270,7 @@ async fn wait_for_console_event(
                         &event_log,
                         session_id,
                         replay_until,
+                        replay_clock_samples,
                         event_kind,
                         page.clone(),
                         page_state.as_mut(),
