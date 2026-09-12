@@ -15,6 +15,7 @@ from typing import Any, Callable, Optional, Type, Union
 
 from . import _rustwright
 from .sync_api import (
+    _ACTION_CANCELLATION,
     APIRequest as SyncAPIRequest,
     APIRequestContext as SyncAPIRequestContext,
     APIResponse as SyncAPIResponse,
@@ -706,6 +707,32 @@ def _rewrite_sliced_wait_timeout_message(message: str, timeout: Any) -> str:
     if rewritten != message:
         return rewritten
     return re.sub(r"timed out after [0-9]+(?:\.[0-9]+)? ms", f"Timeout {timeout_label}ms exceeded.", message, count=1)
+
+
+async def _run_sync_action(
+    sync_owner: Any,
+    action_func: Callable[..., Any],
+    *args: Any,
+    timeout: Optional[float] = None,
+    **kwargs: Any,
+) -> Any:
+    # Context is copied into the executor by _run_sync_call. Sync polls and
+    # native dispatch use the same token without changing public signatures.
+    cancellation = _rustwright._RustCancelToken()
+    context = _ACTION_CANCELLATION.set(cancellation)
+    try:
+        return await _run_sync_call(action_func, *args, timeout=timeout, **kwargs)
+    except asyncio.CancelledError:
+        cancellation.cancel()
+        raise
+    except TimeoutError as exc:
+        raw_timeout = _async_wait_default_timeout(sync_owner) if timeout is None else timeout
+        message = _rewrite_sliced_wait_timeout_message(str(exc), raw_timeout)
+        if message == str(exc):
+            raise
+        raise _copy_wire_error_metadata(exc, TimeoutError(message)) from None
+    finally:
+        _ACTION_CANCELLATION.reset(context)
 
 
 async def _run_sync_wait_sliced(
@@ -3126,7 +3153,7 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
                 for value in (modifiers, position, delay, button, click_count, force, no_wait_after, trial)
             )
         ):
-            await _run_sync_wait_sliced(
+            await _run_sync_action(
                 self._sync,
                 self._sync.click,
                 selector,
@@ -3926,7 +3953,7 @@ class AsyncLocator(_AsyncLocatorGeneratedMixin, _AsyncWrapper):
     ) -> None:
         if not isinstance(target, _AsyncWrapper):
             getattr(target, "_impl_obj")
-        await _run_sync_wait_sliced(
+        await _run_sync_action(
             self._sync,
             self._sync.drag_to,
             target._sync,

@@ -47,6 +47,9 @@ _CUSTOM_SELECTOR_ENGINES: dict[str, str] = {}
 _DOWNLOADS_NOT_ACCEPTED = "Pass 'accept_downloads=True' when you are creating your browser context."
 _MISSING = object()
 _UNSET = object()
+_ACTION_CANCELLATION: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "rustwright_action_cancellation", default=None,
+)
 _SYNC_CLOSE_OPEN = "open"
 _SYNC_CLOSE_CLOSING = "closing"
 _SYNC_CLOSE_CLOSED = "closed"
@@ -1747,16 +1750,42 @@ def _translate_error(exc: Exception) -> Error:
     return Error(message)
 
 
+def _check_action_cancelled() -> None:
+    cancellation = _ACTION_CANCELLATION.get()
+    if cancellation is not None and cancellation.is_cancelled():
+        raise Error("Action was cancelled")
+
+
+def _action_cancel_kwargs() -> dict[str, Any]:
+    cancellation = _ACTION_CANCELLATION.get()
+    return {} if cancellation is None else {"cancel": cancellation}
+
+
+def _call_action(fn, *args, **kwargs):
+    """Commit a Python-managed dispatch and let its required cleanup finish."""
+    cancellation = _ACTION_CANCELLATION.get()
+    if cancellation is None:
+        return fn(*args, **kwargs)
+    # The Rust gate arbitrates cancellation atomically. Nested calls and cleanup
+    # must not observe cancellation after that gate has admitted the dispatch.
+    context = _ACTION_CANCELLATION.set(None)
+    try:
+        return _call(cancellation.run_committed, fn, args, kwargs)
+    finally:
+        _ACTION_CANCELLATION.reset(context)
+
+
 def _call(fn, *args, **kwargs):
+    _check_action_cancelled()
     try:
         return fn(*args, **kwargs)
     except (RuntimeError, ValueError) as exc:
         raise _translate_error(exc) from None
 
 
-def _call_native_key(method: str, key: str, fn, *args):
+def _call_native_key(method: str, key: str, fn, *args, **kwargs):
     try:
-        return _call_with_method_prefix(method, fn, *args)
+        return _call_with_method_prefix(method, fn, *args, **kwargs)
     except Error as exc:
         message = str(exc).removeprefix(f"{method}: ")
         unsupported = re.fullmatch(r"unsupported key(?: modifier)?: (.*)", message)
@@ -5224,9 +5253,11 @@ def _event_wait_step(remaining: float, owner: Any = None) -> float:
 
 
 def _sleep_until_next_poll(deadline: float, interval: float = 0.02) -> None:
+    _check_action_cancelled()
     remaining = deadline - time.monotonic()
     if remaining > 0:
         time.sleep(min(interval, remaining))
+    _check_action_cancelled()
 
 
 def _actionability_probe_timeout(remaining_ms: float, timeout_disabled: bool = False) -> float:
@@ -24437,11 +24468,13 @@ return null;
             self._index,
             _json(options),
             self._page._default_timeout if timeout is None else timeout,
+            **_action_cancel_kwargs(),
         )
         return _decode_json_result_json(result)
 
     def _fill_apply(self, value: str, *, strict: bool, forced: bool, timeout: float) -> dict[str, Any]:
-        result = _call(
+        result = _call_action(
+            _call,
             self._page._core.locator_fill_apply,
             _json(self._spec),
             self._index,
@@ -24461,7 +24494,8 @@ return null;
         timeout: float,
         method: str,
     ) -> dict[str, Any]:
-        result = _call_with_method_prefix(
+        result = _call_action(
+            _call_with_method_prefix,
             method,
             self._page._core.locator_select_apply,
             _json(self._spec),
@@ -24520,6 +24554,7 @@ return null;
         stable_position_required: bool = True,
         action_position: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
+        _check_action_cancelled()
         self._raise_if_frame_locator_in_composite(f"Locator.{action}")
         method = _locator_method_for_action(action)
         _raise_if_owner_unavailable(self._page, method=method)
@@ -24530,6 +24565,7 @@ return null;
         requires_stable = require_stable or (check_stable and state in {"actionable", "stable", "scrollable"})
 
         while True:
+            _check_action_cancelled()
             _raise_if_owner_unavailable(self._page, method=method)
             remaining_ms = max((deadline - time.monotonic()) * 1000, 1.0)
             command_timeout = _actionability_probe_timeout(remaining_ms, timeout_disabled)
@@ -24557,6 +24593,7 @@ return null;
                     break
                 _sleep_until_next_poll(deadline)
                 continue
+            _check_action_cancelled()
             if self._strict and not self._explicit_index:
                 self._raise_frame_strict_violation(last_info.get("frame_strict_violation"))
             count = int(last_info.get("count") or 0)
@@ -25159,6 +25196,21 @@ return {
         return offset_x, offset_y
 
     def _with_mouse_modifiers(self, modifiers: Optional[Iterable[str]], action: Callable[[], None]) -> None:
+        pending = []
+        for modifier in modifiers or []:
+            normalized = self._page.keyboard._normalize_modifier(str(modifier))
+            if normalized is None:
+                raise Error(f"unsupported mouse modifier: {modifier}")
+            if normalized not in self._page.keyboard._modifiers:
+                pending.append(normalized)
+        if not pending:
+            action()
+            return
+        # Modifier-down is the first input in this sequence. Keep modifier-up
+        # and the pointer sequence inside the same cancellation boundary.
+        _call_action(self._dispatch_with_mouse_modifiers, pending, action)
+
+    def _dispatch_with_mouse_modifiers(self, modifiers: Iterable[str], action: Callable[[], None]) -> None:
         pressed: list[str] = []
         existing = set(self._page.keyboard._modifiers)
         try:
@@ -25295,6 +25347,7 @@ return {
             self._index,
             json.dumps(action),
             self._page._default_timeout if timeout is None else timeout,
+            **_action_cancel_kwargs(),
         )
 
     def _mouse_dblclick(
@@ -25527,6 +25580,7 @@ return {{ ok: true, value: __rw_fn(matches, payload.arg) }};
             action,
             timeout_ms,
             on_poll,
+            **_action_cancel_kwargs(),
         )
         self._page._slow_mo()
 
@@ -25574,6 +25628,7 @@ return {{ ok: true, value: __rw_fn(matches, payload.arg) }};
             text,
             delay_value,
             remaining_ms,
+            **_action_cancel_kwargs(),
         )
         self._page._slow_mo()
 
@@ -25608,6 +25663,7 @@ return {{ ok: true, value: __rw_fn(matches, payload.arg) }};
             key,
             delay_value,
             remaining_ms,
+            **_action_cancel_kwargs(),
         )
         self._page._slow_mo()
 
@@ -25853,6 +25909,9 @@ return {{ ok: true, value: __rw_fn(matches, payload.arg) }};
 
     def focus(self, *, timeout: Optional[float] = None) -> None:
         self._wait_for_single("focus", state="attached", timeout=timeout)
+        _call_action(self._focus, timeout=timeout)
+
+    def _focus(self, *, timeout: Optional[float]) -> None:
         self._eval(
             """
 	if (!el) throw new Error('No element matches locator');
@@ -25864,7 +25923,8 @@ return true;
         self._page._slow_mo()
 
     def _focus_for_keyboard_action(self, *, timeout: Optional[float] = None) -> bool:
-        self.focus(timeout=timeout)
+        # The caller waits before committing the focus/type/cleanup sequence.
+        self._focus(timeout=timeout)
         return bool(
             self._eval(
                 """
@@ -25905,7 +25965,8 @@ return true;
 
     def blur(self, *, timeout: Optional[float] = None) -> None:
         self._wait_for_single("blur", state="attached", timeout=timeout)
-        self._eval(
+        _call_action(
+            self._eval,
             """
 	if (!el) throw new Error('No element matches locator');
 if (typeof el.blur === 'function') el.blur();
@@ -26239,7 +26300,8 @@ return true;
     ) -> None:
         self._wait_for_single("set input files", state="attached", timeout=timeout)
         payloads = _file_payloads(files)
-        self._eval(
+        _call_action(
+            self._eval,
             f"""
 if (!el) throw new Error('No element matches locator');
 if (!(el instanceof HTMLInputElement) || el.type !== 'file') throw new Error('Element is not a file input');
@@ -26574,7 +26636,8 @@ return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
 
     def select_text(self, *, force: Optional[bool] = None, timeout: Optional[float] = None) -> None:
         self._wait_for_single("select text", state="attached" if force else "visible", timeout=timeout)
-        self._eval(
+        _call_action(
+            self._eval,
             """
 if (!el) throw new Error('No element matches locator');
 if ((el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) && typeof el.select === 'function') {
@@ -26613,16 +26676,20 @@ return true;
             name="delay",
         )
         self._wait_for_single("press sequentially", state="attached", timeout=timeout)
-        fallback_focused = self._focus_for_keyboard_action(timeout=timeout)
-        try:
-            if fallback_focused:
-                self._page.keyboard._type_without_text(text, delay=delay_value)
-            else:
-                self._page.keyboard.type(text, delay=delay_value)
-            self._page._slow_mo()
-        finally:
-            if fallback_focused:
-                self._cleanup_keyboard_fallback_focus()
+
+        def dispatch() -> None:
+            fallback_focused = self._focus_for_keyboard_action(timeout=timeout)
+            try:
+                if fallback_focused:
+                    self._page.keyboard._type_without_text(text, delay=delay_value)
+                else:
+                    self._page.keyboard.type(text, delay=delay_value)
+                self._page._slow_mo()
+            finally:
+                if fallback_focused:
+                    self._cleanup_keyboard_fallback_focus()
+
+        _call_action(dispatch)
 
     def screenshot(
         self,
