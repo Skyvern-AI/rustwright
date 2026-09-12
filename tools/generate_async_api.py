@@ -120,6 +120,7 @@ HAND_METHODS = {
 # _install_async_expectation_negated_aliases.make_alias.
 HAND_ASYNC_HELPERS = (
     "_run_sync_call",
+    "_run_sync_action",
     "_await_native",
     "_await_native_method",
     "_await_native_action",
@@ -201,17 +202,26 @@ UNWRAP_ARGUMENTS = {
 }
 
 
-# These methods intentionally slice blocking sync waits so cancellation and
-# unrelated event-loop work can make progress. The method bodies are otherwise
-# ordinary delegation, so the runner choice stays explicit generator data.
+# Only observational waits may retry after a slice times out. Mutations must
+# receive their full timeout once, because a timeout can follow physical input.
 SLICED_WAIT_METHODS = {
+    "AsyncPage": ("wait_for_url", "wait_for_function"),
+    "AsyncFrame": ("wait_for_selector", "wait_for_url", "wait_for_function"),
+    "AsyncLocator": ("wait_for",),
+    "AsyncElementHandle": ("wait_for_selector", "wait_for_element_state"),
+}
+
+
+# These actions retain async timeout-message formatting without retrying the
+# sync operation. The executor keeps the event loop free while the action waits.
+SINGLE_DISPATCH_METHODS = {
     "AsyncPage": (
-        "wait_for_url", "wait_for_function", "dblclick", "type", "press",
+        "dblclick", "type", "press",
         "hover", "tap", "drag_and_drop", "focus", "check", "uncheck",
         "select_option", "set_input_files", "set_checked",
     ),
     "AsyncFrame": (
-        "wait_for_selector", "wait_for_url", "wait_for_function", "click",
+        "click",
         "dblclick", "fill", "type", "press", "hover", "tap", "focus",
         "check", "uncheck", "set_checked", "select_option",
         "set_input_files", "drag_and_drop",
@@ -220,13 +230,13 @@ SLICED_WAIT_METHODS = {
         "click", "dblclick", "fill", "type", "press", "hover", "tap",
         "focus", "blur", "clear", "check", "uncheck", "set_checked",
         "select_option", "set_input_files", "scroll_into_view_if_needed",
-        "select_text", "press_sequentially", "wait_for",
+        "select_text", "press_sequentially",
     ),
     "AsyncElementHandle": (
         "click", "dblclick", "fill", "type", "press", "hover", "tap",
-        "wait_for_selector", "check", "uncheck", "set_checked",
+        "check", "uncheck", "set_checked",
         "select_option", "set_input_files", "scroll_into_view_if_needed",
-        "select_text", "wait_for_element_state",
+        "select_text",
     ),
 }
 
@@ -485,6 +495,9 @@ def _delegating_call(
     runner_args: list[ast.expr] = [sync_method, *positional]
     if method.name in SLICED_WAIT_METHODS.get(async_class, ()):
         runner = "_generated_run_sync_wait_sliced"
+    elif method.name in SINGLE_DISPATCH_METHODS.get(async_class, ()):
+        runner = "_generated_run_sync_action"
+    if runner != "_generated_run_sync_call":
         runner_args = [
             ast.Attribute(
                 value=ast.Name(id="self", ctx=ast.Load()),
@@ -692,6 +705,12 @@ async def _generated_run_sync_call(func: Any, /, *args: Any, **kwargs: Any) -> A
     from .async_api import _run_sync_call
 
     return await _run_sync_call(func, *args, **kwargs)
+
+
+async def _generated_run_sync_action(sync_owner: Any, func: Any, /, *args: Any, **kwargs: Any) -> Any:
+    from .async_api import _run_sync_action
+
+    return await _run_sync_action(sync_owner, func, *args, **kwargs)
 
 
 async def _generated_run_sync_wait_sliced(sync_owner: Any, func: Any, /, *args: Any, **kwargs: Any) -> Any:
