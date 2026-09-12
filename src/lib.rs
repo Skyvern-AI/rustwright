@@ -28,7 +28,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 #[cfg(feature = "python")]
-use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule, PyTuple};
 #[cfg(feature = "python")]
 use pyo3::IntoPyObjectExt;
 use serde::de::{MapAccess, SeqAccess, Visitor};
@@ -2731,6 +2731,22 @@ impl PyRustCancelToken {
 
     fn cancel(&self) {
         self.token.cancel();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    // Python dispatch and its cleanup share the existing atomic commit boundary.
+    // Cancellation can win before this callback, but cannot interrupt it halfway.
+    fn run_committed(
+        &self,
+        callback: &Bound<'_, PyAny>,
+        args: &Bound<'_, PyTuple>,
+        kwargs: &Bound<'_, PyDict>,
+    ) -> PyResult<Py<PyAny>> {
+        let _commit = self.token.begin_physical_action().map_err(py_err)?;
+        callback.call(args, Some(kwargs)).map(Bound::unbind)
     }
 }
 
@@ -40778,7 +40794,7 @@ impl PyPage {
         .map_err(py_err)
     }
 
-    #[pyo3(signature = (locator_json, locator_index, action_json, timeout_ms=None))]
+    #[pyo3(signature = (locator_json, locator_index, action_json, timeout_ms=None, cancel=None))]
     fn dispatch_locator_pointer_action(
         &self,
         py: Python<'_>,
@@ -40786,6 +40802,7 @@ impl PyPage {
         locator_index: usize,
         action_json: &str,
         timeout_ms: Option<f64>,
+        cancel: Option<PyRef<'_, PyRustCancelToken>>,
     ) -> PyResult<()> {
         let action = serde_json::from_str::<Value>(action_json)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -40794,6 +40811,7 @@ impl PyPage {
         let client = Arc::clone(&browser.client);
         let locator_json = locator_json.to_string();
         let timeout = BrowserInner::command_timeout(timeout_ms);
+        let cancel = cancel.map(|cancel| cancel.token.clone());
 
         py.detach(move || {
             browser.block_on(async move {
@@ -40811,7 +40829,7 @@ impl PyPage {
                     action.get(name).and_then(Value::as_i64).unwrap_or(default)
                 };
                 let position = action.get("position").and_then(Value::as_object);
-                let resolved = resolve_locator_point(
+                let resolved = cancelable(cancel.clone(), resolve_locator_point(
                     Arc::clone(&page),
                     &locator_json,
                     locator_index,
@@ -40820,7 +40838,7 @@ impl PyPage {
                     None,
                     false,
                     deadline,
-                )
+                ))
                 .await?;
                 let top_x = number("targetX")?;
                 let top_y = number("targetY")?;
@@ -40833,6 +40851,7 @@ impl PyPage {
 
                 match kind {
                     "click" => {
+                        let _commit = cancel.as_ref().map(CancelToken::begin_physical_action).transpose()?;
                         let button = action
                             .get("button")
                             .and_then(Value::as_str)
@@ -40856,6 +40875,7 @@ impl PyPage {
                         .await?;
                     }
                     "hover" => {
+                        let _commit = cancel.as_ref().map(CancelToken::begin_physical_action).transpose()?;
                         dispatch_mouse_move_sequence_in_session(
                             &client,
                             &resolved.session_id,
@@ -40871,6 +40891,7 @@ impl PyPage {
                         .await?;
                     }
                     "tap" => {
+                        let _commit = cancel.as_ref().map(CancelToken::begin_physical_action).transpose()?;
                         client
                             .send(
                                 "Input.dispatchTouchEvent",
@@ -40909,7 +40930,7 @@ impl PyPage {
                             .and_then(Value::as_str)
                             .ok_or_else(|| RwError::Message("drag action is missing target locator".to_string()))?;
                         let target_position = action.get("targetPosition").and_then(Value::as_object);
-                        let target = resolve_locator_point(
+                        let target = cancelable(cancel.clone(), resolve_locator_point(
                             Arc::clone(&page),
                             target_locator_json,
                             integer("targetIndex", 0).max(0) as usize,
@@ -40918,13 +40939,14 @@ impl PyPage {
                             None,
                             false,
                             deadline,
-                        )
+                        ))
                         .await?;
                         if target.session_id != resolved.session_id {
                             return Err(RwError::Message(
                                 "drag source and target must belong to the same CDP target".to_string(),
                             ));
                         }
+                        let _commit = cancel.as_ref().map(CancelToken::begin_physical_action).transpose()?;
                         dispatch_mouse_move_sequence_in_session(
                             &client,
                             &resolved.session_id,
@@ -42376,7 +42398,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         .map_err(py_err)
     }
 
-    #[pyo3(signature = (locator_json, index, options_json, timeout_ms=None))]
+    #[pyo3(signature = (locator_json, index, options_json, timeout_ms=None, cancel=None))]
     fn locator_probe_state(
         &self,
         py: Python<'_>,
@@ -42384,16 +42406,18 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         index: usize,
         options_json: &str,
         timeout_ms: Option<f64>,
+        cancel: Option<PyRef<'_, PyRustCancelToken>>,
     ) -> PyResult<String> {
         let body = locator_probe_state_body(options_json).map_err(py_err)?;
         let page = Arc::clone(&self.inner);
         let locator_json = locator_json.to_string();
         let timeout = BrowserInner::command_timeout(timeout_ms);
+        let cancel = cancel.map(|cancel| cancel.token.clone());
         py.detach(move || {
             let browser = Arc::clone(&page.browser);
-            browser.block_on(async move {
+            browser.block_on(cancelable(cancel, async move {
                 evaluate_locator_action_for_page(page, locator_json, index, body, timeout).await
-            })
+            }))
         })
         .map_err(py_err)
     }
@@ -42590,7 +42614,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         text: &str,
         timeout_ms: Option<f64>,
     ) -> PyResult<()> {
-        self.type_text_native(locator_json, index, text, None, timeout_ms)
+        self.type_text_native(locator_json, index, text, None, timeout_ms, None)
     }
 
     fn keyboard_primary_modifier(&self) -> &'static str {
@@ -42699,7 +42723,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         .to_string())
     }
 
-    #[pyo3(signature = (locator_json, index, text, delay_ms=None, timeout_ms=None))]
+    #[pyo3(signature = (locator_json, index, text, delay_ms=None, timeout_ms=None, cancel=None))]
     fn type_text_native(
         &self,
         locator_json: &str,
@@ -42707,6 +42731,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         text: &str,
         delay_ms: Option<f64>,
         timeout_ms: Option<f64>,
+        cancel: Option<PyRef<'_, PyRustCancelToken>>,
     ) -> PyResult<()> {
         let page = Arc::clone(&self.inner);
         let browser = Arc::clone(&page.browser);
@@ -42714,6 +42739,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         let text = text.to_string();
         let deadline = OperationDeadline::new(native_input_timeout(timeout_ms));
         let delay = native_input_delay(delay_ms);
+        let cancel = cancel.map(|cancel| cancel.token.clone());
         browser
             .block_on(type_locator_for_native_input(
                 &page,
@@ -42723,12 +42749,12 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                 delay,
                 deadline,
                 InputDispatchPolicy::ActionDeadline,
-                None,
+                cancel.as_ref(),
             ))
             .map_err(py_err)
     }
 
-    #[pyo3(signature = (locator_json, index, key, delay_ms=None, timeout_ms=None))]
+    #[pyo3(signature = (locator_json, index, key, delay_ms=None, timeout_ms=None, cancel=None))]
     fn press_key_native(
         &self,
         locator_json: &str,
@@ -42736,6 +42762,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         key: &str,
         delay_ms: Option<f64>,
         timeout_ms: Option<f64>,
+        cancel: Option<PyRef<'_, PyRustCancelToken>>,
     ) -> PyResult<()> {
         let page = Arc::clone(&self.inner);
         let browser = Arc::clone(&page.browser);
@@ -42743,6 +42770,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         let key = key.to_string();
         let deadline = OperationDeadline::new(native_input_timeout(timeout_ms));
         let delay = native_input_delay(delay_ms);
+        let cancel = cancel.map(|cancel| cancel.token.clone());
         browser
             .block_on(press_locator_for_native_input(
                 &page,
@@ -42752,7 +42780,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                 delay,
                 deadline,
                 InputDispatchPolicy::ActionDeadline,
-                None,
+                cancel.as_ref(),
             ))
             .map_err(py_err)
     }
