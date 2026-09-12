@@ -42958,7 +42958,7 @@ def test_async_page_click_and_fill_native_eligibility_matches_sync(monkeypatch):
 
     monkeypatch.setattr(async_api, "_native_page_hot_path_supported", lambda _page: True)
     monkeypatch.setattr(async_api, "_native_selector_locator", lambda *args, **kwargs: FakeLocator())
-    monkeypatch.setattr(async_api, "_run_sync_wait_sliced", record_sync_dispatch)
+    monkeypatch.setattr(async_api, "_run_sync_action", record_sync_dispatch)
 
     async def run() -> None:
         await page.click("#target")
@@ -43214,6 +43214,155 @@ def test_async_locator_click_waits_for_delayed_element():
 
             assert await page.evaluate("document.body.dataset.clicked") == "yes"
             await browser.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("wrapper", ["locator", "page", "page_fallback", "frame", "element_handle"])
+def test_async_mutations_dispatch_once_with_slow_handlers(wrapper):
+    async def run() -> None:
+        from rustwright.async_api import async_playwright
+
+        content = """
+            <button id="toggle">Toggle</button><input id="field">
+            <script>
+            window.__clicks = window.__inputs = window.__presses = 0;
+            function record(event, counter, delay) {
+              if (!event.isTrusted) return;
+              window[counter]++;
+              const end = performance.now() + delay;
+              while (performance.now() < end) {}
+            }
+            document.querySelector('#toggle').addEventListener('click', event => {
+              record(event, '__clicks', 300);
+            });
+            document.querySelector('#field').addEventListener('input', event => {
+              record(event, '__inputs', 75);
+            });
+            document.querySelector('#field').addEventListener('keydown', event => {
+              if (event.key === 'Enter') record(event, '__presses', 300);
+            });
+            </script>
+        """
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                if wrapper == "frame":
+                    await page.set_content(f'<iframe name="child" srcdoc="{escape(content, quote=True)}"></iframe>')
+                    owner = page.frame(name="child")
+                    assert owner is not None
+                else:
+                    await page.set_content(content)
+                    owner = page
+
+                for method, selector, args, counter in (
+                    ("click", "#toggle", (), "__clicks"),
+                    ("fill", "#field", ("value",), "__inputs"),
+                    ("press", "#field", ("Enter",), "__presses"),
+                ):
+                    options = {"timeout": 2000}
+                    if wrapper == "locator":
+                        target = owner.locator(selector)
+                    elif wrapper == "element_handle":
+                        target = await owner.query_selector(selector)
+                        assert target is not None
+                    else:
+                        target = owner
+                        args = (selector, *args)
+                        if wrapper == "page_fallback" and method in {"click", "fill"}:
+                            options["force"] = False
+                    # Each handler exceeds the old 50 ms slice. Retrying the
+                    # mutation delivered repeated trusted events and timed out.
+                    await getattr(target, method)(*args, **options)
+                    assert await owner.evaluate(f"window.{counter}") == 1
+                assert await owner.locator("#field").input_value() == "value"
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("wrapper", ["locator", "frame"])
+def test_async_cancel_pending_mutation_prevents_late_dispatch(wrapper, monkeypatch):
+    async def run() -> None:
+        from rustwright import async_api
+
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        finished = asyncio.Event()
+        started_at = None
+        finished_at = None
+        run_sync_call = async_api._run_sync_call
+
+        async def observe_action_start(func, *args, **kwargs):
+            if func.__name__ in {"click", "fill", "press"} and kwargs.get("timeout") == 30000:
+                def action():
+                    nonlocal started_at, finished_at
+                    started_at = time.monotonic()
+                    loop.call_soon_threadsafe(entered.set)
+                    try:
+                        return func(*args, **kwargs)
+                    finally:
+                        finished_at = time.monotonic()
+                        loop.call_soon_threadsafe(finished.set)
+
+                return await run_sync_call(action)
+            return await run_sync_call(func, *args, **kwargs)
+
+        monkeypatch.setattr(async_api, "_run_sync_call", observe_action_start)
+        async with async_api.async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                for method, args in (("click", ()), ("fill", ("value",)), ("press", ("Enter",))):
+                    await page.set_content('<iframe name="child"></iframe>' if wrapper == "frame" else "")
+                    owner = page.frame(name="child") if wrapper == "frame" else page
+                    assert owner is not None
+                    await owner.evaluate("""() => {
+                      window.__events = {click: 0, input: 0, keydown: 0};
+                      for (const type of ['click', 'input', 'keydown']) {
+                        document.addEventListener(type, event => {
+                          if (event.isTrusted) window.__events[type]++;
+                        });
+                      }
+                    }""")
+                    target = owner if wrapper == "frame" else owner.locator("#late")
+                    call_args = ("#late", *args) if wrapper == "frame" else args
+                    entered.clear()
+                    finished.clear()
+                    finished_at = None
+                    pending = asyncio.create_task(getattr(target, method)(*call_args, timeout=30000))
+                    # Prove the executor has started, so cancellation cannot pass
+                    # merely by removing a job that is still queued.
+                    await asyncio.wait_for(entered.wait(), timeout=5)
+                    assert not pending.done()
+                    assert not finished.is_set()
+                    cancelled_at = time.monotonic()
+                    assert started_at is not None and cancelled_at - started_at < 5
+                    pending.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await pending
+                    # The 30 s action cannot time out or find a target here.
+                    # Require actual worker exit, even if loop scheduling is late.
+                    await asyncio.wait_for(finished.wait(), timeout=10)
+                    assert finished_at is not None and finished_at - cancelled_at < 10
+                    await owner.evaluate("""() => {
+                      const input = document.createElement('input');
+                      input.id = 'late';
+                      document.body.appendChild(input);
+                    }""")
+                    # Longer than both the old 50 ms slice and the 20 ms poll.
+                    await asyncio.sleep(0.25)
+                    expected = {"click": 0, "input": 0, "keydown": 0}
+                    assert await owner.evaluate("window.__events") == expected
+                    assert await owner.locator("#late").input_value() == ""
+                    # Positive control: these same listeners must observe input.
+                    await getattr(target, method)(*call_args, timeout=30000)
+                    expected[{"click": "click", "fill": "input", "press": "keydown"}[method]] = 1
+                    assert await owner.evaluate("window.__events") == expected
+            finally:
+                await browser.close()
 
     asyncio.run(run())
 
