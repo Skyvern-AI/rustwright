@@ -1477,7 +1477,7 @@ fn real_stdio_snapshot_click_monotonic_refs_and_clean_shutdown() {
     );
     assert_eq!(
         tool("browser_drag")["inputSchema"]["properties"]["startElement"]["type"],
-        json!(["string", "null"])
+        json!("string")
     );
     assert_eq!(
         tool("browser_network_request")["inputSchema"]["required"],
@@ -1493,14 +1493,13 @@ fn real_stdio_snapshot_click_monotonic_refs_and_clean_shutdown() {
             "request-headers",
             "request-body",
             "response-headers",
-            "response-body",
-            null
+            "response-body"
         ])
     );
     assert_eq!(
         tool("browser_file_upload")["inputSchema"]["properties"]["paths"],
         json!({
-            "type": ["array", "null"],
+            "type": "array",
             "items": {"type": "string"}
         })
     );
