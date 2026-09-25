@@ -46,6 +46,11 @@ All notable user-facing changes to Rustwright are documented in this file.
 - Fixed native drag-and-drop to stop dispatching trailing pointer and mouse release events after a completed drop.
 - Hardened sync and async context creation rollback and close disposal retries.
 
+### Documentation
+
+- Added a Mintlify documentation configuration, quickstart, and guide to the
+  generated Python API inventories and compatibility evidence.
+
 ## [0.3.0] - 2026-08-16
 
 ### Added

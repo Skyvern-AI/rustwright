@@ -1,0 +1,76 @@
+---
+title: "Quickstart"
+description: "Install Rustwright and migrate a basic Playwright script."
+---
+
+## Python
+
+Install Rustwright and its managed Chromium build:
+
+```bash
+pip install rustwright
+python -m rustwright install chromium
+```
+
+Change the import in an existing synchronous Playwright script:
+
+```diff
+- from playwright.sync_api import sync_playwright
++ from rustwright.sync_api import sync_playwright
+
+  with sync_playwright() as playwright:
+      browser = playwright.chromium.launch(headless=True)
+      page = browser.new_page()
+      page.goto("https://example.com")
+      print(page.title())
+      browser.close()
+```
+
+For async code, switch to `rustwright.async_api`:
+
+```python
+from rustwright.async_api import async_playwright
+
+async with async_playwright() as playwright:
+    browser = await playwright.chromium.launch(headless=True)
+    page = await browser.new_page()
+    await page.goto("https://example.com")
+    print(await page.title())
+    await browser.close()
+```
+
+<Warning>
+API presence does not imply complete behavioral parity. Check the [parity map](/PARITY) before migrating a large suite.
+</Warning>
+
+## Node.js
+
+The Node binding is experimental and supports a smaller API surface.
+
+```bash
+npm install rustwright
+```
+
+```diff
+- import { chromium } from "playwright";
++ import { chromium } from "rustwright";
+
+  const browser = await chromium.launch();
+  const page = await browser.newPage();
+  await page.goto("https://example.com");
+  console.log(await page.title());
+  await browser.close();
+```
+
+Point Rustwright at an existing browser with `RUSTWRIGHT_CHROMIUM`, `CHROME`, or `CHROMIUM` when you do not want it to discover a local executable.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Review API parity" icon="list-check" href="/PARITY">
+    Compare sync and async coverage with Playwright Python.
+  </Card>
+  <Card title="Use a remote browser" icon="server" href="/REMOTE_BROWSERS">
+    Connect through raw CDP without the Playwright wire protocol.
+  </Card>
+</CardGroup>
