@@ -30990,6 +30990,55 @@ def test_cli_show_trace_renders_static_viewer(tmp_path: Path):
     assert "data:image/gif;base64," in html
 
 
+def _write_minimal_trace(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    events = [
+        {"type": "context-options", "browserName": "chromium", "sdkLanguage": "python", "title": "Local Trace"},
+        {"type": "before", "callId": "call@1", "class": "Page", "method": "goto", "params": {}},
+        {"type": "after", "callId": "call@1", "result": {}},
+    ]
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("trace.trace", "\n".join(json.dumps(event) for event in events) + "\n")
+
+
+def test_cli_show_trace_decodes_percent_encoded_file_urls(monkeypatch, tmp_path: Path, capsys):
+    from rustwright import cli
+
+    trace_path = tmp_path / "my traces" / "run 1.zip"
+    _write_minimal_trace(trace_path)
+    output_path = tmp_path / "viewer.html"
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.show_trace([trace_path.as_uri(), "--output", str(output_path)]) == 0
+    assert "%20" in trace_path.as_uri()
+    assert "Local Trace" in output_path.read_text(encoding="utf-8")
+    assert "goto" in output_path.read_text(encoding="utf-8")
+    capsys.readouterr()
+
+    assert cli.trace(["actions", trace_path.as_uri()]) == 0
+    assert "goto" in capsys.readouterr().out
+
+
+def test_cli_trace_commands_treat_windows_drive_prefix_as_local_path(monkeypatch, tmp_path: Path, capsys):
+    from rustwright import cli
+
+    # On POSIX this is a relative path whose first component is "C:"; on
+    # Windows it is a drive-qualified path. Neither is a URL.
+    _write_minimal_trace(tmp_path / "C:" / "traces" / "run.zip")
+    output_path = tmp_path / "viewer.html"
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.show_trace(["C:/traces/run.zip", "--output", str(output_path)]) == 0
+    assert "Local Trace" in output_path.read_text(encoding="utf-8")
+    capsys.readouterr()
+
+    assert cli.trace(["actions", "C:/traces/run.zip"]) == 0
+    assert "goto" in capsys.readouterr().out
+
+    assert cli.show_trace(["https://example.test/trace.zip"]) == 1
+    assert "local trace zip files only" in capsys.readouterr().err
+
+
 def test_cli_trace_lists_actions_requests_and_errors(tmp_path: Path):
     require_reference_module(
         "playwright",
