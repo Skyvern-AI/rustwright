@@ -30256,6 +30256,34 @@ def test_common_automation_signals_are_suppressed(page):
     assert worker_signals["languages"] == ["en-US", "en"]
 
 
+def test_worker_runs_after_its_object_url_is_revoked(page):
+    page.set_content("<main>Revoked worker URL</main>")
+
+    result = page.evaluate(
+        """() => new Promise((resolve, reject) => {
+            const source = `
+                self.userAgent = navigator.userAgent;
+                self.onmessage = event => postMessage({ value: event.data + 1, userAgent: self.userAgent });
+            `;
+            const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+            const worker = new Worker(url);
+            URL.revokeObjectURL(url);
+            worker.onmessage = event => {
+                worker.terminate();
+                resolve(event.data);
+            };
+            worker.onerror = () => {
+                worker.terminate();
+                reject(new Error('worker script failed to load'));
+            };
+            worker.postMessage(41);
+        })"""
+    )
+
+    assert result["value"] == 42
+    assert "HeadlessChrome" not in result["userAgent"]
+
+
 def test_service_worker_automation_signals_are_suppressed(browser, http_server):
     context = browser.new_context()
     try:

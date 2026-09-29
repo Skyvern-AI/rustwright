@@ -44,6 +44,11 @@ All notable user-facing changes to Rustwright are documented in this file.
 ### Fixed
 
 - Fixed native drag-and-drop to stop dispatching trailing pointer and mouse release events after a completed drop.
+- Fixed dedicated workers failing when a page revokes the object URL right after
+  `new Worker(url)`. The worker identity shim now inlines the original object-URL
+  script instead of re-fetching the caller's URL from inside the worker, and
+  every other worker script loads through the native `Worker` constructor
+  unchanged.
 - Hardened sync and async context creation rollback and close disposal retries.
 
 ## [0.3.0] - 2026-08-16

@@ -7736,6 +7736,17 @@ multiline-compatible = """4.5.6"""
     }
 
     #[test]
+    fn stealth_worker_shim_never_refetches_the_caller_script_url() {
+        let script = stealth_init_script();
+
+        assert!(script.contains("const inlineScript = readObjectUrlWorkerScript(absoluteUrl);"));
+        assert!(script.contains("if (inlineScript === null) {"));
+        assert!(!script.contains("importScripts("));
+        assert!(!script.contains("import ${JSON.stringify(absoluteUrl)};"));
+        assert_eq!(script.matches("new NativeWorker(scriptURL, options)").count(), 2);
+    }
+
+    #[test]
     fn chromium_default_launch_args_disable_system_keychains() {
         let args = chromium_effective_launch_args(&LaunchOptions::default());
 
@@ -54615,14 +54626,27 @@ const STEALTH_INIT_SCRIPT_TEMPLATE: &str = r#"
           '})();'
         ].join('\n');
       };
+      const readObjectUrlWorkerScript = url => {
+        if (!/^blob:/i.test(url)) return null;
+        try {
+          const request = new XMLHttpRequest();
+          request.open('GET', url, false);
+          request.send(null);
+          if (request.status !== 0 && request.status !== 200) return null;
+          return typeof request.responseText === 'string' ? request.responseText : null;
+        } catch (_) {
+          return null;
+        }
+      };
       const WrappedWorker = function(scriptURL, options) {
         try {
           const workerOptions = options || {};
           const absoluteUrl = new URL(String(scriptURL), location.href).href;
-          const identitySource = makeWorkerIdentitySource();
-          const source = workerOptions.type === 'module'
-            ? `${identitySource}\nimport ${JSON.stringify(absoluteUrl)};`
-            : `${identitySource}\nimportScripts(${JSON.stringify(absoluteUrl)});`;
+          const inlineScript = readObjectUrlWorkerScript(absoluteUrl);
+          if (inlineScript === null) {
+            return new NativeWorker(scriptURL, options);
+          }
+          const source = `${makeWorkerIdentitySource()}\n${inlineScript}`;
           const blobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
           return new NativeWorker(blobUrl, workerOptions);
         } catch (_) {
