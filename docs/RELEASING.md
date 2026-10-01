@@ -8,7 +8,8 @@ Use `/version-upgrade <version> prepare` to create and validate a release PR
 without publishing. Use `/version-upgrade <version> full release` only when the
 agent should merge the prepared release, run final dry runs on the merged
 commit, tag it, and publish to both PyPI and npm. The skill is defined in
-`.claude/skills/version-upgrade/SKILL.md`.
+`.claude/skills/version-upgrade/SKILL.md`. Approve the `nuget`, `rubygems`,
+`maven-central`, and `crates-io` deployments yourself.
 
 ## One-time setup
 
@@ -24,20 +25,27 @@ commit, tag it, and publish to both PyPI and npm. The skill is defined in
 - [ ] In GitHub, create an `npm` environment, add a required reviewer, and add an environment secret named `NPM_TOKEN`.
 - [ ] Supply `NPM_TOKEN`: create an npm granular access token with **Packages and scopes: Read and write**, **All Packages** for the first unscoped publish, and **Bypass 2FA** for non-interactive publishing. Set an expiration and calendar a rotation. After the first release, replace it with a token restricted to `rustwright` if npm permits that scope.
 - [ ] Confirm the npm account behind `NPM_TOKEN` may create the unscoped public package `rustwright`. Unscoped packages are owned by npm user accounts, not organizations.
+- [ ] In GitHub, create a `crates-io` environment and add a required reviewer.
+- [ ] In crates.io, open **Settings → Trusted Publishing** for both `rustwright-core` and `rustwright`, add a GitHub publisher, and enter exactly:
+  - Repository owner: `Skyvern-AI`
+  - Repository name: `rustwright`
+  - Workflow filename: `release-crates.yml`
+  - Environment: `crates-io`
+- [ ] Do not create a crates.io API token secret. `.github/workflows/release-crates.yml` uses the `crates-io` GitHub environment and OIDC Trusted Publishing.
 - [ ] `examples/quickstart.py` is the public smoke test used by the registry-verification step below; confirm it still runs cleanly before tagging.
-
-`rustwright-core` and `rustwright` are already published on crates.io, but no workflow publishes them: there is no crates.io job and no `CARGO_REGISTRY_TOKEN`, so a `v*` tag leaves both crates untouched and they are updated by hand. Publishing the core commits the team to Rust API compatibility, documentation, security advisories, and an additional release channel, so decide deliberately whether to keep that channel current, add a dedicated crates.io workflow, or yank it — but do not let it drift silently behind the tagged releases.
 
 ## Prepare a release
 
-- [ ] Choose one version in SemVer form, for example `0.2.0`. A single `v*` tag drives the PyPI, npm, NuGet, RubyGems, and Maven Central workflows, and each one compares its own packages against that tag, so every version field in the tree has to hold that exact string.
-- [ ] Set that exact string in every source-of-truth field. All five tagged
+- [ ] Choose one version in SemVer form, for example `0.2.0`. A single `v*` tag drives the PyPI, npm, NuGet, RubyGems, Maven Central, and crates.io workflows, and each one compares its own packages against that tag, so every version field in the tree has to hold that exact string.
+- [ ] Set that exact string in every source-of-truth field. All six tagged
       workflows validate their own packages, so a field missed here fails the
       release at tag time, after the tag is already pushed:
   - `pyproject.toml` → `[project].version`
   - `Cargo.toml` → `[package].version` for `rustwright-core`
   - `capi/Cargo.toml` → `[package].version` for `rustwright-capi`
-  - `rust-native/Cargo.toml` → `[package].version` for `rustwright`
+  - `rust-native/Cargo.toml` → **two** sites: `[package].version` for
+    `rustwright` and the `version` requirement on its `rustwright_core`
+    dependency
   - `node/Cargo.toml` → `[package].version` for `rustwright-node`
   - `node/package.json` → `version`
   - `csharp/Rustwright/Rustwright.csproj` → `<Version>`
@@ -89,6 +97,7 @@ commit, tag it, and publish to both PyPI and npm. The skill is defined in
   ```bash
   cargo check --locked
   cargo test --locked
+  python3 tools/check_crate_release.py
   cargo metadata --manifest-path cli/Cargo.toml --locked --format-version 1 > /dev/null
   cargo metadata --manifest-path mcp/Cargo.toml --locked --format-version 1 > /dev/null
   (cd node && npm ci --ignore-scripts && npm run build && npm run smoke)
@@ -102,18 +111,20 @@ only in its temporary assembled package.
 ## Dry run
 
 - [ ] Merge the version bump and release setup before tagging.
-- [ ] Dry-run **all five** workflows against the release commit, not just PyPI and
+- [ ] Dry-run **all six** workflows against the release commit, not just PyPI and
       npm. One tag starts all of them, so a workflow you did not dry-run is a
       workflow that first runs for real. For each of **Release Python package**,
       **Release Node.js package**, **Release .NET package**, **Release Ruby
-      gem**, and **Release Maven package**, open **Actions → *workflow* → Run
-      workflow**, select the release commit, leave `dry_run` checked, and run it.
+      gem**, **Release Maven package**, and **Release Rust crates**, open
+      **Actions → *workflow* → Run workflow**, select the release commit, leave
+      `dry_run` checked, and run it.
 - [ ] Confirm each run's `validate release metadata` job passed. That job is what
       compares the tree against the tag, so a green metadata job is the signal
       that the version fields are consistent.
 - [ ] Download and inspect the build artifacts: `pypi-wheel-*`, `pypi-sdist`,
-      `npm-package`, the NuGet `.nupkg`, the platform gems, and the Maven bundle.
-      A dispatch with `dry_run: true` never reaches any publish job.
+      `npm-package`, the NuGet `.nupkg`, the platform gems, the Maven bundle,
+      and `crates-package`. A dispatch with `dry_run: true` never reaches any
+      publish job.
 
 ## Publish
 
@@ -125,9 +136,9 @@ only in its temporary assembled package.
   git push origin "v${VERSION}"
   ```
 
-- [ ] Approve all five GitHub environment deployments: `pypi`, `npm`, `nuget`,
-      `rubygems`, and `maven-central`. The one tag starts every workflow;
-      publishing is also guarded to `Skyvern-AI/rustwright`.
+- [ ] Approve all six GitHub environment deployments: `pypi`, `npm`, `nuget`,
+      `rubygems`, `maven-central`, and `crates-io`. The one tag starts every
+      workflow; publishing is also guarded to `Skyvern-AI/rustwright`.
 - [ ] Maven Central publishes are **permanent** — a released coordinate cannot be
       deleted, only superseded. PyPI, npm, NuGet, RubyGems, and crates.io allow
       yanking, which hides a version from resolution without removing it. Treat
@@ -165,8 +176,14 @@ only in its temporary assembled package.
 - [ ] Update the prose that describes a binding as unpublished now that it is
       published — `java/README.md` still frames the Maven coordinates as planned
       and the artifact as unavailable.
-- [ ] `rustwright-core` and `rustwright` on crates.io are **not** published by
-      any workflow. If this release is meant to reach crates.io, publish both by
-      hand from the tagged commit, core first, and confirm the versions match
-      the tag. If it is not, record that decision so the gap is deliberate.
+- [ ] Confirm crates.io lists `${VERSION}` for `rustwright-core` and
+      `rustwright`, then build a new project against the release. Do not
+      publish either crate by hand from a development checkout; a manual
+      package can include files that never reached the public repository.
+
+  ```bash
+  test_dir="$(mktemp -d)"
+  (cd "$test_dir" && cargo new --quiet verify && cd verify && cargo add "rustwright@${VERSION}" && cargo check)
+  ```
+
 - [ ] Record both registry URLs and workflow run URLs on the release tracking issue.
