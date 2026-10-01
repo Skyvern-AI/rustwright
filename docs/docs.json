@@ -1,0 +1,73 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Rustwright",
+  "description": "Playwright-compatible browser automation powered by an in-process Rust CDP engine.",
+  "colors": {
+    "primary": "#ef643c",
+    "light": "#f47b55",
+    "dark": "#d94b28"
+  },
+  "logo": {
+    "light": "/assets/logo.png",
+    "dark": "/assets/logo.png",
+    "href": "https://github.com/Skyvern-AI/rustwright"
+  },
+  "favicon": "/assets/logo.png",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": ["index", "quickstart"]
+          },
+          {
+            "group": "Guides",
+            "pages": ["REMOTE_BROWSERS", "agent-interfaces", "async-design"]
+          },
+          {
+            "group": "Compatibility",
+            "pages": ["PARITY", "reference"]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Python API surface",
+            "pages": [
+              "api-surface/playwright-sync-api",
+              "api-surface/playwright-async-api"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "PyPI",
+        "href": "https://pypi.org/project/rustwright/"
+      },
+      {
+        "label": "GitHub",
+        "href": "https://github.com/Skyvern-AI/rustwright",
+        "icon": "github"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Install Rustwright",
+      "href": "/quickstart"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/Skyvern-AI/rustwright"
+    }
+  }
+}
