@@ -10,6 +10,9 @@ homepage = "https://github.com/Skyvern-AI/rustwright"
 readme = "README.md"
 keywords = ["browser", "automation", "cdp", "playwright", "chromium"]
 categories = ["web-programming"]
+# The crates.io package carries only the engine sources, not the bindings,
+# tests, or workflows of the whole repository.
+include = ["/src/**/*.rs", "/README.md", "/LICENSE"]
 
 [workspace]
 members = ["node", "capi", "rust-native", "agent"]

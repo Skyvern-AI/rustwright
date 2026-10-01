@@ -4,6 +4,12 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Each release tag now publishes the `rustwright-core` and `rustwright` Rust
+  crates to crates.io. The `rustwright-core` package now contains only the
+  engine sources.
+
 ### Breaking
 
 - Removed `disable_playwright_compat()`. Compatibility aliases are now a one-way

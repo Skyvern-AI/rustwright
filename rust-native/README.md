@@ -8,15 +8,14 @@ This crate is a thin, ergonomic wrapper over `rustwright-core`. It runs the engi
 in-process; there is no separate binding library to load.
 
 ```rust
-use rustwright::{chromium, LaunchOptions};
+use rustwright::{chromium, ActionOptions, GotoOptions, LaunchOptions};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> rustwright::Result<()> {
     let browser = chromium().launch(LaunchOptions::default())?;
     let page = browser.new_page()?;
-    page.goto("https://example.com", None)?;
-    println!("{}", page.title(None)?);
-    browser.close()?;
-    Ok(())
+    page.goto("https://example.com", GotoOptions::default())?;
+    println!("{}", page.title(ActionOptions::default())?);
+    browser.close()
 }
 ```
 
