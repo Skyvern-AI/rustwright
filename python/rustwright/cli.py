@@ -17,6 +17,7 @@ import sys
 import tempfile
 from typing import Sequence
 from urllib.parse import urlparse
+from urllib.request import url2pathname
 from urllib import request as url_request
 import zipfile
 
@@ -1368,6 +1369,25 @@ def _default_trace_output(trace_paths: list[Path]) -> Path:
     return Path.cwd() / "rustwright-trace-viewer.html"
 
 
+_WINDOWS_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+
+
+def _local_trace_file(value: object) -> Path | None:
+    """Resolve a trace argument to a local path, or return None for remote URLs.
+
+    A Windows drive prefix such as ``C:\\traces\\t.zip`` parses as a URL scheme, so
+    it is treated as a plain path. ``file:`` URLs are percent-decoded.
+    """
+    text = str(value)
+    if not _WINDOWS_DRIVE_PREFIX.match(text):
+        parsed = urlparse(text)
+        if parsed.scheme not in {"", "file"}:
+            return None
+        if parsed.scheme == "file":
+            text = url2pathname(parsed.path)
+    return Path(text).expanduser().resolve()
+
+
 def show_trace(argv: Sequence[str], *, program: str = "playwright") -> int:
     args = _show_trace_parser(program).parse_args(list(argv))
     trace_values = [args.trace] if args.trace else []
@@ -1378,11 +1398,11 @@ def show_trace(argv: Sequence[str], *, program: str = "playwright") -> int:
         return 1
     trace_paths: list[Path] = []
     for value in trace_values:
-        parsed = urlparse(str(value))
-        if parsed.scheme and parsed.scheme not in {"", "file"}:
+        trace_file = _local_trace_file(value)
+        if trace_file is None:
             print("Rustwright show-trace currently supports local trace zip files only.", file=sys.stderr)
             return 1
-        trace_paths.append(Path(parsed.path if parsed.scheme == "file" else str(value)).expanduser().resolve())
+        trace_paths.append(trace_file)
     try:
         summaries = [_trace_summary(path) for path in trace_paths]
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
@@ -1400,10 +1420,10 @@ def show_trace(argv: Sequence[str], *, program: str = "playwright") -> int:
 def _trace_command_path(value: str | None) -> Path:
     if not value:
         raise ValueError("trace command requires a trace zip path")
-    parsed = urlparse(str(value))
-    if parsed.scheme and parsed.scheme not in {"", "file"}:
+    trace_file = _local_trace_file(value)
+    if trace_file is None:
         raise ValueError("Rustwright trace currently supports local trace zip files only.")
-    return Path(parsed.path if parsed.scheme == "file" else str(value)).expanduser().resolve()
+    return trace_file
 
 
 def _trace_error_text(error: object) -> str:
