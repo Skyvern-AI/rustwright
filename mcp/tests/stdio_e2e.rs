@@ -1468,6 +1468,10 @@ fn real_stdio_snapshot_click_monotonic_refs_and_clean_shutdown() {
         json!(["png", "jpeg"])
     );
     assert_eq!(
+        tool("browser_take_screenshot")["inputSchema"]["properties"]["filename"],
+        json!({"type": "string"})
+    );
+    assert_eq!(
         tool("browser_network_requests")["inputSchema"]["properties"]["static"]["default"],
         false
     );
@@ -3981,6 +3985,97 @@ fn real_stdio_screenshot_over_cap_falls_back_to_temp_png_path() {
         "server screenshot directory survived graceful shutdown: {}",
         screenshot_temp_dir.display()
     );
+}
+
+#[test]
+fn real_stdio_screenshot_filename_saves_inside_the_workspace() {
+    if chromium().executable_path().is_none() {
+        eprintln!("skipping screenshot filename MCP test: Chromium executable unavailable");
+        return;
+    }
+
+    let page_server = PageServer::start();
+    let workspace = std::env::temp_dir().join(format!(
+        "rustwright-mcp-screenshot-{}-{}",
+        std::process::id(),
+        STDIO_WORKSPACE_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(workspace.join("shots")).expect("create screenshot workspace");
+    let workspace_text = workspace.to_string_lossy().to_string();
+    let mut server =
+        ServerProcess::spawn_with_env(&[("RUSTWRIGHT_MCP_WORKSPACE", &workspace_text)]);
+    server.initialize();
+    let _ = call_tool(
+        &mut server,
+        430,
+        "browser_navigate",
+        json!({"url": page_server.url()}),
+    );
+
+    // A relative filename resolves inside the configured workspace and
+    // replaces the inline image payload with a text acknowledgement.
+    let saved = call_tool(
+        &mut server,
+        431,
+        "browser_take_screenshot",
+        json!({"filename": "shots/capture.png"}),
+    );
+    assert_eq!(
+        saved["result"]["isError"], false,
+        "expected screenshot filename save to succeed: {saved}"
+    );
+    let saved_content = saved["result"]["content"]
+        .as_array()
+        .expect("screenshot save content array");
+    assert!(
+        saved_content.iter().all(|item| item["type"] != "image"),
+        "filename save must not return inline image data: {saved}"
+    );
+    let saved_text = result_text(&saved);
+    assert!(
+        saved_text.contains("Screenshot written to"),
+        "{saved_text}"
+    );
+    let artifact = workspace.join("shots").join("capture.png");
+    let bytes = fs::read(&artifact).expect("read saved screenshot");
+    assert!(
+        bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "saved screenshot file did not contain a PNG"
+    );
+    assert!(
+        saved_text.contains(artifact.to_string_lossy().as_ref()),
+        "save acknowledgement did not name the artifact: {saved_text}"
+    );
+
+    // Absolute paths remain confined to the configured workspace.
+    let outside = workspace
+        .parent()
+        .expect("workspace parent directory")
+        .join("outside.png");
+    let rejected = call_tool(
+        &mut server,
+        432,
+        "browser_take_screenshot",
+        json!({"filename": outside.to_string_lossy()}),
+    );
+    assert_eq!(
+        rejected["result"]["isError"], true,
+        "outside-workspace screenshot filename must be rejected: {rejected}"
+    );
+    assert!(
+        error_result_text(&rejected)
+            .contains("confined to the configured actor workspace"),
+        "{}",
+        error_result_text(&rejected)
+    );
+    assert!(
+        !outside.exists(),
+        "rejected screenshot filename must not create a file: {}",
+        outside.display()
+    );
+
+    server.finish();
+    fs::remove_dir_all(workspace).expect("remove screenshot workspace");
 }
 
 #[test]

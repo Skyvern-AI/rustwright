@@ -504,6 +504,8 @@ struct ScreenshotArgs {
     full_page: bool,
     #[serde(default = "default_screenshot_type")]
     r#type: RawScreenshotType,
+    #[serde(default)]
+    filename: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -908,6 +910,7 @@ pub(crate) fn parse_op(
                     RawScreenshotType::Png => ScreenshotType::Png,
                     RawScreenshotType::Jpeg => ScreenshotType::Jpeg,
                 },
+                filename: args.filename,
             })
         }
         ToolKind::Close => {
@@ -1244,7 +1247,8 @@ fn schema(kind: ToolKind) -> JsonObject {
             "type": "object",
             "properties": {
                 "type": {"type": "string", "enum": ["png", "jpeg"], "default": "png"},
-                "fullPage": {"type": "boolean", "default": false}
+                "fullPage": {"type": "boolean", "default": false},
+                "filename": {"type": "string"}
             },
             "additionalProperties": false
         }),
@@ -1616,6 +1620,79 @@ mod tests {
         ] {
             assert!(
                 parse_op(upload, Some(invalid.as_object().unwrap().clone())).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn screenshot_schema_and_arguments_parse_filename_save_targets() {
+        let screenshot = TOOL_SPECS
+            .iter()
+            .copied()
+            .find(|spec| spec.name == "browser_take_screenshot")
+            .unwrap();
+        let descriptor = descriptor(screenshot);
+        assert_eq!(
+            descriptor.input_schema["properties"]["filename"],
+            json!({"type": "string"})
+        );
+        assert_eq!(descriptor.input_schema["additionalProperties"], false);
+        for (arguments, expected_filename, expected_type) in [
+            (
+                json!({}),
+                None::<String>,
+                ScreenshotType::Png,
+            ),
+            (
+                json!({"filename": null}),
+                None,
+                ScreenshotType::Png,
+            ),
+            (
+                json!({"filename": "/tmp/workspace/shots/page.png"}),
+                Some("/tmp/workspace/shots/page.png".to_owned()),
+                ScreenshotType::Png,
+            ),
+            (
+                json!({"filename": "shots/page.png", "fullPage": true, "type": "jpeg"}),
+                Some("shots/page.png".to_owned()),
+                ScreenshotType::Jpeg,
+            ),
+            (
+                json!({"filename": "shots/page.png", "full_page": true}),
+                Some("shots/page.png".to_owned()),
+                ScreenshotType::Png,
+            ),
+        ] {
+            let op = parse_op(screenshot, Some(arguments.as_object().unwrap().clone()));
+            let BrowserOp::TakeScreenshot {
+                full_page,
+                image_type,
+                filename,
+            } = op.expect("valid screenshot arguments")
+            else {
+                panic!("expected screenshot op");
+            };
+            assert_eq!(filename, expected_filename, "{arguments}");
+            assert_eq!(
+                full_page,
+                arguments.get("fullPage").or(arguments.get("full_page")) == Some(&json!(true)),
+                "{arguments}"
+            );
+            match (expected_type, image_type) {
+                (ScreenshotType::Png, ScreenshotType::Png)
+                | (ScreenshotType::Jpeg, ScreenshotType::Jpeg) => {}
+                _ => panic!("unexpected screenshot type for {arguments}"),
+            }
+        }
+        for invalid in [
+            json!({"filename": 1}),
+            json!({"filename": "shots/page.png", "unknown": true}),
+            json!({"type": "webp"}),
+        ] {
+            assert!(
+                parse_op(screenshot, Some(invalid.as_object().unwrap().clone())).is_err(),
                 "{invalid}"
             );
         }

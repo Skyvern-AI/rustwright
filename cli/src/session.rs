@@ -173,6 +173,7 @@ impl BrowserSession {
                 let output = self.request(BrowserOp::TakeScreenshot {
                     full_page,
                     image_type: ScreenshotType::Png,
+                    filename: None,
                 })?;
                 let bytes = image_from_output(output)?;
                 fs::write(&path, &bytes).with_context(|| format!("failed to write {path}"))?;
