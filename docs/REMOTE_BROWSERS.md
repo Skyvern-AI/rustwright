@@ -127,8 +127,8 @@ The vendored `docs/remote-browser/chrome-seccomp.json` comes from
 file `etc/docker/seccomp/chrome.json`. Jessie Frazelle published the source
 under the MIT License. The complete notice is preserved in
 [`docs/remote-browser/LICENSE.chrome-seccomp`](remote-browser/LICENSE.chrome-seccomp).
-The immutable source is
-<https://raw.githubusercontent.com/jfrazelle/dotfiles/94c5f2bc4178d4000ff6f1ae5cc585799ef25d37/etc/docker/seccomp/chrome.json>.
+The immutable source is the
+[pinned seccomp profile](https://raw.githubusercontent.com/jfrazelle/dotfiles/94c5f2bc4178d4000ff6f1ae5cc585799ef25d37/etc/docker/seccomp/chrome.json).
 The allowlist still requires review against the pinned browser before a
 production claim.
 

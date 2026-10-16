@@ -1,0 +1,52 @@
+---
+title: "Rustwright"
+description: "Playwright-compatible browser automation on an in-process Rust CDP engine."
+---
+
+Rustwright keeps the Playwright-shaped API while replacing the Node driver with a native Rust engine that speaks Chrome DevTools Protocol directly.
+
+<Note>
+Rustwright is alpha software and currently supports Chromium. Use the [parity map](/PARITY) to distinguish API presence from behavior covered by the shared test suite.
+</Note>
+
+<CardGroup cols={2}>
+  <Card title="Install and migrate" icon="rocket" href="/quickstart">
+    Install the Python or Node package and switch an existing Playwright import.
+  </Card>
+  <Card title="Check compatibility" icon="code-compare" href="/PARITY">
+    See supported, exercised, and missing Playwright methods by API group.
+  </Card>
+  <Card title="Connect a remote browser" icon="globe" href="/REMOTE_BROWSERS">
+    Connect to raw Chromium CDP endpoints and understand the security boundary.
+  </Card>
+  <Card title="Build agent interfaces" icon="robot" href="/agent-interfaces">
+    Use the native CLI and MCP server for compact, agent-friendly browser control.
+  </Card>
+</CardGroup>
+
+## Architecture
+
+```text
+playwright-python:  your code --pipe--> Node driver --CDP--> Chromium
+rustwright:         your code ---------------------CDP--> Chromium
+```
+
+The Rust core owns Chromium process management, browser primitives, input, events, network interception, and artifact helpers. Thin language bindings expose that engine without a separate driver subprocess.
+
+## Choose your surface
+
+<Tabs>
+  <Tab title="Python">
+    The Python package provides sync and async Playwright-shaped APIs and has the broadest compatibility coverage.
+  </Tab>
+  <Tab title="Node.js">
+    The experimental Node binding exposes a smaller surface backed by the same Rust engine.
+  </Tab>
+  <Tab title="CLI and MCP">
+    The native CLI and MCP server expose persistent browser sessions and compact accessibility snapshots for agents.
+  </Tab>
+</Tabs>
+
+<Info>
+The generated API inventories show whether a symbol exists. The [parity map](/PARITY) also shows which sync methods are exercised by the shared compatibility suite.
+</Info>
