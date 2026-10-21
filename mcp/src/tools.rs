@@ -1124,8 +1124,8 @@ fn schema(kind: ToolKind) -> JsonObject {
             "properties": {
                 "startTarget": {"type": "string"},
                 "endTarget": {"type": "string"},
-                "startElement": {"type": ["string", "null"]},
-                "endElement": {"type": ["string", "null"]}
+                "startElement": {"type": "string"},
+                "endElement": {"type": "string"}
             },
             "required": ["startTarget", "endTarget"],
             "additionalProperties": false
@@ -1150,7 +1150,7 @@ fn schema(kind: ToolKind) -> JsonObject {
                     "default": "info"
                 },
                 "all": {"type": "boolean", "default": false},
-                "filename": {"type": ["string", "null"]}
+                "filename": {"type": "string"}
             },
             "additionalProperties": false
         }),
@@ -1158,8 +1158,8 @@ fn schema(kind: ToolKind) -> JsonObject {
             "type": "object",
             "properties": {
                 "static": {"type": "boolean", "default": false},
-                "filter": {"type": ["string", "null"]},
-                "filename": {"type": ["string", "null"]}
+                "filter": {"type": "string"},
+                "filename": {"type": "string"}
             },
             "additionalProperties": false
         }),
@@ -1168,16 +1168,15 @@ fn schema(kind: ToolKind) -> JsonObject {
             "properties": {
                 "index": {"type": "integer", "minimum": 1},
                 "part": {
-                    "type": ["string", "null"],
+                    "type": "string",
                     "enum": [
                         "request-headers",
                         "request-body",
                         "response-headers",
-                        "response-body",
-                        null
+                        "response-body"
                     ]
                 },
-                "filename": {"type": ["string", "null"]}
+                "filename": {"type": "string"}
             },
             "required": ["index"],
             "additionalProperties": false
@@ -1196,7 +1195,7 @@ fn schema(kind: ToolKind) -> JsonObject {
             "type": "object",
             "properties": {
                 "accept": {"type": "boolean"},
-                "promptText": {"type": ["string", "null"]}
+                "promptText": {"type": "string"}
             },
             "required": ["accept"],
             "additionalProperties": false
@@ -1205,7 +1204,7 @@ fn schema(kind: ToolKind) -> JsonObject {
             "type": "object",
             "properties": {
                 "paths": {
-                    "type": ["array", "null"],
+                    "type": "array",
                     "items": {"type": "string"}
                 }
             },
@@ -1441,8 +1440,8 @@ mod tests {
             "properties": {
                 "startTarget": {"type": "string"},
                 "endTarget": {"type": "string"},
-                "startElement": {"type": ["string", "null"]},
-                "endElement": {"type": ["string", "null"]}
+                "startElement": {"type": "string"},
+                "endElement": {"type": "string"}
             },
             "required": ["startTarget", "endTarget"],
             "additionalProperties": false
@@ -1593,7 +1592,7 @@ mod tests {
         assert_eq!(
             descriptor.input_schema["properties"]["paths"],
             json!({
-                "type": ["array", "null"],
+                "type": "array",
                 "items": {"type": "string"}
             })
         );
