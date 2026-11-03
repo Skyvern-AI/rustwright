@@ -27,7 +27,7 @@ jobs:
       - name: Build librustwright_capi (release)
         run: cargo build -p rustwright-capi --release --locked
       - name: Upload native library
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: librustwright_capi-linux
           path: target/release/librustwright_capi.so
@@ -146,7 +146,7 @@ jobs:
           PY
       - name: Upload results
         if: steps.has.outputs.ok == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: results-${{ matrix.lang }}
           path: ${{ env.RW_OUT }}
