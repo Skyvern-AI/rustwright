@@ -62,7 +62,7 @@ jobs:
 
       - name: Download native library
         if: steps.has.outputs.ok == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: librustwright_capi-linux
           path: target/release
@@ -159,7 +159,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Download all language results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: results-*
           path: results
