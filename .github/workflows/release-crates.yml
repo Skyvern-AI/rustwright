@@ -1,0 +1,120 @@
+name: Release Rust crates
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Package and verify the crates without publishing"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-crates-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: validate and package crates
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Validate release metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: python3 tools/check_crate_release.py
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      # Packaging both crates in one command verifies the facade against the
+      # just-packaged core, so a release that changes both is checked before
+      # anything reaches crates.io.
+      - name: Package and verify crates
+        run: cargo package --locked -p rustwright-core -p rustwright
+
+      - name: Upload crate packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crates-package
+          path: target/package/*.crate
+          if-no-files-found: error
+
+  publish:
+    name: publish to crates.io
+    needs: package
+    if: >-
+      ${{
+        github.repository == 'Skyvern-AI/rustwright' &&
+        github.ref_type == 'tag' &&
+        (
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+        )
+      }}
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/rustwright
+    # Trusted Publishing (OIDC): exchange the workflow's GitHub identity for a
+    # short-lived crates.io token — no long-lived CARGO_REGISTRY_TOKEN secret.
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The rustwright-core verify build compiles pyo3, which needs a Python
+      # interpreter.
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - name: crates.io login (Trusted Publishing)
+        id: crates_io_auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      # The core publishes first because the facade depends on it. A crate
+      # version that already exists is skipped, so a rerun after a partial
+      # failure publishes only what is missing. A failed lookup falls through
+      # to cargo publish, which refuses a version that already exists.
+      - name: Publish crates
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          for crate in rustwright-core rustwright; do
+            if curl -fs --output /dev/null \
+              --user-agent "rustwright-release (https://github.com/Skyvern-AI/rustwright)" \
+              "https://crates.io/api/v1/crates/${crate}/${version}"; then
+              echo "${crate} ${version} is already on crates.io; skipping."
+            else
+              cargo publish --locked -p "$crate"
+            fi
+          done

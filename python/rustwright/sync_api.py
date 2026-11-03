@@ -47,6 +47,9 @@ _CUSTOM_SELECTOR_ENGINES: dict[str, str] = {}
 _DOWNLOADS_NOT_ACCEPTED = "Pass 'accept_downloads=True' when you are creating your browser context."
 _MISSING = object()
 _UNSET = object()
+_ACTION_CANCELLATION: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "rustwright_action_cancellation", default=None,
+)
 _SYNC_CLOSE_OPEN = "open"
 _SYNC_CLOSE_CLOSING = "closing"
 _SYNC_CLOSE_CLOSED = "closed"
@@ -1747,16 +1750,42 @@ def _translate_error(exc: Exception) -> Error:
     return Error(message)
 
 
+def _check_action_cancelled() -> None:
+    cancellation = _ACTION_CANCELLATION.get()
+    if cancellation is not None and cancellation.is_cancelled():
+        raise Error("Action was cancelled")
+
+
+def _action_cancel_kwargs() -> dict[str, Any]:
+    cancellation = _ACTION_CANCELLATION.get()
+    return {} if cancellation is None else {"cancel": cancellation}
+
+
+def _call_action(fn, *args, **kwargs):
+    """Commit a Python-managed dispatch and let its required cleanup finish."""
+    cancellation = _ACTION_CANCELLATION.get()
+    if cancellation is None:
+        return fn(*args, **kwargs)
+    # The Rust gate arbitrates cancellation atomically. Nested calls and cleanup
+    # must not observe cancellation after that gate has admitted the dispatch.
+    context = _ACTION_CANCELLATION.set(None)
+    try:
+        return _call(cancellation.run_committed, fn, args, kwargs)
+    finally:
+        _ACTION_CANCELLATION.reset(context)
+
+
 def _call(fn, *args, **kwargs):
+    _check_action_cancelled()
     try:
         return fn(*args, **kwargs)
     except (RuntimeError, ValueError) as exc:
         raise _translate_error(exc) from None
 
 
-def _call_native_key(method: str, key: str, fn, *args):
+def _call_native_key(method: str, key: str, fn, *args, **kwargs):
     try:
-        return _call_with_method_prefix(method, fn, *args)
+        return _call_with_method_prefix(method, fn, *args, **kwargs)
     except Error as exc:
         message = str(exc).removeprefix(f"{method}: ")
         unsupported = re.fullmatch(r"unsupported key(?: modifier)?: (.*)", message)
@@ -1932,6 +1961,22 @@ def _is_context_cleanup_complete(context: Any) -> bool:
 def _update_sync_cleanup_complete(context: Any) -> None:
     context._rustwright_sync_close_cleanup_complete = _is_context_cleanup_complete(context)
 
+
+def _is_page_cleanup_complete(page: Any) -> bool:
+    return all(
+        bool(getattr(page, name, False))
+        for name in (
+            "_rustwright_sync_close_sessions_closed",
+            "_rustwright_sync_close_default_context_cleaned",
+            "_rustwright_sync_close_context_removed",
+            "_rustwright_sync_close_close_event_emitted",
+            "_rustwright_sync_close_memory_released",
+            "_rustwright_sync_close_owned_context_closed",
+        )
+    )
+
+def _update_page_cleanup_complete(page: Any) -> None:
+    page._rustwright_sync_close_cleanup_complete = _is_page_cleanup_complete(page)
 
 _CLOSE_WAIT_FALLBACK_MS = 30_000.0
 
@@ -3945,6 +3990,10 @@ _EVENT_DIALOG_DISPATCH: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "rustwright_event_dialog_dispatch",
     default=None,
 )
+_EVENT_DIALOG_CLAIM: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "rustwright_event_dialog_claim",
+    default=None,
+)
 
 
 class _DialogDispatch:
@@ -3954,6 +4003,8 @@ class _DialogDispatch:
         "remaining",
         "finished",
         "captured",
+        "handler_claims",
+        "next_claim",
         "handled",
         "fallback_started",
         "lock",
@@ -3965,6 +4016,8 @@ class _DialogDispatch:
         self.remaining = remaining
         self.finished = False
         self.captured = False
+        self.handler_claims: set[int] = set()
+        self.next_claim = 0
         self.handled = False
         self.fallback_started = False
         self.lock = threading.Lock()
@@ -3972,6 +4025,26 @@ class _DialogDispatch:
     def capture(self) -> None:
         with self.lock:
             self.captured = True
+
+    def release_capture(self) -> None:
+        with self.lock:
+            self.captured = False
+
+    def claim_handler(self) -> int:
+        with self.lock:
+            self.next_claim += 1
+            claim = self.next_claim
+            self.handler_claims.add(claim)
+            return claim
+
+    def release_handler_claim(self, claim: Optional[int]) -> None:
+        if claim is None:
+            return
+        with self.lock:
+            self.handler_claims.discard(claim)
+            finished = self.finished
+        if finished:
+            self.maybe_fallback()
 
     def mark_handled(self) -> None:
         with self.lock:
@@ -4004,6 +4077,7 @@ class _DialogDispatch:
             if (
                 not self.finished
                 or self.captured
+                or self.handler_claims
                 or self.handled
                 or self.fallback_started
             ):
@@ -5179,9 +5253,11 @@ def _event_wait_step(remaining: float, owner: Any = None) -> float:
 
 
 def _sleep_until_next_poll(deadline: float, interval: float = 0.02) -> None:
+    _check_action_cancelled()
     remaining = deadline - time.monotonic()
     if remaining > 0:
         time.sleep(min(interval, remaining))
+    _check_action_cancelled()
 
 
 def _actionability_probe_timeout(remaining_ms: float, timeout_disabled: bool = False) -> float:
@@ -8988,6 +9064,7 @@ def _wait_for_descriptor_event_impl(
             timeout,
             method=method or descriptor.timeout_method,
         )
+    event_state = state if state is not None else {}
     if waiter is None:
         waiter = _create_descriptor_waiter(target, descriptor, deadline, timeout_display)
     if descriptor.competing_waiter_factory is not None:
@@ -8999,7 +9076,6 @@ def _wait_for_descriptor_event_impl(
         and descriptor.competing_waiter_factory is None
         else None
     )
-    event_state = state or {}
     native_wait_matching = getattr(waiter, "wait_matching", None)
     native_wait = kind in {"console", "pageerror"} and callable(native_wait_matching)
     native_matcher = _native_event_matcher(kind, matcher) if native_wait else None
@@ -9309,6 +9385,9 @@ class _ListenerEventContextManager:
         self._deadline: Optional[float] = None
         self._timeout_display = ""
         self._dialog_owner_release: Optional[Callable[[], None]] = None
+        self._state_lock = threading.Lock()
+        self._error: Optional[BaseException] = None
+        self._deadline_expired = False
 
     def __enter__(self) -> "_ListenerEventContextManager":
         descriptor = _event_waiter_descriptor(self._kind)
@@ -9322,16 +9401,43 @@ class _ListenerEventContextManager:
             self._dialog_owner_release = self._page._acquire_dialog_waiter()
 
         def handler(value: Any) -> None:
-            if self._value is None and descriptor.matches(self._page, self._matcher, value):
-                owner_release = self._dialog_owner_release
-                self._dialog_owner_release = None
-                if self._kind == "dialog" and isinstance(value, Dialog):
-                    self._page._capture_dialog(value, owner_release)
-                elif owner_release is not None:
-                    owner_release()
-                self._value = value
-                self._ready.set()
-
+            try:
+                matched = descriptor.matches(self._page, self._matcher, value)
+            except BaseException as exc:
+                with self._state_lock:
+                    if self._error is None and self._value is None and not self._deadline_expired:
+                        self._error = exc
+                        self._ready.set()
+                        release = self._dialog_owner_release
+                        self._dialog_owner_release = None
+                    else:
+                        release = self._dialog_owner_release
+                        self._dialog_owner_release = None
+                if release is not None:
+                    release()
+                return
+            if not matched:
+                return
+            with self._state_lock:
+                if self._value is not None or self._error is not None or self._deadline_expired:
+                    release = self._dialog_owner_release
+                    self._dialog_owner_release = None
+                    capture = False
+                else:
+                    self._value = value
+                    release = self._dialog_owner_release
+                    self._dialog_owner_release = None
+                    capture = True
+                    if self._kind == "dialog" and isinstance(value, Dialog):
+                        self._page._capture_dialog(value, release)
+                        release = None
+                    self._ready.set()
+            if not capture and release is not None:
+                release()
+            elif capture and release is not None:
+                release()
+        if self._kind == "dialog":
+            setattr(handler, "_rustwright_dialog_predicate_waiter", True)
         self._handler = handler
         try:
             self._page.on(descriptor.event, handler)
@@ -9356,21 +9462,35 @@ class _ListenerEventContextManager:
                     if self._deadline is None
                     else max((self._deadline - time.monotonic()) * 1000, 0)
                 )
-                _wait_for_ready_event_or_owner_close(
-                    self._ready,
-                    self._page,
-                    descriptor.event,
-                    timeout_ms,
-                    self._timeout_display,
-                    deadline=self._deadline,
-                )
+                try:
+                    _wait_for_ready_event_or_owner_close(
+                        self._ready,
+                        self._page,
+                        descriptor.event,
+                        timeout_ms,
+                        self._timeout_display,
+                        deadline=self._deadline,
+                    )
+                except BaseException:
+                    with self._state_lock:
+                        won = self._value is not None or self._error is not None
+                        if not won:
+                            self._deadline_expired = True
+                    if not won:
+                        raise
+                with self._state_lock:
+                    error = self._error
+                if error is not None:
+                    raise error
         finally:
             if self._handler is not None:
                 self._page.remove_listener(descriptor.event, self._handler)
             self._handler = None
-            if self._dialog_owner_release is not None:
-                self._dialog_owner_release()
+            with self._state_lock:
+                release = self._dialog_owner_release
                 self._dialog_owner_release = None
+            if release is not None:
+                release()
 
     @property
     def value(self) -> Any:
@@ -10274,6 +10394,30 @@ class Dialog(_EventEmitter):
             dispatch.capture()
         if release_now:
             owner_release()
+    def _claim_handler(self) -> Optional[int]:
+        dispatch = self._dispatch
+        return dispatch.claim_handler() if dispatch is not None else None
+
+    def _release_handler_claim(self, claim: Optional[int]) -> None:
+        dispatch = self._dispatch
+        if dispatch is not None:
+            dispatch.release_handler_claim(claim)
+
+    def _release_capture(self) -> None:
+        with self._fallback_lock:
+            self._captured = False
+        dispatch = self._dispatch
+        if dispatch is not None:
+            dispatch.release_capture()
+
+    def _release_capture_if_unowned(self) -> None:
+        with self._fallback_lock:
+            if self._handled or self._owner_releases or not self._captured:
+                return
+            self._captured = False
+        dispatch = self._dispatch
+        if dispatch is not None:
+            dispatch.release_capture()
 
     def _mark_handled(self) -> None:
         with self._fallback_lock:
@@ -11894,6 +12038,7 @@ class Browser:
             context.close()
             raise
         page._owns_context = True
+        page._rustwright_sync_close_default_context_cleaned = False
         return page
 
     def new_context(
@@ -16307,7 +16452,7 @@ class Page:
         self._auth_waiter: Any = None
         self._proxy_auth_credentials: Optional[tuple[str, str]] = None
         self._http_auth_credentials: Optional[tuple[str, str, Optional[str]]] = None
-        self._dialog_dispatch_count = 0
+        self._beforeunload_dispatch_count = 0
         self._dialog_state_lock = threading.Lock()
         self._dialog_waiter_count = 0
         self._dialog_operation_count = 0
@@ -16379,7 +16524,22 @@ class Page:
         self._clock_initialized: set[str] = set()
         self._closing = False
         self._closed = False
+        self._rustwright_sync_close_state = _SYNC_CLOSE_OPEN
+        self._rustwright_sync_close_condition = threading.Condition()
+        self._rustwright_sync_close_owner: Optional[int] = None
+        self._rustwright_sync_close_generation = 0
+        self._rustwright_sync_close_outcomes: dict[int, _CloseAttemptOutcome] = {}
+        self._rustwright_sync_close_waiters: dict[int, int] = {}
+        self._rustwright_sync_close_native_disposed = False
+        self._rustwright_sync_close_beforeunload_count: Optional[int] = None
+        self._rustwright_sync_close_close_event_emitted = False
+        self._rustwright_sync_close_default_context_cleaned = True
+        self._rustwright_sync_close_owned_context_closed = False
+        self._rustwright_sync_close_cleanup_complete = False
+        self._rustwright_sync_close_sessions_closed = False
+        self._rustwright_sync_close_context_removed = False
         self._rustwright_async_close_state = "open"
+        self._rustwright_async_close_sync_owner: Optional[int] = None
         self._rustwright_async_close_task: Any = None
         self._closed_reason: Optional[str] = None
         self._event_pump_stop_lock = threading.Lock()
@@ -16388,6 +16548,7 @@ class Page:
         self._event_dispatch_condition = threading.Condition(self._event_dispatch_lock)
         self._event_handler_registrations: dict[tuple[str, int], _EventHandlerRegistration] = {}
         self._event_stream = self._core.combined_event_stream()
+        self._event_pump_terminal_consumed = False
         self._event_pump_thread: Optional[threading.Thread] = None
         if _start_event_pump:
             self._event_pump_thread = threading.Thread(
@@ -17313,9 +17474,6 @@ class Page:
                 "referer": normalized_referer,
             },
         )
-        single_process_crash_navigation = (
-            self._uses_single_process_fallback() and target_url.lower().startswith("chrome://crash")
-        )
         try:
             try:
                 target_scheme = url_parse.urlparse(target_url).scheme.lower()
@@ -17357,9 +17515,11 @@ class Page:
                     and self._download_started_for_url(download_waiter, target_url, timeout=1_000.0)
                 ):
                     raise Error("Page.goto: Download is starting") from None
-                if target_url.lower().startswith("chrome://crash") and message.startswith("Page.goto: net::ERR_ABORTED"):
+                if self._crashed or (
+                    target_url.lower().startswith("chrome://crash")
+                    and message.startswith("Page.goto: net::ERR_ABORTED")
+                ):
                     crash_error = Error("Page crashed")
-                    self._mark_crashed()
                     raise crash_error from None
                 if message.startswith("Protocol error (Page.navigate):"):
                     raise Error(f"Page.goto: {message}") from None
@@ -17407,9 +17567,8 @@ class Page:
             self._slow_mo()
         except Exception as exc:
             self._clear_context_pageload_pending()
-            if single_process_crash_navigation:
+            if self._crashed:
                 crash_error = Error("Page crashed")
-                self._mark_crashed()
                 self._trace_end_action(call_id, error=crash_error)
                 raise crash_error from exc
             self._trace_end_action(call_id, error=exc)
@@ -20847,6 +21006,10 @@ class Page:
         for session in sessions:
             session._mark_owner_closed()
 
+    def _remove_page_from_context(self) -> None:
+        if self._context is not None and self in self._context._pages:
+            self._context._pages.remove(self)
+
     def bring_to_front(self) -> None:
         self.evaluate("() => window.focus()")
 
@@ -21226,69 +21389,307 @@ class Page:
             depth=_normalize_aria_snapshot_depth(depth, method="Page.aria_snapshot"),
             mode=_normalize_aria_snapshot_mode(mode, method="Page.aria_snapshot"),
         )
+    def _acquire_sync_close_follower(self) -> Optional[int]:
+        current_thread = threading.get_ident()
+        with self._rustwright_sync_close_condition:
+            if self._rustwright_sync_close_state != _SYNC_CLOSE_CLOSING:
+                return None
+            if self._rustwright_sync_close_owner == current_thread:
+                return None
+            generation = self._rustwright_sync_close_generation
+            self._rustwright_sync_close_waiters[generation] = (
+                self._rustwright_sync_close_waiters.get(generation, 0) + 1
+            )
+            return generation
+
+    def _wait_for_sync_close_generation(self, generation: int) -> None:
+        deadline = _sync_close_wait_deadline(self)
+        with self._rustwright_sync_close_condition:
+            try:
+                while generation not in self._rustwright_sync_close_outcomes:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        _raise_close_wait_timeout("Page.close")
+                    self._rustwright_sync_close_condition.wait(timeout=remaining)
+                outcome = self._rustwright_sync_close_outcomes[generation]
+            finally:
+                waiter_count = self._rustwright_sync_close_waiters.get(generation, 0)
+                if waiter_count <= 1:
+                    self._rustwright_sync_close_waiters.pop(generation, None)
+                else:
+                    self._rustwright_sync_close_waiters[generation] = waiter_count - 1
+        if outcome.error is not None:
+            _raise_close_error(outcome.error)
+
+    def _fallback_close_dialog(self) -> None:
+        self._maybe_fallback_pending_dialogs()
+
+
+    def _wait_for_sync_close_completion(self) -> None:
+        generation = self._acquire_sync_close_follower()
+        if generation is not None:
+            self._wait_for_sync_close_generation(generation)
+
+    def _begin_sync_close(self) -> bool:
+        current_thread = threading.get_ident()
+        deadline = _sync_close_wait_deadline(self)
+        with self._rustwright_sync_close_condition:
+            while (
+                self._rustwright_sync_close_state == _SYNC_CLOSE_CLOSING
+                or (
+                    self._rustwright_async_close_state == "closing"
+                    and self._rustwright_async_close_sync_owner != current_thread
+                )
+            ):
+                if (
+                    self._rustwright_sync_close_state == _SYNC_CLOSE_CLOSING
+                    and self._rustwright_sync_close_owner == current_thread
+                ):
+                    return False
+                if self._rustwright_sync_close_state == _SYNC_CLOSE_CLOSING:
+                    waited_generation = self._rustwright_sync_close_generation
+                    self._rustwright_sync_close_waiters[waited_generation] = (
+                        self._rustwright_sync_close_waiters.get(waited_generation, 0) + 1
+                    )
+                    try:
+                        while waited_generation not in self._rustwright_sync_close_outcomes:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                _raise_close_wait_timeout("Page.close")
+                            self._rustwright_sync_close_condition.wait(timeout=remaining)
+                        outcome = self._rustwright_sync_close_outcomes[waited_generation]
+                    finally:
+                        waiter_count = self._rustwright_sync_close_waiters.get(waited_generation, 0)
+                        if waiter_count <= 1:
+                            self._rustwright_sync_close_waiters.pop(waited_generation, None)
+                        else:
+                            self._rustwright_sync_close_waiters[waited_generation] = waiter_count - 1
+                    if outcome.error is not None:
+                        _raise_close_error(outcome.error)
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _raise_close_wait_timeout("Page.close")
+                self._rustwright_sync_close_condition.wait(timeout=remaining)
+            if self._rustwright_sync_close_state == _SYNC_CLOSE_CLOSED:
+                outcome = self._rustwright_sync_close_outcomes.get(self._rustwright_sync_close_generation)
+                if outcome is not None and outcome.error is not None:
+                    _raise_close_error(outcome.error)
+                return False
+            for generation in tuple(self._rustwright_sync_close_outcomes):
+                if not self._rustwright_sync_close_waiters.get(generation, 0):
+                    self._rustwright_sync_close_outcomes.pop(generation, None)
+            self._rustwright_sync_close_state = _SYNC_CLOSE_CLOSING
+            self._rustwright_sync_close_owner = current_thread
+            self._rustwright_sync_close_generation += 1
+            return True
+    def _finish_sync_close_success(self) -> None:
+        with self._rustwright_sync_close_condition:
+            generation = self._rustwright_sync_close_generation
+            self._rustwright_sync_close_outcomes[generation] = _CloseAttemptOutcome(generation)
+            self._rustwright_sync_close_state = _SYNC_CLOSE_CLOSED
+            self._rustwright_sync_close_owner = None
+            self._rustwright_sync_close_condition.notify_all()
+
+    def _finish_sync_close_failure(self, error: BaseException) -> None:
+        with self._rustwright_sync_close_condition:
+            generation = self._rustwright_sync_close_generation
+            snapshot = _CloseErrorSnapshot.from_exception(error)
+            self._rustwright_sync_close_outcomes[generation] = _CloseAttemptOutcome(
+                generation, snapshot
+            )
+            terminal = (
+                getattr(self, "_rustwright_sync_close_native_disposed", False)
+                and getattr(self, "_rustwright_sync_close_cleanup_complete", False)
+            )
+            self._closed = terminal
+            self._closing = terminal
+            self._rustwright_sync_close_state = _SYNC_CLOSE_CLOSED if terminal else _SYNC_CLOSE_OPEN
+            self._rustwright_sync_close_owner = None
+            self._rustwright_sync_close_condition.notify_all()
+    def _note_event_batch_consumed(self, terminal: bool) -> None:
+        with self._event_dispatch_condition:
+            # Native cursors track reads; several drained batches can share one.
+            # Only consumption of the terminal envelope completes this barrier.
+            self._event_pump_terminal_consumed |= terminal
+            self._event_dispatch_condition.notify_all()
+
+    def _wait_for_close_event_dispatch_or_fallback(
+        self,
+        initial_beforeunload_count: Optional[int] = None,
+    ) -> bool:
+        deadline = _sync_close_wait_deadline(self)
+        with self._event_dispatch_condition:
+            while True:
+                if (
+                    initial_beforeunload_count is not None
+                    and self._beforeunload_dispatch_count != initial_beforeunload_count
+                ):
+                    return True
+                if self._event_pump_terminal_consumed:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._fallback_close_dialog()
+                    return False
+                self._event_dispatch_condition.wait(timeout=remaining)
+
+
 
     def close(self, *, run_before_unload: Optional[bool] = None, reason: Optional[str] = None) -> None:
-        if self._closed:
-            return
+        with self._rustwright_sync_close_condition:
+            if self._rustwright_sync_close_state == _SYNC_CLOSE_CLOSED:
+                return
         normalized_reason = None
         if reason is not None:
             normalized_reason = _normalize_string_option(reason, method="Page.close", name="reason")
-        self._closed_reason = normalized_reason
-        run_before_unload = bool(run_before_unload or False)
-        if not run_before_unload:
-            self._closing = True
-        if self._video is not None:
-            self._video._finalize()
-        self._screencast.stop()
-        for har_path, url_filter, content_mode, har_mode in self._har_recordings:
-            _write_har(har_path, [self], url_filter, content_mode=content_mode, har_mode=har_mode)
-        if self._fetch_enabled:
-            try:
-                _call(self._core.disable_fetch, self._default_timeout)
-            except Error:
-                pass
-            self._fetch_enabled = False
-        if self._binding_server is not None:
-            self._binding_server.shutdown()
-            self._binding_server.server_close()
-            self._binding_server = None
-        if self._crash_session is not None:
-            try:
-                self._crash_session.detach()
-            except Error:
-                pass
-            self._crash_session = None
-            self._crash_waiter = None
-        dialog_dispatch_count = self._dialog_dispatch_count
+        if not self._begin_sync_close():
+            return
         try:
-            try:
-                _call(self._core.close, self._default_timeout, run_before_unload)
-            except Error as exc:
-                if not _is_ignorable_close_error(exc):
-                    raise
-            if run_before_unload and self._event_handlers.get("dialog"):
-                deadline = time.monotonic() + min(self._default_timeout / 1000, 0.5)
-                while self._dialog_dispatch_count == dialog_dispatch_count and time.monotonic() < deadline:
-                    time.sleep(0.01)
-        finally:
-            self._stop_event_pump()
-            self._detach_worker_console_propagation(force=True)
-            self._stop_worker_thread()
-            self._reap_worker_event_threads()
-        self._closed = True
+            self._close_impl(
+                normalized_reason=normalized_reason,
+                run_before_unload=bool(run_before_unload or False),
+            )
+        except BaseException as exc:
+            self._finish_sync_close_failure(exc)
+            raise
+        else:
+            self._finish_sync_close_success()
+
+    def _purge_owned_default_context(self) -> None:
+        if self._rustwright_sync_close_default_context_cleaned:
+            return
+        if self._owns_context and self._context is not None:
+            self._context._cleanup_default_context_state()
+        self._rustwright_sync_close_default_context_cleaned = True
+
+    def _run_close_cleanup(self) -> None:
+        self._closed = False
         self._closing = True
-        self._mark_owned_cdp_sessions_closed()
-        if self._context is not None and self in self._context._pages:
-            self._context._pages.remove(self)
-        _emit_event(self._event_handlers, "close", self)
-        self._release_memory_buffers()
-        if (
-            self._owns_context
-            and self._context is not None
-            and getattr(self._context, "_rustwright_sync_close_state", _SYNC_CLOSE_OPEN) == _SYNC_CLOSE_OPEN
-            and getattr(self._context, "_rustwright_async_close_state", "open") != "closing"
-        ):
-            self._context.close()
+        first_error: Optional[BaseException] = None
+
+        def run_cleanup(stage: Callable[[], None], marker: str) -> None:
+            nonlocal first_error
+            if getattr(self, marker, False):
+                return
+            try:
+                stage()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+                return
+            setattr(self, marker, True)
+            _update_page_cleanup_complete(self)
+
+        run_cleanup(
+            self._mark_owned_cdp_sessions_closed,
+            "_rustwright_sync_close_sessions_closed",
+        )
+        run_cleanup(
+            self._remove_page_from_context,
+            "_rustwright_sync_close_context_removed",
+        )
+        if not self._rustwright_sync_close_close_event_emitted:
+            self._closed = True
+            try:
+                _emit_event(self._event_handlers, "close", self)
+            except BaseException as exc:
+                first_error = first_error or exc
+            else:
+                self._rustwright_sync_close_close_event_emitted = True
+                _update_page_cleanup_complete(self)
+        run_cleanup(self._release_memory_buffers, "_rustwright_sync_close_memory_released")
+        if not self._rustwright_sync_close_owned_context_closed:
+            def close_owned_context() -> None:
+                if not self._owns_context:
+                    return
+                if (
+                    self._context is not None
+                    and getattr(self._context, "_rustwright_sync_close_state", _SYNC_CLOSE_OPEN)
+                    == _SYNC_CLOSE_OPEN
+                    and getattr(self._context, "_rustwright_async_close_state", "open") != "closing"
+                ):
+                    self._context.close()
+
+            run_cleanup(close_owned_context, "_rustwright_sync_close_owned_context_closed")
+        _update_page_cleanup_complete(self)
+        native_disposed = getattr(self, "_rustwright_sync_close_native_disposed", True)
+        if self._rustwright_sync_close_cleanup_complete and native_disposed:
+            self._closed = True
+            self._closing = True
+        else:
+            self._closed = False
+            self._closing = False
+        if first_error is not None:
+            raise first_error
+
+    def _close_impl(self, *, normalized_reason: Optional[str], run_before_unload: bool) -> None:
+        self._closed_reason = normalized_reason
+        first_error: Optional[BaseException] = None
+        native_attempted = self._rustwright_sync_close_native_disposed
+        try:
+            if self._video is not None:
+                self._video._finalize()
+            self._screencast.stop()
+            for har_path, url_filter, content_mode, har_mode in self._har_recordings:
+                _write_har(har_path, [self], url_filter, content_mode=content_mode, har_mode=har_mode)
+            if self._fetch_enabled:
+                try:
+                    _call(self._core.disable_fetch, self._default_timeout)
+                except Error:
+                    pass
+                self._fetch_enabled = False
+            if self._binding_server is not None:
+                self._binding_server.shutdown()
+                self._binding_server.server_close()
+                self._binding_server = None
+            if self._crash_session is not None:
+                try:
+                    self._crash_session.detach()
+                except Error:
+                    pass
+                self._crash_session = None
+                self._crash_waiter = None
+            if not self._rustwright_sync_close_native_disposed:
+                self._purge_owned_default_context()
+                with self._event_dispatch_condition:
+                    beforeunload_dispatch_count = self._beforeunload_dispatch_count
+                if not run_before_unload:
+                    self._closing = True
+                native_attempted = True
+                try:
+                    _call(self._core.close, self._default_timeout, run_before_unload)
+                except Error as exc:
+                    if not _is_ignorable_close_error(exc):
+                        raise
+                self._rustwright_sync_close_native_disposed = True
+                if run_before_unload:
+                    self._rustwright_sync_close_beforeunload_count = beforeunload_dispatch_count
+            if self._rustwright_sync_close_beforeunload_count is not None:
+                if not self._wait_for_close_event_dispatch_or_fallback(
+                    self._rustwright_sync_close_beforeunload_count
+                ):
+                    raise TimeoutError("Page.close: timed out waiting for beforeunload event dispatch; retry close")
+                self._rustwright_sync_close_beforeunload_count = None
+        except BaseException as exc:
+            first_error = exc
+        finally:
+            if native_attempted and self._rustwright_sync_close_beforeunload_count is None:
+                try:
+                    self._stop_event_pump()
+                    self._detach_worker_console_propagation(force=True)
+                    self._stop_worker_thread()
+                    self._reap_worker_event_threads()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                try:
+                    self._run_close_cleanup()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def get_by_text(self, text: str, *, exact: bool = False) -> "Locator":
         return Locator(self, {"kind": "text", "text": _text_matcher(text), "exact": exact})
@@ -21435,7 +21836,6 @@ class Page:
         dispatch = _EVENT_DIALOG_DISPATCH.get()
         if isinstance(dispatch, _DialogDispatch):
             dispatch.settle()
-
     def _wait_for_event_handler_removal(
         self,
         event: str,
@@ -21497,10 +21897,7 @@ class Page:
         return None
 
     def _dialog_fallback_suppressed(self, dialog: Dialog) -> bool:
-        if getattr(dialog, "_captured", False):
-            return True
-        with self._dialog_state_lock:
-            return self._dialog_waiter_count > 0 or self._dialog_operation_count > 0
+        return bool(getattr(dialog, "_captured", False))
 
     def _dialog_dispatch_finished(self, dispatch: _DialogDispatch) -> None:
         if getattr(dispatch.dialog, "_handled", False):
@@ -21595,20 +21992,31 @@ class Page:
                     dialog_dispatch.settle()
                 continue
             activated = True
-            if event == "dialog" and args and self._dialog_operation_active():
-                capture = getattr(args[0], "_capture", None)
-                if callable(capture):
-                    capture()
             sequence_token = _EVENT_DISPATCH_SEQUENCE.set((self, event_sequence))
             owner_token = _EVENT_DISPATCH_OWNER.set(owner)
             registration_token = _EVENT_DISPATCH_REGISTRATION.set(state)
             deferred_token = _EVENT_DISPATCH_DEFERRED.set(False)
             dialog_token = _EVENT_DIALOG_DISPATCH.set(dialog_dispatch)
+            claim: Optional[int] = None
+            if (
+                event == "dialog"
+                and args
+                and not getattr(state.handler, "_rustwright_dialog_predicate_waiter", False)
+            ):
+                claim_handler = getattr(args[0], "_claim_handler", None)
+                if callable(claim_handler):
+                    claim = claim_handler()
+            claim_token = _EVENT_DIALOG_CLAIM.set(claim)
+            handler_raised = False
             try:
                 try:
                     state.handler(*args)
                 except Exception:
+                    handler_raised = True
                     continue
+                except BaseException:
+                    handler_raised = True
+                    raise
             finally:
                 deferred = _EVENT_DISPATCH_DEFERRED.get()
                 _EVENT_DISPATCH_DEFERRED.reset(deferred_token)
@@ -21616,12 +22024,16 @@ class Page:
                 _EVENT_DISPATCH_OWNER.reset(owner_token)
                 _EVENT_DISPATCH_SEQUENCE.reset(sequence_token)
                 if not deferred:
+                    if handler_raised:
+                        release_claim = getattr(args[0], "_release_handler_claim", None) if args else None
+                        if callable(release_claim):
+                            release_claim(claim)
                     self._finish_event_handler(state, owner)
+                _EVENT_DIALOG_CLAIM.reset(claim_token)
                 _EVENT_DIALOG_DISPATCH.reset(dialog_token)
         if dialog_dispatch is not None:
             dialog_dispatch.finish_if_idle()
         return activated
-
     def _dismiss_dialog_if_unhandled(self, dialog: Dialog) -> None:
         with dialog._fallback_lock:
             if dialog._handled or dialog._fallback_attempted:
@@ -21639,7 +22051,10 @@ class Page:
     def _handle_dialog_event(self, payload: dict[str, Any]) -> None:
         dialog = Dialog(self, payload)
         self._dispatch_event_handlers("dialog", dialog)
-        self._dialog_dispatch_count += 1
+        with self._event_dispatch_condition:
+            if dialog.type == "beforeunload":
+                self._beforeunload_dispatch_count += 1
+            self._event_dispatch_condition.notify_all()
 
     def _snapshot_event_handlers(
         self,
@@ -21762,6 +22177,16 @@ class Page:
         if detach_worker_forwards:
             self._detach_worker_console_propagation()
 
+    def _ack_event_batch(self) -> bool:
+        ack_batch = getattr(self._event_stream, "ack_batch", None)
+        if not callable(ack_batch):
+            return True
+        try:
+            _call(ack_batch)
+        except Error:
+            return False
+        return True
+
     def _event_pump(self) -> None:
         while self._event_listeners_active():
             try:
@@ -21769,13 +22194,19 @@ class Page:
             except Error:
                 break
             if not isinstance(batch, list):
+                if not self._ack_event_batch():
+                    break
                 continue
+            stop_after_ack = False
+            terminal_consumed = False
             for envelope in batch:
                 if not isinstance(envelope, dict):
                     continue
                 kind = str(envelope.get("kind") or "")
                 if kind == "_closed":
-                    return
+                    terminal_consumed = True
+                    stop_after_ack = True
+                    break
                 if kind == "_overflow":
                     self._reconcile_event_stream_overflow(envelope.get("payload"))
                     continue
@@ -21790,7 +22221,13 @@ class Page:
                     event_sequence=event_sequence,
                 )
                 if not self._event_listeners_active():
-                    return
+                    stop_after_ack = True
+                    break
+            if not self._ack_event_batch():
+                break
+            self._note_event_batch_consumed(terminal_consumed)
+            if stop_after_ack:
+                return
 
     def _reconcile_event_stream_overflow(self, payload: Any) -> None:
         dropped = payload.get("dropped") if isinstance(payload, dict) else None
@@ -21800,7 +22237,7 @@ class Page:
             dropped_count = 0
         warnings.warn(
             f"rustwright page event stream overflow: dropped {dropped_count} event(s); "
-            "network-idle and dialog bookkeeping was resynchronized",
+            "network-idle bookkeeping was resynchronized",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -21808,10 +22245,7 @@ class Page:
             self._network_idle_active_requests.clear()
             self._network_idle_last_activity = time.monotonic()
             self._network_idle_condition.notify_all()
-        try:
-            _call(self._core.handle_dialog, False, None, min(self._default_timeout, 500.0))
-        except Error:
-            pass
+        # Retained dialog openings follow overflow and use ownership-aware dispatch.
 
     def _handle_observation_event(
         self,
@@ -24034,11 +24468,13 @@ return null;
             self._index,
             _json(options),
             self._page._default_timeout if timeout is None else timeout,
+            **_action_cancel_kwargs(),
         )
         return _decode_json_result_json(result)
 
     def _fill_apply(self, value: str, *, strict: bool, forced: bool, timeout: float) -> dict[str, Any]:
-        result = _call(
+        result = _call_action(
+            _call,
             self._page._core.locator_fill_apply,
             _json(self._spec),
             self._index,
@@ -24058,7 +24494,8 @@ return null;
         timeout: float,
         method: str,
     ) -> dict[str, Any]:
-        result = _call_with_method_prefix(
+        result = _call_action(
+            _call_with_method_prefix,
             method,
             self._page._core.locator_select_apply,
             _json(self._spec),
@@ -24117,6 +24554,7 @@ return null;
         stable_position_required: bool = True,
         action_position: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
+        _check_action_cancelled()
         self._raise_if_frame_locator_in_composite(f"Locator.{action}")
         method = _locator_method_for_action(action)
         _raise_if_owner_unavailable(self._page, method=method)
@@ -24127,6 +24565,7 @@ return null;
         requires_stable = require_stable or (check_stable and state in {"actionable", "stable", "scrollable"})
 
         while True:
+            _check_action_cancelled()
             _raise_if_owner_unavailable(self._page, method=method)
             remaining_ms = max((deadline - time.monotonic()) * 1000, 1.0)
             command_timeout = _actionability_probe_timeout(remaining_ms, timeout_disabled)
@@ -24154,6 +24593,7 @@ return null;
                     break
                 _sleep_until_next_poll(deadline)
                 continue
+            _check_action_cancelled()
             if self._strict and not self._explicit_index:
                 self._raise_frame_strict_violation(last_info.get("frame_strict_violation"))
             count = int(last_info.get("count") or 0)
@@ -24756,6 +25196,21 @@ return {
         return offset_x, offset_y
 
     def _with_mouse_modifiers(self, modifiers: Optional[Iterable[str]], action: Callable[[], None]) -> None:
+        pending = []
+        for modifier in modifiers or []:
+            normalized = self._page.keyboard._normalize_modifier(str(modifier))
+            if normalized is None:
+                raise Error(f"unsupported mouse modifier: {modifier}")
+            if normalized not in self._page.keyboard._modifiers:
+                pending.append(normalized)
+        if not pending:
+            action()
+            return
+        # Modifier-down is the first input in this sequence. Keep modifier-up
+        # and the pointer sequence inside the same cancellation boundary.
+        _call_action(self._dispatch_with_mouse_modifiers, pending, action)
+
+    def _dispatch_with_mouse_modifiers(self, modifiers: Iterable[str], action: Callable[[], None]) -> None:
         pressed: list[str] = []
         existing = set(self._page.keyboard._modifiers)
         try:
@@ -24892,6 +25347,7 @@ return {
             self._index,
             json.dumps(action),
             self._page._default_timeout if timeout is None else timeout,
+            **_action_cancel_kwargs(),
         )
 
     def _mouse_dblclick(
@@ -25124,6 +25580,7 @@ return {{ ok: true, value: __rw_fn(matches, payload.arg) }};
             action,
             timeout_ms,
             on_poll,
+            **_action_cancel_kwargs(),
         )
         self._page._slow_mo()
 
@@ -25171,6 +25628,7 @@ return {{ ok: true, value: __rw_fn(matches, payload.arg) }};
             text,
             delay_value,
             remaining_ms,
+            **_action_cancel_kwargs(),
         )
         self._page._slow_mo()
 
@@ -25205,6 +25663,7 @@ return {{ ok: true, value: __rw_fn(matches, payload.arg) }};
             key,
             delay_value,
             remaining_ms,
+            **_action_cancel_kwargs(),
         )
         self._page._slow_mo()
 
@@ -25450,6 +25909,9 @@ return {{ ok: true, value: __rw_fn(matches, payload.arg) }};
 
     def focus(self, *, timeout: Optional[float] = None) -> None:
         self._wait_for_single("focus", state="attached", timeout=timeout)
+        _call_action(self._focus, timeout=timeout)
+
+    def _focus(self, *, timeout: Optional[float]) -> None:
         self._eval(
             """
 	if (!el) throw new Error('No element matches locator');
@@ -25461,7 +25923,8 @@ return true;
         self._page._slow_mo()
 
     def _focus_for_keyboard_action(self, *, timeout: Optional[float] = None) -> bool:
-        self.focus(timeout=timeout)
+        # The caller waits before committing the focus/type/cleanup sequence.
+        self._focus(timeout=timeout)
         return bool(
             self._eval(
                 """
@@ -25502,7 +25965,8 @@ return true;
 
     def blur(self, *, timeout: Optional[float] = None) -> None:
         self._wait_for_single("blur", state="attached", timeout=timeout)
-        self._eval(
+        _call_action(
+            self._eval,
             """
 	if (!el) throw new Error('No element matches locator');
 if (typeof el.blur === 'function') el.blur();
@@ -25836,7 +26300,8 @@ return true;
     ) -> None:
         self._wait_for_single("set input files", state="attached", timeout=timeout)
         payloads = _file_payloads(files)
-        self._eval(
+        _call_action(
+            self._eval,
             f"""
 if (!el) throw new Error('No element matches locator');
 if (!(el instanceof HTMLInputElement) || el.type !== 'file') throw new Error('Element is not a file input');
@@ -26171,7 +26636,8 @@ return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
 
     def select_text(self, *, force: Optional[bool] = None, timeout: Optional[float] = None) -> None:
         self._wait_for_single("select text", state="attached" if force else "visible", timeout=timeout)
-        self._eval(
+        _call_action(
+            self._eval,
             """
 if (!el) throw new Error('No element matches locator');
 if ((el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) && typeof el.select === 'function') {
@@ -26210,16 +26676,20 @@ return true;
             name="delay",
         )
         self._wait_for_single("press sequentially", state="attached", timeout=timeout)
-        fallback_focused = self._focus_for_keyboard_action(timeout=timeout)
-        try:
-            if fallback_focused:
-                self._page.keyboard._type_without_text(text, delay=delay_value)
-            else:
-                self._page.keyboard.type(text, delay=delay_value)
-            self._page._slow_mo()
-        finally:
-            if fallback_focused:
-                self._cleanup_keyboard_fallback_focus()
+
+        def dispatch() -> None:
+            fallback_focused = self._focus_for_keyboard_action(timeout=timeout)
+            try:
+                if fallback_focused:
+                    self._page.keyboard._type_without_text(text, delay=delay_value)
+                else:
+                    self._page.keyboard.type(text, delay=delay_value)
+                self._page._slow_mo()
+            finally:
+                if fallback_focused:
+                    self._cleanup_keyboard_fallback_focus()
+
+        _call_action(dispatch)
 
     def screenshot(
         self,

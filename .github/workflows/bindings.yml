@@ -27,7 +27,7 @@ jobs:
       - name: Build librustwright_capi (release)
         run: cargo build -p rustwright-capi --release --locked
       - name: Upload native library
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: librustwright_capi-linux
           path: target/release/librustwright_capi.so
@@ -62,7 +62,7 @@ jobs:
 
       - name: Download native library
         if: steps.has.outputs.ok == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: librustwright_capi-linux
           path: target/release
@@ -71,7 +71,7 @@ jobs:
       - name: Install Chrome
         if: steps.has.outputs.ok == 'true'
         id: chrome
-        uses: browser-actions/setup-chrome@v1
+        uses: browser-actions/setup-chrome@v2
         with:
           chrome-version: stable
       - name: Point engine at Chrome
@@ -146,7 +146,7 @@ jobs:
           PY
       - name: Upload results
         if: steps.has.outputs.ok == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: results-${{ matrix.lang }}
           path: ${{ env.RW_OUT }}
@@ -159,7 +159,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Download all language results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: results-*
           path: results

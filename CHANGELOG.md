@@ -4,6 +4,12 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Each release tag now publishes the `rustwright-core` and `rustwright` Rust
+  crates to crates.io. The `rustwright-core` package now contains only the
+  engine sources.
+
 ### Breaking
 
 - Removed `disable_playwright_compat()`. Compatibility aliases are now a one-way
@@ -45,6 +51,7 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 - Fixed native drag-and-drop to stop dispatching trailing pointer and mouse release events after a completed drop.
 - Hardened sync and async context creation rollback and close disposal retries.
+- Fixed `show-trace` and `trace` to decode percent-encoded `file:` URLs and to accept Windows drive-letter paths such as `C:\traces\run.zip` instead of rejecting them as remote URLs.
 
 ## [0.3.0] - 2026-08-16
 
