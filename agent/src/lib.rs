@@ -635,6 +635,7 @@ pub enum BrowserOp {
     TakeScreenshot {
         full_page: bool,
         image_type: ScreenshotType,
+        filename: Option<String>,
     },
     Close,
 }
@@ -5264,6 +5265,7 @@ impl BrowserState {
         &mut self,
         full_page: bool,
         image_type: ScreenshotType,
+        filename: Option<&str>,
         request: &ActorRequest,
     ) -> Result<BrowserOutput, BrowserError> {
         let remaining = Self::remaining(request)?;
@@ -5284,6 +5286,18 @@ impl BrowserState {
                 request.timeout_ms,
             )
         })?;
+        if let Some(filename) = filename {
+            let artifact = write_output_bytes(
+                self.config.workspace.as_deref(),
+                &bytes,
+                filename,
+                "screenshot",
+            )?;
+            return Ok(BrowserOutput::Text(format!(
+                "Screenshot written to `{}`.",
+                artifact.display()
+            )));
+        }
         Ok(BrowserOutput::Image {
             bytes,
             mime: image_type.mime(),
@@ -5484,7 +5498,8 @@ impl BrowserState {
             BrowserOp::TakeScreenshot {
                 full_page,
                 image_type,
-            } => self.take_screenshot(*full_page, *image_type, request),
+                filename,
+            } => self.take_screenshot(*full_page, *image_type, filename.as_deref(), request),
             BrowserOp::Close => {
                 let had_browser = self.browser.is_some();
                 self.close();
@@ -6131,6 +6146,15 @@ fn write_text_output(
     filename: &str,
     purpose: &str,
 ) -> Result<PathBuf, BrowserError> {
+    write_output_bytes(workspace, content.as_bytes(), filename, purpose)
+}
+
+fn write_output_bytes(
+    workspace: Option<&Path>,
+    bytes: &[u8],
+    filename: &str,
+    purpose: &str,
+) -> Result<PathBuf, BrowserError> {
     if filename.is_empty() {
         return Err(BrowserError::Message(format!(
             "{purpose} filename must be non-empty"
@@ -6185,7 +6209,7 @@ fn write_text_output(
         .create_new(true)
         .open(&resolved)
         .map_err(|error| BrowserError::Message(format!("{purpose} output failed: {error}")))?;
-    if let Err(error) = output.write_all(content.as_bytes()) {
+    if let Err(error) = output.write_all(bytes) {
         drop(output);
         let _ = fs::remove_file(&resolved);
         return Err(BrowserError::Message(format!(
@@ -8080,6 +8104,7 @@ mod tests {
             BrowserOp::TakeScreenshot {
                 full_page: false,
                 image_type: ScreenshotType::Png,
+                filename: None,
             }
             .bypass_response_shaping()
         );
@@ -8832,6 +8857,83 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("remove confinement fixture");
+    }
+
+    #[test]
+    fn binary_output_writer_confines_relative_and_absolute_paths() {
+        static COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+        let root = env::temp_dir().join(format!(
+            "rustwright-mcp-screenshot-output-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(workspace.join("shots")).expect("create output workspace");
+        let workspace = workspace.canonicalize().expect("canonicalize workspace");
+
+        let relative = write_output_bytes(
+            Some(&workspace),
+            b"png-bytes",
+            "shots/relative.png",
+            "screenshot",
+        )
+        .expect("relative output");
+        assert_eq!(fs::read(&relative).unwrap(), b"png-bytes");
+        assert_eq!(relative, workspace.join("shots").join("relative.png"));
+
+        let absolute = write_output_bytes(
+            Some(&workspace),
+            b"absolute-bytes",
+            workspace.join("absolute.png").to_str().unwrap(),
+            "screenshot",
+        )
+        .expect("absolute in-workspace output");
+        assert!(absolute.starts_with(&workspace.canonicalize().unwrap()));
+        assert_eq!(fs::read(&absolute).unwrap(), b"absolute-bytes");
+
+        assert!(
+            write_output_bytes(Some(&workspace), b"x", "", "screenshot")
+                .unwrap_err()
+                .to_string()
+                .contains("filename must be non-empty")
+        );
+        assert!(
+            write_output_bytes(None, b"x", "missing.png", "screenshot")
+                .unwrap_err()
+                .to_string()
+                .contains("must be set for screenshot file output")
+        );
+        assert!(
+            write_output_bytes(
+                Some(&workspace),
+                b"x",
+                root.join("outside.png").to_str().unwrap(),
+                "screenshot",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("confined to the configured actor workspace")
+        );
+        assert!(
+            write_output_bytes(Some(&workspace), b"x", "shots/relative.png", "screenshot")
+                .unwrap_err()
+                .to_string()
+                .contains("output file already exists")
+        );
+        assert!(
+            write_output_bytes(Some(&workspace), b"x", "absent/missing.png", "screenshot")
+                .unwrap_err()
+                .to_string()
+                .contains("output directory is unavailable")
+        );
+        assert_eq!(
+            write_text_output(Some(&workspace), "text", "text.txt", "console").unwrap(),
+            workspace.join("text.txt")
+        );
+        assert_eq!(fs::read(workspace.join("text.txt")).unwrap(), b"text");
+
+        fs::remove_dir_all(root).expect("remove screenshot output fixture");
     }
 
     fn process_rows() -> Vec<(u32, u32)> {
