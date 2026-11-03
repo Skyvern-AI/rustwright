@@ -1638,16 +1638,8 @@ mod tests {
         );
         assert_eq!(descriptor.input_schema["additionalProperties"], false);
         for (arguments, expected_filename, expected_type) in [
-            (
-                json!({}),
-                None::<String>,
-                ScreenshotType::Png,
-            ),
-            (
-                json!({"filename": null}),
-                None,
-                ScreenshotType::Png,
-            ),
+            (json!({}), None::<String>, ScreenshotType::Png),
+            (json!({"filename": null}), None, ScreenshotType::Png),
             (
                 json!({"filename": "/tmp/workspace/shots/page.png"}),
                 Some("/tmp/workspace/shots/page.png".to_owned()),

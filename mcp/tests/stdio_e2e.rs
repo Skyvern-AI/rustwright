@@ -4031,10 +4031,7 @@ fn real_stdio_screenshot_filename_saves_inside_the_workspace() {
         "filename save must not return inline image data: {saved}"
     );
     let saved_text = result_text(&saved);
-    assert!(
-        saved_text.contains("Screenshot written to"),
-        "{saved_text}"
-    );
+    assert!(saved_text.contains("Screenshot written to"), "{saved_text}");
     let artifact = workspace.join("shots").join("capture.png");
     let bytes = fs::read(&artifact).expect("read saved screenshot");
     assert!(
@@ -4062,8 +4059,7 @@ fn real_stdio_screenshot_filename_saves_inside_the_workspace() {
         "outside-workspace screenshot filename must be rejected: {rejected}"
     );
     assert!(
-        error_result_text(&rejected)
-            .contains("confined to the configured actor workspace"),
+        error_result_text(&rejected).contains("confined to the configured actor workspace"),
         "{}",
         error_result_text(&rejected)
     );
