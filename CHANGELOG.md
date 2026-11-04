@@ -53,6 +53,11 @@ All notable user-facing changes to Rustwright are documented in this file.
 - Hardened sync and async context creation rollback and close disposal retries.
 - Fixed `show-trace` and `trace` to decode percent-encoded `file:` URLs and to accept Windows drive-letter paths such as `C:\traces\run.zip` instead of rejecting them as remote URLs.
 
+### Documentation
+
+- Added a Mintlify documentation configuration, quickstart, and guide to the
+  generated Python API inventories and compatibility evidence.
+
 ## [0.3.0] - 2026-08-16
 
 ### Added
