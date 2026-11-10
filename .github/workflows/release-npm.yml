@@ -134,7 +134,7 @@ jobs:
 
       - name: Install cargo-zigbuild
         if: ${{ matrix.platform.zig }}
-        uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: cargo-zigbuild
 
