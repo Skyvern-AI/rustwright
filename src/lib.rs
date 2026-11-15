@@ -7058,7 +7058,24 @@ multiline-compatible = """4.5.6"""
         assert!(!is_locator_wait_context_loss(&RwError::Message(
             "Execution context was destroyed.".to_string()
         )));
+        // The serialized-evaluate path rewraps a destroyed context as this message.
+        assert!(is_locator_wait_context_loss(
+            &upstream_context_destroyed_error()
+        ));
+        // Page text that only contains the rewrapped message is not context loss.
+        assert!(!is_locator_wait_context_loss(&RwError::Message(format!(
+            "Error: {UPSTREAM_CONTEXT_DESTROYED_MESSAGE}
+    at <anonymous>:1:7"
+        ))));
         assert!(!is_locator_wait_context_loss(&RwError::Timeout(100)));
+        // Locator.evaluate resends user code, so it keeps retrying only the raw CDP form.
+        assert!(!is_locator_evaluate_retryable_context_loss(
+            &upstream_context_destroyed_error()
+        ));
+        assert!(is_locator_evaluate_retryable_context_loss(&RwError::Cdp {
+            method: "Runtime.callFunctionOn".to_string(),
+            message: "Cannot find context with specified id".to_string(),
+        }));
     }
 
     #[test]
@@ -23408,6 +23425,106 @@ return this.dataset.mainWorldOverride === "observed";
     }
 
     #[tokio::test]
+    async fn locator_evaluate_never_resends_user_code_after_context_loss() {
+        let mut harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        let evaluation = evaluate_locator_for_page(
+            Arc::clone(&harness.page),
+            json!({"kind": "css", "selector": "#target"}).to_string(),
+            0,
+            "globalThis.beaconCount += 1;".to_string(),
+            Duration::from_millis(500),
+        );
+        let responder = async move {
+            harness
+                .reply_serializer_install("page-session", None, "serializer-before-navigation")
+                .await;
+            // A navigation destroys the context after the user function was dispatched.
+            let user_command = harness.next_command("Runtime.callFunctionOn").await;
+            harness.reply_error_with_code(
+                &user_command,
+                -32_000,
+                "Execution context was destroyed.",
+            );
+            harness
+        };
+        let (result, mut harness) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(evaluation, responder)
+        })
+        .await
+        .expect("the evaluation must fail instead of retrying");
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            UPSTREAM_CONTEXT_DESTROYED_MESSAGE
+        );
+        // No second resolution and no second Runtime.callFunctionOn.
+        assert!(matches!(
+            harness.write_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn locator_wait_rearms_when_serialized_evaluate_loses_its_context() {
+        let mut harness = navigation_test_harness(4);
+        let page = Arc::clone(&harness.page);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
+        let attempt_page = Arc::clone(&page);
+        let wait = tokio::spawn(run_locator_wait_retry(
+            page,
+            Duration::from_secs(5),
+            move |deadline| {
+                attempt_count.fetch_add(1, Ordering::SeqCst);
+                let page = Arc::clone(&attempt_page);
+                async move {
+                    evaluate_expression_in_session_before(
+                        &page.browser.client,
+                        "page-session",
+                        None,
+                        make_evaluate_expression(
+                            "document.querySelector('#target') !== null",
+                            None,
+                        ),
+                        deadline,
+                    )
+                    .await
+                }
+            },
+        ));
+
+        // A navigation destroys the context while the first attempt is in the page.
+        let install = harness.next_command("Runtime.evaluate").await;
+        harness.reply(
+            &install,
+            json!({ "result": { "type": "function", "objectId": "serializer-before-navigation" } }),
+        );
+        let first_attempt = harness.next_command("Runtime.callFunctionOn").await;
+        harness.reply_error_with_code(&first_attempt, -32_000, "Execution context was destroyed.");
+
+        // The wait proves the target is still alive, then re-arms in the new document.
+        harness.reply_next("Target.getTargetInfo", json!({})).await;
+        let reinstall = harness.next_command("Runtime.evaluate").await;
+        harness.reply(
+            &reinstall,
+            json!({ "result": { "type": "function", "objectId": "serializer-after-navigation" } }),
+        );
+        let second_attempt = harness.next_command("Runtime.callFunctionOn").await;
+        assert_eq!(
+            second_attempt["params"]["objectId"],
+            "serializer-after-navigation"
+        );
+        harness.reply(
+            &second_attempt,
+            json!({ "result": { "type": "boolean", "value": true } }),
+        );
+
+        assert_eq!(wait.await.unwrap().unwrap(), "true");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn evaluate_serializer_cache_reinstalls_once_after_navigation_recreates_context() {
         let mut harness = navigation_test_harness(4);
         let client = Arc::clone(&harness.page.browser.client);
@@ -35159,10 +35276,11 @@ fn execution_context_destroyed_error(error: &RwError) -> bool {
     )
 }
 
+const UPSTREAM_CONTEXT_DESTROYED_MESSAGE: &str =
+    "Execution context was destroyed, most likely because of a navigation.";
+
 fn upstream_context_destroyed_error() -> RwError {
-    RwError::Message(
-        "Execution context was destroyed, most likely because of a navigation.".to_string(),
-    )
+    RwError::Message(UPSTREAM_CONTEXT_DESTROYED_MESSAGE.to_string())
 }
 
 async fn install_runtime_value_serializer(
@@ -35895,7 +36013,7 @@ async fn evaluate_locator_for_page(
             Err(error)
                 if attempt == 0
                     && (is_frame_ownership_changed(&error)
-                        || is_locator_wait_context_loss(&error)) =>
+                        || is_locator_evaluate_retryable_context_loss(&error)) =>
             {
                 continue;
             }
@@ -37287,7 +37405,7 @@ async fn evaluate_locator_handle_for_page(
             Err(error)
                 if attempt == 0
                     && (is_frame_ownership_changed(&error)
-                        || is_locator_wait_context_loss(&error)) =>
+                        || is_locator_evaluate_retryable_context_loss(&error)) =>
             {
                 continue;
             }
@@ -38759,9 +38877,23 @@ async fn page_history_observed_impl(
     })
 }
 
+// The one-shot retry in Locator.evaluate and Locator.evaluate_handle resends the
+// caller's function. The rewrapped serialized-evaluate error is reported after that
+// function may have run, so it never triggers the resend. Waits and read-only probes
+// use is_locator_wait_context_loss directly.
+fn is_locator_evaluate_retryable_context_loss(error: &RwError) -> bool {
+    !matches!(error, RwError::Message(_)) && is_locator_wait_context_loss(error)
+}
+
 fn is_locator_wait_context_loss(error: &RwError) -> bool {
     let message = match error {
         RwError::Cdp { message, .. } => message.to_ascii_lowercase(),
+        // The serialized-evaluate path reports a destroyed context as this exact
+        // message instead of the raw CDP error. Any other message is page text. A page
+        // can still produce this one by throwing the same string, and user code may
+        // have run before it, so paths that resend user code must not accept this arm
+        // (see is_locator_evaluate_retryable_context_loss).
+        RwError::Message(message) => return message == UPSTREAM_CONTEXT_DESTROYED_MESSAGE,
         _ => return false,
     };
     // Only retry when the resolved execution environment disappeared; page terminal state is
