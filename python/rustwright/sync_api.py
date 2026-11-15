@@ -1775,6 +1775,15 @@ def _call_action(fn, *args, **kwargs):
         _ACTION_CANCELLATION.reset(context)
 
 
+def _call_cleanup(fn, *args, **kwargs):
+    """Run required cleanup even after the owning async call was cancelled."""
+    context = _ACTION_CANCELLATION.set(None)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        _ACTION_CANCELLATION.reset(context)
+
+
 def _call(fn, *args, **kwargs):
     _check_action_cancelled()
     try:
@@ -15644,7 +15653,7 @@ class Frame(_EventEmitter):
                 matched = handle._truthy(command_timeout)
             finally:
                 if not matched and not handle._disposed:
-                    handle.dispose()
+                    _call_cleanup(handle.dispose)
             if matched:
                 return handle
             time.sleep(interval)
@@ -16184,6 +16193,9 @@ class Frame(_EventEmitter):
         if self._is_main:
             return False
         if self._frame_id and self._page._cdp_frame_entry_for_id(self._frame_id) is None:
+            # The frame tree lookup swallows errors, so a cancelled action also looks
+            # like a missing frame. Detached is permanent, so do not conclude it then.
+            _check_action_cancelled()
             self._mark_detached()
             return True
         selector = self._frame_selector or "iframe,frame"
@@ -19788,7 +19800,7 @@ class Page:
                 matched = handle._truthy(command_timeout)
             finally:
                 if not matched and not handle._disposed:
-                    handle.dispose()
+                    _call_cleanup(handle.dispose)
             if matched:
                 return handle
             time.sleep(interval)
@@ -27685,7 +27697,7 @@ class _PreparedEvaluateArgument:
     def dispose_temporaries(self) -> None:
         for handle in self.temporaries:
             try:
-                handle.dispose()
+                _call_cleanup(handle.dispose)
             except Error:
                 pass
 

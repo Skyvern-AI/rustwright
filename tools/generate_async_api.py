@@ -204,24 +204,26 @@ UNWRAP_ARGUMENTS = {
 
 # Only observational waits may retry after a slice times out. Mutations must
 # receive their full timeout once, because a timeout can follow physical input.
+# wait_for_function is not observational: each slice would restart the caller's
+# predicate, dropping a pending promise and repeating its side effects.
 SLICED_WAIT_METHODS = {
-    "AsyncPage": ("wait_for_url", "wait_for_function"),
-    "AsyncFrame": ("wait_for_selector", "wait_for_url", "wait_for_function"),
+    "AsyncPage": ("wait_for_url",),
+    "AsyncFrame": ("wait_for_selector", "wait_for_url"),
     "AsyncLocator": ("wait_for",),
     "AsyncElementHandle": ("wait_for_selector", "wait_for_element_state"),
 }
 
 
-# These actions retain async timeout-message formatting without retrying the
-# sync operation. The executor keeps the event loop free while the action waits.
+# These calls retain async timeout-message formatting without retrying the
+# sync operation. The executor keeps the event loop free while the call waits.
 SINGLE_DISPATCH_METHODS = {
     "AsyncPage": (
-        "dblclick", "type", "press",
+        "wait_for_function", "dblclick", "type", "press",
         "hover", "tap", "drag_and_drop", "focus", "check", "uncheck",
         "select_option", "set_input_files", "set_checked",
     ),
     "AsyncFrame": (
-        "click",
+        "wait_for_function", "click",
         "dblclick", "fill", "type", "press", "hover", "tap", "focus",
         "check", "uncheck", "set_checked", "select_option",
         "set_input_files", "drag_and_drop",

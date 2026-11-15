@@ -52,6 +52,7 @@ All notable user-facing changes to Rustwright are documented in this file.
 - Fixed native drag-and-drop to stop dispatching trailing pointer and mouse release events after a completed drop.
 - Hardened sync and async context creation rollback and close disposal retries.
 - Fixed `show-trace` and `trace` to decode percent-encoded `file:` URLs and to accept Windows drive-letter paths such as `C:\traces\run.zip` instead of rejecting them as remote URLs.
+- Fixed async `Page.wait_for_function()` and `Frame.wait_for_function()` timing out when the predicate returned a promise that took longer than 50ms. The async API now evaluates the predicate once per poll instead of restarting it for every internal wait slice, and cancelling the awaiting task still stops the polling.
 
 ## [0.3.0] - 2026-08-16
 

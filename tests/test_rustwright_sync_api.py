@@ -12805,6 +12805,108 @@ def test_frame_wait_for_function_returns_js_handle(page):
         handle.dispose()
 
 
+def test_async_wait_for_function_awaits_slow_predicate_promise_once():
+    predicate = """(ms) => {
+      window.__predicateCalls = (window.__predicateCalls || 0) + 1;
+      return new Promise(resolve => setTimeout(() => resolve(window.__predicateCalls), ms));
+    }"""
+
+    async def run() -> None:
+        from rustwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content("<iframe srcdoc='<p>child</p>'></iframe>")
+                child = page.frames[1]
+
+                # The promise outlives several 50ms async wait slices. Restarting the
+                # predicate per slice would never see it resolve and would rerun it.
+                for target in (page, page.main_frame, child):
+                    await target.evaluate("() => { window.__predicateCalls = 0; }")
+                    handle = await target.wait_for_function(predicate, arg=300, timeout=5_000)
+                    assert await handle.json_value() == 1
+                    assert await target.evaluate("() => window.__predicateCalls") == 1
+                    await handle.dispose()
+
+                for target, owner in ((page, "Page"), (page.main_frame, "Frame")):
+                    with pytest.raises(TimeoutError) as never_settles:
+                        await target.wait_for_function("() => new Promise(() => {})", timeout=400)
+                    assert str(never_settles.value) == f"{owner}.wait_for_function: Timeout 400ms exceeded."
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_wait_for_function_cancellation_stops_polling_the_page():
+    async def run() -> None:
+        from rustwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content("<main>polling</main>")
+                waiter = asyncio.create_task(
+                    page.wait_for_function(
+                        "() => { window.__polls = (window.__polls || 0) + 1; return false; }",
+                        timeout=30_000,
+                        polling=10,
+                    )
+                )
+                started = await page.wait_for_function("() => window.__polls > 3", timeout=5_000)
+                await started.dispose()
+
+                cancelled_at = time.monotonic()
+                waiter.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await waiter
+                assert time.monotonic() - cancelled_at < 1.0
+
+                # A poll that was already in the page may still land. After that the
+                # count must settle: live 10ms polling would add about 30 per sample.
+                polls = -1
+                for _ in range(20):
+                    await asyncio.sleep(0.3)
+                    current = await page.evaluate("() => window.__polls")
+                    if current == polls:
+                        break
+                    polls = current
+                else:
+                    pytest.fail("the page was still being polled after cancellation")
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_async_child_frame_wait_for_function_cancellation_keeps_frame_attached():
+    async def run() -> None:
+        from rustwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content("<iframe srcdoc='<p>child</p>'></iframe>")
+                child = page.frames[1]
+
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(child.wait_for_function("() => false", timeout=10_000), 0.3)
+
+                # Let the cancelled worker reach its next poll. That poll must not be
+                # read as the frame having gone away.
+                await asyncio.sleep(0.3)
+                assert not child.is_detached()
+                assert await child.evaluate("() => document.body.textContent") == "child"
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
 def test_evaluate_dom_node_serialization_and_frame_handle(page):
     child = "<button id='go'>Frame Button</button>"
     page.set_content(
