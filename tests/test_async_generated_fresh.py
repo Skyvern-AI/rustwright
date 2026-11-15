@@ -368,6 +368,27 @@ def test_evaluate_argument_temporaries_are_released_after_cancellation() -> None
     assert released == [temporary]
 
 
+def test_cancelled_frame_lookup_does_not_mark_frame_detached() -> None:
+    from rustwright import _rustwright, sync_api
+
+    token = _rustwright._RustCancelToken()
+    token.cancel()
+    # A cancelled frame tree lookup swallows its error and reports no entry.
+    page = SimpleNamespace(_cdp_frame_entry_for_id=lambda frame_id: None)
+    frame = sync_api.Frame(page, frame_id="child")
+
+    context = sync_api._ACTION_CANCELLATION.set(token)
+    try:
+        with pytest.raises(sync_api.Error, match="Action was cancelled"):
+            frame.is_detached()
+    finally:
+        sync_api._ACTION_CANCELLATION.reset(context)
+
+    assert not frame._detached
+    # Without a cancellation the same lookup result still means detached.
+    assert frame.is_detached()
+
+
 def test_non_class_async_helpers_stay_hand_written() -> None:
     tree = ast.parse(ASYNC_API.read_text(encoding="utf-8"))
     parents: dict[ast.AST, ast.AST] = {}

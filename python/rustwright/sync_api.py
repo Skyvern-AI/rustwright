@@ -16193,6 +16193,9 @@ class Frame(_EventEmitter):
         if self._is_main:
             return False
         if self._frame_id and self._page._cdp_frame_entry_for_id(self._frame_id) is None:
+            # The frame tree lookup swallows errors, so a cancelled action also looks
+            # like a missing frame. Detached is permanent, so do not conclude it then.
+            _check_action_cancelled()
             self._mark_detached()
             return True
         selector = self._frame_selector or "iframe,frame"

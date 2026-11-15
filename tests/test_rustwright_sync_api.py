@@ -12882,6 +12882,31 @@ def test_async_wait_for_function_cancellation_stops_polling_the_page():
     asyncio.run(run())
 
 
+def test_async_child_frame_wait_for_function_cancellation_keeps_frame_attached():
+    async def run() -> None:
+        from rustwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content("<iframe srcdoc='<p>child</p>'></iframe>")
+                child = page.frames[1]
+
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(child.wait_for_function("() => false", timeout=10_000), 0.3)
+
+                # Let the cancelled worker reach its next poll. That poll must not be
+                # read as the frame having gone away.
+                await asyncio.sleep(0.3)
+                assert not child.is_detached()
+                assert await child.evaluate("() => document.body.textContent") == "child"
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
 def test_evaluate_dom_node_serialization_and_frame_handle(page):
     child = "<button id='go'>Frame Button</button>"
     page.set_content(
