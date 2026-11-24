@@ -716,6 +716,14 @@ async def _run_sync_action(
     timeout: Optional[float] = None,
     **kwargs: Any,
 ) -> Any:
+    """Run a sync operation once, with the caller's full timeout.
+
+    Use this runner for every operation that must not start again: a mutation,
+    or a wait that runs caller-supplied code such as ``wait_for_function``.
+    Cancelling the awaiting task cancels the token, which the sync polls and
+    the native calls observe. The native call then stops waiting for the
+    browser; code that already runs in the page is not interrupted.
+    """
     # Context is copied into the executor by _run_sync_call. Sync polls and
     # native dispatch use the same token without changing public signatures.
     cancellation = _rustwright._RustCancelToken()
@@ -742,6 +750,13 @@ async def _run_sync_wait_sliced(
     timeout: Optional[float] = None,
     **kwargs: Any,
 ) -> Any:
+    """Run a restartable sync wait in short slices until it finishes.
+
+    Each slice calls ``wait_func`` again, so the wait must lose nothing when it
+    restarts: it re-checks a condition that the engine owns, such as a selector
+    state. A wait that runs caller-supplied code is not restartable. Use
+    ``_run_sync_action`` for it.
+    """
     raw_timeout = _async_wait_default_timeout(sync_owner) if timeout is None else timeout
     if isinstance(raw_timeout, bool):
         return await _run_sync_call(wait_func, *args, timeout=timeout, **kwargs)

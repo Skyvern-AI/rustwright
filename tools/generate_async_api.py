@@ -202,25 +202,32 @@ UNWRAP_ARGUMENTS = {
 }
 
 
-# Only observational waits may retry after a slice times out. Mutations must
-# receive their full timeout once, because a timeout can follow physical input.
+# A sliced wait calls the sync method again after each slice times out. Only a
+# wait that loses nothing when it restarts may be sliced: the engine re-checks a
+# condition that it owns, such as a selector state or the page URL.
+# Mutations must receive their full timeout once, because a timeout can follow
+# physical input. `wait_for_function` runs caller-supplied code that can be slow
+# or stateful, so a restart can drop its result. It is a single dispatch.
 SLICED_WAIT_METHODS = {
-    "AsyncPage": ("wait_for_url", "wait_for_function"),
-    "AsyncFrame": ("wait_for_selector", "wait_for_url", "wait_for_function"),
+    "AsyncPage": ("wait_for_url",),
+    "AsyncFrame": ("wait_for_selector", "wait_for_url"),
     "AsyncLocator": ("wait_for",),
     "AsyncElementHandle": ("wait_for_selector", "wait_for_element_state"),
 }
 
 
-# These actions retain async timeout-message formatting without retrying the
-# sync operation. The executor keeps the event loop free while the action waits.
+# These methods call the sync operation once with the caller's full timeout and
+# hand it a cancellation token. They retain async timeout-message formatting.
+# The executor keeps the event loop free while the operation waits.
 SINGLE_DISPATCH_METHODS = {
     "AsyncPage": (
+        "wait_for_function",
         "dblclick", "type", "press",
         "hover", "tap", "drag_and_drop", "focus", "check", "uncheck",
         "select_option", "set_input_files", "set_checked",
     ),
     "AsyncFrame": (
+        "wait_for_function",
         "click",
         "dblclick", "fill", "type", "press", "hover", "tap", "focus",
         "check", "uncheck", "set_checked", "select_option",

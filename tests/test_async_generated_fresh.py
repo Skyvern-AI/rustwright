@@ -64,13 +64,17 @@ def test_every_class_async_method_has_one_owner() -> None:
     assert len(actual_hand | expected_generated) == 391
 
 
-def test_only_observational_waits_use_sliced_runner() -> None:
+def test_only_restartable_waits_use_sliced_runner() -> None:
     assert SLICED_WAIT_METHODS == {
-        "AsyncPage": ("wait_for_url", "wait_for_function"),
-        "AsyncFrame": ("wait_for_selector", "wait_for_url", "wait_for_function"),
+        "AsyncPage": ("wait_for_url",),
+        "AsyncFrame": ("wait_for_selector", "wait_for_url"),
         "AsyncLocator": ("wait_for",),
         "AsyncElementHandle": ("wait_for_selector", "wait_for_element_state"),
     }
+    # A slice restarts the sync call. `wait_for_function` runs caller-supplied
+    # code, so a restart can drop the result of a slow or stateful predicate.
+    for class_name in ("AsyncPage", "AsyncFrame"):
+        assert "wait_for_function" in SINGLE_DISPATCH_METHODS[class_name]
     wait_names = {name for names in SLICED_WAIT_METHODS.values() for name in names}
     wait_names.add("wait_for_load_state")
     for class_name, methods in SINGLE_DISPATCH_METHODS.items():

@@ -42336,35 +42336,44 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
             .map_err(py_err)
     }
 
-    #[pyo3(signature = (expression, arg_json=None, timeout_ms=None))]
+    #[pyo3(signature = (expression, arg_json=None, timeout_ms=None, cancel=None))]
     fn evaluate_handle(
         &self,
         expression: &str,
         arg_json: Option<&str>,
         timeout_ms: Option<f64>,
+        cancel: Option<PyRef<'_, PyRustCancelToken>>,
     ) -> PyResult<String> {
         let expression = make_evaluate_expression(expression, arg_json);
-        self.evaluate_handle_expression(&expression, timeout_ms)
+        let cancel = cancel.map(|cancel| cancel.token.clone());
+        self.evaluate_handle_expression(&expression, timeout_ms, cancel)
             .map_err(py_err)
     }
 
-    #[pyo3(signature = (function_declaration, arguments_json, return_by_value=true, timeout_ms=None))]
+    #[pyo3(signature = (function_declaration, arguments_json, return_by_value=true, timeout_ms=None, cancel=None))]
     fn evaluate_with_call_arguments(
         &self,
         function_declaration: &str,
         arguments_json: &str,
         return_by_value: bool,
         timeout_ms: Option<f64>,
+        cancel: Option<PyRef<'_, PyRustCancelToken>>,
     ) -> PyResult<String> {
         let arguments = serde_json::from_str::<Value>(arguments_json)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let cancel = cancel.map(|cancel| cancel.token.clone());
         if return_by_value {
             return self
-                .call_function_in_default_context(function_declaration, Some(arguments), timeout_ms)
+                .call_function_in_default_context(
+                    function_declaration,
+                    Some(arguments),
+                    timeout_ms,
+                    cancel,
+                )
                 .map_err(py_err);
         }
         let global_payload = self
-            .evaluate_handle_expression("globalThis", timeout_ms)
+            .evaluate_handle_expression("globalThis", timeout_ms, cancel.clone())
             .map_err(py_err)?;
         let global = serde_json::from_str::<Value>(&global_payload)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -42372,7 +42381,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
             .get("objectId")
             .and_then(Value::as_str)
             .ok_or_else(|| PyRuntimeError::new_err("CDP did not return a global object handle"))?;
-        let result = self.call_function_on_handle(
+        let result = self.call_function_on_handle_before_cancel(
             object_id,
             function_declaration,
             Some(arguments),
@@ -42380,6 +42389,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
             timeout_ms,
             None,
             None,
+            cancel,
         );
         let _ = self.js_handle_dispose(object_id, timeout_ms, None);
         result.map_err(py_err)
@@ -45507,10 +45517,17 @@ impl PyPage {
         evaluate_expression_for_page(Arc::clone(&self.inner), expression.to_string(), timeout_ms)
     }
 
+    /// Evaluates `expression` in the main frame and returns a remote handle.
+    ///
+    /// The evaluation awaits a returned promise for up to `timeout_ms`. A
+    /// cancelled `cancel` token ends that wait at once, so the calling thread
+    /// does not stay blocked on a promise that nobody awaits any more. The
+    /// code in the page is not interrupted.
     fn evaluate_handle_expression(
         &self,
         expression: &str,
         timeout_ms: Option<f64>,
+        cancel: Option<CancelToken>,
     ) -> RwResult<String> {
         let page = Arc::clone(&self.inner);
         let expression = expression.to_string();
@@ -45518,7 +45535,7 @@ impl PyPage {
         let browser = Arc::clone(&page.browser);
         let client = Arc::clone(&browser.client);
         let session_id = page.session_id.clone();
-        browser.block_on(async move {
+        browser.block_on(cancelable(cancel, async move {
             let result = client
                 .send(
                     "Runtime.evaluate",
@@ -45533,7 +45550,7 @@ impl PyPage {
                 )
                 .await?;
             runtime_result_to_remote_object_with_session(&result, &session_id)
-        })
+        }))
     }
 
     fn call_function_in_default_context(
@@ -45541,6 +45558,7 @@ impl PyPage {
         function_declaration: &str,
         arguments: Option<Value>,
         timeout_ms: Option<f64>,
+        cancel: Option<CancelToken>,
     ) -> RwResult<String> {
         let page = Arc::clone(&self.inner);
         let function_declaration = function_declaration.to_string();
@@ -45555,7 +45573,7 @@ impl PyPage {
             .as_deref()
             .map(|frame_id| format!("frame:{frame_id}"));
         let realm = client.serializer_realm_key(&session_id, realm_identity.as_deref());
-        browser.block_on(async move {
+        browser.block_on(cancelable(cancel, async move {
             let result = call_function_in_context_with_serialized_result_before(
                 &client,
                 &realm,
@@ -45566,7 +45584,7 @@ impl PyPage {
             )
             .await?;
             runtime_serialized_result_to_json(&result)
-        })
+        }))
     }
 
     fn call_function_on_handle(
@@ -45579,6 +45597,33 @@ impl PyPage {
         session_id: Option<&str>,
         realm_identity: Option<&str>,
     ) -> RwResult<String> {
+        self.call_function_on_handle_before_cancel(
+            object_id,
+            function_declaration,
+            arguments,
+            return_by_value,
+            timeout_ms,
+            session_id,
+            realm_identity,
+            None,
+        )
+    }
+
+    /// Calls a function on a remote object. A cancelled `cancel` token ends the
+    /// wait for the reply at once, which matters when the function returns a
+    /// promise that the page never settles.
+    #[allow(clippy::too_many_arguments)]
+    fn call_function_on_handle_before_cancel(
+        &self,
+        object_id: &str,
+        function_declaration: &str,
+        arguments: Option<Value>,
+        return_by_value: bool,
+        timeout_ms: Option<f64>,
+        session_id: Option<&str>,
+        realm_identity: Option<&str>,
+        cancel: Option<CancelToken>,
+    ) -> RwResult<String> {
         let page = Arc::clone(&self.inner);
         let object_id = object_id.to_string();
         let function_declaration = function_declaration.to_string();
@@ -45589,7 +45634,7 @@ impl PyPage {
             .map(ToString::to_string)
             .unwrap_or_else(|| page.session_id.clone());
         let realm = client.serializer_realm_key(&session_id, realm_identity);
-        browser.block_on(async move {
+        browser.block_on(cancelable(cancel, async move {
             let result = if return_by_value {
                 call_function_with_serialized_result_before(
                     &client,
@@ -45620,7 +45665,7 @@ impl PyPage {
             } else {
                 runtime_result_to_remote_object_with_session(&result, &session_id)
             }
-        })
+        }))
     }
 
     fn evaluate_locator(

@@ -15631,36 +15631,54 @@ class Frame(_EventEmitter):
         timeout: Optional[float] = None,
         polling: Any = None,
     ) -> JSHandle:
-        expression = _normalize_string_option(expression, method="Frame.wait_for_function", name="expression")
-        effective_timeout, timeout_display = _normalize_timeout_option(
-            timeout, default=_effective_default_timeout_value(self._page), method="Frame.wait_for_function"
+        return self._wait_for_function(
+            expression, arg=arg, timeout=timeout, polling=polling, method="Frame.wait_for_function"
         )
-        interval = _normalize_wait_for_function_polling(polling, method="Frame.wait_for_function")
+
+    def _wait_for_function(
+        self,
+        expression: str,
+        *,
+        arg: Any,
+        timeout: Optional[float],
+        polling: Any,
+        method: str,
+    ) -> JSHandle:
+        expression = _normalize_string_option(expression, method=method, name="expression")
+        effective_timeout, timeout_display = _normalize_timeout_option(
+            timeout, default=_effective_default_timeout_value(self._page), method=method
+        )
+        interval = _normalize_wait_for_function_polling(polling, method=method)
         if timeout is not None and float(timeout) < 0:
-            raise TimeoutError(f"Frame.wait_for_function: Timeout {timeout_display}ms exceeded.")
+            raise TimeoutError(f"{method}: Timeout {timeout_display}ms exceeded.")
         deadline = float("inf") if effective_timeout == 0 else time.monotonic() + (effective_timeout / 1000)
+
+        def remaining_ms() -> float:
+            return 0 if effective_timeout == 0 else max((deadline - time.monotonic()) * 1000, 1.0)
+
         while time.monotonic() < deadline:
             if self._is_main:
-                command_timeout = 0 if effective_timeout == 0 else max((deadline - time.monotonic()) * 1000, 1.0)
-                handle = self._page._evaluate_handle_with_timeout(
-                    expression,
-                    arg,
-                    timeout_ms=command_timeout,
-                    method="Frame.wait_for_function",
-                )
+                try:
+                    handle = self._page._evaluate_handle_with_timeout(
+                        expression, arg, timeout_ms=remaining_ms(), method=method
+                    )
+                except TimeoutError:
+                    # The predicate returned a promise that outlived the wait.
+                    break
             else:
+                # A child frame evaluates through the locator path, which has
+                # no timeout and no cancellation for a pending promise.
                 handle = self.evaluate_handle(expression, arg)
             matched = False
             try:
-                command_timeout = 0 if effective_timeout == 0 else max((deadline - time.monotonic()) * 1000, 1.0)
-                matched = handle._truthy(command_timeout)
+                matched = handle._truthy(remaining_ms())
             finally:
                 if not matched and not handle._disposed:
                     handle.dispose()
             if matched:
                 return handle
             time.sleep(interval)
-        raise TimeoutError(f"Frame.wait_for_function: Timeout {timeout_display}ms exceeded.")
+        raise TimeoutError(f"{method}: Timeout {timeout_display}ms exceeded.")
 
     def add_script_tag(
         self,
@@ -19741,6 +19759,10 @@ class Page:
         self._mark_request_cookie_sync_required()
         self._mark_history_events_may_arrive()
         command_timeout = timeout_ms
+        # An async caller that abandons the call must not leave this thread
+        # blocked on a promise that the page never settles. The token ends the
+        # wait for the browser; it does not interrupt code in the page.
+        cancel_kwargs = _action_cancel_kwargs()
         prepared = _prepare_evaluate_argument(self, arg) if arg is not None else None
         if prepared is not None and prepared.has_handles:
             try:
@@ -19752,6 +19774,7 @@ class Page:
                         json_module_dumps(prepared.cdp_arguments()),
                         False,
                         command_timeout,
+                        **cancel_kwargs,
                     )
                 )
                 return JSHandle(self, payload, owner_frame=self._main_frame)
@@ -19766,6 +19789,7 @@ class Page:
                 expression,
                 arg_json,
                 command_timeout,
+                **cancel_kwargs,
             )
         )
         return JSHandle(self, payload, owner_frame=self._main_frame)
@@ -19783,32 +19807,9 @@ class Page:
     ) -> JSHandle:
         if expression is None:
             raise TypeError("Frame.wait_for_function() missing 1 required positional argument: 'expression'")
-        expression = _normalize_string_option(expression, method="Page.wait_for_function", name="expression")
-        effective_timeout, timeout_display = _normalize_timeout_option(
-            timeout, default=_effective_default_timeout_value(self), method="Page.wait_for_function"
+        return self._main_frame._wait_for_function(
+            expression, arg=arg, timeout=timeout, polling=polling, method="Page.wait_for_function"
         )
-        interval = _normalize_wait_for_function_polling(polling, method="Page.wait_for_function")
-        if timeout is not None and float(timeout) < 0:
-            raise TimeoutError(f"Page.wait_for_function: Timeout {timeout_display}ms exceeded.")
-        deadline = float("inf") if effective_timeout == 0 else time.monotonic() + (effective_timeout / 1000)
-        while time.monotonic() < deadline:
-            command_timeout = 0 if effective_timeout == 0 else max((deadline - time.monotonic()) * 1000, 1.0)
-            handle = self._evaluate_handle_with_timeout(
-                expression,
-                arg,
-                timeout_ms=command_timeout,
-                method="Page.wait_for_function",
-            )
-            matched = False
-            try:
-                matched = handle._truthy(command_timeout)
-            finally:
-                if not matched and not handle._disposed:
-                    handle.dispose()
-            if matched:
-                return handle
-            time.sleep(interval)
-        raise TimeoutError(f"Page.wait_for_function: Timeout {timeout_display}ms exceeded.")
 
     def add_script_tag(
         self,
