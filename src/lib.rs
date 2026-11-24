@@ -2506,7 +2506,13 @@ pub enum RemoteProtocolSuspicion {
     PlaywrightLikeFirstReply,
 }
 
+/// The error type of the engine.
+///
+/// The enum is non-exhaustive: the engine replaces message-shaped errors with
+/// typed variants over time, and a new variant must not break a build. Code
+/// outside this crate that matches on it needs a wildcard arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum RwError {
     #[error("{0}")]
     Message(String),
@@ -2522,6 +2528,15 @@ pub enum RwError {
     RemoteDiscoveryFailed,
     #[error("Protocol error ({method}): {message}")]
     Cdp { method: String, message: String },
+    /// The JavaScript realm of an evaluation was torn down around the call,
+    /// usually by a navigation.
+    ///
+    /// This outcome does not prove whether the evaluated code ran. A wait or a
+    /// probe may be sent again; caller-supplied code and mutations must not.
+    /// Page JavaScript cannot produce this variant by throwing an error with
+    /// the same text, so classifiers match the variant and never the message.
+    #[error("Execution context was destroyed, most likely because of a navigation.")]
+    ExecutionContextDestroyed,
     #[error("timed out after {0} ms")]
     Timeout(u64),
     #[error("operation cancelled")]
@@ -7059,6 +7074,31 @@ multiline-compatible = """4.5.6"""
             "Execution context was destroyed.".to_string()
         )));
         assert!(!is_locator_wait_context_loss(&RwError::Timeout(100)));
+    }
+
+    #[test]
+    fn destroyed_context_is_classified_by_variant_and_never_by_message() {
+        let destroyed = RwError::ExecutionContextDestroyed;
+        assert_eq!(
+            destroyed.to_string(),
+            "Execution context was destroyed, most likely because of a navigation."
+        );
+        // A wait or a read-only probe may re-arm, but the outcome is not proof
+        // that the code did not run, so an action step must not run again.
+        assert!(is_locator_wait_context_loss(&destroyed));
+        assert!(is_transient_probe_error(&destroyed));
+        assert!(!is_protocol_context_loss(&destroyed));
+        assert!(!is_transient_action_resolution_error(&destroyed));
+        assert_eq!(
+            action_dispatch_reply_disposition(&destroyed),
+            ActionDispatchReplyDisposition::AmbiguousContextLoss
+        );
+
+        // Page JavaScript can throw an error with the same text. It is an
+        // ordinary evaluation failure and must stop a wait.
+        let thrown_by_page = RwError::Message(destroyed.to_string());
+        assert!(!is_locator_wait_context_loss(&thrown_by_page));
+        assert!(!is_protocol_context_loss(&thrown_by_page));
     }
 
     #[test]
@@ -12979,6 +13019,91 @@ return this.dataset.mainWorldOverride === "observed";
             .unwrap()
             .cached_execution_context("main-frame", "page-session")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn selector_wait_rearms_after_navigation_destroys_its_context() {
+        let mut harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+
+        let wait = page_wait_for_selector_async(
+            Arc::clone(&harness.page),
+            json!({"kind": "css", "selector": "#done"}).to_string(),
+            0,
+            "visible".to_string(),
+            Duration::from_secs(2),
+            false,
+        );
+        let responder = async move {
+            harness
+                .reply_serializer_install("page-session", None, "serializer-before-navigation")
+                .await;
+            let interrupted = harness.next_command("Runtime.callFunctionOn").await;
+            assert_eq!(
+                interrupted["params"]["objectId"],
+                "serializer-before-navigation"
+            );
+            // The navigation commits while the in-page wait is still pending.
+            harness.reply_error(&interrupted, "Execution context was destroyed.");
+
+            let liveness = harness.next_command("Target.getTargetInfo").await;
+            assert_eq!(liveness["params"]["targetId"], "test-target");
+            harness.reply(
+                &liveness,
+                json!({"targetInfo": {"targetId": "test-target", "type": "page"}}),
+            );
+
+            // The wait re-arms in the realm of the new document.
+            harness
+                .reply_serializer_install("page-session", None, "serializer-after-navigation")
+                .await;
+            let rearmed = harness.next_command("Runtime.callFunctionOn").await;
+            assert_eq!(rearmed["params"]["objectId"], "serializer-after-navigation");
+            harness.reply(
+                &rearmed,
+                json!({"result": {"type": "boolean", "value": true}}),
+            );
+            assert!(harness.write_rx.try_recv().is_err());
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(wait, responder)
+        })
+        .await
+        .expect("selector wait must finish after it re-arms");
+        assert!(result.expect("selector wait must survive the navigation"));
+    }
+
+    #[tokio::test]
+    async fn locator_evaluation_never_resends_its_body_after_context_destruction() {
+        let mut harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+
+        // `Locator.evaluate` sends caller-supplied code through this path.
+        let evaluation = evaluate_locator_for_page(
+            Arc::clone(&harness.page),
+            json!({"kind": "css", "selector": "#beacon"}).to_string(),
+            0,
+            "return globalThis.beaconCount += 1;".to_string(),
+            Duration::from_millis(500),
+        );
+        let responder = async move {
+            harness
+                .reply_serializer_install("page-session", None, "serializer-before-navigation")
+                .await;
+            let interrupted = harness.next_command("Runtime.callFunctionOn").await;
+            harness.reply_error(&interrupted, "Execution context was destroyed.");
+            harness
+        };
+        let (result, mut harness) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(evaluation, responder)
+        })
+        .await
+        .expect("interrupted locator evaluation must return");
+        assert!(matches!(result, Err(RwError::ExecutionContextDestroyed)));
+        assert!(
+            harness.try_next_command_any().is_none(),
+            "the evaluation body must not be sent a second time"
+        );
     }
 
     #[test]
@@ -34688,8 +34813,15 @@ async fn evaluate_actionability_probe(
     Ok(serde_json::from_value(state)?)
 }
 
+/// The resolution of an action target failed before the action's own code ran,
+/// so the action may resolve its target again.
+///
+/// An action step can change page state: it scrolls, focuses, or prepares a
+/// dispatch. `RwError::ExecutionContextDestroyed` does not prove that such a
+/// step did not run, so it is not transient here. A read-only probe uses
+/// `is_transient_probe_error`.
 fn is_transient_action_resolution_error(error: &RwError) -> bool {
-    if is_locator_wait_context_loss(error) {
+    if is_protocol_context_loss(error) {
         return true;
     }
     let message = match error {
@@ -34706,8 +34838,15 @@ fn is_transient_action_resolution_error(error: &RwError) -> bool {
     .any(|fragment| message.contains(fragment))
 }
 
+/// A read-only probe changes nothing, so it may also run again when its
+/// context was destroyed while it ran.
+fn is_transient_probe_error(error: &RwError) -> bool {
+    matches!(error, RwError::ExecutionContextDestroyed)
+        || is_transient_action_resolution_error(error)
+}
+
 fn is_transient_actionability_target_error(error: &RwError) -> bool {
-    if is_transient_action_resolution_error(error) {
+    if is_transient_probe_error(error) {
         return true;
     }
     let message = match error {
@@ -34768,7 +34907,7 @@ async fn wait_for_actionable_locator_point(
                     requires_enabled,
                 ));
             }
-            Err(error) if is_transient_action_resolution_error(&error) => {
+            Err(error) if is_transient_probe_error(&error) => {
                 verify_locator_wait_target_liveness(&page, deadline).await?;
                 let _ = refresh_page_frame_tree(
                     &page,
@@ -35387,12 +35526,6 @@ fn execution_context_destroyed_error(error: &RwError) -> bool {
     )
 }
 
-fn upstream_context_destroyed_error() -> RwError {
-    RwError::Message(
-        "Execution context was destroyed, most likely because of a navigation.".to_string(),
-    )
-}
-
 async fn install_runtime_value_serializer(
     client: &CdpClient,
     session_id: &str,
@@ -35450,7 +35583,7 @@ async fn serializer_for_realm(
     let _install_guard = install_lock.lock().await;
     if !client.serializer_install_is_current(realm, generation, &install_lock) {
         client.cleanup_serializer_install(realm, generation, &install_lock);
-        return Err(upstream_context_destroyed_error());
+        return Err(RwError::ExecutionContextDestroyed);
     }
     if let Some(object_id) = client.serializer_handle(realm) {
         return Ok(object_id);
@@ -35486,7 +35619,7 @@ async fn serializer_for_realm(
     ) {
         client.cleanup_serializer_install(realm, generation, &install_lock);
         client.release_uncommitted_serializer(realm, object_id);
-        return Err(upstream_context_destroyed_error());
+        return Err(RwError::ExecutionContextDestroyed);
     }
     Ok(object_id)
 }
@@ -35582,7 +35715,7 @@ async fn evaluate_serialized_expression_before(
         }
         Err(error) if execution_context_destroyed_error(&error) => {
             client.forget_serializer(realm);
-            return Err(upstream_context_destroyed_error());
+            return Err(RwError::ExecutionContextDestroyed);
         }
         result => result?,
     };
@@ -35661,7 +35794,7 @@ async fn call_function_with_serialized_result_before(
         }
         Err(error) if execution_context_destroyed_error(&error) => {
             client.forget_serializer(realm);
-            Err(upstream_context_destroyed_error())
+            Err(RwError::ExecutionContextDestroyed)
         }
         result => result,
     }
@@ -35704,7 +35837,7 @@ async fn call_function_in_context_with_serialized_result_before(
         }
         Err(error) if execution_context_destroyed_error(&error) => {
             client.forget_serializer(realm);
-            Err(upstream_context_destroyed_error())
+            Err(RwError::ExecutionContextDestroyed)
         }
         result => result,
     }
@@ -36120,10 +36253,13 @@ async fn evaluate_locator_for_page(
         match evaluate_locator_resolution(&page, &resolution, expression, deadline, Duration::ZERO)
             .await
         {
+            // The body can carry caller-supplied code (`Locator.evaluate`), so
+            // re-resolve only when the protocol proves that the body did not
+            // run. `ExecutionContextDestroyed` is not such a proof and
+            // propagates to the caller.
             Err(error)
                 if attempt == 0
-                    && (is_frame_ownership_changed(&error)
-                        || is_locator_wait_context_loss(&error)) =>
+                    && (is_frame_ownership_changed(&error) || is_protocol_context_loss(&error)) =>
             {
                 continue;
             }
@@ -36395,6 +36531,9 @@ enum ActionDispatchReplyDisposition {
 
 fn action_dispatch_reply_disposition(error: &RwError) -> ActionDispatchReplyDisposition {
     let message = match error {
+        RwError::ExecutionContextDestroyed => {
+            return ActionDispatchReplyDisposition::AmbiguousContextLoss;
+        }
         RwError::Cdp { message, .. } | RwError::Message(message) => message.to_ascii_lowercase(),
         _ => return ActionDispatchReplyDisposition::DeterministicFailure,
     };
@@ -37512,10 +37651,11 @@ async fn evaluate_locator_handle_for_page(
         let remote =
             evaluate_handle_locator_resolution(&page, &resolution, expression, deadline).await;
         let mut remote = match remote {
+            // The body can carry caller-supplied code (`Locator.evaluate_handle`),
+            // so the rule of `evaluate_locator_for_page` applies here too.
             Err(error)
                 if attempt == 0
-                    && (is_frame_ownership_changed(&error)
-                        || is_locator_wait_context_loss(&error)) =>
+                    && (is_frame_ownership_changed(&error) || is_protocol_context_loss(&error)) =>
             {
                 continue;
             }
@@ -38987,7 +39127,27 @@ async fn page_history_observed_impl(
     })
 }
 
+/// The resolved execution environment disappeared, by any route.
+///
+/// Use this for evaluations that are safe to send again: waits, read-only
+/// probes, and reads of state that an earlier step already committed. It
+/// includes `RwError::ExecutionContextDestroyed`, which does not prove whether
+/// the evaluated code ran. An evaluation that changes page state or carries
+/// caller-supplied code must use `is_protocol_context_loss` instead.
 fn is_locator_wait_context_loss(error: &RwError) -> bool {
+    matches!(error, RwError::ExecutionContextDestroyed) || is_protocol_context_loss(error)
+}
+
+/// The protocol itself reported that the session, frame, or realm is gone.
+///
+/// Function-wrapped evaluations, which include every locator script, convert a
+/// realm that was destroyed around dispatched code into
+/// `RwError::ExecutionContextDestroyed`. For them a protocol-shaped loss
+/// therefore comes from setup (frame hop, isolated world, serializer install)
+/// or from a pre-dispatch rejection, and proves that the evaluated code did
+/// not run. Script-goal evaluations do not make that conversion, so this
+/// classifier is not such a proof for them.
+fn is_protocol_context_loss(error: &RwError) -> bool {
     let message = match error {
         RwError::Cdp { message, .. } => message.to_ascii_lowercase(),
         _ => return false,
