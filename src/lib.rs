@@ -7874,6 +7874,7 @@ multiline-compatible = """4.5.6"""
             "--headless=new",
             "--hide-scrollbars",
             "--no-sandbox",
+            "--no-startup-window",
         ]
         .into_iter()
         .map(str::to_string)
@@ -7882,6 +7883,27 @@ multiline-compatible = """4.5.6"""
             chromium_effective_launch_args(&LaunchOptions::default()),
             expected_default
         );
+        assert!(!chromium_launch_opens_startup_page(&expected_default, &[]));
+
+        let mut profile_launch = LaunchOptions::default();
+        profile_launch.user_data_dir = Some("profile".to_string());
+        assert_eq!(
+            chromium_effective_launch_args(&profile_launch),
+            expected_default
+        );
+
+        let mut persistent_launch = LaunchOptions::default();
+        persistent_launch.persistent = true;
+        let persistent_args = chromium_effective_launch_args(&persistent_launch);
+        assert_eq!(
+            persistent_args,
+            expected_default[..expected_default.len() - 1]
+        );
+        assert!(chromium_launch_opens_startup_page(&persistent_args, &[]));
+        assert!(!chromium_launch_opens_startup_page(
+            &persistent_args,
+            &["--no-startup-window".to_string()]
+        ));
 
         let mut user_features = LaunchOptions::default();
         user_features.args = vec![
@@ -26383,6 +26405,11 @@ struct LaunchOptions {
     timeout: Option<f64>,
     #[serde(default, alias = "userDataDir")]
     user_data_dir: Option<String>,
+    /// The launch is for a persistent context. The browser then starts with one `about:blank`
+    /// page, and that page is the initial page of the context. Without this option, the browser
+    /// starts with no page.
+    #[serde(default)]
+    persistent: bool,
     #[serde(default)]
     env: HashMap<String, String>,
     #[serde(default, alias = "chromiumSandbox")]
@@ -26455,6 +26482,7 @@ impl Default for LaunchOptions {
             ignore_default_args: Vec::new(),
             timeout: Some(30_000.0),
             user_data_dir: None,
+            persistent: false,
             env: HashMap::new(),
             chromium_sandbox: false,
             proxy: None,
@@ -29993,34 +30021,20 @@ impl BrowserInner {
         }
         self.client.close();
 
-        let mut cleanup_error = None;
-        if let Some(mut child) = self.process.lock().unwrap().take() {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            let mut exited = false;
-            while Instant::now() < deadline {
-                match child.try_wait() {
-                    Ok(Some(_)) => {
-                        exited = true;
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        cleanup_error = Some(error);
-                        break;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if !exited {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-
-        self.profile_dir.lock().unwrap().take();
-        let result = cleanup_error.map_or(Ok(()), |error| Err(RwError::Io(error)));
+        let result = self.end_owned_process();
         self.lifecycle.finish(sender, generation, &result, true);
         result
+    }
+
+    /// Ends the browser process that this browser owns, then removes the temporary profile
+    /// directory of the launch. Does nothing for a browser that it did not launch.
+    fn end_owned_process(&self) -> RwResult<()> {
+        let result = match self.process.lock().unwrap().take() {
+            Some(mut child) => reap_browser_process(&mut child),
+            None => Ok(()),
+        };
+        self.profile_dir.lock().unwrap().take();
+        result.map_err(RwError::Io)
     }
 }
 
@@ -30286,6 +30300,28 @@ impl Drop for BrowserInner {
     }
 }
 
+/// Waits up to 3 s for a browser process to exit after `Browser.close`, then kills it.
+/// Returns the error of a failed wait.
+///
+/// Chromium exits some tens of milliseconds after `Browser.close`. One check costs one system
+/// call, so the short interval lets a close end when the process ends.
+fn reap_browser_process(child: &mut Child) -> std::io::Result<()> {
+    const EXIT_LIMIT: Duration = Duration::from_secs(3);
+    const POLL_INTERVAL: Duration = Duration::from_millis(2);
+    let deadline = Instant::now() + EXIT_LIMIT;
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(error),
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
 async fn close_browser_cleanup(browser: Arc<BrowserInner>) -> RwResult<()> {
     if browser.process.lock().unwrap().is_some() {
         let client = Arc::clone(&browser.client);
@@ -30297,36 +30333,9 @@ async fn close_browser_cleanup(browser: Arc<BrowserInner>) -> RwResult<()> {
     browser.client.release_memory_buffers();
     browser.attached_pages.clear();
 
-    tokio::task::spawn_blocking(move || -> RwResult<()> {
-        let mut cleanup_error = None;
-        if let Some(mut child) = browser.process.lock().unwrap().take() {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            let mut exited = false;
-            while Instant::now() < deadline {
-                match child.try_wait() {
-                    Ok(Some(_)) => {
-                        exited = true;
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        cleanup_error = Some(error);
-                        break;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if !exited {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-        browser.profile_dir.lock().unwrap().take();
-        cleanup_error.map_or(Ok(()), |error| Err(RwError::Io(error)))
-    })
-    .await
-    .map_err(|error| RwError::Message(error.to_string()))??;
-    Ok(())
+    tokio::task::spawn_blocking(move || browser.end_owned_process())
+        .await
+        .map_err(|error| RwError::Message(error.to_string()))?
 }
 
 async fn close_browser_async(browser: Arc<BrowserInner>) -> RwResult<()> {
@@ -56064,7 +56073,28 @@ fn chromium_default_launch_args(options: &LaunchOptions) -> Vec<String> {
     if !options.chromium_sandbox {
         default_args.push("--no-sandbox".to_string());
     }
+    if !options.persistent {
+        // A launch starts with no window, as in Playwright. Chrome makes the first window and
+        // the first renderer when the caller opens a page, so the launch does not wait for a
+        // startup page that the caller did not ask for. With this switch and a debugging port,
+        // Chrome also stays alive when its last window closes.
+        // A launch for a persistent context keeps one `about:blank` page: that page is the
+        // initial page of the context.
+        default_args.push(CHROMIUM_NO_STARTUP_WINDOW_ARG.to_string());
+    }
     default_args
+}
+
+const CHROMIUM_NO_STARTUP_WINDOW_ARG: &str = "--no-startup-window";
+
+/// Reports if a launch opens `about:blank` as its startup page. It does not when
+/// `--no-startup-window` is in effect, from the defaults or from the caller.
+///
+/// The URL must not be on the command line in that case: full Chrome ignores a URL with that
+/// switch, but the headless shell opens it.
+fn chromium_launch_opens_startup_page(default_args: &[String], user_args: &[String]) -> bool {
+    !has_chromium_arg(default_args, CHROMIUM_NO_STARTUP_WINDOW_ARG)
+        && !has_chromium_arg(user_args, CHROMIUM_NO_STARTUP_WINDOW_ARG)
 }
 
 fn launch_chromium_attempt(
@@ -56120,6 +56150,8 @@ fn launch_chromium_attempt(
 
     let (effective_default_args, effective_user_args) =
         chromium_effective_launch_arg_parts(options);
+    let opens_startup_page =
+        chromium_launch_opens_startup_page(&effective_default_args, &effective_user_args);
     for arg in effective_default_args {
         command.arg(arg);
     }
@@ -56138,7 +56170,9 @@ fn launch_chromium_attempt(
     if single_process_fallback && !has_chromium_arg(&options.args, "--single-process") {
         command.arg("--single-process");
     }
-    command.arg("about:blank");
+    if opens_startup_page {
+        command.arg("about:blank");
+    }
 
     launch_phases.transition(startup_timing::Phase::ProcessToEndpoint);
     let mut child = match command.spawn() {
@@ -56178,16 +56212,8 @@ fn launch_chromium_attempt(
             .await
         })
     } else {
-        let version_url = format!("http://127.0.0.1:{port}/json/version");
         runtime.block_on(async {
-            poll_ws_endpoint(
-                &version_url,
-                timeout,
-                &mut child,
-                stderr_file.path(),
-                cancelled,
-            )
-            .await
+            poll_ws_endpoint(port, timeout, &mut child, stderr_file.path(), cancelled).await
         })
     };
     let ws_endpoint = match ws_endpoint_result {
@@ -56251,13 +56277,36 @@ fn should_retry_chromium_single_process(options: &LaunchOptions, error: &RwError
                 && (error.contains("signal: 11") || error.contains("SIGSEGV"))))
 }
 
+/// The interval of the cheap checks for the debugging endpoint during a launch: a connect to
+/// the port, or a read of the `DevToolsActivePort` file.
+const LAUNCH_ENDPOINT_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// Reports if a local TCP port accepts a connection. A connect to a closed local port fails at
+/// once. The limit is for a host that drops the packets instead.
+async fn local_port_is_open(port: u16) -> bool {
+    let connect = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port));
+    matches!(
+        tokio::time::timeout(Duration::from_millis(50), connect).await,
+        Ok(Ok(_))
+    )
+}
+
+/// Waits until the Chromium process of a launch answers on its debugging port, and returns the
+/// WebSocket endpoint of the browser.
+///
+/// Chromium opens the port some tens of milliseconds after it starts. The wait checks the port
+/// at a short interval, which costs one refused connect for each check. The HTTP request for
+/// the endpoint costs much more, so it starts only when the port is open. Chromium answers
+/// that request when the browser is ready, so the launch ends at that moment and not at the
+/// next poll.
 async fn poll_ws_endpoint(
-    version_url: &str,
+    port: u16,
     timeout: Duration,
     child: &mut Child,
     stderr_path: &Path,
     cancelled: Option<Arc<AtomicBool>>,
 ) -> RwResult<String> {
+    let version_url = format!("http://127.0.0.1:{port}/json/version");
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_error: Option<RwError> = None;
     loop {
@@ -56279,9 +56328,15 @@ async fn poll_ws_endpoint(
                 stderr_path,
             )));
         }
+        if !local_port_is_open(port).await {
+            // The same error as the endpoint request gives for a closed port.
+            last_error = Some(RwError::RemoteDiscoveryFailed);
+            tokio::time::sleep(LAUNCH_ENDPOINT_POLL_INTERVAL).await;
+            continue;
+        }
         let request_timeout = std::cmp::min(Duration::from_secs(2), deadline - now);
         match resolve_ws_endpoint(
-            version_url,
+            &version_url,
             tokio::time::Instant::now() + request_timeout,
             request_timeout,
             &[],
@@ -56360,7 +56415,7 @@ async fn poll_ws_endpoint_from_devtools_active_port(
                 )));
             }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(LAUNCH_ENDPOINT_POLL_INTERVAL).await;
     }
 }
 
