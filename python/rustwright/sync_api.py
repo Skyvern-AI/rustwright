@@ -4146,6 +4146,48 @@ def _add_listener_to_handlers(
     handlers_by_event.setdefault(event, []).append(f)
 
 
+_PACKAGE_DIRECTORY = os.path.dirname(os.path.abspath(__file__)) + os.sep
+# The async API sets this variable before it runs `Page.pause()` on a worker
+# thread, because that thread does not have the frames of the script.
+_PAUSE_CALL_LOCATION: contextvars.ContextVar[Optional[DebuggerLocation]] = contextvars.ContextVar(
+    "rustwright_pause_call_location",
+    default=None,
+)
+
+
+def _pause_call_location() -> DebuggerLocation:
+    """Returns the line of the script that called `pause()`.
+
+    That is the nearest frame that is not in this package.
+    """
+    asyncio_file = getattr(sys.modules.get("asyncio"), "__file__", None)
+    asyncio_directory = os.path.dirname(os.path.abspath(asyncio_file)) + os.sep if asyncio_file else None
+    frame = sys._getframe(1)
+    while frame is not None:
+        filename = frame.f_code.co_filename
+        path = os.path.abspath(filename)
+        if not path.startswith(_PACKAGE_DIRECTORY):
+            # A pause that runs as a task of its own, for example below
+            # `asyncio.wait_for()`, has no frame of the script.
+            if asyncio_directory is not None and path.startswith(asyncio_directory):
+                return {}
+            return {"file": filename, "line": frame.f_lineno}
+        frame = frame.f_back
+    return {}
+
+
+def _print_pause_hint(location: DebuggerLocation) -> None:
+    # There is no Inspector window. Without this line, a paused script looks
+    # the same as a script that stopped for an unknown reason.
+    where = f" ({location['file']}:{location['line']})" if location.get("file") else ""
+    print(
+        f"Rustwright: the script is paused at page.pause(){where}. "
+        "To continue, run playwright.resume() in the DevTools console of the page, or close the page.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 class _DebuggerEvents:
     PausedStateChanged = "pausedstatechanged"
 
@@ -4157,24 +4199,68 @@ class Debugger(_EventEmitter):
         self._context = context
         self._paused_details: Optional[DebuggerPausedDetails] = None
         self._event_handlers: dict[str, list[Callable[..., Any]]] = {}
+        # The token of the `page.pause()` call that waits now. The core ends
+        # that wait when the token is cancelled.
+        self._pause_resume_token: Any = None
+        self._pause_lock = threading.Lock()
+        # Held while the pages of the context have the resume hook of a
+        # `page.pause()` call. `resume()` ends a pause before the core has
+        # removed the hook, and the next pause must not add its hook until
+        # then: its hook leaves a `window.playwright` that it finds alone,
+        # also the one that the core is about to remove.
+        self._pause_hook_lock = threading.Lock()
 
     @property
     def paused_details(self) -> Optional[DebuggerPausedDetails]:
         return copy.deepcopy(self._paused_details)
 
     def request_pause(self) -> None:
-        if self._paused_details is not None:
-            raise Error("debugger is already paused")
-        self._paused_details = {
-            "location": {},
-            "title": "Paused",
-        }
+        with self._pause_lock:
+            if self._paused_details is not None:
+                raise Error("debugger is already paused")
+            self._paused_details = {
+                "location": {},
+                "title": "Paused",
+            }
         self._emit_local_event(self.Events.PausedStateChanged)
 
     def resume(self) -> None:
-        if self._paused_details is None:
-            return
-        self._paused_details = None
+        with self._pause_lock:
+            if self._paused_details is None:
+                return
+            self._paused_details = None
+            token, self._pause_resume_token = self._pause_resume_token, None
+        if token is not None:
+            token.cancel()
+        self._emit_local_event(self.Events.PausedStateChanged)
+
+    def _begin_page_pause(self, location: DebuggerLocation) -> Any:
+        """Records the pause of a `page.pause()` call and returns its token.
+
+        The caller then emits the event, and it must call `_end_page_pause`
+        also when a handler of that event raises.
+
+        Returns None when another `page.pause()` call of the context waits
+        already. Playwright does not pause a second call.
+        """
+        with self._pause_lock:
+            if self._pause_resume_token is not None:
+                return None
+            # After `request_pause()`, the debugger reports a pause that has
+            # no location. The details of this call replace that report, and
+            # the reported pause ends with this call: when this call returns,
+            # the debugger is not paused.
+            self._paused_details = {"location": location, "title": "Pause"}
+            token = self._pause_resume_token = _rustwright._RustCancelToken()
+        return token
+
+    def _end_page_pause(self, token: Any) -> None:
+        with self._pause_lock:
+            if self._pause_resume_token is not token:
+                # `resume()` ended this pause and reported the change.
+                return
+            self._pause_resume_token = None
+            self._paused_details = None
         self._emit_local_event(self.Events.PausedStateChanged)
 
     def next(self) -> None:
@@ -11285,6 +11371,7 @@ class BrowserType(_EventEmitter):
             "proxy": normalized_proxy,
             "downloads_path": normalized_downloads_path,
             "slow_mo": normalized_slow_mo,
+            "headed": options.get("headless") is False,
         }
         return options, launch_options
 
@@ -11933,6 +12020,10 @@ class Browser:
         self._tracing_path: Optional[str | Path] = None
         self._bound_endpoint: Optional[str] = None
         self._connected_over_cdp = bool(launch_options.get("_connected_over_cdp"))
+        # True only for a browser that this library launched with
+        # `headless=False`. `page.pause()` stops the script only in such a
+        # browser, as in Playwright.
+        self._headed = bool(launch_options.get("headed"))
         self._owned_cdp_sessions: list[CDPSession] = []
         self._closed = False
         self._rustwright_sync_close_state = _SYNC_CLOSE_OPEN
@@ -21256,6 +21347,30 @@ class Page:
         return self._video
 
     def pause(self) -> None:
+        location = _PAUSE_CALL_LOCATION.get()
+        if location is None:
+            location = _pause_call_location()
+        context = self._context
+        browser = context._browser if context is not None else None
+        # Playwright stops the script only in a headed browser that it
+        # launched. In a headless browser, and in a browser that it attached
+        # to, the call returns at once.
+        if browser is None or not browser._headed or self._closed:
+            return None
+        debugger = context._debugger
+        token = debugger._begin_page_pause(location)
+        if token is None:
+            return None
+        try:
+            debugger._emit_local_event(debugger.Events.PausedStateChanged)
+            _print_pause_hint(location)
+            # A pause that starts right after `debugger.resume()` waits here
+            # until the core has removed the hook of the pause before it.
+            with debugger._pause_hook_lock:
+                peers = [page._core for page in context._pages if page is not self and not page._closed]
+                _call(self._core.pause, token, peers, **_action_cancel_kwargs())
+        finally:
+            debugger._end_page_pause(token)
         return None
 
     def add_locator_handler(

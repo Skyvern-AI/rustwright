@@ -99,11 +99,13 @@ from .sync_api import (
     _normalize_string_option,
     _normalize_wait_for_selector_state,
     _options_from_explicit_kwargs,
+    _pause_call_location,
     _response_from_payload,
     _translate_error,
     _write_har,
     _CONSOLE_HISTORY_BUFFER,
     _PAGE_ERROR_HISTORY_BUFFER,
+    _PAUSE_CALL_LOCATION,
 )
 from .sync_api import sync_playwright as _sync_playwright
 from ._async_generated import (
@@ -2971,6 +2973,49 @@ class AsyncPage(_AsyncPageGeneratedMixin, _AsyncWrapper):
 
     def get_by_title(self, text: str, *, exact: Optional[bool] = None) -> "AsyncLocator":
         return AsyncLocator(self._sync.get_by_title(text, exact=bool(exact) if exact is not None else False))
+
+    async def pause(self) -> None:
+        # The pause can wait for a long time, so it gets a thread of its own.
+        # A thread of the shared executor would stay busy for the full pause,
+        # and `context.debugger.resume()` needs a thread of that executor.
+        loop = asyncio.get_running_loop()
+        finished: asyncio.Future[Any] = loop.create_future()
+
+        def settle(error: Optional[BaseException]) -> None:
+            if finished.done():
+                return
+            if error is None:
+                finished.set_result(None)
+            else:
+                finished.set_exception(error)
+
+        def run(call: Callable[[], Any]) -> None:
+            error: Optional[BaseException] = None
+            try:
+                call()
+            except BaseException as exc:
+                error = exc
+            try:
+                loop.call_soon_threadsafe(settle, error)
+            except RuntimeError:
+                # The event loop is closed. No task waits for the result.
+                pass
+
+        location_reset = _PAUSE_CALL_LOCATION.set(_pause_call_location())
+        cancellation = _rustwright._RustCancelToken()
+        cancellation_reset = _ACTION_CANCELLATION.set(cancellation)
+        try:
+            # The copy of the context gives the thread the two variables.
+            call = functools.partial(contextvars.copy_context().run, self._sync.pause)
+            threading.Thread(target=run, args=(call,), name="rustwright-pause", daemon=True).start()
+            await finished
+        except asyncio.CancelledError:
+            # The token ends the wait on the thread.
+            cancellation.cancel()
+            raise
+        finally:
+            _ACTION_CANCELLATION.reset(cancellation_reset)
+            _PAUSE_CALL_LOCATION.reset(location_reset)
 
     async def goto(
         self,
