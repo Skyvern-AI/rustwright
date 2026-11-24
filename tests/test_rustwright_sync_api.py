@@ -25740,6 +25740,96 @@ def test_page_pause_returns_in_normal_headless_mode(page):
     assert time.monotonic() - started < 0.5
 
 
+RESUME_WHEN_PAUSED_HTML = """
+<script>
+  const timer = setInterval(() => {
+    if (window.playwright) { clearInterval(timer); window.playwright.resume(); }
+  }, 20);
+</script>
+"""
+
+
+def test_page_pause_waits_for_resume_in_headed_browser(browser):
+    # A test container has no display. The flag makes this headless browser
+    # count as a browser that was launched with headless=False.
+    browser._headed = True
+    context = browser.new_context()
+    page = context.new_page()
+    debugger = context.debugger
+    seen = []
+    debugger.on("pausedstatechanged", lambda: seen.append(debugger.paused_details is not None))
+
+    # `playwright.resume()` in the page ends the pause and leaves no trace.
+    page.set_content(RESUME_WHEN_PAUSED_HTML)
+    page.pause()
+    assert debugger.paused_details is None
+    assert page.evaluate("typeof window.playwright") == "undefined"
+
+    during = []
+
+    def when_paused(action):
+        def run():
+            wait_until(lambda: (debugger.paused_details or {}).get("title") == "Pause", timeout=10)
+            during.append(debugger.paused_details)
+            action()
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        return thread
+
+    # `context.debugger.resume()` on another thread ends the pause. After
+    # `request_pause()`, the details are the details of the `page.pause()` call.
+    debugger.request_pause()
+    thread = when_paused(debugger.resume)
+    page.pause()
+    thread.join()
+    assert during[0]["title"] == "Pause"
+    assert during[0]["location"]["file"].endswith("test_rustwright_sync_api.py")
+
+    # A page that closes ends the pause without an error.
+    thread = when_paused(page.close)
+    assert page.pause() is None
+    thread.join()
+    assert page.is_closed()
+    assert debugger.paused_details is None
+    assert seen == [True, False, True, True, False, True, False]
+    context.close()
+
+
+def test_async_page_pause_ends_on_resume_and_on_cancel():
+    async def run() -> None:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            # See the sync test: the flag stands for a launch with headless=False.
+            browser._sync._headed = True
+            context = await browser.new_context()
+            page = await context.new_page()
+            debugger = context.debugger
+
+            pause = asyncio.ensure_future(page.pause())
+            await wait_until_async(lambda: debugger.paused_details is not None)
+            assert not pause.done()
+            await debugger.resume()
+            await asyncio.wait_for(pause, 5)
+            assert debugger.paused_details is None
+
+            # A cancelled task ends the pause, and the next pause works.
+            pause = asyncio.ensure_future(page.pause())
+            await wait_until_async(lambda: debugger.paused_details is not None)
+            pause.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pause
+            await wait_until_async(lambda: debugger.paused_details is None)
+            await page.set_content(RESUME_WHEN_PAUSED_HTML)
+            await asyncio.wait_for(page.pause(), 5)
+            assert await page.evaluate("typeof window.playwright") == "undefined"
+            await browser.close()
+
+    asyncio.run(run())
+
+
 def test_page_pick_locator_returns_clicked_locator(page):
     page.set_content(
         """

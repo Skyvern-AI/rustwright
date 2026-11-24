@@ -42315,6 +42315,74 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
             .map_err(py_err)
     }
 
+    /// Stops the calling thread until the pause ends: a page resumed it, the
+    /// caller cancelled `resume`, or the page went away. Python does not need
+    /// to know which of these ended the pause.
+    #[pyo3(signature = (resume, peers, cancel=None))]
+    fn pause(
+        &self,
+        py: Python<'_>,
+        resume: PyRef<'_, PyRustCancelToken>,
+        peers: Vec<PyRef<'_, PyPage>>,
+        cancel: Option<PyRef<'_, PyRustCancelToken>>,
+    ) -> PyResult<()> {
+        // The pause has no time limit, and a thread that waits in the engine
+        // does not run Python signal handlers. The wait returns to Python at
+        // this interval, so that Ctrl-C can stop a paused script. The pause
+        // then removes its hooks first; see `PAUSE_HOOK_TIMEOUT` for the
+        // delay when the browser does not answer.
+        const SIGNAL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+        let page = Arc::clone(&self.inner);
+        // `into_iter` releases the borrow of each peer before the wait.
+        let peers: Vec<Arc<PageInner>> = peers
+            .into_iter()
+            .map(|peer| Arc::clone(&peer.inner))
+            .filter(|peer| !Arc::ptr_eq(peer, &page))
+            .collect();
+        let resume = resume.token.clone();
+        let cancel = cancel
+            .map(|cancel| cancel.token.clone())
+            .unwrap_or_default();
+        let browser = Arc::clone(&page.browser);
+        // The pause is a task of the runtime, so it reads the events of the
+        // browser also while this thread runs Python code, for example a
+        // slow signal handler. A pause that only this thread polls could
+        // fall behind the events in that time and lose the resume.
+        let mut pause =
+            browser
+                .runtime
+                .handle()
+                .spawn(pause_page(page, peers, resume, Some(cancel.clone())));
+        let joined = loop {
+            // The timer is made inside the block, because it needs the
+            // runtime.
+            let slice = py.detach(|| {
+                browser.block_on_raw(async {
+                    tokio::time::timeout(SIGNAL_CHECK_INTERVAL, &mut pause).await
+                })
+            });
+            match slice {
+                Ok(joined) => break joined,
+                Err(_) => {
+                    if let Err(signal) = py.check_signals() {
+                        // End the wait, and let the pause remove its hooks
+                        // before the signal goes to the caller.
+                        cancel.cancel();
+                        let _ = py.detach(|| browser.block_on_raw(&mut pause));
+                        return Err(signal);
+                    }
+                }
+            }
+        };
+        match joined {
+            Ok(end) => end.map(|_| ()).map_err(py_err),
+            Err(error) => Err(py_err(RwError::Message(format!(
+                "page.pause() stopped: {error}"
+            )))),
+        }
+    }
+
     #[pyo3(signature = (headers_json, timeout_ms=None))]
     fn set_extra_http_headers(&self, headers_json: &str, timeout_ms: Option<f64>) -> PyResult<()> {
         let headers: Value = serde_json::from_str(headers_json)
@@ -58332,6 +58400,413 @@ async fn wait_for_binding_event_for_page(
             Err(_) => return Err(RwError::Timeout(timeout.as_millis() as u64)),
         }
     }
+}
+
+/// Why a pause of the script ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PauseEnd {
+    /// A page called `playwright.resume()`, or the caller ended the pause.
+    Resumed,
+    /// The paused page closed or crashed, or the browser disconnected.
+    PageGone,
+}
+
+/// The limit for the protocol commands that install the resume hook of one
+/// page. The removal has this limit twice: once for the commands that clean
+/// the documents, and once for the detach.
+///
+/// The install and the removal do not stop early. A browser that does not
+/// answer therefore delays the start of the wait by this limit, and the end
+/// of the pause by twice this limit, also when Ctrl-C asks for the end.
+const PAUSE_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Sends one command of a resume hook. `deadline` is the limit for all
+/// commands of the install, or of one part of the removal.
+async fn send_pause_hook_command(
+    client: &CdpClient,
+    method: &str,
+    params: Value,
+    session_id: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> RwResult<Value> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(RwError::Timeout(PAUSE_HOOK_TIMEOUT.as_millis() as u64));
+    }
+    client.send(method, params, session_id, remaining).await
+}
+
+/// A binding name that no earlier pause of this process used.
+///
+/// The name is not a secret. Page script that can call the binding can also
+/// call `playwright.resume()`.
+fn pause_resume_binding_name() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static NEXT_PAUSE: AtomicU64 = AtomicU64::new(0);
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    format!(
+        "__resume_{random:016x}_{}",
+        NEXT_PAUSE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// The script that gives a page `playwright.resume()` during a pause.
+///
+/// The browser installs the binding function in each new document before this
+/// script runs. The script takes the function out of the global object at
+/// once, so page script never sees a global with the binding name. A document
+/// that has its own `window.playwright` keeps it.
+///
+/// The caller must not start a pause for a page while an earlier pause of
+/// that page still removes its hook. The script would keep the object of the
+/// earlier pause, and the earlier pause would then remove it.
+fn pause_resume_hook_source(binding: &str) -> RwResult<String> {
+    Ok(format!(
+        "(() => {{\n\
+           const name = {name};\n\
+           const call = globalThis[name];\n\
+           if (typeof call !== 'function') return;\n\
+           delete globalThis[name];\n\
+           if ('playwright' in window) return;\n\
+           const api = {{ resume: () => {{ call('resume'); }} }};\n\
+           Object.defineProperty(api, name, {{ value: true }});\n\
+           Object.defineProperty(window, 'playwright', {{ value: api, configurable: true, writable: true }});\n\
+         }})()",
+        name = serde_json::to_string(binding)?,
+    ))
+}
+
+/// The script that takes `playwright.resume()` out of a document again. It
+/// removes `window.playwright` only when the resume hook made it.
+fn pause_resume_hook_removal_source(binding: &str) -> RwResult<String> {
+    Ok(format!(
+        "(() => {{\n\
+           const name = {name};\n\
+           delete globalThis[name];\n\
+           const api = window.playwright;\n\
+           if (api && Object.prototype.hasOwnProperty.call(api, name)) delete window.playwright;\n\
+         }})()",
+        name = serde_json::to_string(binding)?,
+    ))
+}
+
+/// The resume hook of one page for one pause.
+///
+/// The hook has a protocol session of its own. The browser gives a binding to
+/// each new document only when the session has the Runtime domain enabled,
+/// and the pause must not change the domains of the session that the page
+/// uses. When the hook session is detached, the browser drops the binding and
+/// the scripts.
+struct PauseResumeHook {
+    page: Arc<PageInner>,
+    session_id: Option<String>,
+    /// The identifier of the hook script, when the page confirmed the script.
+    script_identifier: Option<String>,
+}
+
+/// Attaches the hook session to a page, and adds the binding and the script.
+///
+/// The hook is returned also when a command failed, so that the caller can
+/// give it to `remove_pause_resume_hook`.
+async fn install_pause_resume_hook(
+    page: &Arc<PageInner>,
+    binding: &str,
+    source: &str,
+) -> (PauseResumeHook, RwResult<()>) {
+    let mut hook = PauseResumeHook {
+        page: Arc::clone(page),
+        session_id: None,
+        script_identifier: None,
+    };
+    let client = &page.browser.client;
+    let deadline = tokio::time::Instant::now() + PAUSE_HOOK_TIMEOUT;
+    let attached = match send_pause_hook_command(
+        client,
+        "Target.attachToTarget",
+        json!({ "targetId": page.target_id, "flatten": true }),
+        None,
+        deadline,
+    )
+    .await
+    {
+        Ok(attached) => attached,
+        Err(error) => return (hook, Err(error)),
+    };
+    let Some(session_id) = attached.get("sessionId").and_then(Value::as_str) else {
+        let error = RwError::Message("CDP did not return a sessionId".to_string());
+        return (hook, Err(error));
+    };
+    hook.session_id = Some(session_id.to_string());
+    // The binding comes before the script, because the script takes the
+    // binding function. The main world of a frame has an empty name, so the
+    // empty context name keeps the binding out of each isolated world that
+    // has a name. The script runs in the main world only and could not
+    // remove the function there. An isolated world without a name still gets
+    // the function and keeps it until its document goes away. Page script
+    // cannot see that world.
+    let setup = [
+        ("Runtime.enable", json!({})),
+        (
+            "Runtime.addBinding",
+            json!({ "name": binding, "executionContextName": "" }),
+        ),
+        ("Page.enable", json!({})),
+    ];
+    for (method, params) in setup {
+        if let Err(error) =
+            send_pause_hook_command(client, method, params, Some(session_id), deadline).await
+        {
+            return (hook, Err(error));
+        }
+    }
+    // `runImmediately` also runs the script in each document that the page
+    // has now.
+    match send_pause_hook_command(
+        client,
+        "Page.addScriptToEvaluateOnNewDocument",
+        json!({ "source": source, "runImmediately": true }),
+        Some(session_id),
+        deadline,
+    )
+    .await
+    {
+        Ok(added) => {
+            hook.script_identifier = added
+                .get("identifier")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            (hook, Ok(()))
+        }
+        Err(error) => (hook, Err(error)),
+    }
+}
+
+/// Takes `playwright.resume()` out of each document of the page and detaches
+/// the hook session. A page that is gone has nothing to remove, so errors are
+/// not reported.
+async fn remove_pause_resume_hook(hook: PauseResumeHook, removal_source: &str) {
+    let Some(session_id) = hook.session_id.as_deref() else {
+        return;
+    };
+    let client = &hook.page.browser.client;
+    let deadline = tokio::time::Instant::now() + PAUSE_HOOK_TIMEOUT;
+    // First stop the hook for new documents. A document that starts after
+    // the removal below would keep `playwright.resume()` otherwise.
+    if let Some(identifier) = hook.script_identifier.as_deref() {
+        let _ = send_pause_hook_command(
+            client,
+            "Page.removeScriptToEvaluateOnNewDocument",
+            json!({ "identifier": identifier }),
+            Some(session_id),
+            deadline,
+        )
+        .await;
+    }
+    // A script with `runImmediately` is the one command that runs code in
+    // each document of the page, also in the documents of iframes.
+    let _ = send_pause_hook_command(
+        client,
+        "Page.addScriptToEvaluateOnNewDocument",
+        json!({ "source": removal_source, "runImmediately": true }),
+        Some(session_id),
+        deadline,
+    )
+    .await;
+    // The detach has a limit of its own. It must go out also when the page
+    // did not answer the commands above: it takes the binding and the
+    // scripts away from each later document.
+    let _ = send_pause_hook_command(
+        client,
+        "Target.detachFromTarget",
+        json!({ "sessionId": session_id }),
+        None,
+        tokio::time::Instant::now() + PAUSE_HOOK_TIMEOUT,
+    )
+    .await;
+}
+
+/// True when the paused page cannot resume: it closed or crashed, or the
+/// browser disconnected.
+fn paused_page_is_gone(page: &PageInner) -> bool {
+    page.target_closed.load(Ordering::SeqCst)
+        || page.crashed.load(Ordering::SeqCst)
+        || page.lifecycle.is_closed()
+        || !page.browser.client.is_connected()
+}
+
+/// What a received event means for a pause of `page`.
+fn pause_end_for_event(event: &Value, page: &PageInner, binding: &str) -> Option<PauseEnd> {
+    let param = |name: &str| {
+        event
+            .get("params")
+            .and_then(|params| params.get(name))
+            .and_then(Value::as_str)
+    };
+    let session = event.get("sessionId").and_then(Value::as_str);
+    match event.get("method").and_then(Value::as_str)? {
+        // The binding name is unique for the pause, so the session is not
+        // examined: the hook session of each page of the pause can resume it.
+        "Runtime.bindingCalled" => (param("name") == Some(binding)).then_some(PauseEnd::Resumed),
+        "Target.detachedFromTarget" => {
+            (param("sessionId") == Some(page.session_id.as_str())).then_some(PauseEnd::PageGone)
+        }
+        "Target.targetDestroyed" | "Target.targetCrashed" => {
+            (param("targetId") == Some(page.target_id.as_str())).then_some(PauseEnd::PageGone)
+        }
+        "Inspector.targetCrashed" | "Inspector.detached" => {
+            (session == Some(page.session_id.as_str())).then_some(PauseEnd::PageGone)
+        }
+        _ => None,
+    }
+}
+
+/// Waits until a page resumes the pause, the caller cancels `resume`, or the
+/// paused page goes away. It has no time limit.
+///
+/// `cursor` is the position in the event log at which `events` starts.
+async fn wait_for_pause_end(
+    events: &mut broadcast::Receiver<Value>,
+    mut cursor: u64,
+    page: &PageInner,
+    binding: &str,
+    resume: &CancelToken,
+) -> PauseEnd {
+    let mut alive = page.browser.client.alive_tx.subscribe();
+    loop {
+        // Read the value of the channel itself, and mark it as seen. The
+        // channel then wakes the wait for each later change, also when the
+        // flag behind `is_connected` changes a moment after the channel.
+        let connected = *alive.borrow_and_update();
+        if !connected || paused_page_is_gone(page) {
+            return PauseEnd::PageGone;
+        }
+        tokio::select! {
+            () = resume.cancelled() => return PauseEnd::Resumed,
+            changed = alive.changed() => {
+                if changed.is_err() {
+                    return PauseEnd::PageGone;
+                }
+            }
+            received = events.recv() => match received {
+                Ok(event) => {
+                    if let Some(sequence) = cdp_event_sequence(&event) {
+                        cursor = cursor.max(sequence.saturating_add(1));
+                    }
+                    if let Some(end) = pause_end_for_event(&event, page, binding) {
+                        return end;
+                    }
+                }
+                // The receiver skipped events, and one of them can be the
+                // resume. The event log keeps the last events, so read the
+                // skipped events there.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let skipped = page
+                        .browser
+                        .client
+                        .event_log
+                        .lock()
+                        .unwrap()
+                        .entries_since(cursor);
+                    for (sequence, event) in skipped {
+                        cursor = cursor.max(sequence.saturating_add(1));
+                        if let Some(end) = pause_end_for_event(&event, page, binding) {
+                            return end;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return PauseEnd::PageGone,
+            },
+        }
+    }
+}
+
+/// Stops the caller until the pause of `page` ends.
+///
+/// During the pause, each document of `page` and of the pages in `peers` has
+/// `playwright.resume()`. An iframe that runs in a process of its own is the
+/// exception. The pause ends when one of the documents calls it, when the
+/// caller cancels `resume`, or when `page` goes away. After the pause, the
+/// pages have no trace of the hook. `cancel` ends the wait with an error, and
+/// the hooks are removed in that case too.
+///
+/// The caller must run one pause at a time for a page, from this call until
+/// its result. See `pause_resume_hook_source`.
+async fn pause_page(
+    page: Arc<PageInner>,
+    peers: Vec<Arc<PageInner>>,
+    resume: CancelToken,
+    cancel: Option<CancelToken>,
+) -> RwResult<PauseEnd> {
+    if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+        return Err(RwError::Cancelled);
+    }
+    if resume.is_cancelled() {
+        return Ok(PauseEnd::Resumed);
+    }
+    let binding = pause_resume_binding_name();
+    let source = pause_resume_hook_source(&binding)?;
+    let removal_source = pause_resume_hook_removal_source(&binding)?;
+    // Subscribe before a page has the hook, so that no resume is lost.
+    let (mut events, cursor) = page.browser.client.subscribe_with_cursor();
+
+    // The install and the removal are not cancellable. A cancelled install
+    // could leave a hook session that nothing detaches later.
+    let targets = std::iter::once(&page).chain(peers.iter());
+    let install = futures_util::future::join_all(
+        targets.map(|target| install_pause_resume_hook(target, &binding, &source)),
+    );
+    let wait = wait_for_pause_end(&mut events, cursor, &page, &binding, &resume);
+    tokio::pin!(install, wait);
+
+    // The wait runs during the install too. A page can call the binding as
+    // soon as it has the hook, and the receiver must be read from that
+    // moment, or enough later events could push the call out of it.
+    let mut early_end = None;
+    let install_results = loop {
+        tokio::select! {
+            results = &mut install => break results,
+            end = &mut wait, if early_end.is_none() => early_end = Some(end),
+        }
+    };
+    let mut hooks = Vec::with_capacity(install_results.len());
+    let mut installed = Ok(());
+    for (index, (hook, result)) in install_results.into_iter().enumerate() {
+        hooks.push(hook);
+        // The first hook is the hook of `page`. A peer that cannot take the
+        // hook does not stop the pause.
+        if index == 0 {
+            installed = result;
+        }
+    }
+
+    let end = match (installed, early_end) {
+        // The pause ended while the hooks were installed.
+        (_, Some(end)) => Ok(end),
+        (Ok(()), None) => match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => Err(RwError::Cancelled),
+                    end = &mut wait => Ok(end),
+                }
+            }
+            None => Ok(wait.await),
+        },
+        // A page that went away while the hook was installed ends the pause
+        // in the usual way. Each other failure is an error for the caller.
+        (Err(_), None) if paused_page_is_gone(&page) => Ok(PauseEnd::PageGone),
+        (Err(error), None) => Err(error),
+    };
+
+    futures_util::future::join_all(
+        hooks
+            .into_iter()
+            .map(|hook| remove_pause_resume_hook(hook, &removal_source)),
+    )
+    .await;
+    end
 }
 
 async fn wait_for_download_event(
