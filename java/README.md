@@ -2,9 +2,9 @@
 
 This dependency-free Java 23 package uses the finalized `java.lang.foreign` API. Published JARs bundle the Rustwright C ABI native libraries, while from-source and exact-path loading remain available. The binding owns and serializes native browser/page handles, copies native errors immediately, and releases all transferred Rust strings, screenshot buffers, and opaque handles with their matching ABI free function.
 
-## Install (not yet published)
+## Install (Maven Central)
 
-The planned Maven Central coordinates are `io.github.skyvern-ai:rustwright:0.3.0`. The artifact is not yet published. Once it is available, add it with Gradle:
+The Maven Central coordinates are `io.github.skyvern-ai:rustwright:0.3.0`. Add the dependency with Gradle:
 
 ```kotlin
 dependencies {

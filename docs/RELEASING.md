@@ -173,9 +173,9 @@ only in its temporary assembled package.
       supported target), and Maven Central
       (`io.github.skyvern-ai:rustwright`). Maven Central can take several hours
       to surface a new coordinate in search after the deployment succeeds.
-- [ ] Update the prose that describes a binding as unpublished now that it is
-      published — `java/README.md` still frames the Maven coordinates as planned
-      and the artifact as unavailable.
+- [ ] Confirm that no guide describes a published binding as unpublished. The
+      root `README.md` lists the install command for each language, and each
+      binding guide has an install section.
 - [ ] Confirm crates.io lists `${VERSION}` for `rustwright-core` and
       `rustwright`, then build a new project against the release. Do not
       publish either crate by hand from a development checkout; a manual
