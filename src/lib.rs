@@ -16238,6 +16238,49 @@ return this.dataset.mainWorldOverride === "observed";
     }
 
     #[test]
+    fn main_frame_url_includes_a_received_navigation_before_the_listener_applies_it() {
+        let harness = navigation_test_harness(8);
+        warm_main_frame_cache(&harness.page);
+        assert_eq!(
+            main_frame_url_after_received_events(&harness.page).as_deref(),
+            Some("https://example.test/")
+        );
+        assert!(!harness.page.frame_cache_is_behind_received_events());
+
+        // No listener runs in this test, so only the read can apply the event.
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Page.frameNavigated",
+            "params": {
+                "frame": {
+                    "id": "main-frame",
+                    "loaderId": "loader-next",
+                    "url": "https://example.test/next"
+                }
+            }
+        }));
+        assert_eq!(
+            harness.page.cached_main_frame_url().as_deref(),
+            Some("https://example.test/"),
+            "the cache alone is older than the received event"
+        );
+        assert!(harness.page.frame_cache_is_behind_received_events());
+        assert_eq!(
+            main_frame_url_after_received_events(&harness.page).as_deref(),
+            Some("https://example.test/next")
+        );
+        assert!(!harness.page.frame_cache_is_behind_received_events());
+
+        // An event that changes no frame cache keeps the read on the fast path.
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Network.loadingFinished",
+            "params": {"requestId": "request-1"}
+        }));
+        assert!(!harness.page.frame_cache_is_behind_received_events());
+    }
+
+    #[test]
     fn reconciliation_and_the_page_listener_cannot_deadlock() {
         const NAVIGATIONS: usize = 20_000;
         let harness = navigation_test_harness(4096);
@@ -25424,13 +25467,7 @@ return this.dataset.mainWorldOverride === "observed";
     fn network_request_mutation_backfills_redirect_when_later_sequence_arrives_first() {
         let mut log = CdpEventLog {
             next_seq: 10,
-            events: VecDeque::with_capacity(CDP_EVENT_LOG_LIMIT),
-            retained_bytes: 0,
-            retention_gate: Arc::new(CdpRetentionGate::new()),
-            action_dispatch_receipts: HashMap::new(),
-            console_replay_windows: HashMap::new(),
-            active_dialogs: HashMap::new(),
-            next_console_replay_cutoff_generation: 0,
+            ..CdpEventLog::new()
         };
         let initial = json!({
             "sessionId": "page-session",
@@ -27358,6 +27395,16 @@ struct CdpEventLog {
     // Live dialogs must survive eviction until Chromium closes them.
     active_dialogs: HashMap<String, (u64, Value)>,
     next_console_replay_cutoff_generation: u64,
+    /// The sequence of the newest received event that changes a frame cache
+    /// (see `is_frame_cache_invalidation_method`). A reader of a frame cache
+    /// compares it with its own cursor and needs no scan of the log. It is a
+    /// fact about the connection, so it stays when the log drops the event.
+    ///
+    /// There is one sequence for all pages of the connection, on purpose. An
+    /// event of one page makes the next read of each other page reconcile
+    /// once, which is cheap. A sequence for each page would need the owner of
+    /// each session here, and a wrong owner would hide an event from a page.
+    newest_frame_cache_event_seq: Option<u64>,
 }
 
 impl CdpEventLog {
@@ -27371,7 +27418,15 @@ impl CdpEventLog {
             console_replay_windows: HashMap::new(),
             active_dialogs: HashMap::new(),
             next_console_replay_cutoff_generation: 0,
+            newest_frame_cache_event_seq: None,
         }
+    }
+
+    /// True when the log has received an event that changes a frame cache at
+    /// or after `cursor`.
+    fn has_frame_cache_event_since(&self, cursor: u64) -> bool {
+        self.newest_frame_cache_event_seq
+            .is_some_and(|sequence| sequence >= cursor)
     }
 
     fn begin_console_replay_cutoff(&mut self, session_id: &str, sample: Option<f64>) -> u64 {
@@ -27495,7 +27550,11 @@ impl CdpEventLog {
                 Value::Number(seq.into()),
             );
         }
-        match event.get("method").and_then(Value::as_str) {
+        let method = event.get("method").and_then(Value::as_str);
+        if is_frame_cache_invalidation_method(method) {
+            self.newest_frame_cache_event_seq = Some(seq);
+        }
+        match method {
             Some("Page.javascriptDialogOpening") => {
                 if let (Some(session), Some(mut dialog)) = (
                     event.get("sessionId").and_then(Value::as_str),
@@ -27598,14 +27657,20 @@ impl CdpEventLog {
     }
 
     fn entries_since_limited(&self, cursor: u64, limit: usize) -> Vec<(u64, Value)> {
-        let oldest = self.oldest_seq();
-        let start = cursor.saturating_sub(oldest) as usize;
+        self.iter_since(cursor)
+            .take(limit)
+            .map(|(sequence, event)| (sequence, event.clone()))
+            .collect()
+    }
+
+    /// The retained events from `cursor` on, read in place. A caller that
+    /// keeps the lock of the log for the whole read needs no copy of an event.
+    fn iter_since(&self, cursor: u64) -> impl Iterator<Item = (u64, &Value)> {
+        let start = cursor.saturating_sub(self.oldest_seq()) as usize;
         self.events
             .iter()
             .skip(start)
-            .take(limit)
-            .map(|entry| (entry.sequence, entry.event.clone()))
-            .collect()
+            .map(|entry| (entry.sequence, &entry.event))
     }
 
     fn entries_between(&self, start: u64, end: u64) -> Vec<(u64, Value)> {
@@ -32742,6 +32807,24 @@ impl PageInner {
         Ok(self.session_id.clone())
     }
 
+    /// True when the connection has received an event that changes a frame
+    /// cache, and reconciliation has not replayed that event for this page.
+    fn frame_cache_is_behind_received_events(&self) -> bool {
+        // The lock of the frame state is released at the end of this
+        // statement. Do not keep it while the log is locked: the lock order
+        // is event_log -> main_frame_id -> frame_state.
+        let frame_event_cursor = self.frame_state.lock().unwrap().frame_event_cursor;
+        self.browser
+            .client
+            .event_log
+            .lock()
+            .unwrap()
+            .has_frame_cache_event_since(frame_event_cursor)
+    }
+
+    /// Reads the URL of the main frame from the frame cache as it is. Use
+    /// `main_frame_url_after_received_events` for a URL that a caller sees:
+    /// it applies the navigation events that the listener has not applied yet.
     fn cached_main_frame_url(&self) -> Option<String> {
         let main_id = self.main_frame_id.lock().unwrap().clone();
         let state = self.frame_state.lock().unwrap();
@@ -38744,7 +38827,7 @@ async fn page_reload_observed_impl(
     let expected_frame_id = page
         .main_frame_id(&client, &session_id, deadline.remaining()?)
         .await?;
-    let expected_url = page.cached_main_frame_url();
+    let expected_url = main_frame_url_after_received_events(&page);
     let (mut events, event_cursor) = client.subscribe_with_cursor();
     // The observed waiter can capture the main response and finish on the
     // matching Page.frameNavigated event. The legacy reload contract instead
@@ -42456,9 +42539,16 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
     fn url(&self, timeout_ms: Option<f64>) -> PyResult<String> {
         // Playwright's page.url is a synchronous read of the last-known main-frame
         // url, never a round-trip. Serve it from the frame cache the page already
-        // maintains from Page.frameNavigated so the getter cannot block on (or time
+        // maintains from Page.frameNavigated so the getter cannot wait for (or time
         // out against) an execution context that is being torn down mid-navigation.
-        if let Some(url) = self.inner.cached_main_frame_url() {
+        // The cache first applies every navigation event that the connection has
+        // received, so the url is never older than an event that a listener has seen.
+        //
+        // That step can wait a short time for engine locks while this thread
+        // keeps the interpreter lock. It is safe because no engine path keeps
+        // the retention gate, the navigation transition lock, the event log, or
+        // the frame state while it waits for the interpreter lock.
+        if let Some(url) = main_frame_url_after_received_events(&self.inner) {
             return Ok(url);
         }
         let json = self
@@ -46745,7 +46835,7 @@ impl RustwrightPage {
     }
 
     pub fn url(&self) -> String {
-        self.inner.cached_main_frame_url().unwrap_or_default()
+        main_frame_url_after_received_events(&self.inner).unwrap_or_default()
     }
 
     /// Set or clear this page's general default timeout in milliseconds.
@@ -53442,8 +53532,12 @@ mod native_network_record_tests {
 }
 
 fn is_frame_cache_invalidation_event(event: &Value) -> bool {
+    is_frame_cache_invalidation_method(event.get("method").and_then(Value::as_str))
+}
+
+fn is_frame_cache_invalidation_method(method: Option<&str>) -> bool {
     matches!(
-        event.get("method").and_then(Value::as_str),
+        method,
         Some(
             "Page.frameAttached"
                 | "Page.frameNavigated"
@@ -53505,9 +53599,12 @@ fn reconcile_frame_cache_invalidations_locked(
     let replay_start = observation_replay_cursor
         .map(|cursor| cursor.min(frame_replay_cursor))
         .unwrap_or(frame_replay_cursor);
-    for (sequence, event) in log.entries_since(replay_start) {
+    // The caller holds the lock of the log, so the replay reads each event in
+    // place. A copy of every event would make the cost of a reconciliation
+    // grow with the size of the events since the last one.
+    for (sequence, event) in log.iter_since(replay_start) {
         let method = event.get("method").and_then(Value::as_str).unwrap_or("");
-        if is_unreplayable_cdp_event(&event) {
+        if is_unreplayable_cdp_event(event) {
             reconciliation.unreplayable_sequences.push(sequence);
             state.mark_all_frame_caches_dirty();
             continue;
@@ -53529,7 +53626,7 @@ fn reconcile_frame_cache_invalidations_locked(
                     owned_session,
                 });
         }
-        if sequence < frame_replay_cursor || !is_frame_cache_invalidation_event(&event) {
+        if sequence < frame_replay_cursor || !is_frame_cache_invalidation_event(event) {
             continue;
         }
         let event_sequence = Some(sequence);
@@ -53755,6 +53852,25 @@ fn arm_recovered_attached_iframe_sessions(
 
 fn reconcile_frame_cache_invalidations(page: &Arc<PageInner>) {
     reconcile_frame_cache_invalidations_impl(page, false);
+}
+
+/// The URL of the main frame, after every navigation event that the
+/// connection has received.
+///
+/// The listener of the page applies navigation events to the frame cache on a
+/// task of its own. Another consumer can receive the same event first, for
+/// example the handler of a `framenavigated` listener. A read of the cache
+/// alone could then return the URL from before that navigation.
+/// Reconciliation applies the received events first. It runs only when such
+/// an event is pending, so a read stays cheap on a page with many other events.
+fn main_frame_url_after_received_events(page: &Arc<PageInner>) -> Option<String> {
+    if page.frame_cache_is_behind_received_events() {
+        // Reconciliation can start the setup task of an iframe session, and
+        // the caller can be a thread outside the runtime.
+        let _runtime = page.browser.runtime.enter();
+        reconcile_frame_cache_invalidations(page);
+    }
+    page.cached_main_frame_url()
 }
 
 fn reconcile_frame_cache_invalidations_after_lag(page: &Arc<PageInner>) {
