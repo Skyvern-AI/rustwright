@@ -21469,6 +21469,14 @@ return this.dataset.mainWorldOverride === "observed";
     }
 
     #[test]
+    fn stealth_init_script_keeps_the_native_worker_constructor() {
+        // A replaced constructor starts each worker from a blob URL. That
+        // breaks relative URLs and a `worker-src` policy, and a page can
+        // detect the replacement.
+        assert!(!stealth_init_script().contains("Worker"));
+    }
+
+    #[test]
     fn legacy_navigation_events_and_opt_in_details_report_both_navigation_classes() {
         let harness = navigation_test_harness(4);
         *harness.page.main_frame_id.lock().unwrap() = Some("frame-1".to_owned());
@@ -54501,7 +54509,7 @@ async fn install_stealth_defaults(browser: &BrowserInner, session_id: &str) -> R
     try_join_all([
         browser.client.send(
             "Page.addScriptToEvaluateOnNewDocument",
-            json!({ "source": stealth_init_script.clone() }),
+            json!({ "source": stealth_init_script }),
             Some(session_id),
             Duration::from_secs(5),
         ),
@@ -54739,15 +54747,21 @@ fn stealth_user_agent_metadata(user_agent: &str, mobile: Option<bool>) -> Value 
     })
 }
 
-fn stealth_init_script() -> String {
-    STEALTH_INIT_SCRIPT_TEMPLATE.replace("__UA_ARCHITECTURE__", stealth_architecture())
+/// The script that every document runs first.
+///
+/// It must not replace the `Worker` constructor. A dedicated worker inherits
+/// the user agent override of its page. A replaced constructor starts the
+/// worker from a `blob:` URL, which breaks relative URLs in the worker and a
+/// `worker-src` policy, and a page can detect the replacement.
+fn stealth_init_script() -> &'static str {
+    STEALTH_INIT_SCRIPT
 }
 
 fn worker_stealth_init_script() -> String {
     WORKER_STEALTH_INIT_SCRIPT_TEMPLATE.replace("__UA_ARCHITECTURE__", stealth_architecture())
 }
 
-const STEALTH_INIT_SCRIPT_TEMPLATE: &str = r#"
+const STEALTH_INIT_SCRIPT: &str = r#"
 (() => {
   try {
     delete Navigator.prototype.webdriver;
@@ -55031,104 +55045,6 @@ const STEALTH_INIT_SCRIPT_TEMPLATE: &str = r#"
     try { Object.defineProperty(window, rejectionHandlerName, { value: rejectionHandler, configurable: true, enumerable: false, writable: true }); } catch (_) {}
     window.addEventListener('error', errorHandler, true);
     window.addEventListener('unhandledrejection', rejectionHandler, true);
-  } catch (_) {}
-  try {
-    const workerMarker = Symbol.for('nativeWorkerIdentityWrapped');
-    const NativeWorker = window.Worker;
-    if (typeof NativeWorker === 'function' && !NativeWorker[workerMarker]) {
-      const makeWorkerIdentitySource = () => {
-        const ua = String(navigator.userAgent || '');
-        const appVersion = String(navigator.appVersion || '');
-        const platform = String(navigator.platform || '');
-        const language = String(navigator.language || 'en-US');
-        const languages = Array.from(navigator.languages || [language]).map(String);
-        const chromeFullVersion = (ua.match(/Chrome\/([^\s]+)/) || [])[1] || '';
-        const fullVersionForBrand = brand => {
-          const name = String(brand.brand || '');
-          const version = String(brand.version || '');
-          if ((name === 'Chromium' || name === 'Google Chrome') && chromeFullVersion) return chromeFullVersion;
-          if (name === 'Not A(Brand') return '24.0.0.0';
-          return version;
-        };
-        const mapBrand = brand => ({
-          brand: String(brand.brand || ''),
-          version: String(brand.version || '')
-        });
-        const mapFullVersionBrand = brand => ({
-          brand: String(brand.brand || ''),
-          version: fullVersionForBrand(brand)
-        });
-        const uaBrands = navigator.userAgentData ? Array.from(navigator.userAgentData.brands || []).map(mapBrand) : [];
-        const uaData = navigator.userAgentData ? {
-          brands: uaBrands,
-          fullVersionList: uaBrands.map(mapFullVersionBrand),
-          mobile: !!navigator.userAgentData.mobile,
-          platform: String(navigator.userAgentData.platform || platform),
-          architecture: '__UA_ARCHITECTURE__'
-        } : null;
-        const uaDataJson = JSON.stringify(uaData);
-        return [
-          '(() => {',
-          '  const defineNavigatorValue = (name, value) => {',
-          '    try { Object.defineProperty(Object.getPrototypeOf(navigator), name, { get: () => value, configurable: true }); } catch (_) {}',
-          '    try { Object.defineProperty(navigator, name, { get: () => value, configurable: true }); } catch (_) {}',
-          '  };',
-          `  defineNavigatorValue('userAgent', ${JSON.stringify(ua)});`,
-          `  defineNavigatorValue('appVersion', ${JSON.stringify(appVersion)});`,
-          `  defineNavigatorValue('platform', ${JSON.stringify(platform)});`,
-          `  defineNavigatorValue('language', ${JSON.stringify(language)});`,
-          `  defineNavigatorValue('languages', ${JSON.stringify(languages)});`,
-          '  try { delete Object.getPrototypeOf(navigator).webdriver; } catch (_) {}',
-          '  try { delete navigator.webdriver; } catch (_) {}',
-          `  const uaData = ${uaDataJson};`,
-          '  if (uaData) {',
-          '    const data = {',
-          '      brands: uaData.brands,',
-          '      mobile: uaData.mobile,',
-          '      platform: uaData.platform,',
-          '      getHighEntropyValues: async hints => {',
-          '        const values = { brands: uaData.brands, mobile: uaData.mobile, platform: uaData.platform };',
-          '        for (const hint of hints || []) {',
-          "          if (hint === 'fullVersionList') values.fullVersionList = uaData.fullVersionList;",
-          "          if (hint === 'architecture') values.architecture = uaData.architecture;",
-          "          if (hint === 'bitness') values.bitness = '64';",
-          "          if (hint === 'model') values.model = '';",
-          "          if (hint === 'platformVersion') values.platformVersion = '';",
-          '        }',
-          '        return values;',
-          '      },',
-          '      toJSON: () => ({ brands: uaData.brands, mobile: uaData.mobile, platform: uaData.platform })',
-          '    };',
-          "    defineNavigatorValue('userAgentData', data);",
-          '  }',
-          '})();'
-        ].join('\n');
-      };
-      const WrappedWorker = function(scriptURL, options) {
-        try {
-          const workerOptions = options || {};
-          const absoluteUrl = new URL(String(scriptURL), location.href).href;
-          const identitySource = makeWorkerIdentitySource();
-          const source = workerOptions.type === 'module'
-            ? `${identitySource}\nimport ${JSON.stringify(absoluteUrl)};`
-            : `${identitySource}\nimportScripts(${JSON.stringify(absoluteUrl)});`;
-          const blobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
-          return new NativeWorker(blobUrl, workerOptions);
-        } catch (_) {
-          return new NativeWorker(scriptURL, options);
-        }
-      };
-      WrappedWorker.prototype = NativeWorker.prototype;
-      try { Object.setPrototypeOf(WrappedWorker, NativeWorker); } catch (_) {}
-      try { Object.defineProperty(WrappedWorker, 'name', { value: 'Worker', configurable: true }); } catch (_) {}
-      try { Object.defineProperty(WrappedWorker, 'toString', { value: () => 'function Worker() { [native code] }', configurable: true }); } catch (_) {}
-      try { Object.defineProperty(WrappedWorker, workerMarker, { value: true }); } catch (_) {}
-      Object.defineProperty(window, 'Worker', {
-        value: WrappedWorker,
-        configurable: true,
-        writable: true
-      });
-    }
   } catch (_) {}
 })();
 "#;
