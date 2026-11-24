@@ -7044,6 +7044,22 @@ multiline-compatible = """4.5.6"""
     }
 
     #[test]
+    fn stealth_identity_override_keeps_the_browser_language() {
+        let identity = stealth_identity_override(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+             HeadlessChrome/149.0.7812.0 Safari/537.36",
+        );
+
+        let user_agent = identity["userAgent"].as_str().unwrap();
+        assert!(user_agent.contains("Chrome/149.0.7812.0"));
+        assert!(!user_agent.contains("Headless"));
+        assert!(identity["userAgentMetadata"].is_object());
+        // A language in this override replaces the browser's own
+        // Accept-Language header and navigator.languages on every page.
+        assert!(identity.get("acceptLanguage").is_none());
+    }
+
+    #[test]
     fn locator_wait_context_loss_classification_is_narrow() {
         for message in [
             "Inspected target navigated or closed",
@@ -54431,6 +54447,23 @@ async fn refresh_page_frame_tree(page: &Arc<PageInner>, timeout: Duration) -> Rw
     Ok(())
 }
 
+/// The identity override that every page session receives.
+///
+/// It removes the headless marker from the browser's own user agent and sends
+/// the matching client hints. It carries no `acceptLanguage`: Chromium then
+/// keeps the `Accept-Language` header and `navigator.languages` that the
+/// browser already has, from `--lang`, `--accept-lang`, or the profile of a
+/// browser that Rustwright attached to. A context `locale` sets both values
+/// explicitly through `set_user_agent`.
+fn stealth_identity_override(browser_user_agent: &str) -> Value {
+    let user_agent = browser_user_agent.replace("HeadlessChrome/", "Chrome/");
+    let user_agent_metadata = stealth_user_agent_metadata(&user_agent, None);
+    json!({
+        "userAgent": user_agent,
+        "userAgentMetadata": user_agent_metadata,
+    })
+}
+
 async fn install_stealth_defaults(browser: &BrowserInner, session_id: &str) -> RwResult<()> {
     let cached_override = browser.stealth_user_agent_override.lock().unwrap().clone();
     let user_agent_override = if let Some(cached_override) = cached_override {
@@ -54449,15 +54482,7 @@ async fn install_stealth_defaults(browser: &BrowserInner, session_id: &str) -> R
         let override_value = version
             .get("userAgent")
             .and_then(Value::as_str)
-            .map(|user_agent| {
-                let user_agent = user_agent.replace("HeadlessChrome/", "Chrome/");
-                let user_agent_metadata = stealth_user_agent_metadata(&user_agent, None);
-                json!({
-                    "userAgent": user_agent,
-                    "acceptLanguage": "en-US,en",
-                    "userAgentMetadata": user_agent_metadata,
-                })
-            })
+            .map(stealth_identity_override)
             .unwrap_or(Value::Null);
         *browser.stealth_user_agent_override.lock().unwrap() = Some(override_value.clone());
         override_value
