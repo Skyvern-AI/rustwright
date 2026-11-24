@@ -542,6 +542,10 @@ const CDP_RETAINED_STRING_MAX_BYTES: usize = 8 * 1024;
 const CDP_RETAINED_ARRAY_MAX_ITEMS: usize = 128;
 const CDP_DIAGNOSTIC_TRAFFIC_LIMIT: usize = 32;
 const CDP_EVENT_UNREPLAYABLE_MARKER: &str = "__rustwright_cdp_event_unreplayable";
+/// The event reader adds this key to a `Browser.downloadWillBegin` event when
+/// the download started in a popup that had not committed a navigation. The
+/// value is the target id of the page that opened the popup.
+const CDP_EVENT_POPUP_OPENER_KEY: &str = "__rustwright_popup_opener_target_id";
 const CDP_DIAGNOSTIC_LIST_LIMIT: usize = 32;
 const CDP_DIAGNOSTIC_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const TIMEOUT_DIAGNOSTIC_BANNER: &str = "RUSTWRIGHT TIMEOUT DIAGNOSTIC";
@@ -12505,8 +12509,18 @@ multiline-compatible = """4.5.6"""
             );
             self.reply(&binding, json!({}));
         }
-        fn emit(&self, event: Value) {
-            self.observe_runtime_event(&event);
+        fn emit(&self, mut event: Value) {
+            let deliver = self
+                .page
+                .browser
+                .client
+                .runtime_state
+                .lock()
+                .unwrap()
+                .ingest_event(&mut event);
+            if !deliver {
+                return;
+            }
             dispatch_cdp_payload(
                 event,
                 Arc::clone(&self.pending),
@@ -21477,6 +21491,185 @@ return this.dataset.mainWorldOverride === "observed";
     }
 
     #[test]
+    fn popup_download_belongs_to_the_page_that_opened_the_popup() {
+        let harness = navigation_test_harness(8);
+        *harness.page.main_frame_id.lock().unwrap() = Some("main-frame".to_owned());
+        harness
+            .page
+            .browser
+            .client
+            .runtime_state
+            .lock()
+            .unwrap()
+            .target_tracking_session = Some("tracking-session".to_owned());
+        let mut events = harness.events.subscribe();
+        // The browser reports each page target on the tracking session.
+        let target_reported = |method: &str, target_id: &str, opener_id: &str, url: &str| {
+            harness.emit(json!({
+                "sessionId": "tracking-session",
+                "method": method,
+                "params": {
+                    "targetInfo": {
+                        "targetId": target_id,
+                        "type": "page",
+                        "url": url,
+                        "openerId": opener_id,
+                    },
+                },
+            }));
+        };
+        let popup_opened = |popup_id: &str, opener_id: &str| {
+            target_reported("Target.targetCreated", popup_id, opener_id, "");
+        };
+        // Returns the download event as a consumer receives it.
+        let download_started = |events: &mut broadcast::Receiver<Value>, frame_id: &str| {
+            harness.emit(json!({
+                "method": "Browser.downloadWillBegin",
+                "params": {
+                    "guid": "guid-1",
+                    "frameId": frame_id,
+                    "url": "https://example.test/report.txt",
+                    "suggestedFilename": "report.txt",
+                },
+            }));
+            // No consumer receives a report of the tracking session, so the
+            // next event is the download.
+            let event = events.try_recv().expect("consumers receive the download");
+            assert_eq!(event["method"], "Browser.downloadWillBegin");
+            event
+        };
+        let owned_by_page =
+            |download: &Value| native_page_event_from_cdp(&harness.page, download).is_some();
+        let opener_in_payload = |download: &Value| {
+            download_from_begin_event(download, "/downloads").unwrap()["opener_target_id"].clone()
+        };
+
+        // The page does not know this frame, so the download is not its own.
+        let download = download_started(&mut events, "popup-1");
+        assert!(!owned_by_page(&download));
+        assert_eq!(opener_in_payload(&download), Value::Null);
+
+        // The popup has not committed a navigation, so the page that opened it
+        // owns the download.
+        popup_opened("popup-1", "test-target");
+        let download = download_started(&mut events, "popup-1");
+        let (event, terminal) = native_page_event_from_cdp(&harness.page, &download)
+            .expect("the opener owns the download");
+        assert!(matches!(event, RustwrightPageEvent::Download { .. }));
+        assert!(!terminal);
+        assert_eq!(opener_in_payload(&download), "test-target");
+
+        // The browser closes the popup after the download starts. A consumer
+        // that reads the download event later still finds the opener in it.
+        harness.emit(json!({
+            "sessionId": "tracking-session",
+            "method": "Target.targetDestroyed",
+            "params": { "targetId": "popup-1" },
+        }));
+        assert!(owned_by_page(&download));
+        assert_eq!(opener_in_payload(&download), "test-target");
+        let later_download = download_started(&mut events, "popup-1");
+        assert_eq!(opener_in_payload(&later_download), Value::Null);
+
+        // A popup of another page is not a download of this page.
+        popup_opened("popup-2", "other-target");
+        let download = download_started(&mut events, "popup-2");
+        assert!(!owned_by_page(&download));
+        assert_eq!(opener_in_payload(&download), "other-target");
+
+        // The browser reports a change of the popup, for example a session
+        // that attaches to it. The URL stays empty until a navigation commits.
+        popup_opened("popup-3", "test-target");
+        target_reported("Target.targetInfoChanged", "popup-3", "test-target", "");
+        let download = download_started(&mut events, "popup-3");
+        assert_eq!(opener_in_payload(&download), "test-target");
+
+        // A popup that commits a navigation owns its later downloads, and it
+        // never returns to the record.
+        target_reported(
+            "Target.targetInfoChanged",
+            "popup-3",
+            "test-target",
+            "about:blank",
+        );
+        target_reported("Target.targetInfoChanged", "popup-3", "test-target", "");
+        let download = download_started(&mut events, "popup-3");
+        assert!(!owned_by_page(&download));
+        assert_eq!(opener_in_payload(&download), Value::Null);
+
+        // The download of the main frame is unchanged.
+        let download = download_started(&mut events, "main-frame");
+        assert!(owned_by_page(&download));
+        assert_eq!(opener_in_payload(&download), Value::Null);
+
+        // The main frame of this page is a popup of another page, and its
+        // first navigation becomes a download. The opener owns that download.
+        popup_opened("main-frame", "other-target");
+        let download = download_started(&mut events, "main-frame");
+        assert!(!owned_by_page(&download));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_engine_resumes_each_new_page_and_closes_its_extra_session() {
+        let mut harness = navigation_test_harness(8);
+        let client = Arc::clone(&harness.page.browser.client);
+        let mut attached_targets = client.attached_targets();
+        let attached = |session_id: &str, target_type: &str, waiting_for_debugger: bool| {
+            json!({
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": session_id,
+                    "waitingForDebugger": waiting_for_debugger,
+                    "targetInfo": {
+                        "targetId": format!("{session_id}-target"),
+                        "type": target_type,
+                        "url": "",
+                    },
+                },
+            })
+        };
+        let mut settle_queued_target = || {
+            let target = attached_targets
+                .try_recv()
+                .expect("the reader queues the target while it reads the event");
+            tokio::spawn(settle_attached_target(Arc::clone(&client), target, false))
+        };
+
+        // Browser-level auto-attach opens a session for a new page and holds
+        // the page. A popup is held in the renderer of the page that opened
+        // it, and that page cannot run script until the popup resumes. The
+        // engine resumes the page and closes the extra session.
+        harness.emit(attached("held-session", "page", true));
+        let settled = settle_queued_target();
+        let resume = harness
+            .next_command("Runtime.runIfWaitingForDebugger")
+            .await;
+        assert_eq!(resume["sessionId"], "held-session");
+        harness.reply(&resume, json!({}));
+        let detach = harness.next_command("Target.detachFromTarget").await;
+        assert_eq!(detach["params"]["sessionId"], "held-session");
+        harness.reply(&detach, json!({}));
+        settled.await.unwrap();
+
+        // A session that the engine opened itself is resumed and stays open.
+        harness.emit(attached("explicit-session", "page", false));
+        let settled = settle_queued_target();
+        let resume = harness
+            .next_command("Runtime.runIfWaitingForDebugger")
+            .await;
+        assert_eq!(resume["sessionId"], "explicit-session");
+        harness.reply(&resume, json!({}));
+        settled.await.unwrap();
+        assert!(harness.try_next_command_any().is_none());
+
+        // A browser session has nothing to resume.
+        harness.emit(attached("tracking-session", "browser", false));
+        settle_queued_target().await.unwrap();
+        assert!(harness.try_next_command_any().is_none());
+    }
+
+    #[test]
     fn legacy_navigation_events_and_opt_in_details_report_both_navigation_classes() {
         let harness = navigation_test_harness(4);
         *harness.page.main_frame_id.lock().unwrap() = Some("frame-1".to_owned());
@@ -26631,6 +26824,108 @@ struct SerializerRelease {
     object_id: String,
 }
 
+/// A target that the browser attached to this client, through auto-attach or
+/// through `Target.attachToTarget`.
+#[derive(Debug, PartialEq, Eq)]
+struct AttachedTarget {
+    session_id: String,
+    target_type: String,
+    /// The browser target reported the attachment, not a page session.
+    browser_level: bool,
+    /// The browser holds the target until a debugger resumes it.
+    waiting_for_debugger: bool,
+}
+
+impl AttachedTarget {
+    fn from_event(event: &Value) -> Option<Self> {
+        let params = event.get("params")?;
+        Some(Self {
+            session_id: params.get("sessionId")?.as_str()?.to_string(),
+            target_type: params
+                .pointer("/targetInfo/type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            browser_level: event.get("sessionId").is_none(),
+            waiting_for_debugger: params
+                .get("waitingForDebugger")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+
+    /// The session exists only because browser-level auto-attach covers pages:
+    /// the browser opened it and holds the page for it.
+    ///
+    /// `waitingForDebugger` describes the attach, not the page. Chromium
+    /// reports `false` for every explicit `Target.attachToTarget`, also while
+    /// it still holds the page for an auto-attached session. A session that
+    /// the engine opened itself is therefore never taken for this one.
+    fn is_page_held_for_auto_attach(&self) -> bool {
+        self.browser_level && self.target_type == "page" && self.waiting_for_debugger
+    }
+}
+
+/// Popups whose first navigation has not committed, with the page that opened
+/// each popup.
+///
+/// A popup that starts a download never commits its first navigation.
+/// Chromium reports that download with the target id of the popup as the frame
+/// id, and then closes the popup. The download belongs to the page that opened
+/// the popup. Playwright applies the same rule.
+///
+/// The record follows the page targets that the browser reports on the
+/// target-tracking session of the engine (see `track_page_targets`). The
+/// browser reports an empty URL for a page until its first navigation commits.
+#[derive(Default)]
+struct PendingPopupOpeners {
+    opener_by_popup: HashMap<String, String>,
+}
+
+impl PendingPopupOpeners {
+    fn text<'a>(target_info: &'a Value, key: &str) -> Option<&'a str> {
+        target_info
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    }
+
+    /// The browser reported a new target.
+    fn target_created(&mut self, target_info: &Value) {
+        let is_uncommitted_page = Self::text(target_info, "type") == Some("page")
+            && Self::text(target_info, "url").is_none();
+        if !is_uncommitted_page {
+            return;
+        }
+        if let (Some(popup_id), Some(opener_id)) = (
+            Self::text(target_info, "targetId"),
+            Self::text(target_info, "openerId"),
+        ) {
+            self.opener_by_popup
+                .insert(popup_id.to_string(), opener_id.to_string());
+        }
+    }
+
+    /// The browser reported a change of a target. A popup that has committed
+    /// a navigation owns its later downloads.
+    fn target_changed(&mut self, target_info: &Value) {
+        if Self::text(target_info, "url").is_none() {
+            return;
+        }
+        if let Some(target_id) = Self::text(target_info, "targetId") {
+            self.opener_by_popup.remove(target_id);
+        }
+    }
+
+    fn target_destroyed(&mut self, target_id: &str) {
+        self.opener_by_popup.remove(target_id);
+    }
+
+    fn opener_of(&self, popup_id: &str) -> Option<&str> {
+        self.opener_by_popup.get(popup_id).map(String::as_str)
+    }
+}
+
 struct CdpRuntimeState {
     serializers: HashMap<SerializerRealmKey, SerializerCacheEntry>,
     serializer_install_locks: HashMap<SerializerRealmKey, Arc<tokio::sync::Mutex<()>>>,
@@ -26639,6 +26934,13 @@ struct CdpRuntimeState {
     execution_realms: HashMap<(String, String), RuntimeExecutionRealm>,
     session_realms: HashMap<String, String>,
     frame_loaders: HashMap<(String, String), String>,
+    pending_popup_openers: PendingPopupOpeners,
+    /// The session of the engine on which the browser reports every page
+    /// target (see `track_page_targets`). No consumer sees its events.
+    target_tracking_session: Option<String>,
+    /// Receives every attached target. The reader fills it while it reads the
+    /// event, so a slow consumer cannot miss a target that waits for a resume.
+    attached_target_tx: Option<mpsc::UnboundedSender<AttachedTarget>>,
     release_tx: Option<mpsc::UnboundedSender<SerializerRelease>>,
     #[cfg(any(test, feature = "test-support"))]
     serializer_release_count: usize,
@@ -26654,6 +26956,9 @@ impl CdpRuntimeState {
             execution_realms: HashMap::new(),
             session_realms: HashMap::new(),
             frame_loaders: HashMap::new(),
+            pending_popup_openers: PendingPopupOpeners::default(),
+            target_tracking_session: None,
+            attached_target_tx: None,
             #[cfg(any(test, feature = "test-support"))]
             serializer_release_count: 0,
             release_tx,
@@ -26754,6 +27059,65 @@ impl CdpRuntimeState {
         self.evict_serializer_realms(evicted, release_live);
     }
 
+    /// The first step for each event that the reader receives, before a
+    /// consumer can see the event. Returns false for an event that no consumer
+    /// may see.
+    fn ingest_event(&mut self, event: &mut Value) -> bool {
+        if self.is_target_tracking_event(event) {
+            self.observe_tracked_target(event);
+            return false;
+        }
+        self.record_popup_opener_of_download(event);
+        self.observe_event(event);
+        true
+    }
+
+    fn is_target_tracking_event(&self, event: &Value) -> bool {
+        let session_id = event.get("sessionId").and_then(Value::as_str);
+        session_id.is_some() && session_id == self.target_tracking_session.as_deref()
+    }
+
+    fn observe_tracked_target(&mut self, event: &Value) {
+        let params = event.get("params").unwrap_or(&Value::Null);
+        let target_info = params.get("targetInfo").unwrap_or(&Value::Null);
+        match event.get("method").and_then(Value::as_str) {
+            Some("Target.targetCreated") => {
+                self.pending_popup_openers.target_created(target_info);
+            }
+            Some("Target.targetInfoChanged") => {
+                self.pending_popup_openers.target_changed(target_info);
+            }
+            Some("Target.targetDestroyed") => {
+                if let Some(target_id) = params.get("targetId").and_then(Value::as_str) {
+                    self.pending_popup_openers.target_destroyed(target_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Writes the owner of a popup download into its event.
+    ///
+    /// The browser closes the popup after the download starts, and a consumer
+    /// can read the event much later. The owner is therefore decided here,
+    /// while the record still has the popup.
+    fn record_popup_opener_of_download(&self, event: &mut Value) {
+        if event.get("method").and_then(Value::as_str) != Some("Browser.downloadWillBegin") {
+            return;
+        }
+        let opener_id = event
+            .pointer("/params/frameId")
+            .and_then(Value::as_str)
+            .and_then(|frame_id| self.pending_popup_openers.opener_of(frame_id))
+            .map(ToString::to_string);
+        if let (Some(opener_id), Some(event)) = (opener_id, event.as_object_mut()) {
+            event.insert(
+                CDP_EVENT_POPUP_OPENER_KEY.to_string(),
+                Value::String(opener_id),
+            );
+        }
+    }
+
     fn observe_event(&mut self, event: &Value) {
         let method = event.get("method").and_then(Value::as_str).unwrap_or("");
         if method == "Target.attachedToTarget" {
@@ -26774,6 +27138,15 @@ impl CdpRuntimeState {
                         self.session_realms
                             .insert(child_session_id.to_string(), realm_identity);
                     }
+                }
+            }
+            if let Some(attached) = AttachedTarget::from_event(event) {
+                let delivered = self
+                    .attached_target_tx
+                    .as_ref()
+                    .is_some_and(|sender| sender.send(attached).is_ok());
+                if !delivered {
+                    self.attached_target_tx = None;
                 }
             }
             return;
@@ -26921,6 +27294,9 @@ impl CdpRuntimeState {
         self.execution_realms = HashMap::new();
         self.session_realms = HashMap::new();
         self.frame_loaders = HashMap::new();
+        self.pending_popup_openers = PendingPopupOpeners::default();
+        self.target_tracking_session = None;
+        self.attached_target_tx = None;
     }
 }
 
@@ -27916,7 +28292,7 @@ fn dispatch_cdp_payload_with_diagnostics(
             let _ = sender.send(result);
         }
     } else {
-        runtime_state.lock().unwrap().observe_event(&payload);
+        let deliver = runtime_state.lock().unwrap().ingest_event(&mut payload);
         if payload.get("guid").is_none() && payload.get("method").and_then(Value::as_str).is_some()
         {
             if let Some(detector) = playwright_like_first_reply {
@@ -27927,6 +28303,9 @@ fn dispatch_cdp_payload_with_diagnostics(
             .lock()
             .unwrap()
             .push(CdpTrafficEntry::received_event(&payload));
+        if !deliver {
+            return;
+        }
         let mut event_log = event_log.lock().unwrap();
         event_log.record_action_dispatch_receipt(&payload);
         let payload = event_log.push(payload);
@@ -28563,6 +28942,15 @@ impl CdpClient {
 
     fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.events.subscribe()
+    }
+
+    /// Delivers every target that the browser attaches to this client from now
+    /// on. Unlike `subscribe`, this queue cannot drop an attachment. A new
+    /// receiver replaces the earlier one.
+    fn attached_targets(&self) -> mpsc::UnboundedReceiver<AttachedTarget> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        self.runtime_state.lock().unwrap().attached_target_tx = Some(sender);
+        receiver
     }
 
     fn subscribe_with_cursor(&self) -> (broadcast::Receiver<Value>, u64) {
@@ -45867,7 +46255,7 @@ fn launch_chromium_with_options_cancellation(
             return Err(error);
         }
     };
-    if let Err(error) = start_service_worker_stealth_auto_attach_cancelable(
+    if let Err(error) = start_browser_auto_attach_cancelable(
         &runtime,
         Arc::clone(&client),
         Duration::from_secs(5),
@@ -46145,13 +46533,9 @@ fn connect_browser_over_cdp_cancelable(
     if let Some(options) = test_options {
         options.observe("Target.setAutoAttach", remaining);
     }
-    if let Err(error) = start_service_worker_stealth_auto_attach_cancelable(
-        &runtime,
-        Arc::clone(&client),
-        remaining,
-        cancel,
-        None,
-    ) {
+    if let Err(error) =
+        start_browser_auto_attach_cancelable(&runtime, Arc::clone(&client), remaining, cancel, None)
+    {
         client.close();
         return Err(error);
     }
@@ -46982,6 +47366,13 @@ impl RustwrightBrowser {
                     Some("Target.targetCreated")
                     | Some("Target.targetInfoChanged")
                     | Some("Target.attachedToTarget") => {
+                        // The engine resumes this page and closes the session
+                        // at once. It is not a page that the engine drives.
+                        if AttachedTarget::from_event(&event)
+                            .is_some_and(|target| target.is_page_held_for_auto_attach())
+                        {
+                            continue;
+                        }
                         let Some(info) = event.pointer("/params/targetInfo") else {
                             continue;
                         };
@@ -48683,7 +49074,17 @@ fn native_page_event_from_cdp(
         }
         "Browser.downloadWillBegin" => {
             let frame_id = event.pointer("/params/frameId").and_then(Value::as_str)?;
-            if page.main_frame_id.lock().unwrap().as_deref() != Some(frame_id) {
+            // A popup that starts a download never commits a navigation. Its
+            // download belongs to the page that opened it, and to no other
+            // page.
+            let popup_opener = event
+                .get(CDP_EVENT_POPUP_OPENER_KEY)
+                .and_then(Value::as_str);
+            let owner_is_this_page = match popup_opener {
+                Some(opener_id) => opener_id == page.target_id,
+                None => page.main_frame_id.lock().unwrap().as_deref() == Some(frame_id),
+            };
+            if !owner_is_this_page {
                 return None;
             }
             Some((
@@ -54545,7 +54946,22 @@ async fn install_worker_stealth_defaults(client: &CdpClient, session_id: &str) -
     Ok(())
 }
 
-fn start_service_worker_stealth_auto_attach_cancelable(
+/// Asks the browser to attach the engine to every page and service worker,
+/// and resumes each target that the browser holds for a debugger.
+///
+/// Service workers are held so that the engine can install their identity
+/// before their script runs.
+///
+/// Pages are in the filter because of `window.open()`. While a browser-level
+/// auto-attach is active, Chromium holds every popup until a debugger resumes
+/// it, and the page that opened the popup cannot run script during that time.
+/// Chromium applies the hold even when the filter excludes pages, and then no
+/// session exists that can resume the popup. With pages in the filter, the
+/// browser attaches the engine to each new page and the engine resumes it.
+///
+/// The same step starts the target tracking of the engine (see
+/// `track_page_targets`).
+fn start_browser_auto_attach_cancelable(
     runtime: &tokio::runtime::Runtime,
     client: Arc<CdpClient>,
     timeout: Duration,
@@ -54553,28 +54969,36 @@ fn start_service_worker_stealth_auto_attach_cancelable(
     startup_probe: Option<&startup_timing::StartupProbe>,
 ) -> RwResult<()> {
     let phase_started = startup_probe.map(|_| Instant::now());
+    // The queue must exist before the command. The browser reports the targets
+    // that exist already before it answers.
+    let mut attached_targets = client.attached_targets();
     let result = runtime.block_on(cancelable(cancel, async {
-        client
-            .send(
-                "Target.setAutoAttach",
-                json!({
-                    "autoAttach": true,
-                    "waitForDebuggerOnStart": true,
-                    "flatten": true,
-                    "filter": [
-                        { "type": "page", "exclude": true },
-                        { "type": "iframe", "exclude": true },
-                        { "type": "worker", "exclude": true },
-                        { "type": "shared_worker", "exclude": true },
-                        { "type": "background_page", "exclude": true },
-                        { "type": "service_worker", "exclude": false },
-                    ],
-                }),
-                None,
-                timeout,
-            )
-            .await
-            .map(|_| ())
+        let auto_attach = client.enqueue(
+            "Target.setAutoAttach",
+            json!({
+                "autoAttach": true,
+                "waitForDebuggerOnStart": true,
+                "flatten": true,
+                // The first entry that matches a target decides. The entry
+                // without a type excludes every other target type.
+                "filter": [
+                    { "type": "page", "exclude": false },
+                    { "type": "service_worker", "exclude": false },
+                    { "exclude": true },
+                ],
+            }),
+            None,
+            timeout,
+        )?;
+        // Target tracking starts in the same round trip, after the command
+        // above. It is complete before the engine resumes a page and before a
+        // caller gets the browser, so no popup can start a download unseen.
+        let (auto_attach, tracking) =
+            tokio::join!(auto_attach.wait(), track_page_targets(&client, timeout));
+        // The reader inspects only the first answer of the connection for
+        // another protocol. That answer can belong to either command.
+        tracking?;
+        auto_attach.map(|_| ())
     }));
     let phase_timing = phase_started.map(|started| (started, started.elapsed()));
     if let Err(error) = result {
@@ -54590,42 +55014,20 @@ fn start_service_worker_stealth_auto_attach_cancelable(
         return Err(error);
     }
 
-    let mut events = client.subscribe();
+    // The engine has attached to nothing itself yet, so each page in the queue
+    // now is one that existed before the command.
+    let mut existing_targets = Vec::new();
+    while let Ok(target) = attached_targets.try_recv() {
+        existing_targets.push(target);
+    }
     runtime.spawn(async move {
-        loop {
-            let event = match events.recv().await {
-                Ok(event) => event,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => break,
-            };
-            if event.get("method").and_then(Value::as_str) != Some("Target.attachedToTarget") {
-                continue;
-            }
-            let info = event.pointer("/params/targetInfo").unwrap_or(&Value::Null);
-            let Some(session_id) = event.pointer("/params/sessionId").and_then(Value::as_str)
-            else {
-                continue;
-            };
-            if info.get("type").and_then(Value::as_str) != Some("service_worker") {
-                let _ = client
-                    .send(
-                        "Runtime.runIfWaitingForDebugger",
-                        json!({}),
-                        Some(session_id),
-                        Duration::from_secs(5),
-                    )
-                    .await;
-                continue;
-            }
-            let _ = install_worker_stealth_defaults(&client, session_id).await;
-            let _ = client
-                .send(
-                    "Runtime.runIfWaitingForDebugger",
-                    json!({}),
-                    Some(session_id),
-                    Duration::from_secs(5),
-                )
-                .await;
+        // One task for each target: a slow service worker must not delay the
+        // resume of a popup.
+        for target in existing_targets {
+            tokio::spawn(settle_attached_target(Arc::clone(&client), target, true));
+        }
+        while let Some(target) = attached_targets.recv().await {
+            tokio::spawn(settle_attached_target(Arc::clone(&client), target, false));
         }
     });
     if let (Some(probe), Some((started, duration))) = (startup_probe, phase_timing) {
@@ -54637,6 +55039,95 @@ fn start_service_worker_stealth_auto_attach_cancelable(
             startup_timing::Status::Ok,
         );
     }
+    Ok(())
+}
+
+/// Prepares one attached target and lets it run.
+///
+/// The engine attaches to the pages it drives with `Target.attachToTarget`.
+/// The page session that browser-level auto-attach opens is an extra one. Its
+/// only use is the resume of the page, so the engine closes it after that.
+///
+/// `existed_before_auto_attach` is true for a target that the browser reported
+/// in answer to `Target.setAutoAttach`.
+async fn settle_attached_target(
+    client: Arc<CdpClient>,
+    target: AttachedTarget,
+    existed_before_auto_attach: bool,
+) {
+    // A browser session has nothing to resume (see `track_page_targets`).
+    if target.target_type == "browser" {
+        return;
+    }
+    let timeout = Duration::from_secs(5);
+    if target.target_type == "service_worker" {
+        let _ = install_worker_stealth_defaults(&client, &target.session_id).await;
+    }
+    let _ = client
+        .send(
+            "Runtime.runIfWaitingForDebugger",
+            json!({}),
+            Some(target.session_id.as_str()),
+            timeout,
+        )
+        .await;
+    let extra_page_session = target.browser_level
+        && target.target_type == "page"
+        && (target.waiting_for_debugger || existed_before_auto_attach);
+    if extra_page_session {
+        let _ = client
+            .send(
+                "Target.detachFromTarget",
+                json!({ "sessionId": target.session_id }),
+                None,
+                timeout,
+            )
+            .await;
+    }
+}
+
+/// Opens a browser session for the engine alone, and asks the browser to
+/// report every page target on it.
+///
+/// The reader applies those reports to the record of the popups that have not
+/// committed a navigation (see `PendingPopupOpeners`), and passes them to no
+/// consumer. Target discovery on the session that consumers use stays off
+/// until a consumer turns it on.
+///
+/// The engine watches no page session for this. A session with the `Page`
+/// domain enabled would change how the browser handles a dialog of that page.
+///
+/// The function returns when the browser has answered, or after `timeout`.
+/// If the browser refuses the session or does not answer, the engine works
+/// without it, and a download that starts in a popup reaches no page. The
+/// only error is an endpoint that speaks another protocol.
+async fn track_page_targets(client: &CdpClient, timeout: Duration) -> RwResult<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let attached = match client
+        .send("Target.attachToBrowserTarget", json!({}), None, timeout)
+        .await
+    {
+        Ok(attached) => attached,
+        Err(error @ RwError::RemoteProtocolSuspected(_)) => return Err(error),
+        Err(_) => return Ok(()),
+    };
+    let Some(session_id) = attached.get("sessionId").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    // The reader must know the session before the browser reports a target on
+    // it.
+    client.runtime_state.lock().unwrap().target_tracking_session = Some(session_id.to_string());
+    let _ = client
+        .send(
+            "Target.setDiscoverTargets",
+            json!({
+                "discover": true,
+                "filter": [{ "type": "page", "exclude": false }, { "exclude": true }],
+            }),
+            Some(session_id),
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await;
     Ok(())
 }
 
@@ -57987,21 +58478,53 @@ async fn wait_for_popup_page(
                     .get("browserContextId")
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
-                return match attach_existing_page(browser, target_id.clone(), context_id, remaining)
-                    .await
+                let error = match attach_existing_page(
+                    Arc::clone(&browser),
+                    target_id.clone(),
+                    context_id,
+                    remaining,
+                )
+                .await
                 {
-                    Ok(inner) => Ok(PyPage { inner }),
-                    Err(error) => {
-                        seen_target_ids.lock().unwrap().remove(&target_id);
-                        Err(error)
-                    }
+                    Ok(inner) => return Ok(PyPage { inner }),
+                    Err(error) => error,
                 };
+                seen_target_ids.lock().unwrap().remove(&target_id);
+                // A popup can close before the attach finishes, for example
+                // when its first navigation becomes a download. That popup is
+                // not delivered, and the wait continues for the next one. The
+                // cause of the attach error is not examined: when the target
+                // is gone, there is no page to deliver.
+                if matches!(error, RwError::Timeout(_))
+                    || target_exists(&browser.client, &target_id, deadline).await
+                {
+                    return Err(error);
+                }
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(_)) => return Err(RwError::Message("CDP event stream closed".to_string())),
             Err(_) => return Err(RwError::Timeout(timeout.as_millis() as u64)),
         }
     }
+}
+
+/// Asks the browser if the target is still open. No answer before the
+/// deadline counts as a closed target.
+#[cfg(feature = "python")]
+async fn target_exists(
+    client: &CdpClient,
+    target_id: &str,
+    deadline: tokio::time::Instant,
+) -> bool {
+    client
+        .send(
+            "Target.getTargetInfo",
+            json!({ "targetId": target_id }),
+            None,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await
+        .is_ok()
 }
 
 async fn wait_for_cdp_event(
@@ -58761,6 +59284,11 @@ fn file_chooser_from_event(event: &Value) -> Option<Value> {
     }))
 }
 
+/// Builds the download payload for a `Browser.downloadWillBegin` event.
+///
+/// `opener_target_id` is set when the download started in a popup that had not
+/// committed a navigation. The download then belongs to the page with that
+/// target id, and to no other page.
 fn download_from_begin_event(event: &Value, download_path: &str) -> Option<Value> {
     let params = event.get("params")?;
     let guid = params.get("guid").and_then(Value::as_str).unwrap_or("");
@@ -58768,10 +59296,15 @@ fn download_from_begin_event(event: &Value, download_path: &str) -> Option<Value
         .get("suggestedFilename")
         .and_then(Value::as_str)
         .unwrap_or("");
+    let opener_target_id = event
+        .get(CDP_EVENT_POPUP_OPENER_KEY)
+        .cloned()
+        .unwrap_or(Value::Null);
     Some(json!({
         "guid": guid,
         "url": params.get("url").cloned().unwrap_or(Value::String(String::new())),
         "frame_id": params.get("frameId").cloned().unwrap_or(Value::Null),
+        "opener_target_id": opener_target_id,
         "suggested_filename": suggested_filename,
         "path": PathBuf::from(download_path).join(guid).to_string_lossy().to_string(),
     }))
