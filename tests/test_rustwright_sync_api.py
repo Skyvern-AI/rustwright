@@ -30410,12 +30410,40 @@ def test_default_request_headers_do_not_expose_headless_chrome(page, http_server
     assert "HeadlessChrome" not in headers.get("user-agent", "")
     assert "HeadlessChrome" not in headers.get("sec-ch-ua", "")
     assert "HeadlessChrome" not in combined_headers
-    assert headers.get("accept-language") == "en-US,en;q=0.9"
-    assert page.evaluate("navigator.languages") == ["en-US", "en"]
+    # The header and the page must report the same languages: the browser's own.
+    accept_language = headers.get("accept-language")
+    assert accept_language
+    header_languages = [entry.split(";")[0].strip() for entry in accept_language.split(",")]
+    assert header_languages == page.evaluate("navigator.languages")
     brands = page.evaluate(
         "() => navigator.userAgentData ? navigator.userAgentData.brands.map(brand => brand.brand).join(' ') : ''"
     )
     assert "HeadlessChrome" not in brands
+
+
+def test_stealth_defaults_keep_the_browser_accept_language(playwright, http_server):
+    browser = playwright.chromium.launch(headless=True, args=["--accept-lang=de-DE,de"])
+    try:
+        page = browser.new_page()
+        headers = page.goto(f"{http_server}/request-headers").json()
+
+        # Chromium can append its own fallback languages after the configured ones.
+        header_languages = [
+            entry.split(";")[0].strip() for entry in headers.get("accept-language", "").split(",")
+        ]
+        assert header_languages[:2] == ["de-DE", "de"]
+        assert page.evaluate("navigator.language") == "de-DE"
+        assert page.evaluate("navigator.languages")[:2] == ["de-DE", "de"]
+        assert "HeadlessChrome" not in headers.get("user-agent", "")
+
+        # An explicit context locale still replaces the browser's languages.
+        context = browser.new_context(locale="fr-FR")
+        localized = context.new_page()
+        assert localized.goto(f"{http_server}/request-headers").json()["accept-language"] == "fr-FR"
+        assert localized.evaluate("navigator.languages") == ["fr-FR"]
+        context.close()
+    finally:
+        browser.close()
 
 
 def test_browser_context_new_page(browser):

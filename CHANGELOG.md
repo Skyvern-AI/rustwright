@@ -63,6 +63,7 @@ All notable user-facing changes to Rustwright are documented in this file.
 - Fixed `show-trace` and `trace` to decode percent-encoded `file:` URLs and to accept Windows drive-letter paths such as `C:\traces\run.zip` instead of rejecting them as remote URLs.
 - Fixed `page.url` and the `url` of the main frame to include a navigation as soon as a listener receives its event. Inside a `framenavigated` handler, the URL could still be the one from before the navigation.
 - Fixed `page.frames` and `page.frame()` to return a usable frame after an iframe is removed and a new iframe takes its position. The new frame got the `Frame` object of the removed iframe and reported detached.
+- Fixed the default stealth identity to keep the browser's own `Accept-Language` header and `navigator.languages`. Rustwright replaced both with `en-US,en` on every page, which switched users of another locale to English pages, also in a browser attached with `connect_over_cdp()`. A browser configured with `--lang` or `--accept-lang` now keeps its languages. The context `locale` option still sets them explicitly.
 
 ## [0.3.0] - 2026-08-16
 
