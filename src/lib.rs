@@ -32826,14 +32826,25 @@ impl PageFrameState {
             .insert(frame_id.to_string(), session_id.to_string());
         if let Some(previous_session_id) = previous_session_id.as_deref() {
             if previous_session_id != session_id {
-                self.invalidate_iframe_session_markers(previous_session_id);
-                if self
+                let previous_lost_its_root = self
                     .session_frames
                     .get(previous_session_id)
                     .map(String::as_str)
-                    == Some(frame_id)
-                {
+                    == Some(frame_id);
+                if previous_lost_its_root {
                     self.session_frames.remove(previous_session_id);
+                }
+                // The markers belong to a session, not to a frame. A session that had this
+                // frame as a local child keeps its own root frame when the frame gets a
+                // session of its own (an iframe in a cross-origin iframe), and its setup
+                // stays valid. Without its markers, its root frame is never routable again.
+                if previous_lost_its_root
+                    || !self
+                        .frame_sessions
+                        .values()
+                        .any(|owner| owner == previous_session_id)
+                {
+                    self.invalidate_iframe_session_markers(previous_session_id);
                 }
             }
         }
@@ -32983,7 +32994,11 @@ impl PageFrameState {
             .next_attachment_generation
             .checked_add(1)
             .expect("frame attachment generation overflow");
-        self.invalidate_iframe_session_markers(&session_id);
+        // A session that hosts this frame as a local child keeps its own root frame, and its
+        // setup stays valid. Only a session that loses its root frame loses its markers.
+        if self.session_frames.get(&session_id).map(String::as_str) == Some(frame_id) {
+            self.invalidate_iframe_session_markers(&session_id);
+        }
         self.frame_session_errors.remove(frame_id);
         let link = FrameSwapLink {
             losing_session_id: session_id,
