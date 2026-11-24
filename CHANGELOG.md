@@ -53,6 +53,7 @@ All notable user-facing changes to Rustwright are documented in this file.
 - Hardened sync and async context creation rollback and close disposal retries.
 - Fixed `show-trace` and `trace` to decode percent-encoded `file:` URLs and to accept Windows drive-letter paths such as `C:\traces\run.zip` instead of rejecting them as remote URLs.
 - Fixed `page.url` and the `url` of the main frame to include a navigation as soon as a listener receives its event. Inside a `framenavigated` handler, the URL could still be the one from before the navigation.
+- Fixed `page.frames` and `page.frame()` to return a usable frame after an iframe is removed and a new iframe takes its position. The new frame got the `Frame` object of the removed iframe and reported detached.
 
 ## [0.3.0] - 2026-08-16
 
