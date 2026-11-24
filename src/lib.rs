@@ -4,7 +4,7 @@ use std::fs;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -16237,6 +16237,65 @@ return this.dataset.mainWorldOverride === "observed";
         );
     }
 
+    #[test]
+    fn reconciliation_and_the_page_listener_cannot_deadlock() {
+        const NAVIGATIONS: usize = 20_000;
+        let harness = navigation_test_harness(4096);
+        warm_main_frame_cache(&harness.page);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            // The real listener handles each event on a runtime worker.
+            let _runtime_context = runtime.enter();
+            let (events, start_cursor) = harness.page.browser.client.subscribe_with_cursor();
+            start_page_frame_cache_tracking_with_subscription(
+                &harness.page,
+                events,
+                start_cursor,
+                "page-session",
+            );
+        }
+        let page = Arc::clone(&harness.page);
+        let pending = Arc::clone(&harness.pending);
+        let events = harness.events.clone();
+        let event_log = Arc::clone(&harness.event_log);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // A caller thread reconciles directly after each navigation, as a
+        // locator action does after `goto`. The listener handles the same
+        // navigation at the same time.
+        std::thread::spawn(move || {
+            for index in 0..NAVIGATIONS {
+                dispatch_cdp_payload(
+                    json!({
+                        "sessionId": "page-session",
+                        "method": "Page.frameNavigated",
+                        "params": {
+                            "frame": {
+                                "id": "main-frame",
+                                "loaderId": format!("loader-{index}"),
+                                "url": format!("https://example.test/{index}"),
+                            },
+                        },
+                    }),
+                    Arc::clone(&pending),
+                    events.clone(),
+                    Arc::clone(&event_log),
+                );
+                reconcile_frame_cache_invalidations(&page);
+            }
+            let _ = done_tx.send(());
+        });
+        if done_rx.recv_timeout(Duration::from_secs(20)).is_err() {
+            // A deadlocked worker never returns, and a runtime waits for its
+            // workers when it drops.
+            std::mem::forget(runtime);
+            panic!("reconciliation and the page listener deadlocked");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sequence_gate_constructor_setup_navigation_precedes_first_live_event() {
         let harness = navigation_test_harness(8);
@@ -16354,9 +16413,11 @@ return this.dataset.mainWorldOverride === "observed";
         let harness = navigation_test_harness(8);
         let before = navigation_observation_snapshot(&harness.page);
         {
-            let mut navigation_transition = harness.page.navigation_transition_lock.lock().unwrap();
+            let retention_gate = harness.page.browser.client.retention_gate();
+            let _retention_guard = retention_gate.lock_for_write();
+            let mut navigation_transition = harness.page.lock_navigation_transition();
             navigation_transition.advance_reconciled(11);
-            prune_page_navigation_epochs_to_contiguous_progress(
+            prune_page_navigation_epochs_to_contiguous_progress_locked(
                 &harness.page,
                 &navigation_transition,
             );
@@ -27129,6 +27190,44 @@ fn is_unreplayable_cdp_event(event: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Checks the lock order between the retention gate of a client and the
+/// navigation transition lock of a page. The checks run in debug builds only.
+///
+/// The order is: the retention gate, then the navigation transition lock. The
+/// listener of a page waits for the navigation transition lock while it holds
+/// the gate. A thread that waits for the gate while it holds the navigation
+/// transition lock therefore blocks that listener, itself, and the reader of
+/// the connection, and no timeout can end the wait.
+mod lock_order {
+    #[cfg(debug_assertions)]
+    thread_local! {
+        static NAVIGATION_TRANSITION_LOCKS_HELD: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn navigation_transition_locked() {
+        #[cfg(debug_assertions)]
+        NAVIGATION_TRANSITION_LOCKS_HELD.with(|held| held.set(held.get() + 1));
+    }
+
+    pub(super) fn navigation_transition_unlocked() {
+        #[cfg(debug_assertions)]
+        NAVIGATION_TRANSITION_LOCKS_HELD.with(|held| held.set(held.get() - 1));
+    }
+
+    pub(super) fn assert_retention_gate_may_be_locked() {
+        #[cfg(debug_assertions)]
+        NAVIGATION_TRANSITION_LOCKS_HELD.with(|held| {
+            assert_eq!(
+                held.get(),
+                0,
+                "lock order: this thread holds a navigation transition lock, \
+                 so it must not lock the retention gate"
+            );
+        });
+    }
+}
+
 struct CdpRetentionGate {
     write_lock: Mutex<()>,
     enabled: AtomicBool,
@@ -27142,16 +27241,22 @@ impl CdpRetentionGate {
         }
     }
 
-    fn lock_for_write(&self) -> Option<MutexGuard<'_, ()>> {
-        let guard = self.write_lock.lock().unwrap();
-        self.enabled.load(Ordering::SeqCst).then_some(guard)
-    }
-    fn lock_for_release(&self) -> MutexGuard<'_, ()> {
+    fn lock(&self) -> MutexGuard<'_, ()> {
+        lock_order::assert_retention_gate_may_be_locked();
         self.write_lock.lock().unwrap()
     }
 
+    fn lock_for_write(&self) -> Option<MutexGuard<'_, ()>> {
+        let guard = self.lock();
+        self.enabled.load(Ordering::SeqCst).then_some(guard)
+    }
+
+    fn lock_for_release(&self) -> MutexGuard<'_, ()> {
+        self.lock()
+    }
+
     fn disable(&self) {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = self.lock();
         self.enabled.store(false, Ordering::SeqCst);
     }
 
@@ -29784,6 +29889,31 @@ struct NavigationTransitionState {
     contiguous_event_watermark: Option<u64>,
 }
 
+/// Holds `PageInner::navigation_transition_lock`.
+struct NavigationTransitionGuard<'a> {
+    state: MutexGuard<'a, NavigationTransitionState>,
+}
+
+impl Deref for NavigationTransitionGuard<'_> {
+    type Target = NavigationTransitionState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl DerefMut for NavigationTransitionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
+impl Drop for NavigationTransitionGuard<'_> {
+    fn drop(&mut self) {
+        lock_order::navigation_transition_unlocked();
+    }
+}
+
 impl NavigationTransitionState {
     fn initialize(&mut self, event_cursor: u64) {
         self.contiguous_event_watermark = event_cursor.checked_sub(1);
@@ -29904,6 +30034,8 @@ struct PageInner {
     session_id: String,
     context_id: Option<String>,
     main_frame_id: Mutex<Option<String>>,
+    /// Serializes the navigation transitions of the page. Lock it with
+    /// `lock_navigation_transition`, which states the lock order.
     navigation_transition_lock: Mutex<NavigationTransitionState>,
     frame_state: Mutex<PageFrameState>,
     iframe_setup_tasks: IframeSetupTaskRegistry,
@@ -30094,6 +30226,19 @@ impl Drop for CreatedTargetGuard {
 }
 
 impl PageInner {
+    /// Locks the navigation transition state of the page.
+    ///
+    /// Lock order: the retention gate of the client, then this lock, then the
+    /// event log, `main_frame_id`, and `frame_state`. A thread that holds this
+    /// lock must not lock the retention gate (see `lock_order`). Under this
+    /// lock, call the functions with the `_locked` suffix: their caller holds
+    /// the gate.
+    fn lock_navigation_transition(&self) -> NavigationTransitionGuard<'_> {
+        let state = self.navigation_transition_lock.lock().unwrap();
+        lock_order::navigation_transition_locked();
+        NavigationTransitionGuard { state }
+    }
+
     fn mark_delivered(&self) {
         self.close_target_on_drop.store(false, Ordering::SeqCst);
     }
@@ -51176,10 +51321,7 @@ fn initialize_page_frame_cache_tracking(
     event_cursor: u64,
     page_session_id: &str,
 ) {
-    page.navigation_transition_lock
-        .lock()
-        .unwrap()
-        .initialize(event_cursor);
+    page.lock_navigation_transition().initialize(event_cursor);
     page.observation_event_cursor
         .store(event_cursor, Ordering::SeqCst);
     page.frame_state
@@ -51198,16 +51340,16 @@ fn cdp_event_sequence(event: &Value) -> Option<u64> {
 }
 
 fn listener_sequence_has_gap(page: &PageInner, sequence: u64) -> bool {
-    page.navigation_transition_lock
-        .lock()
-        .unwrap()
+    page.lock_navigation_transition()
         .sequence_has_gap_before(sequence)
 }
 
 fn advance_contiguous_progress_after_live_event(page: &PageInner, sequence: u64) {
-    let mut navigation_transition = page.navigation_transition_lock.lock().unwrap();
-    if navigation_transition.advance_live(sequence) {
-        prune_page_navigation_epochs_to_contiguous_progress(page, &navigation_transition);
+    let retention_gate = page.browser.client.retention_gate();
+    let retention_guard = retention_gate.lock_for_write();
+    let mut navigation_transition = page.lock_navigation_transition();
+    if navigation_transition.advance_live(sequence) && retention_guard.is_some() {
+        prune_page_navigation_epochs_to_contiguous_progress_locked(page, &navigation_transition);
     }
 }
 
@@ -51692,13 +51834,17 @@ fn record_accepted_navigation_observation(
     observation: AcceptedNavigationObservation,
     event_sequence: Option<u64>,
 ) {
-    let retention_gate = page.browser.client.retention_gate();
-    let Some(_retention_guard) = retention_gate.lock_for_write() else {
-        return;
-    };
-    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
-        return;
-    }
+    let _ = with_live_page_retention(page, || {
+        record_accepted_navigation_observation_locked(page, observation, event_sequence);
+    });
+}
+
+/// The caller holds the retention gate and found the page live under it.
+fn record_accepted_navigation_observation_locked(
+    page: &PageInner,
+    observation: AcceptedNavigationObservation,
+    event_sequence: Option<u64>,
+) {
     let next_index = page
         .browser
         .next_native_network_index
@@ -51726,14 +51872,11 @@ fn record_accepted_navigation_observation(
     }
 }
 
-fn prune_page_navigation_epochs_to_contiguous_progress(
+/// The caller holds the retention gate.
+fn prune_page_navigation_epochs_to_contiguous_progress_locked(
     page: &PageInner,
     navigation_transition: &NavigationTransitionState,
 ) {
-    let retention_gate = page.browser.client.retention_gate();
-    let Some(_retention_guard) = retention_gate.lock_for_write() else {
-        return;
-    };
     if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
         return;
     }
@@ -51900,14 +52043,9 @@ fn with_live_page_retention<T>(page: &PageInner, write: impl FnOnce() -> T) -> O
 }
 
 fn reset_page_history_after_unreplayable(page: &PageInner, sequence: u64) {
-    let retention_gate = page.browser.client.retention_gate();
-    let Some(_retention_guard) = retention_gate.lock_for_write() else {
-        return;
-    };
-    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
-        return;
-    }
-    reset_page_history_after_unreplayable_locked(page, sequence);
+    let _ = with_live_page_retention(page, || {
+        reset_page_history_after_unreplayable_locked(page, sequence);
+    });
 }
 
 fn reset_page_history_after_unreplayable_locked(page: &PageInner, sequence: u64) {
@@ -52211,7 +52349,7 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
             None
         }
         "Page.frameNavigated" => {
-            let _navigation_transition = page.navigation_transition_lock.lock().unwrap();
+            let _navigation_transition = page.lock_navigation_transition();
             let mut main_frame_id = page.main_frame_id.lock().unwrap();
             let mut state = page.frame_state.lock().unwrap();
             apply_accepted_frame_navigation_transition(
@@ -52225,7 +52363,7 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
             )
         }
         "Page.navigatedWithinDocument" => {
-            let _navigation_transition = page.navigation_transition_lock.lock().unwrap();
+            let _navigation_transition = page.lock_navigation_transition();
             let main_frame_id = page.main_frame_id.lock().unwrap();
             let mut state = page.frame_state.lock().unwrap();
             apply_accepted_same_document_navigation_transition(
@@ -52347,7 +52485,7 @@ fn record_page_observation_event_with_ownership(
     };
     let mut accepted_document_navigation_epoch = None;
     if let Some((frame_id, loader_id)) = main_document {
-        let _navigation_transition = page.navigation_transition_lock.lock().unwrap();
+        let _navigation_transition = page.lock_navigation_transition();
         let main_frame_id = page.main_frame_id.lock().unwrap().clone();
         if main_frame_id
             .as_deref()
@@ -53571,7 +53709,8 @@ fn reconcile_frame_cache_invalidations_locked(
     reconciliation
 }
 
-fn record_reconciled_navigation_observations(
+/// The caller holds the retention gate and found the page live under it.
+fn record_reconciled_navigation_observations_locked(
     page: &PageInner,
     observations: Vec<AcceptedNavigationObservationAtSequence>,
 ) {
@@ -53582,7 +53721,7 @@ fn record_reconciled_navigation_observations(
             "reconciled navigation observations must remain in event sequence order"
         );
         previous_sequence = Some(observation.sequence);
-        record_accepted_navigation_observation(
+        record_accepted_navigation_observation_locked(
             page,
             observation.observation,
             Some(observation.sequence),
@@ -53635,13 +53774,13 @@ fn reconcile_frame_cache_invalidations_impl_with_hook(
     // live navigation from overtaking a replayed observation. The same guard
     // owns the one contiguous progress watermark.
     let retention_gate = page.browser.client.retention_gate();
-    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+    let Some(retention_guard) = retention_gate.lock_for_write() else {
         return;
     };
     if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
         return;
     }
-    let mut navigation_transition = page.navigation_transition_lock.lock().unwrap();
+    let mut navigation_transition = page.lock_navigation_transition();
     // Global page cache lock order: event_log -> main_frame_id -> frame_state.
     let (reconciliation, unknown_gap_boundary) = {
         let log = page.browser.client.event_log.lock().unwrap();
@@ -53673,25 +53812,27 @@ fn reconcile_frame_cache_invalidations_impl_with_hook(
         }
         (reconciliation, unknown_gap_boundary)
     };
-    drop(_retention_guard);
+    // The gate stays locked until the navigation transition lock is released
+    // (see `PageInner::lock_navigation_transition`).
     for sequence in reconciliation.unreplayable_sequences.iter().copied() {
-        reset_page_history_after_unreplayable(page, sequence);
+        reset_page_history_after_unreplayable_locked(page, sequence);
     }
     if let Some(sequence) = unknown_gap_boundary {
         // The bounded log can no longer replay every uncovered listener event.
         // Place the conservative boundary immediately before the oldest
         // retained event so that event and all later observations are not
         // attributed to the document from before the unknown gap.
-        record_accepted_navigation_observation(
+        record_accepted_navigation_observation_locked(
             page,
             AcceptedNavigationObservation::Document { loader_id: None },
             Some(sequence),
         );
     }
     let replay_cursor = reconciliation.replay_cursor;
-    record_reconciled_navigation_observations(page, reconciliation.navigation_observations);
+    record_reconciled_navigation_observations_locked(page, reconciliation.navigation_observations);
     navigation_transition.advance_reconciled(replay_cursor);
     drop(navigation_transition);
+    drop(retention_guard);
     record_replayed_page_observations(page, reconciliation.replayed_page_observations);
     if listener_gap {
         advance_observation_event_cursor(page, replay_cursor);
@@ -53845,14 +53986,14 @@ async fn refresh_frame_tree_session_locked(
     // event_log prevents a transport event from being inserted between the
     // cursor barrier and the generation/registration recheck.
     let retention_gate = page.browser.client.retention_gate();
-    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+    let Some(retention_guard) = retention_gate.lock_for_write() else {
         return Ok(());
     };
     if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
         return Ok(());
     }
     let root_frame_id = tree.root_frame_id.clone();
-    let navigation_transition = page.navigation_transition_lock.lock().unwrap();
+    let navigation_transition = page.lock_navigation_transition();
     let (reconciliation, authoritative_effects) = {
         let event_log = page.browser.client.event_log.lock().unwrap();
         let mut main_frame_id = page.main_frame_id.lock().unwrap();
@@ -53886,9 +54027,11 @@ async fn refresh_frame_tree_session_locked(
         };
         (reconciliation, authoritative_effects)
     };
-    drop(_retention_guard);
-    record_reconciled_navigation_observations(page, reconciliation.navigation_observations);
+    // The gate stays locked until the navigation transition lock is released
+    // (see `PageInner::lock_navigation_transition`).
+    record_reconciled_navigation_observations_locked(page, reconciliation.navigation_observations);
     drop(navigation_transition);
+    drop(retention_guard);
     page.iframe_setup_tasks.abort_generations(
         reconciliation
             .removed_setup_generations
