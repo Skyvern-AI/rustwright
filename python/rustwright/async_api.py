@@ -1157,11 +1157,21 @@ def _wrap_async_frame(value: Any) -> Any:
         else:
             key = ("named", getattr(value, "_name", ""), getattr(value, "_url", ""))
         existing = cache.get(key)
-        if existing is not None:
+        # A key by frame id names one frame. A key by position can name a new
+        # frame after its frame is detached, so two sync frames at one position
+        # share a wrapper only while neither of them is detached.
+        value_detached = bool(getattr(value, "_detached", False))
+        if existing is not None and (
+            existing._sync is value
+            or key[0] in ("main", "id")
+            or not (value_detached or getattr(existing._sync, "_detached", False))
+        ):
             setattr(value, "_rustwright_async_frame", existing)
             return existing
         wrapper = AsyncFrame(value)
-        cache[key] = wrapper
+        # The cache keeps the wrapper of the frame that the page has now.
+        if existing is None or not value_detached:
+            cache[key] = wrapper
         setattr(value, "_rustwright_async_frame", wrapper)
         return wrapper
     wrapper = AsyncFrame(value)

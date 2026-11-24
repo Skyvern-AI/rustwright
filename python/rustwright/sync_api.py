@@ -14933,6 +14933,9 @@ class Frame(_EventEmitter):
         self._is_main = is_main
         self._frame_id = frame_id
         self._detached = detached
+        # The parent of this frame when the page listed the frame last. A
+        # detached frame keeps it.
+        self._bound_parent: Optional["Frame"] = None
         self._uses_direct_evaluation = False
         self._child_frame_cache: list["Frame"] = []
 
@@ -14941,12 +14944,17 @@ class Frame(_EventEmitter):
             raise Error(f"{method}: Frame was detached")
 
     def _remember_child_frame(self, frame: "Frame") -> None:
+        frame._bound_parent = frame.parent_frame
         if all(existing is not frame for existing in self._child_frame_cache):
             self._child_frame_cache.append(frame)
 
     def _mark_detached(self) -> None:
         if self._detached:
             return
+        # A new frame can take the position of the parent later. A frame that
+        # the page never listed keeps the parent that its position gives now.
+        if self._bound_parent is None:
+            self._bound_parent = self.parent_frame
         self._detached = True
         for child in list(self._child_frame_cache):
             child._mark_detached()
@@ -14998,6 +15006,8 @@ class Frame(_EventEmitter):
     def parent_frame(self) -> Optional["Frame"]:
         if self._is_main:
             return None
+        if self._detached and self._bound_parent is not None:
+            return self._bound_parent
         parent_spec = _parent_frame_spec_from_frame_spec(self._frame_spec)
         if parent_spec is None:
             return self._page.main_frame
@@ -15024,13 +15034,15 @@ class Frame(_EventEmitter):
                         "frame_index": frame_index,
                         "inner": {"kind": "css", "selector": "*"},
                     }
-                )
+                ),
+                live=True,
             )
             frame._name = str(entry.get("name") or "")
             frame._url = str(entry.get("url") or "")
             frame_id = entry.get("id")
             if frame_id:
                 frame._frame_id = str(frame_id)
+            frame._bound_parent = frame.parent_frame
             children.append(frame)
         self._child_frame_cache = children
         return children
@@ -16637,10 +16649,13 @@ class Page:
     def main_frame(self) -> Frame:
         return self._main_frame
 
-    def _frame_from_spec(self, frame_spec: Dict[str, Any]) -> Frame:
+    def _frame_from_spec(self, frame_spec: Dict[str, Any], *, live: bool = False) -> Frame:
         key = json.dumps(frame_spec, sort_keys=True, separators=(",", ":"))
         frame = self._frame_object_cache.get(key)
-        if frame is None:
+        # A detached object stays detached. `live` says that the page has a
+        # frame at this position now. That frame is a different frame, so it
+        # gets an object of its own.
+        if frame is None or (live and frame._detached):
             selector = frame_spec.get("frame_selector") if frame_spec.get("kind") == "frame" else None
             index = frame_spec.get("frame_index") if frame_spec.get("kind") == "frame" else None
             frame = Frame(
@@ -16661,13 +16676,14 @@ class Page:
                 if isinstance(root, dict):
                     return root
             except Exception:
-                pass
+                # A cancelled action did not read the tree. "No tree" would tell
+                # the caller that every frame of the page is gone.
+                _check_action_cancelled()
         try:
             session = CDPSession(_call(self._core.cdp_session))
             payload = session.send("Page.getFrameTree")
-        except Error:
-            return None
         except Exception:
+            _check_action_cancelled()
             return None
         root = payload.get("frameTree") if isinstance(payload, dict) else None
         if not isinstance(root, dict):
@@ -27636,7 +27652,7 @@ class ElementHandle(_EventEmitter):
         frame_spec = _content_frame_spec_from_element_locator(self._locator, canonical_frame_index=frame_index)
         if frame_spec is None:
             return None
-        frame = self._locator._page._frame_from_spec(frame_spec)
+        frame = self._locator._page._frame_from_spec(frame_spec, live=True)
         owner_frame = self.owner_frame()
         if owner_frame._frame_id is None:
             if owner_frame._is_main:
