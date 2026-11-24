@@ -8122,6 +8122,64 @@ def test_page_download_waiters_ignore_other_pages(browser, http_server):
         context.close()
 
 
+def test_download_started_in_a_popup_reaches_the_page_that_opened_it(browser, http_server):
+    context = browser.new_context()
+    opener = context.new_page()
+    bystander = context.new_page()
+    download_url = f"{http_server}/download"
+    try:
+        opener.set_content(f"<a id='blank' target='_blank' href='{download_url}'>Download</a>")
+        triggers = [
+            lambda: opener.evaluate("url => { window.open(url); }", download_url),
+            lambda: opener.evaluate("url => { window.open(url, '_blank'); }", download_url),
+            lambda: opener.click("#blank"),
+        ]
+        for trigger in triggers:
+            # The popup never commits a navigation, so the browser reports the
+            # download on the popup target.
+            with opener.expect_download(timeout=5_000) as download_info:
+                trigger()
+            download = download_info.value
+            assert download.url == download_url
+            assert download.suggested_filename == "report.txt"
+            assert download.path().read_bytes() == b"download-body"
+
+        # A page that did not open the popup does not receive its download.
+        with pytest.raises(TimeoutError):
+            with bystander.expect_download(timeout=500):
+                opener.evaluate("url => { window.open(url); }", download_url)
+
+        # A popup that committed a navigation owns its later downloads. Here
+        # the popup commits about:blank before the opener sends it to the file.
+        with pytest.raises(TimeoutError):
+            with opener.expect_download(timeout=500):
+                opener.evaluate(
+                    "url => { const popup = window.open(); setTimeout(() => { popup.location = url; }, 100); }",
+                    download_url,
+                )
+    finally:
+        context.close()
+
+
+def test_window_open_never_blocks_the_page_that_called_it(browser, http_server):
+    context = browser.new_context()
+    page = context.new_page()
+    popup_url = f"{http_server}/page"
+    try:
+        page.set_content("<button id='open' onclick='window.open(this.dataset.url)'>Open</button>")
+        page.evaluate("url => { document.querySelector('#open').dataset.url = url; }", popup_url)
+        # Chromium holds each popup until a debugger resumes it, and the page
+        # that opened the popup cannot run script during that time. No popup
+        # listener is active here, so the engine must resume every popup.
+        for _ in range(3):
+            assert page.evaluate("url => { open(url); return 'opened'; }", popup_url) == "opened"
+        page.click("#open")
+        page.click("#open")
+        assert page.evaluate("1 + 1") == 2
+    finally:
+        context.close()
+
+
 def test_overlapping_download_waiters_preserve_page_metadata(page):
     from benchmarks.automation_cases import overlapping_download_waiters_preserve_page_metadata
 

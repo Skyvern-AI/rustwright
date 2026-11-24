@@ -18073,6 +18073,11 @@ class Page:
         return False
 
     def _download_payload_belongs_to_page(self, payload: dict[str, Any]) -> bool:
+        # The core names the opener when the download started in a popup that
+        # never committed a navigation. That page is then the only owner.
+        opener_target_id = payload.get("opener_target_id")
+        if opener_target_id:
+            return str(opener_target_id) == self._target_id
         frame_id = payload.get("frame_id")
         if frame_id is None:
             return True
