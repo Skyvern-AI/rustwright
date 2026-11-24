@@ -11593,6 +11593,9 @@ class BrowserType(_EventEmitter):
         _normalize_permissions_options(context_options, method="BrowserType.launch_persistent_context")
         _normalize_record_video_size_options(context_options, method="BrowserType.launch_persistent_context")
         _normalize_record_har_options(context_options, method="BrowserType.launch_persistent_context")
+        # The browser starts with the `about:blank` page that becomes the initial page of the
+        # context. An empty `user_data_dir` does not change that.
+        launch_options["persistent"] = True
         browser = self._launch_with_normalized_options(launch_options, browser_launch_options)
         context = BrowserContext(None, browser=browser, owns_browser=True, options=context_options)
         browser._contexts.append(context)
