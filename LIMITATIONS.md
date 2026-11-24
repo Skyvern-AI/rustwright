@@ -34,5 +34,16 @@ Rustwright is an alpha, not a complete Playwright replacement.
   web-platform cross-origin masking still applies to external scripts loaded
   without CORS. Subscribing to the `pageerror` event enables the Runtime domain
   and provides full detail for evaluate-created asynchronous callbacks.
+- `page.pause()` has no Inspector window and no code recorder. In a browser
+  that Rustwright launched with `headless=False`, the call stops the script
+  until `playwright.resume()` runs in the DevTools console,
+  `context.debugger.resume()` is called, or the page closes. During a pause,
+  each page of the context has a second protocol session with the Runtime
+  domain enabled, so a page can detect a debugger for that time. The session
+  is removed when the pause ends. Three kinds of document do not get
+  `playwright.resume()`: an iframe that runs in a process of its own, a page
+  that opens during the pause, and a page that defines its own
+  `window.playwright` (the page keeps its object). To continue from such a
+  document, call `context.debugger.resume()` or close the paused page.
 - The implementation still has large monolithic files. A module split is
   planned before beta.
