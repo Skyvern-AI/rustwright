@@ -10,7 +10,7 @@ Run these commands from the repository root. When `--lib` is omitted, the bindin
 
 ## Install (NuGet)
 
-The package is not published yet. Once available from NuGet, install it with:
+Install the package from NuGet:
 
 ```sh
 dotnet add package Rustwright
