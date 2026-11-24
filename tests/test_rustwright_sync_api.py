@@ -3490,6 +3490,8 @@ def test_chromium_connect_over_cdp_adopts_default_context_pages_and_disconnects_
     try:
         launched_page = launched.new_page()
         launched_page.goto(data_url("<title>Origin CDP Page</title><h1>origin</h1>"))
+        # A launched browser has no startup page, so make the default-context page to adopt.
+        launched.new_browser_cdp_session().send("Target.createTarget", {"url": "about:blank"})
 
         connected = playwright.chromium.connect_over_cdp(launched._ws_endpoint)
         assert len(connected.contexts) == 1
@@ -8443,6 +8445,9 @@ def test_launch_includes_default_chromium_arguments(playwright, tmp_path: Path):
         assert "--no-sandbox" in launch_args
         assert "--password-store=basic" in launch_args
         assert "--use-mock-keychain" in launch_args
+        # A launch starts with no window and no startup page.
+        assert "--no-startup-window" in launch_args
+        assert "about:blank" not in launch_args
     finally:
         browser.close()
 
@@ -9198,6 +9203,14 @@ def test_launch_persistent_context_adopts_initial_page_matches_playwright(playwr
     finally:
         if not closed:
             context.close()
+
+    # With an empty user_data_dir the engine makes the profile directory. The context has the
+    # same initial page.
+    context = playwright.chromium.launch_persistent_context("", headless=True)
+    try:
+        assert [page.url for page in context.pages] == ["about:blank"]
+    finally:
+        context.close()
 
 
 def test_launch_slow_mo_delays_page_actions(playwright):
@@ -37035,6 +37048,9 @@ def test_async_connect_over_cdp_adopts_default_context_pages_and_disconnects_onl
             try:
                 launched_page = await launched.new_page()
                 await launched_page.goto(data_url("<title>Async Origin CDP Page</title><h1>origin</h1>"))
+                # A launched browser has no startup page, so make the default-context page to adopt.
+                session = await launched.new_browser_cdp_session()
+                await session.send("Target.createTarget", {"url": "about:blank"})
 
                 connected = await p.chromium.connect_over_cdp(launched._ws_endpoint)
                 assert len(connected.contexts) == 1
