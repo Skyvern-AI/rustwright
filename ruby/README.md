@@ -6,15 +6,15 @@ JSON is handled by the stdlib `json` package.
 
 ## Install (RubyGems)
 
-The platform gems are not published yet. Once available, install the gem with:
+Install the gem:
 
 ```sh
 gem install rustwright
 ```
 
-Published gems will include the native C API library and require no separate
-Rust build. Supported gem platforms are `arm64-darwin`, `x86_64-darwin`,
-`aarch64-linux`, and `x86_64-linux`. Windows is not currently shipped because
+Then load it with `require 'rustwright'`. The published gems include the native
+C API library and require no separate Rust build. Supported gem platforms are
+`arm64-darwin`, `x86_64-darwin`, `aarch64-linux`, and `x86_64-linux`. Windows is not currently shipped because
 the Rust target, Ruby runtime, and RubyGems platform combinations have not yet
 been validated together.
 
