@@ -52,6 +52,17 @@ All notable user-facing changes to Rustwright are documented in this file.
   and `pss_required`) when PSS is available. Role medians are independent
   marginal medians.
 - Chromium launches now include a broader resource-safe default switch set.
+- A Chromium launch now starts with no window (`--no-startup-window`), as in
+  Playwright. The browser does not open an unused `about:blank` page at
+  startup, so the launch is faster and the page list of the Rust API is empty
+  until the first `new_page()`. `launch_persistent_context()` keeps its
+  `about:blank` page. To get the startup page back, pass
+  `--no-startup-window` in `ignore_default_args`.
+- A launch checks for the debugging port of the browser every 2 ms, and
+  `Browser.close()` checks for the exit of the browser process every 2 ms.
+  Both waits polled every 50 ms before. On Windows the port check keeps a
+  cadence of about 50 ms, because a connect to a closed local port does not
+  fail at once there.
 - User-provided feature-list launch arguments now merge with defaults into one
   switch per feature flag.
 
