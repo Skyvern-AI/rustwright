@@ -855,6 +855,33 @@ def http_server():
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if self.path == "/worker-src-self":
+                body = b"<main>Workers from this origin only</main>"
+                self.send_response(200, "OK")
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Security-Policy", "worker-src 'self'")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/worker-identity.js":
+                body = b"""
+                postMessage({
+                  href: self.location.href,
+                  relative: new URL('./json', self.location.href).href,
+                  userAgent: navigator.userAgent,
+                  languages: Array.from(navigator.languages || []),
+                  brands: navigator.userAgentData
+                    ? navigator.userAgentData.brands.map(brand => brand.brand).join(' ')
+                    : ''
+                });
+                """
+                self.send_response(200, "OK")
+                self.send_header("Content-Type", "text/javascript")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path == "/route-abort-child-parent":
                 body = b"""
                 <main id="parent-ready">Parent ready</main>
@@ -30333,6 +30360,39 @@ def test_common_automation_signals_are_suppressed(page):
     assert not worker_signals["webdriverInNavigator"]
     assert worker_signals["language"] == "en-US"
     assert worker_signals["languages"] == ["en-US", "en"]
+
+
+def test_dedicated_worker_keeps_its_script_url_and_the_native_constructor(browser, http_server):
+    context = browser.new_context()
+    page = context.new_page()
+    try:
+        # This page allows workers from its own origin only. A worker that
+        # starts from a blob URL would not run here.
+        page.goto(f"{http_server}/worker-src-self")
+        assert page.evaluate("Function.prototype.toString.call(Worker)") == "function Worker() { [native code] }"
+        assert page.evaluate("Object.getPrototypeOf(Worker) === EventTarget")
+        signals = page.evaluate(
+            """() => new Promise((resolve, reject) => {
+                const worker = new Worker('/worker-identity.js');
+                worker.onmessage = event => resolve(event.data);
+                worker.onerror = () => reject(new Error('the worker did not start'));
+            })"""
+        )
+        assert signals["href"] == f"{http_server}/worker-identity.js"
+        assert signals["relative"] == f"{http_server}/json"
+        # The worker inherits the identity of its page.
+        page_signals = page.evaluate(
+            """() => ({
+                userAgent: navigator.userAgent,
+                languages: Array.from(navigator.languages || []),
+                brands: navigator.userAgentData.brands.map(brand => brand.brand).join(' ')
+            })"""
+        )
+        assert "HeadlessChrome" not in signals["userAgent"]
+        assert "HeadlessChrome" not in signals["brands"]
+        assert {key: signals[key] for key in page_signals} == page_signals
+    finally:
+        context.close()
 
 
 def test_service_worker_automation_signals_are_suppressed(browser, http_server):
