@@ -5,6 +5,25 @@ This package loads the exact Rustwright C ABI shared library at runtime with
 loader-path configuration. It binds all 19 `rw_*` functions from
 `rustwright.h` and exposes the Phase 0 Chromium, browser, and page API.
 
+## Use from another module
+
+Add the module, then pass the path of the C ABI library to `Open`:
+
+```sh
+go get github.com/Skyvern-AI/rustwright/go
+```
+
+```go
+import rustwright "github.com/Skyvern-AI/rustwright/go"
+
+chromium, err := rustwright.Open("/path/to/librustwright_capi.so")
+```
+
+The module has no tagged release yet, so `go get` resolves to the latest
+commit. Build the library from a checkout of this repository with
+`cargo build -p rustwright-capi --release --locked`; it is written to
+`target/release/`.
+
 ## Commands
 
 From the repository root on macOS:
