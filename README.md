@@ -8,7 +8,6 @@
 [![tests](https://img.shields.io/github/actions/workflow/status/Skyvern-AI/rustwright/test.yml?label=tests)](https://github.com/Skyvern-AI/rustwright/actions/workflows/test.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python 3.9–3.14 + 3.15 pre-release](https://img.shields.io/badge/python-3.9%E2%80%933.14%20%2B%203.15%20pre--release-3776AB?logo=python&logoColor=white)](pyproject.toml)
-CPython 3.15 support is verified on 3.15.0rc1 and remains pre-release; CI tracks 3.15-dev until GA.
 [![npm](https://img.shields.io/npm/v/rustwright?logo=npm&label=npm)](https://www.npmjs.com/package/rustwright)
 [![Chromium only](https://img.shields.io/badge/browser-Chromium-4285F4?logo=googlechrome&logoColor=white)](#limitations)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/fG2XXEuQX3)
@@ -82,6 +81,31 @@ See the network-independent [`examples/quickstart.js`](examples/quickstart.js) e
 
 Only a subset of the API surface is bridged — see [Limitations](#limitations).
 
+**Rust, Ruby, C#/.NET, Java, Go, and PHP** (alpha)
+
+These bindings run the same engine. They expose a small API: launch Chromium, open a page, then `goto`, `click`, `fill`, `title`, `textContent`, `evaluate`, `screenshot`, and `close`. Each guide has a complete example.
+
+| Language | Install | Requires | Guide |
+| --- | --- | --- | --- |
+| Rust | `cargo add rustwright` | Rust 1.85+ | [`rust-native/`](rust-native/README.md) |
+| Ruby | `gem install rustwright` | Ruby 2.6+ | [`ruby/`](ruby/README.md) |
+| C# / .NET | `dotnet add package Rustwright` | .NET 8+ | [`csharp/`](csharp/README.md) |
+| Java | Add `io.github.skyvern-ai:rustwright` from Maven Central | JDK 23+ | [`java/`](java/README.md) |
+| Go | `go get github.com/Skyvern-AI/rustwright/go` | Go 1.23+ and the C library | [`go/`](go/README.md) |
+| PHP | Use the [`php/`](php/) directory of this repository | PHP 8.1+ with `ext-ffi`, and the C library | [`php/`](php/README.md) |
+
+The Ruby, .NET, and Java packages include the native library, so they need no Rust toolchain. The Go module has no tagged release yet, so `go get` resolves to the latest commit. Go and PHP load the C library from a path. Build it first:
+
+```bash
+git clone https://github.com/Skyvern-AI/rustwright.git
+cd rustwright
+cargo build -p rustwright-capi --release --locked
+# Linux: target/release/librustwright_capi.so
+# macOS: target/release/librustwright_capi.dylib
+```
+
+These bindings do not download a browser. They use the path in `RUSTWRIGHT_CHROMIUM`, then a Playwright browser cache, then an installed Chrome or Chromium.
+
 **CLI** (agent-focused)
 
 Install the native `rustwright-cli` with one command:
@@ -115,7 +139,7 @@ server, use the standalone [`rustwright-mcp`](mcp/) package.
 - **No Playwright automation fingerprint.** The driver never loads, so its signatures never appear. See [Automation detection](#automation-detection).
 - **Trusted input.** Clicks and typing always use real CDP input events (`Input.dispatchMouseEvent`), not synthetic `element.click()` DOM calls.
 - **Cross-origin iframes (OOPIF).** Auto-attaches out-of-process iframe targets with flattened CDP sessions and routes `frame_locator()` across origins.
-- **One engine, two languages.** The same Rust core backs the Python and Node bindings.
+- **One engine, many languages.** The same Rust core backs the Python and Node bindings, and the alpha Rust, Ruby, C#/.NET, Java, Go, and PHP bindings.
 
 ## How it works
 
