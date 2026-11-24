@@ -12587,6 +12587,73 @@ def test_wait_for_function_and_add_tags(page, http_server):
     assert page.evaluate("getComputedStyle(document.querySelector('#box')).backgroundColor") == "rgb(4, 5, 6)"
 
 
+def test_wait_for_function_reports_one_timeout_for_a_pending_promise(page):
+    page.set_content("<main>pending</main>")
+
+    with pytest.raises(TimeoutError) as timeout_info:
+        page.wait_for_function("() => new Promise(() => {})", timeout=400)
+
+    assert str(timeout_info.value) == "Page.wait_for_function: Timeout 400ms exceeded."
+
+
+def test_async_wait_for_function_evaluates_a_slow_predicate_once():
+    async def run() -> None:
+        from rustwright import async_api
+        from rustwright.async_api import async_playwright
+
+        # One worker makes a wait that outlives its cancelled task observable:
+        # the next call cannot start until that worker is free.
+        async_api.configure_async_executor(max_workers=1)
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.set_content("<main>ready</main>")
+
+                # The promise is slower than one 50 ms async wait slice.
+                slow = await page.wait_for_function(
+                    """(ms) => {
+                      window.__predicateCalls = (window.__predicateCalls || 0) + 1;
+                      return new Promise(resolve => setTimeout(() => resolve('late'), ms));
+                    }""",
+                    arg=300,
+                    timeout=5_000,
+                )
+                assert await slow.json_value() == "late"
+                assert await page.evaluate("window.__predicateCalls") == 1
+
+                frame_value = await page.main_frame.wait_for_function(
+                    "(ms) => new Promise(resolve => setTimeout(() => resolve(7), ms))",
+                    arg=200,
+                    timeout=5_000,
+                )
+                assert await frame_value.json_value() == 7
+
+                with pytest.raises(async_api.TimeoutError) as timeout_info:
+                    await page.wait_for_function("() => new Promise(() => {})", timeout=400)
+                assert str(timeout_info.value) == "Page.wait_for_function: Timeout 400ms exceeded."
+
+                # A plain argument and a handle argument take different native paths.
+                body = await page.evaluate_handle("document.body")
+                for arg in (None, body):
+                    abandoned = asyncio.create_task(
+                        page.wait_for_function("() => new Promise(() => {})", arg=arg, timeout=30_000)
+                    )
+                    await asyncio.sleep(0.3)
+                    abandoned.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await abandoned
+                    started = time.monotonic()
+                    assert await page.evaluate("1 + 1") == 2
+                    assert time.monotonic() - started < 5
+
+                await browser.close()
+        finally:
+            async_api.configure_async_executor()
+
+    asyncio.run(run())
+
+
 def test_add_script_and_style_tag_option_parity(page, tmp_path):
     script_path = tmp_path / "tag.js"
     script_path.write_text("window.__pathScript = 11", encoding="utf-8")
