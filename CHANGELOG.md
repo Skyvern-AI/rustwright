@@ -29,6 +29,7 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ### Changed
 
+- Stealth no longer replaces the page `Worker` constructor. The replacement started each dedicated worker from a `blob:` URL, so relative URLs inside the worker failed, a `worker-src` policy blocked the worker, and a page could detect the replaced constructor. A dedicated worker inherits the user agent and the client hints of its page without the replacement. With a context `locale`, `navigator.language` in a dedicated worker now keeps the browser language, as in Playwright.
 - `Browser.new_page()` now creates a native ephemeral browser context for each
   page. Closing the page disposes its context, matching Playwright isolation.
 - Navigation internals now retain response bodies and drain console and

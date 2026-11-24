@@ -190,7 +190,7 @@ these boundaries:
 | `page/mod.rs` | Page state, frame tree, lifecycle events, navigation. |
 | `page/dom.rs` | DOM querying, selectors, element handles, screenshots/PDF helpers. |
 | `network.rs` | Request/response shaping, routing, HAR-facing metadata, auth/proxy support. |
-| `stealth.rs` | Default identity controls, webdriver suppression, user-agent/client-hint coherence, dedicated-worker identity wrappers, and anti-bot smoke helpers that belong in the Rust layer. |
+| `stealth.rs` | Default identity controls, webdriver suppression, user-agent/client-hint coherence, worker identity, and anti-bot smoke helpers that belong in the Rust layer. |
 | `input.rs` | Keyboard, mouse, touchscreen CDP dispatch. |
 | `artifacts.rs` | Downloads, video, tracing, file output helpers. |
 | `events.rs` | Internal event types and event dispatch helpers. |
