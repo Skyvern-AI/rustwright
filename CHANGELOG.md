@@ -4,6 +4,8 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-24
+
 ### Added
 
 - Each release tag now publishes the `rustwright-core` and `rustwright` Rust
@@ -215,6 +217,7 @@ All notable user-facing changes to Rustwright are documented in this file.
 - Added an experimental Node.js binding for launching Chromium and performing core page navigation, interaction, evaluation, screenshot, and lifecycle operations.
 
 [Unreleased]: https://github.com/Skyvern-AI/rustwright/commits/main
+[0.3.1]: https://github.com/Skyvern-AI/rustwright/releases/tag/v0.3.1
 [0.3.0]: https://github.com/Skyvern-AI/rustwright/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Skyvern-AI/rustwright/releases/tag/v0.2.0
 [0.1.1]: https://github.com/Skyvern-AI/rustwright/releases/tag/v0.1.1
