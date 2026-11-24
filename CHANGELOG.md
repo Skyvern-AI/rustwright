@@ -19,6 +19,13 @@ All notable user-facing changes to Rustwright are documented in this file.
 - Promoted one MCP behavior profile for every client. Snapshot distillation,
   page headers, console deduplication, network notes, compact descriptions, and
   9 KiB/200-line response limits are now the defaults.
+- The Rust `Error` enum (`rustwright_core::RwError`) has a new
+  `ExecutionContextDestroyed` variant. An evaluation whose JavaScript realm was
+  destroyed around the call, usually by a navigation, now returns this variant
+  and no longer returns `Error::Message`. The message text is unchanged.
+- The Rust `Error` enum is now `#[non_exhaustive]`. Rust code outside the crate
+  that matches on it must add a wildcard arm. Later typed variants will then
+  not break a build.
 
 ### Changed
 
@@ -49,6 +56,7 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ### Fixed
 
+- Fixed `Locator.wait_for()` and `wait_for_selector()` to wait through a navigation again. Since 0.3.0, a navigation during the wait raised `Execution context was destroyed, most likely because of a navigation.` The same repair applies to actionability probes and to the checks that follow a committed `fill()`.
 - Fixed native drag-and-drop to stop dispatching trailing pointer and mouse release events after a completed drop.
 - Hardened sync and async context creation rollback and close disposal retries.
 - Fixed `show-trace` and `trace` to decode percent-encoded `file:` URLs and to accept Windows drive-letter paths such as `C:\traces\run.zip` instead of rejecting them as remote URLs.
