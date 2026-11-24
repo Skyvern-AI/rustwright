@@ -9,6 +9,13 @@ All notable user-facing changes to Rustwright are documented in this file.
 - Each release tag now publishes the `rustwright-core` and `rustwright` Rust
   crates to crates.io. The `rustwright-core` package now contains only the
   engine sources.
+- `page.pause()` now stops the script in a browser that Rustwright launched
+  with `headless=False`. To continue, run `playwright.resume()` in the DevTools
+  console of the page, call `context.debugger.resume()`, or close the page.
+  Rustwright has no Inspector window; it prints one line on stderr when the
+  pause starts. In a headless browser, and in a browser that Rustwright
+  attached to with `connect_over_cdp()`, the call returns at once, as in
+  Playwright. Before this change, `page.pause()` returned at once in each case.
 
 ### Breaking
 
