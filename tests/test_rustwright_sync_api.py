@@ -21702,6 +21702,18 @@ def test_detached_frame_child_cache_and_errors_match_playwright(page):
         with pytest.raises(Error, match=r"^Locator\.count: Frame was detached$"):
             stale_frame.locator(selector).count()
 
+    # A new iframe at the position of the removed one is a new frame.
+    page.evaluate(
+        "() => { const frame = document.createElement('iframe'); frame.name = 'next'; document.body.appendChild(frame); }"
+    )
+    page.wait_for_timeout(100)
+    next_frame = page.frame(name="next")
+    assert next_frame is not None and next_frame is not outer
+    assert next_frame.is_detached() is False
+    assert next_frame.evaluate("1 + 1") == 2
+    assert outer.is_detached() is True
+    assert inner.parent_frame is outer
+
 
 def test_locator_description_is_playwright_style_property(page):
     page.set_content("<button>Subscribe</button>")
