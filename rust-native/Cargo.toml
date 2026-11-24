@@ -1,6 +1,6 @@
 [package]
 name = "rustwright"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Idiomatic native Rust API for the Rustwright Chromium CDP engine (a Rust rewrite of Playwright)."
 license = "MIT"
@@ -11,6 +11,6 @@ keywords = ["browser", "automation", "cdp", "chromium", "playwright"]
 categories = ["web-programming"]
 
 [dependencies]
-rustwright_core = { package = "rustwright-core", path = "..", version = "0.3.0", default-features = false }
+rustwright_core = { package = "rustwright-core", path = "..", version = "0.3.1", default-features = false }
 serde = { version = "1.0.194", features = ["derive"] }
 serde_json = "1.0.127"
